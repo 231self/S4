@@ -8,7 +8,6 @@
 app = "s4"
 
 [build]
-  image = "ghcr.io/231self/s4:latest"
 
 [http_service]
   internal_port = 8080

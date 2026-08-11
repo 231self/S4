@@ -13,40 +13,87 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
-  check:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (from rust-toolchain.toml)
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install wasm-tools
-        run: cargo install --locked wasm-tools
-
+          components: rustfmt
       - name: Format
         run: cargo fmt --check
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-tools
+        run: cargo install --locked wasm-tools
       - name: Build Wasm filters
         run: bash scripts/build-filters.sh
-
       - name: Test
         run: cargo test --workspace
 
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-tools
+        run: cargo install --locked wasm-tools
       - name: Build SDKs (drift check)
         if: ${{ !env.ACT }}
         run: |
           bash scripts/generate-sdks.sh
           git diff --exit-code -- sdks/
 
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-tools
+        run: cargo install --locked wasm-tools
       - name: End-to-end (MinIO)
         if: ${{ !env.ACT }}
         run: bash scripts/e2e-local.sh
+
+  # Aggregate status so branch protection's required `check` keeps working
+  # and never ends up "skipped" when a constituent job fails.
+  check:
+    needs: [fmt, lint, test, sdk, e2e]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any check failed
+        if: ${{ contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled') }}
+        run: exit 1
+      - name: All checks passed
+        if: ${{ !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') }}
+        run: echo "all checks passed"

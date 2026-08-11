@@ -44,7 +44,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         cargo build --release -p s4-gateway; \
     fi
 
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
+# Copy the freshly-built binary out of the cache mount to a stable path.
+RUN --mount=type=cache,target=/src/target \
+    if [ "$TARGETARCH" = "arm64" ]; then \
         cp /src/target/aarch64-unknown-linux-gnu/release/s4-gateway /src/gateway-bin; \
     else \
         cp /src/target/release/s4-gateway /src/gateway-bin; \

@@ -761,53 +761,81 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Local { cmd } => {
-            let root = project_root()?;
-            let compose_file = root.join("local").join("docker-compose.yml");
+            const LOCAL_GATEWAY_NAME: &str = "s4-local-gateway";
+            const LOCAL_GATEWAY_IMAGE: &str = "ghcr.io/231self/s4:latest";
+            const LOCAL_GATEWAY_PORT: u16 = 8080;
+
             match cmd {
                 LocalCmd::Init => {
-                    let status = std::process::Command::new("docker")
-                        .args(["compose", "-f"])
-                        .arg(&compose_file)
-                        .args(["up", "-d", "--wait"])
-                        .status()?;
-                    if !status.success() {
-                        bail!("docker compose failed");
+                    // Runs the published gateway image standalone (no repo
+                    // clone, no Postgres): in-memory storage, keys persisted
+                    // on a named volume. Durable MinIO storage is available
+                    // via `just dev-up` in the repo.
+                    let docker_ok = std::process::Command::new("docker")
+                        .args(["version", "--format", "{{.Server.Version}}"])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if !docker_ok {
+                        bail!("docker is not running — start Docker/colima first");
                     }
+
+                    let _ = std::process::Command::new("docker")
+                        .args(["rm", "-f", LOCAL_GATEWAY_NAME])
+                        .status();
+                    let run_status = std::process::Command::new("docker")
+                        .args([
+                            "run",
+                            "-d",
+                            "--name",
+                            LOCAL_GATEWAY_NAME,
+                            "-p",
+                            &format!("{LOCAL_GATEWAY_PORT}:8080"),
+                            "-v",
+                            "s4-local-keys:/app/data",
+                            "-e",
+                            "AUTH_DISABLED=true",
+                            "-e",
+                            "S4_KEYS_FILE=/app/data/keys.json",
+                            LOCAL_GATEWAY_IMAGE,
+                        ])
+                        .status()?;
+                    if !run_status.success() {
+                        bail!(
+                            "failed to start gateway container — is {LOCAL_GATEWAY_IMAGE} pullable?"
+                        );
+                    }
+
+                    let url = format!("http://localhost:{LOCAL_GATEWAY_PORT}");
+                    let mut healthy = false;
+                    for _ in 0..30 {
+                        if reqwest::get(format!("{url}/health"))
+                            .await
+                            .map(|r| r.status().is_success())
+                            .unwrap_or(false)
+                        {
+                            healthy = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    if !healthy {
+                        bail!("gateway did not become healthy at {url}/health");
+                    }
+
                     // Point the CLI at the local gateway in demo mode so the
                     // quickstart works without any credentials.
                     let mut cfg = Config::load();
                     cfg.access_key = None;
                     cfg.secret_key = None;
-                    cfg.gateway = Some("http://localhost:8080".to_string());
+                    cfg.gateway = Some(url.clone());
                     cfg.bucket = None;
                     cfg.save()?;
 
-                    // Best-effort: create the default quickstart bucket.
-                    let mc = |args: &[&str]| {
-                        let status = std::process::Command::new("docker")
-                            .args(["run", "--rm", "--network", "host", "minio/mc", "--no-color"])
-                            .args(args)
-                            .status();
-                        matches!(status, Ok(s) if s.success())
-                    };
-                    if !(mc(&[
-                        "alias",
-                        "set",
-                        "local",
-                        "http://localhost:9000",
-                        "minioadmin",
-                        "minioadmin",
-                    ]) && mc(&["mb", "local/s4-local", "--ignore-existing"]))
-                    {
-                        eprintln!(
-                            "warning: could not create bucket via mc; run 'mc mb local/s4-local' manually"
-                        );
-                    }
-
-                    println!("Local dev environment ready.");
-                    println!("  Gateway: http://localhost:8080");
-                    println!("  MinIO:   http://localhost:9000 (API) / :9001 (Console)");
-                    println!("  Bucket:  s4-local");
+                    println!("S4 local gateway is running (published image).");
+                    println!("  Gateway: {url}");
+                    println!("  Storage: in-memory (durable MinIO via `just dev-up` in the repo)");
+                    println!("  Keys:    persisted in the s4-local-keys volume");
                     println!();
                     println!("Quickstart:");
                     println!("  s4ctl put ./data.csv ingest/data.csv --bucket s4-local");
@@ -817,14 +845,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 LocalCmd::Down => {
                     let status = std::process::Command::new("docker")
-                        .args(["compose", "-f"])
-                        .arg(&compose_file)
-                        .args(["down"])
+                        .args(["rm", "-f", LOCAL_GATEWAY_NAME])
                         .status()?;
                     if status.success() {
-                        println!("Local dev environment stopped.");
+                        println!("S4 local gateway stopped.");
                     } else {
-                        bail!("docker compose failed");
+                        println!("S4 local gateway is not running.");
                     }
                 }
             }

@@ -37,5 +37,10 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Build SDKs (drift check)
+        run: |
+          bash scripts/generate-sdks.sh
+          git diff --exit-code -- sdks/
+
       - name: End-to-end (MinIO)
         run: bash scripts/e2e-local.sh

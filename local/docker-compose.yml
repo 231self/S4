@@ -26,9 +26,14 @@ services:
       S3_ENDPOINT: http://minio:9000
       LISTEN_ADDR: 0.0.0.0:8080
       S4_FILTER_COMPONENT: /app/pii-default.component.wasm
+      AUTH_DISABLED: "true"
+      S4_KEYS_FILE: /app/data/keys.json
+    volumes:
+      - s4-keys:/app/data
     depends_on:
       minio:
         condition: service_healthy
 
 volumes:
   minio-data:
+  s4-keys:

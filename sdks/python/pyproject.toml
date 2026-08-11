@@ -5,7 +5,7 @@ description = "S4 Gateway API"
 authors = [
   {name = "OpenAPI Generator Community",email = "team@openapitools.org"},
 ]
-license = "MIT"
+license = "Apache-2.0"
 readme = "README.md"
 keywords = ["OpenAPI", "OpenAPI-Generator", "S4 Gateway API"]
 requires-python = ">=3.9"

@@ -41,7 +41,7 @@ s4ctl put ./data.csv ingest/data.csv --bucket s4-local
 s4ctl get ingest/data.csv --bucket s4-local
 ```
 
-`s4ctl local init` pulls `ghcr.io/231self/s4` and runs the gateway in local mode
+`s4ctl local init` pulls `ghcr.io/231self/s4/s4` and runs the gateway in local mode
 (`AUTH_DISABLED=true`, keys persisted on a volume, in-memory storage). `s4ctl local
 down` stops it. For durable local storage (MinIO), clone the repo and use
 `just dev-up`.
@@ -91,7 +91,7 @@ Two local pipeline runners, both with persistent caches:
   cache server, so cargo deps are reused across runs).
 - **`just build-local` / `just image-local` / `just publish-local TAG=x`** — dagger
   pipeline (`dagger/main.py`) with cargo registry + target dirs on persistent cache
-  volumes; `publish-local` pushes to `ghcr.io/231self/s4` (needs `docker login ghcr.io`
+  volumes; `publish-local` pushes to `ghcr.io/231self/s4/s4` (needs `docker login ghcr.io`
   once).
 
 See `CONTRIBUTING.md`.

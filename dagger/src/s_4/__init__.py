@@ -3,7 +3,7 @@
 Run locally (requires the Dagger CLI + engine):
     dagger call ci                      # fmt + clippy + filters + tests (cached)
     dagger call image                   # assemble the deploy image
-    dagger call publish --tag=v0.2.0    # build + push ghcr.io/231self/s4:<tag>
+    dagger call publish --tag=v0.2.0    # build + push ghcr.io/231self/s4/s4:<tag>
 
 Sources are cloned in-engine via dag.git (no host filesystem dependency),
 and cargo registry + target dirs live on persistent cache volumes, so
@@ -13,7 +13,7 @@ repeated runs reuse compiled dependencies instead of recompiling.
 import dagger
 from dagger import dag, function, object_type
 
-REGISTRY = "ghcr.io/231self/s4"
+REGISTRY = "ghcr.io/231self/s4/s4"
 REPO = "https://github.com/231self/S4.git"
 DEFAULT_REF = "main"
 

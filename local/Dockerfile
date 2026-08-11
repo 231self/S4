@@ -1,10 +1,15 @@
 FROM rust:latest AS builder
 WORKDIR /build
 COPY . .
-RUN rustup target add wasm32-unknown-unknown
-RUN cargo install wasm-tools
-RUN bash scripts/build-filters.sh
-RUN cargo build --release -p s4-gateway
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    rustup target add wasm32-unknown-unknown \
+    && cargo install wasm-tools
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    bash scripts/build-filters.sh
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release -p s4-gateway
 
 FROM debian:bookworm-slim
 COPY --from=builder /build/target/release/s4-gateway /app/s4-gateway

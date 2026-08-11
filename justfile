@@ -43,6 +43,27 @@ lint-full: lint audit test
 e2e:
   bash scripts/e2e-local.sh
 
+# Run the CI workflow locally with act (no GitHub minutes)
+ci-local:
+  act -W .github/workflows/ci.yml
+
+# Run the release workflow locally with act (tag event; GHCR push needs a
+# token with packages scope)
+release-local:
+  act -W .github/workflows/release.yml -e act/event-tag.json
+
+# Build + test in a dagger container (cargo registry + target cached)
+build-local:
+  dagger call ci
+
+# Build the deploy image locally (dagger)
+image-local:
+  dagger call image
+
+# Build + publish the deploy image to GHCR (needs: docker login ghcr.io once)
+publish-local TAG=latest:
+  dagger call publish --tag={{TAG}}
+
 # Start local dev environment (Docker Compose + MinIO + gateway)
 dev-up: build-filters
   docker compose -f local/docker-compose.yml up -d --build --wait minio gateway

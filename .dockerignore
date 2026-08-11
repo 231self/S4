@@ -1,0 +1,11 @@
+# Keep host build artifacts and VCS metadata out of the image build context.
+# Without this, COPY . . ships the host's target/ (runner-built binaries),
+# which then get copied into the image instead of freshly compiled ones.
+target
+.git
+.jj
+node_modules
+.actrc
+act
+.env
+*.env.resolved

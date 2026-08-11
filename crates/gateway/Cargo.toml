@@ -28,6 +28,7 @@ hmac = "0.12"
 sha2 = "0.10"
 sqlx.workspace = true
 async-trait.workspace = true
+dirs = "6"
 utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-swagger-ui = { workspace = true, features = ["axum"] }
 

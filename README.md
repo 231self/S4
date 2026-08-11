@@ -82,6 +82,18 @@ just e2e          # end-to-end against MinIO (Docker)
 just build-sdks   # regenerate Python/TypeScript SDKs from the OpenAPI spec
 ```
 
+### Run CI/release locally (no GitHub minutes)
+
+Two local pipeline runners, both with persistent caches:
+
+- **`just ci-local`** — runs the real `.github/workflows/ci.yml` via
+  [act](https://github.com/nektos/act) (local Docker; `actions/cache` backed by act's
+  cache server, so cargo deps are reused across runs).
+- **`just build-local` / `just image-local` / `just publish-local TAG=x`** — dagger
+  pipeline (`dagger/main.py`) with cargo registry + target dirs on persistent cache
+  volumes; `publish-local` pushes to `ghcr.io/231self/s4` (needs `docker login ghcr.io`
+  once).
+
 See `CONTRIBUTING.md`.
 
 ## Documentation

@@ -2,23 +2,32 @@
 # Deploy image for the S4 gateway: release binary + Wasm filter components.
 #
 # Build:      docker build -t s4-gateway .
-# Or via CI:  dagger call image (see dagger/main.py)
+# Via CI:     .github/workflows/release.yml (docker/build-push-action, gha cache)
+# Locally:    dagger call publish --tag=... (see dagger/main.py)
+#
+# Cargo registry + target dirs ride on BuildKit cache mounts so incremental
+# builds reuse compiled deps instead of recompiling everything.
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
 
 # Rust 2024 edition requires a recent toolchain; rust:1 tracks latest.
-RUN rustup target add wasm32-unknown-unknown \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    rustup target add wasm32-unknown-unknown \
     && cargo install --locked wasm-tools --version 1.255.0 --root /opt/wasm-tools
 ENV PATH="/opt/wasm-tools/bin:$PATH"
 
 COPY . .
 
 # Wasm filter components (pii-default, envelope-encrypt, stable-encrypt, ...)
-RUN bash scripts/build-filters.sh
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    bash scripts/build-filters.sh
 
 # Release gateway binary
-RUN cargo build --release -p s4-gateway
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p s4-gateway
 
 FROM debian:bookworm-slim
 RUN apt-get update \

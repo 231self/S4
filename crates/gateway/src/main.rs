@@ -8,6 +8,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{delete, get, head, post, put},
 };
+use tower_http::cors::CorsLayer;
 use s4_gateway::plugin_registry::PluginRegistry;
 use s4_gateway::s3_error;
 use s4_gateway::service_storage::{ServiceStorage, parse_service_backends};
@@ -1025,6 +1026,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/{bucket}/{*key}", head(s3_head))
         .route("/{bucket}/{*key}", delete(s3_delete))
         .route("/{bucket}/{*key}", post(s3_post))
+        .layer(CorsLayer::permissive())
         .with_state(state)
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()));
 

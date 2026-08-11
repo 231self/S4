@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Keep link-time memory bounded: matches GitHub's 2-vCPU runner and keeps
+  # local (act/colima) builds from exhausting a shared Docker VM.
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   check:

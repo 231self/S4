@@ -9,7 +9,7 @@ const DEFAULT_GATEWAY: &str = "http://localhost:9000";
 #[derive(Parser)]
 #[command(
     name = "s4ctl",
-    about = "CLI for S4 — zero-trust PII filtering S3 gateway",
+    about = "CLI for S4 — pluggable processing gateway for S3-compatible storage",
     version
 )]
 struct Cli {
@@ -57,7 +57,7 @@ enum Command {
         cmd: PluginCmd,
     },
 
-    /// Upload a file through S4 (with PII filtering)
+    /// Upload a file through S4 (runs it through the plugin pipeline)
     Put {
         /// Source file to upload
         file: PathBuf,
@@ -89,7 +89,7 @@ enum Command {
         cmd: LocalCmd,
     },
 
-    /// End-to-end PII filter test
+    /// End-to-end filter test (uploads a fixture and verifies redaction)
     Test {
         #[command(subcommand)]
         cmd: TestCmd,
@@ -770,13 +770,50 @@ async fn main() -> anyhow::Result<()> {
                         .arg(&compose_file)
                         .args(["up", "-d", "--wait"])
                         .status()?;
-                    if status.success() {
-                        println!("Local dev environment ready.");
-                        println!("  Gateway: http://localhost:8080");
-                        println!("  MinIO:   http://localhost:9000 (API) / :9001 (Console)");
-                    } else {
+                    if !status.success() {
                         bail!("docker compose failed");
                     }
+                    // Point the CLI at the local gateway in demo mode so the
+                    // quickstart works without any credentials.
+                    let mut cfg = Config::load();
+                    cfg.access_key = None;
+                    cfg.secret_key = None;
+                    cfg.gateway = Some("http://localhost:8080".to_string());
+                    cfg.bucket = None;
+                    cfg.save()?;
+
+                    // Best-effort: create the default quickstart bucket.
+                    let mc = |args: &[&str]| {
+                        let status = std::process::Command::new("docker")
+                            .args(["run", "--rm", "--network", "host", "minio/mc", "--no-color"])
+                            .args(args)
+                            .status();
+                        matches!(status, Ok(s) if s.success())
+                    };
+                    if !(mc(&[
+                        "alias",
+                        "set",
+                        "local",
+                        "http://localhost:9000",
+                        "minioadmin",
+                        "minioadmin",
+                    ]) && mc(&["mb", "local/s4-local", "--ignore-existing"]))
+                    {
+                        eprintln!(
+                            "warning: could not create bucket via mc; run 'mc mb local/s4-local' manually"
+                        );
+                    }
+
+                    println!("Local dev environment ready.");
+                    println!("  Gateway: http://localhost:8080");
+                    println!("  MinIO:   http://localhost:9000 (API) / :9001 (Console)");
+                    println!("  Bucket:  s4-local");
+                    println!();
+                    println!("Quickstart:");
+                    println!("  s4ctl put ./data.csv ingest/data.csv --bucket s4-local");
+                    println!("  s4ctl get ingest/data.csv --bucket s4-local");
+                    println!();
+                    println!("Stop with: s4ctl local down");
                 }
                 LocalCmd::Down => {
                     let status = std::process::Command::new("docker")

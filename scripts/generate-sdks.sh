@@ -46,6 +46,7 @@ generate() {
     echo "→ Generating $lang SDK..."
     rm -rf "$dir"
     docker run --rm \
+        -u "$(id -u):$(id -g)" \
         -v "$SDK_DIR:/local" \
         "$GENERATOR_IMAGE" generate \
         -i /local/openapi.json \

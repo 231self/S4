@@ -30,9 +30,11 @@ ENV PATH="/opt/wasm-tools/bin:$PATH"
 COPY . .
 
 # Wasm filter components (pii-default, envelope-encrypt, stable-encrypt, ...)
+# Copied out of the cache mount to a stable path for the runtime stage.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    bash scripts/build-filters.sh
+    bash scripts/build-filters.sh \
+    && cp -r /src/target/components /src/components-out
 
 # Release gateway binary, compiled for the target architecture
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -44,7 +46,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         cargo build --release -p s4-gateway; \
     fi
 
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
+# Copy the freshly-built binary out of the cache mount to a stable path.
+RUN --mount=type=cache,target=/src/target \
+    if [ "$TARGETARCH" = "arm64" ]; then \
         cp /src/target/aarch64-unknown-linux-gnu/release/s4-gateway /src/gateway-bin; \
     else \
         cp /src/target/release/s4-gateway /src/gateway-bin; \
@@ -56,7 +60,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/gateway-bin /usr/local/bin/s4-gateway
-COPY --from=build /src/target/components /app/components
+COPY --from=build /src/components-out /app/components
 
 ENV S4_FILTER_COMPONENT=/app/components/pii-default.component.wasm
 ENV S4_PLUGINS_DIR=/app/components

@@ -1,0 +1,500 @@
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 0", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 1"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 3", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 4"}
+{"order_id": "ORD-5", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-6", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-7", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-8", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 9", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 10"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 11"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "12"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 13 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 14 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "15"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 16 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 17"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 18"}
+{"message": "HIPAA compliant log for record 19", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 20", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 21"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 23", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 24"}
+{"order_id": "ORD-25", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-26", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-27", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-28", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 29", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 30"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 31"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "32"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 33 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 34 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "35"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 36 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 37"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 38"}
+{"message": "HIPAA compliant log for record 39", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 40", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 41"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 43", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 44"}
+{"order_id": "ORD-45", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-46", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-47", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-48", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 49", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 50"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 51"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "52"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 53 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 54 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "55"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 56 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 57"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 58"}
+{"message": "HIPAA compliant log for record 59", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 60", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 61"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 63", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 64"}
+{"order_id": "ORD-65", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-66", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-67", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-68", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 69", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 70"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 71"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "72"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 73 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 74 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "75"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 76 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 77"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 78"}
+{"message": "HIPAA compliant log for record 79", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 80", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 81"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 83", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 84"}
+{"order_id": "ORD-85", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-86", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-87", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-88", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 89", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 90"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 91"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "92"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 93 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 94 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "95"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 96 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 97"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 98"}
+{"message": "HIPAA compliant log for record 99", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 100", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 101"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 103", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 104"}
+{"order_id": "ORD-105", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-106", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-107", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-108", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 109", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 110"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 111"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "112"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 113 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 114 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "115"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 116 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 117"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 118"}
+{"message": "HIPAA compliant log for record 119", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 120", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 121"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 123", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 124"}
+{"order_id": "ORD-125", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-126", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-127", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-128", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 129", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 130"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 131"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "132"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 133 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 134 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "135"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 136 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 137"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 138"}
+{"message": "HIPAA compliant log for record 139", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 140", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 141"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 143", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 144"}
+{"order_id": "ORD-145", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-146", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-147", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-148", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 149", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 150"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 151"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "152"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 153 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 154 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "155"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 156 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 157"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 158"}
+{"message": "HIPAA compliant log for record 159", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 160", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 161"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 163", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 164"}
+{"order_id": "ORD-165", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-166", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-167", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-168", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 169", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 170"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 171"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "172"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 173 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 174 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "175"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 176 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 177"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 178"}
+{"message": "HIPAA compliant log for record 179", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 180", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 181"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 183", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 184"}
+{"order_id": "ORD-185", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-186", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-187", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-188", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 189", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 190"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 191"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "192"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 193 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 194 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "195"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 196 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 197"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 198"}
+{"message": "HIPAA compliant log for record 199", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 200", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 201"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 203", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 204"}
+{"order_id": "ORD-205", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-206", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-207", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-208", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 209", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 210"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 211"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "212"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 213 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 214 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "215"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 216 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 217"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 218"}
+{"message": "HIPAA compliant log for record 219", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 220", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 221"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 223", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 224"}
+{"order_id": "ORD-225", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-226", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-227", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-228", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 229", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 230"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 231"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "232"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 233 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 234 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "235"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 236 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 237"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 238"}
+{"message": "HIPAA compliant log for record 239", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 240", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 241"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 243", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 244"}
+{"order_id": "ORD-245", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-246", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-247", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-248", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 249", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 250"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 251"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "252"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 253 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 254 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "255"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 256 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 257"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 258"}
+{"message": "HIPAA compliant log for record 259", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 260", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 261"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 263", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 264"}
+{"order_id": "ORD-265", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-266", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-267", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-268", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 269", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 270"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 271"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "272"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 273 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 274 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "275"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 276 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 277"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 278"}
+{"message": "HIPAA compliant log for record 279", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 280", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 281"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 283", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 284"}
+{"order_id": "ORD-285", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-286", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-287", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-288", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 289", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 290"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 291"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "292"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 293 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 294 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "295"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 296 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 297"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 298"}
+{"message": "HIPAA compliant log for record 299", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 300", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 301"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 303", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 304"}
+{"order_id": "ORD-305", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-306", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-307", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-308", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 309", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 310"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 311"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "312"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 313 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 314 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "315"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 316 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 317"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 318"}
+{"message": "HIPAA compliant log for record 319", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 320", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 321"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 323", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 324"}
+{"order_id": "ORD-325", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-326", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-327", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-328", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 329", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 330"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 331"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "332"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 333 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 334 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "335"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 336 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 337"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 338"}
+{"message": "HIPAA compliant log for record 339", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 340", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 341"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 343", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 344"}
+{"order_id": "ORD-345", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-346", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-347", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-348", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 349", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 350"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 351"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "352"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 353 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 354 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "355"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 356 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 357"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 358"}
+{"message": "HIPAA compliant log for record 359", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 360", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 361"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 363", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 364"}
+{"order_id": "ORD-365", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-366", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-367", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-368", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 369", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 370"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 371"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "372"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 373 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 374 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "375"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 376 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 377"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 378"}
+{"message": "HIPAA compliant log for record 379", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 380", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 381"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 383", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 384"}
+{"order_id": "ORD-385", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-386", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-387", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-388", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 389", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 390"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 391"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "392"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 393 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 394 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "395"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 396 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 397"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 398"}
+{"message": "HIPAA compliant log for record 399", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 400", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 401"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 403", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 404"}
+{"order_id": "ORD-405", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-406", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-407", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-408", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 409", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 410"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 411"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "412"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 413 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 414 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "415"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 416 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 417"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 418"}
+{"message": "HIPAA compliant log for record 419", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 420", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 421"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 423", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 424"}
+{"order_id": "ORD-425", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-426", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-427", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-428", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 429", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 430"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 431"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "432"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 433 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 434 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "435"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 436 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 437"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 438"}
+{"message": "HIPAA compliant log for record 439", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 440", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 441"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 443", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 444"}
+{"order_id": "ORD-445", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-446", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-447", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-448", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 449", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 450"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 451"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "452"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 453 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 454 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "455"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 456 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 457"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 458"}
+{"message": "HIPAA compliant log for record 459", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 460", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 461"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 463", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 464"}
+{"order_id": "ORD-465", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-466", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-467", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-468", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 469", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 470"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 471"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "472"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 473 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 474 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "475"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 476 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 477"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 478"}
+{"message": "HIPAA compliant log for record 479", "phi": "none", "status": "reviewed"}
+{"email": "[REDACTED_EMAIL]", "name": "Clean Record 480", "status": "active"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "name": "Dual PII 481"}
+{"email": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]", "amount": "9900"}
+{"phone": "555-0100", "name": "No PII 483", "status": "inactive"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "name": "Triple PII 484"}
+{"order_id": "ORD-485", "customer": "[REDACTED_EMAIL]", "total": 1998}
+{"trace_id": "abc-486", "user": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]"}
+{"trace_id": "xyz-487", "user": "[REDACTED_EMAIL]", "card": "[REDACTED_CARD]"}
+{"trace_id": "qwe-488", "user": "[REDACTED_EMAIL]", "note": "clean log line"}
+{"message": "Processed batch 489", "records": 1000, "status": "ok"}
+{"email": "[REDACTED_EMAIL]", "ssn": "[REDACTED_SSN]", "card": "[REDACTED_CARD]", "notes": "All three PII types for record 490"}
+{"email": "[REDACTED_EMAIL]", "name": "Iris the Clean 491"}
+{"user": "[REDACTED_EMAIL]", "partner": "[REDACTED_EMAIL]", "id": "492"}
+{"email": "[REDACTED_EMAIL]", "note": "Record 493 has clean data"}
+{"ssn": "900-12-3456", "email": "[REDACTED_EMAIL]", "note": "Record 494 has 900+ area - clean"}
+{"data": "Some random digits 1234567890123456 but not valid card", "id": "495"}
+{"user_handle": "superuser99", "email": "[REDACTED_EMAIL]", "note": "Record 496 local TLD"}
+{"login": "[REDACTED_EMAIL]", "target": "ip-address-login Record 497"}
+{"description": "Email-like string [REDACTED_EMAIL] with plus addressing Record 498"}
+{"message": "HIPAA compliant log for record 499", "phi": "none", "status": "reviewed"}

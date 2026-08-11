@@ -1,0 +1,299 @@
+# S4 Development Conventions
+
+## Version Control
+
+This is a **jj** repository. Do not use `git` directly for mutations.
+
+```bash
+jj st                # show working copy status
+jj log               # show commit history
+jj commit -m "msg"   # commit working copy changes
+jj git push          # push to origin
+jj git fetch         # fetch from origin
+```
+
+All commits require a description (-m). Avoid interactive flags.
+Verify with `jj st` and `jj log` after each mutation.
+
+## Build
+
+- `just check` — format, lint, test
+- `just check-fmt` — `cargo fmt --check`
+- `just check-lint` — `cargo clippy --all-targets -- -D warnings`
+- `just test` — `cargo test --workspace`
+- `just build-filters` — build the Wasm filter component
+- `just build-sdks` — generate Python + TypeScript client SDKs from OpenAPI spec
+- `just deny` — run cargo-deny
+- `just audit` — run cargo-audit
+
+## Code Conventions
+
+- Rust 2024 edition.
+- No warnings allowed in production code (RUSTFLAGS = -D warnings).
+- Crate boundaries at security/protocol seams, not one crate per noun.
+- If a crate has one caller and no independent tests, merge it.
+- No functionality is added without extensive unit tests.
+- Prefer specialized libraries over raw regex for PII detection (email, card validation).
+
+## Database
+
+- Relational modeling with normalized Postgres relations.
+- JSONB only for opaque provider payloads, signed manifests, and audit details.
+- Store money as integer minor units, byte usage as BIGINT.
+- Use an ORM for all database access: `sqlx` (compile-time checked queries) or `diesel` (type-safe DSL).
+- Never write raw SQL strings inline in application code.
+- All queries must have compile-time verification against the schema.
+- Database migrations must be managed by `sqlx migrate` or `diesel migration`, never applied manually via `psql` or `docker exec`.
+- Migration files live in `migrations/` at the crate or workspace root, versioned sequentially.
+- Run `sqlx migrate run` to apply; test migrations with `sqlx migrate info` before commit.
+
+## API Design
+
+- Frontend-to-backend APIs must be typed end-to-end.
+- Define shared types in a dedicated crate or generate from OpenAPI/Smithy schemas.
+- Use `serde` derive for all request/response types.
+- API errors use a single typed envelope: `{ code, message, details? }`.
+- Never pass raw upstream errors or stack traces to clients.
+- S3 data-plane responses use proper S3 XML error documents.
+
+## Architecture Decisions
+
+Document every infrastructure, auth, storage, and deployment choice so automations stay in line.
+
+### Auth
+
+- **Supabase Auth (GoTrue)** for user signup, login, magic-link emails, and session management.
+- Supabase JS client in the dashboard browser app; `jsonwebtoken` crate in the gateway validates JWTs.
+- API keys (S3 access key + secret) are separate from user sessions. Generated on key creation, hashed with SHA-256, stored in Postgres.
+- Gateway verifies API keys on S3 routes via `x-s4-access-key` / `x-s4-secret-key` headers or `Authorization: Bearer <access_key>:<secret>`.
+
+### Database
+
+- **Supabase Postgres** (local: supabase CLI Docker containers; cloud: Supabase Pro).
+- ORM: `sqlx`. Queries are runtime-checked (`sqlx::query`/`query_as` + `FromRow`); compile-time checked `query!` macros are deferred until `cargo sqlx prepare` (offline) is set up in CI. `sqlx migrate` for schema migrations.
+- Migration files in workspace-root `migrations/`, versioned sequentially (`YYYYMMDDHHMMSS_description.sql`). The gateway runs `sqlx::migrate!()` at startup.
+- `sqlx migrate run` applies; `sqlx migrate info` checks status. Never use `psql` or `docker exec` directly.
+- **API keys are persisted in Postgres** when `DATABASE_URL` is set (`PostgresKeyStore`); otherwise the in-memory `KeyStore` is used (local dev). Both implement the async `KeyRepository` trait. `PostgresKeyStore` survives restarts / scale-to-zero.
+
+### Storage (Object Data)
+
+- **Three-tier storage model** with fallback priority:
+  1. Per-object presigned URL (`x-s4-backend-url` header) — zero-trust, no credential storage
+  2. Per-user backend config (`/dashboard/api/backend`) — IAM Role or S3-compatible creds
+  3. S4 Service Storage — managed multi-cloud buckets with consistent hashing
+  4. Global `S3_ENDPOINT` env var — single shared backend
+  5. In-memory `MemoryStore` — local dev default (HashMap by bucket/key)
+
+- **Presigned URL proxy**: User generates a presigned PUT/GET URL for their bucket with their own SDK. Sends it as `x-s4-backend-url` header. S4 validates S4 API key, filters PII, HTTP-forwards to the presigned URL. No credentials stored in S4. Platform-agnostic (works with S3, R2, B2, MinIO).
+
+- **Per-user backend (IAM Role model)**: Follows Fivetran/Airbyte pattern. User creates an IAM Role in their AWS account with trust policy allowing S4 to assume it, protected by a unique External ID (prevents confused deputy attacks). User pastes Role ARN into dashboard. S4 calls `sts:AssumeRole` for temp credentials. For non-AWS backends (R2, B2, MinIO): user provides endpoint + token via dashboard. Backend config stored in `BackendRegistry` (in-memory, per-user `BackendConfig`).
+
+- **S4 Service Storage**: "Just works" mode. Users write PII-cleansed data without configuring any backend. S4 manages dedicated buckets across multiple cloud providers. Objects distributed via consistent hashing (150 virtual nodes per backend). Dual-write to primary + replica for cross-cloud resilience. Read falls back to replica on primary miss. Configured via `S4_SERVICE_BUCKETS` env var: `provider|endpoint|region|bucket|access_key|secret_key;...`. Implementation in `crates/gateway/src/service_storage.rs`.
+
+- **Multi-cloud write strategies — progress** (how concurrent multi-cloud writes work today, and the variants we track):
+
+  | Strategy | Status | Behavior in S4 today |
+  |----------|--------|----------------------|
+  | Dispersed writes across providers | ✅ implemented | Consistent-hash ring (150 vnodes/backend) assigns each key a primary + one replica, so keys spread across all configured backends; a provider is just an S3-compatible endpoint label (`S4_SERVICE_BUCKETS`) |
+  | Active-active writes | ✅ implemented | `put` dual-writes primary + replica concurrently (`tokio::join!`); a replica write failure is logged and does not fail the request |
+  | Active-read / passive-read (fail-over) | ✅ implemented | `get` reads the primary; on miss/error it falls back to the replica (`"primary miss for {key}, trying replica"`) |
+  | Provider-agnostic R/W | ✅ implemented | No cloud-specific code — every backend is a plain S3-compatible endpoint (AWS, R2, B2, MinIO, …); consistent hashing, dual-write, and fail-over all operate on endpoints only |
+  | Active-active reads (read both, compare / use fastest) | 🔲 planned | Would issue reads to primary + replica in parallel and return the first success (or verify equality) — a latency/consistency trade-off, not yet needed |
+  | Quorum / consistency checking | 🔲 planned | e.g. write to N-of-M, verify digest across replicas on read; useful once object integrity is a requirement |
+  | Regional fail-over / cross-region promotion | 🔲 planned | Promote replica to primary on sustained primary outage (today fail-over is per-request, not a topology change) |
+  | Erasure / sharded dispersal | 🔲 not planned | Sharding a single object across providers (e.g. Reed-Solomon) — heavy, low value for PII-cleansed data |
+
+  Anything not in the "✅ implemented" rows is a future consideration, not currently built.
+
+- Objects are NOT persisted in Postgres — only metadata (keys, usage receipts) goes there.
+
+### CLI (s4ctl)
+
+- Binary crate at `crates/s4ctl/`. Full-featured CLI for S4 operations.
+- Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`.
+- Auth from: `~/.config/s4/config.json` (login saved), `S4_ACCESS_KEY`/`S4_SECRET_KEY` env vars, or demo mode (empty keys fall through to gateway demo bypass).
+- Key expiry support: `--expiry never|30d|90d|1y` (or raw seconds).
+- Backend presign: generates presigned URLs via local AWS CLI for use with S4 proxy.
+
+### OpenAPI & SDK Generation
+
+- OpenAPI 3.1 spec auto-generated from Rust types via `utoipa` + `utoipa-swagger-ui`.
+- Served at `/openapi.json` (raw spec) and `/docs` (Swagger UI).
+- `utoipa::ToSchema` on all API types (`ApiKeyResponse`, `ListKeyResponse`, `CreateKeyRequest`, `DeleteKeyRequest`, `ObjectResponse`, `BackendConfig`).
+- `#[utoipa::path(...)]` annotations on all dashboard API handlers.
+- `just build-sdks` extracts spec, runs `openapi-generator` (Docker) to produce Python and TypeScript SDKs in `sdks/python/` and `sdks/typescript/`.
+- Schema is the single source of truth — SDKs always in sync with server changes.
+- `scripts/generate-sdks.sh` re-applies the hand-written high-level client from `sdks/overlay/<lang>/` after each generation, so it survives regeneration:
+  - `s4_client/highlevel.py` / `highlevel.ts` — `S4Client` with `put_object`/`get_object` (S3 data plane, `x-s4-access-key`/`x-s4-secret-key` auth), `generate_keypair` (RSA-2048 SPKI), `attach_public_key`, and `decrypt_payload` (RSA-OAEP unwrap + AES-256-GCM) for client-side decryption of the stored envelopes. Python extras: `requests`, `cryptography`. TypeScript uses only Web Crypto + global fetch (Node ≥ 18 or browser).
+  - Client flow: `generate_keypair()` → `attach_public_key(public_pem)` once → `put_object(...)` (gateway encrypts PII server-side) → `get_object(...)` + `decrypt_payload(bytes, private_pem)`.
+
+### Web Dashboard
+
+- Single-page HTML/JS served inline from the gateway binary at `/`.
+- Uses Supabase JS client from CDN for auth. No React/Vite build step needed for the gateway crate.
+- Dashboard JS calls `/dashboard/api/*` on the gateway for key management and object listing.
+
+### Deployment
+
+- Single Rust binary (`s4-gateway`). No separate frontend server in dev.
+- **Local**: `restart-dev.sh` builds filters + gateway, kills stale port, nohup-launches.
+- **Cloud candidates**: any container platform (fly.io, render, run.dev). Domain: `s4.the-no-corp.com`.
+- **Emails**: loops.so for transactional (welcome, key created). Supabase Auth handles magic-link emails.
+- **Control plane**: Cloudflare Workers + Pages (per plan Phase 3), deferred until alpha has paying users.
+
+### Secrets & Config
+
+- All secrets via environment variables, never in source or committed config.
+- `S4_PORT`, `LISTEN_ADDR`, `S3_ENDPOINT`, `DATABASE_URL`, `SUPABASE_JWT_SECRET`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`.
+- Local dev uses Supabase CLI default credentials; cloud uses Supabase dashboard values.
+
+### Key Formats
+
+- API key IDs: `s4_<32-hex>` (UUID without dashes).
+- API key secrets: `s4s_<32-hex>`. Revealed once on creation, hashed with SHA-256 for storage.
+- S3 requests authenticate with the plaintext secret (like AWS SigV4 secret key).
+
+### Wasm Filter Plugins
+
+- **Plugin pipeline**: Enabled plugins run in order. Output of plugin N becomes input of plugin N+1.
+- **Plugin registry** (`crates/gateway/src/plugin_registry.rs`): Stores metadata (id, name, version, enabled) and component bytes. Supports import, enable/disable, remove, reorder.
+- **Runtime import**: `POST /dashboard/api/plugins` with `.wasm` body + `x-s4-plugin-name` header.
+- **Runtime toggle**: `PUT /dashboard/api/plugins/{id}` with `{"enabled": true/false}`.
+- **Auto-load**: `S4_PLUGINS_DIR` env var loads all `.wasm` files from a directory at startup.
+- **WIT interface** (`wit/s4-filter/world.wit`): `begin(Context)`, `transform(Vec<u8>) → Decision`, `finish()`. Context carries `format`, `content-type`, `policy-version`. Decision variants: `Emit`, `Drop`, `Reject`.
+- **Sandbox**: 64 MiB memory, 10K table entries, 512 KiB stack. No host imports — pure byte-in/byte-out. Fuel: `S4_WASM_FUEL` env var (default 1B) sets the per-session instruction budget. The baseline `FilterEngine::new` default is 10M (enough for redaction filters); crypto filters (RSA-OAEP is ~25M per wrap) require the pipeline budget, which defaults to 1B.
+- **Default plugin**: `filters/pii-default/` — detects emails (via `@`), credit cards (Luhn check, 13-19 digits), SSNs (9 digits, SSA range validation). Redacts to `[REDACTED_EMAIL]`, `[REDACTED_CARD]`, `[REDACTED_SSN]`.
+
+### Envelope Encryption per Field (design doc)
+
+**Goal**: Encrypt PII fields so they are recoverable by authorized clients, without
+storing plaintext or requiring S4 to hold decryption keys. Falls back to redaction
+when no public key is configured.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      ENCRYPTION ARCHITECTURE                        │
+├───────────────┬───────────────────────┬─────────────────────────────┤
+│  Client SDK   │     S4 Gateway        │       Storage               │
+├───────────────┼───────────────────────┼─────────────────────────────┤
+│               │                       │                             │
+│ 1. Generate   │                       │                             │
+│    keypair    │                       │                             │
+│    (priv+pub) │                       │                             │
+│               │                       │                             │
+│ 2. POST /keys │                       │                             │
+│    with X.509 │                       │                             │
+│    cert ─────→│ 3. Store cert with    │                             │
+│               │    API key in KeyStore│                             │
+│               │                       │                             │
+│ 4. PUT data   │                       │                             │
+│    + API key ─→                       │                             │
+│               │ 5. Authenticate       │                             │
+│               │ 6. Plugin pipeline:   │                             │
+│               │    a. Detect PII      │                             │
+│               │    b. For each field: │                             │
+│               │       • Gen DEK (AES) │                             │
+│               │       • Encrypt DEK   │                             │
+│               │         with cert     │                             │
+│               │       • Encrypt field │                             │
+│               │         with DEK      │                             │
+│               │       • Package:      │                             │
+│               │         {alg, iv,     │                             │
+│               │          enc_dek, ct} │                             │
+│               │ 7. Replace field ─────→ 8. Store                    │
+│               │                       │                             │
+│ 9. GET data  ←─ 10. Return encrypted  │                             │
+│    + API key    │     fields as-is    │                             │
+│               │                       │                             │
+│ 11. Decrypt:  │                       │                             │
+│     • Use priv│                       │                             │
+│       key to  │                       │                             │
+│       decrypt │                       │                             │
+│       enc_dek │                       │                             │
+│     • Use DEK │                       │                             │
+│       to      │                       │                             │
+│       decrypt │                       │                             │
+│       field   │                       │                             │
+└───────────────┴───────────────────────┴─────────────────────────────┘
+```
+
+**Envelope format** (each encrypted field):
+
+```json
+{
+  "alg": "RSA-OAEP/AES-256-GCM",
+  "iv": "<base64 12-byte IV>",
+  "enc_dek": "<base64 RSA-OAEP-encrypted DEK>",
+  "ct": "<base64 AES-256-GCM ciphertext>",
+  "tag": "<base64 16-byte auth tag>"
+}
+```
+
+**WIT interface extension** (to pass public key to plugin):
+
+```wit
+record context {
+  format: string,
+  content-type: string,
+  policy-version: u64,
+  public-key-pem: option<string>,    // NEW: X.509 cert for encryption
+}
+```
+
+**Plugin composition (pipeline)**:
+
+```
+PUT /bucket/data.jsonl + S4 API key (with X.509 cert)
+  │
+  ▼
+[noop]          ← pass-through, baseline benchmark
+  │
+  ▼
+[pii-detect]    ← identifies PII fields (email, SSN, card)
+  │              ← returns Decision::Emit with metadata annotations
+  ▼
+[encrypt]       ← for each annotated PII field:
+  │              ←   if public_key_pem is set in context:
+  │              ←     envelope-encrypt (DEK + cert)
+  │              ←   else:
+  │              ←     redact to [REDACTED_*]
+  ▼
+Storage
+```
+
+**Stable (deterministic) encryption for JOIN keys**:
+
+Certain fields (e.g., `user_id`, `email`) need deterministic encryption —
+same input always produces same ciphertext. This enables JOINs and dedup
+across datasets. Implemented as a separate plugin that uses AES-SIV
+(deterministic AEAD) with a key derived from the API key secret.
+
+```
+field_value → HMAC(api_key_secret, field_value) → deterministic_ciphertext
+```
+
+NOT enabled by default — the user explicitly tags fields as "stable" in
+the API key configuration or request headers.
+
+**Client SDK flow**:
+
+```bash
+# 1. Initialize — generates keypair, sends cert to S4
+s4ctl key create --label prod-encryption --generate-encryption-key
+
+# 2. Upload — S4 encrypts PII fields with the cert
+s4ctl put ./data.jsonl ingest/data.jsonl --bucket my-ingest
+
+# 3. Download — client decrypts fields with private key
+s4ctl get ingest/data.jsonl --bucket my-ingest --decrypt
+```
+
+**Security properties**:
+
+- S4 never has access to the client's private key
+- S4 never sees plaintext PII after encryption (only during the transform in the Wasm sandbox, which is ephemeral per-session)
+- Each field gets a unique DEK (even within the same record)
+- DEK is encrypted with RSA-OAEP (2048-bit minimum) — only the private key holder can recover it
+- AES-256-GCM provides authenticated encryption (confidentiality + integrity)
+- Compromise of one field's DEK doesn't compromise other fields
+- Public key rotation: generate a new API key with a new cert, re-upload data

@@ -1,0 +1,48 @@
+[package]
+name = "s4-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "s4-gateway"
+path = "src/main.rs"
+
+[dependencies]
+s4-error = { path = "../error" }
+s4-wasm-runtime = { path = "../wasm-runtime" }
+anyhow = "1"
+axum.workspace = true
+tokio.workspace = true
+aws-sdk-s3.workspace = true
+aws-config.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+base64 = "0.22"
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+hmac = "0.12"
+sha2 = "0.10"
+sqlx.workspace = true
+async-trait.workspace = true
+utoipa = { workspace = true, features = ["axum_extras"] }
+utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+
+[dev-dependencies]
+proptest.workspace = true
+pollster = "0.4"
+tower = "0.5"
+rsa = { version = "0.9", default-features = false, features = ["pem", "sha2"] }
+sha2 = "0.10"
+sha1 = "0.10"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+base64 = "0.22"
+rand_core = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+x509-parser = "0.16"
+aes-siv = { version = "0.7", default-features = false, features = ["alloc"] }
+hmac = "0.12"
+wasmtime = "47"

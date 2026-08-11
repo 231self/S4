@@ -1,0 +1,12 @@
+[package]
+name = "pii-default"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+pii-shared = { path = "../pii-shared" }

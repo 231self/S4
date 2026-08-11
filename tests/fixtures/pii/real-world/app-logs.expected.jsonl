@@ -1,0 +1,6 @@
+{"timestamp":"2026-08-09T12:00:00Z","level":"INFO","service":"api-gateway","message":"Request processed","trace_id":"abc123","user":"[REDACTED_EMAIL]","ip":"10.0.0.1","duration_ms":45,"status":200}
+{"timestamp":"2026-08-09T12:00:01Z","level":"INFO","service":"auth-service","message":"User login successful","trace_id":"abc124","user":"[REDACTED_EMAIL]","ip":"10.0.0.2","method":"oauth","provider":"google"}
+{"timestamp":"2026-08-09T12:00:02Z","level":"WARN","service":"payment-processor","message":"Card validation failed","trace_id":"abc125","user":"[REDACTED_EMAIL]","card_last4":"4242","amount_cents":9900,"currency":"USD"}
+{"timestamp":"2026-08-09T12:00:03Z","level":"ERROR","service":"data-export","message":"Export failed for user [REDACTED_EMAIL]","trace_id":"abc126","error":"timeout exceeded","retry_count":3}
+{"timestamp":"2026-08-09T12:00:04Z","level":"INFO","service":"registration","message":"New signup from [REDACTED_EMAIL]","trace_id":"abc127","ip":"10.0.0.5","utm_source":"hackernews"}
+{"timestamp":"2026-08-09T12:00:05Z","level":"INFO","service":"api-gateway","message":"Health check passed","trace_id":"abc128","status":"healthy","uptime_seconds":86400}

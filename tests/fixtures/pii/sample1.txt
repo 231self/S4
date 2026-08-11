@@ -1,0 +1,7 @@
+jane.doe@example.com had SSN 123-45-6789, card 4111111111111111
+user2@test.org used SSN 078-05-1120
+no PII in this line
+admin@company.co.uk card 5500000000000004
+Another email: test@mail.io with SSN 001-01-0001
+Solo digit run 1234567890123 no luhn
+Hello, contact support@s4.dev for help.

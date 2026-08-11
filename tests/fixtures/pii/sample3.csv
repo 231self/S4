@@ -1,0 +1,6 @@
+name,email,ssn,card,notes
+Alice,alice@test.com,,,no PII
+Bob,bob@example.com,123-45-6789,378282246310005,has PII
+Charlie,,,5500005555555559,card only
+Dave,dave@mail.com,,,email only
+Eve,,,,"SSN 078-05-1120 card 6011111111111117"

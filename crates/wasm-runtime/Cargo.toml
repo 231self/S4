@@ -1,0 +1,15 @@
+[package]
+name = "s4-wasm-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+s4-error = { path = "../error" }
+wasmtime.workspace = true
+wit-bindgen.workspace = true
+anyhow = "1"
+rand.workspace = true
+
+[build-dependencies]
+wit-bindgen.workspace = true

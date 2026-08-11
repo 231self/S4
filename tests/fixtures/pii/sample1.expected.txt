@@ -1,0 +1,7 @@
+[REDACTED_EMAIL] had SSN [REDACTED_SSN], card [REDACTED_CARD]
+[REDACTED_EMAIL] used SSN [REDACTED_SSN]
+no PII in this line
+[REDACTED_EMAIL] card [REDACTED_CARD]
+Another email: [REDACTED_EMAIL] with SSN [REDACTED_SSN]
+Solo digit run 1234567890123 no luhn
+Hello, contact [REDACTED_EMAIL] for help.

@@ -1,0 +1,5 @@
+{"user":"alice","email":"[REDACTED_EMAIL]","note":"no PII"}
+{"user":"bob","email":"[REDACTED_EMAIL]","ssn":"[REDACTED_SSN]","card":"[REDACTED_CARD]"}
+{"user":"carol","msg":"what about [REDACTED_CARD]?"}
+{"user":"dave","email":"[REDACTED_EMAIL]","msg":"just a test"}
+{"user":"eve","msg":"SSN [REDACTED_SSN] no dashes but area 123 group 45 serial 6789"}

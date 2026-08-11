@@ -1,0 +1,5 @@
+{"user":"alice","email":"alice@redact.io","note":"no PII"}
+{"user":"bob","email":"bob@example.com","ssn":"111-22-3333","card":"378282246310005"}
+{"user":"carol","msg":"what about 6011111111111117?"}
+{"user":"dave","email":"dave@mail.com","msg":"just a test"}
+{"user":"eve","msg":"SSN 123456789 no dashes but area 123 group 45 serial 6789"}

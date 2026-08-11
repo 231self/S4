@@ -1,0 +1,38 @@
+{"id":"email-001","type":"email","field":"[REDACTED_EMAIL]","expected":"redacted"}
+{"id":"email-002","type":"email","field":"[REDACTED_EMAIL]","expected":"redacted"}
+{"id":"email-003","type":"email","field":"[REDACTED_EMAIL]","expected":"redacted"}
+{"id":"email-004","type":"email","field":"[REDACTED_EMAIL]","expected":"redacted"}
+{"id":"email-005","type":"email","field":"[REDACTED_EMAIL]","expected":"redacted"}
+{"id":"email-006","type":"email","field":"not-an-email","expected":"clean"}
+{"id":"email-007","type":"email","field":"@missing-local.com","expected":"clean"}
+{"id":"email-008","type":"ssn","field":"[REDACTED_SSN]","expected":"redacted"}
+{"id":"ssn-001","type":"ssn","field":"[REDACTED_SSN]","expected":"redacted"}
+{"id":"ssn-002","type":"ssn","field":"[REDACTED_SSN]","expected":"redacted"}
+{"id":"ssn-003","type":"ssn","field":"[REDACTED_SSN]","expected":"redacted"}
+{"id":"ssn-004","type":"ssn","field":"[REDACTED_SSN]","expected":"redacted"}
+{"id":"ssn-005","type":"ssn","field":"000-12-3456","expected":"clean"}
+{"id":"ssn-006","type":"ssn","field":"666-12-3456","expected":"clean"}
+{"id":"ssn-007","type":"ssn","field":"900-12-3456","expected":"clean"}
+{"id":"ssn-008","type":"ssn","field":"123-00-4567","expected":"clean"}
+{"id":"ssn-009","type":"ssn","field":"123-45-0000","expected":"clean"}
+{"id":"ssn-010","type":"ssn","field":"999887766","expected":"clean"}
+{"id":"card-001","type":"card","field":"[REDACTED_CARD]","expected":"redacted"}
+{"id":"card-002","type":"card","field":"[REDACTED_CARD]","expected":"redacted"}
+{"id":"card-003","type":"card","field":"[REDACTED_CARD]","expected":"redacted"}
+{"id":"card-004","type":"card","field":"[REDACTED_CARD]","expected":"redacted"}
+{"id":"card-005","type":"card","field":"[REDACTED_CARD]","expected":"redacted"}
+{"id":"card-006","type":"card","field":"[REDACTED_CARD]","expected":"redacted"}
+{"id":"card-007","type":"card","field":"[REDACTED_CARD]","expected":"redacted"}
+{"id":"card-008","type":"card","field":"1234567890123456","expected":"clean"}
+{"id":"card-009","type":"card","field":"1234567890123","expected":"clean"}
+{"id":"card-010","type":"card","field":"41111","expected":"clean"}
+{"id":"combo-001","type":"combo","field":"[REDACTED_EMAIL] SSN [REDACTED_SSN] card [REDACTED_CARD]","expected":"redacted"}
+{"id":"combo-002","type":"combo","field":"[REDACTED_EMAIL] uses [REDACTED_SSN] and [REDACTED_CARD]","expected":"redacted"}
+{"id":"combo-003","type":"combo","field":"no pii in this record","expected":"clean"}
+{"id":"combo-004","type":"combo","field":"numbers 1234567890 12345678901 123456789012","expected":"clean"}
+{"id":"combo-005","type":"combo","field":"ssn-like [REDACTED_SSN] but not 999-99-9999","expected":"redacted"}
+{"id":"combo-006","type":"combo","field":"ssn-like [REDACTED_SSN] but not 999-99-9999","expected":"null"}
+{"id":"unicode-001","type":"unicode","field":"Café résumé at [REDACTED_EMAIL]","expected":"redacted"}
+{"id":"unicode-002","type":"unicode","field":"日本語テキストは安全です","expected":"clean"}
+{"id":"null-001","type":"null","field":null,"expected":"clean"}
+{"id":"empty-001","type":"empty","field":"","expected":"clean"}

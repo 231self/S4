@@ -1,0 +1,26 @@
+# Fly.io app config: S4 gateway, scale-to-zero.
+#
+#   fly launch --no-deploy
+#   fly secrets set SUPABASE_URL=... SUPABASE_ANON_KEY=... SUPABASE_JWT_SECRET=... \
+#     DATABASE_URL=... S4_SERVICE_BUCKETS=... AUTH_DISABLED=false
+#   fly deploy
+
+app = "s4"
+
+[build]
+  image = "ghcr.io/231self/s4:latest"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"   # suspend when idle (scale-to-zero)
+  auto_start_machines = true    # wake on request
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# All configuration is runtime env/secrets, never baked into the image.
+[env]
+  AUTH_DISABLED = "false"

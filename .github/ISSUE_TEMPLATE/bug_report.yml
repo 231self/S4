@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a problem with S4
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Commands, payloads, and configuration needed to reproduce.
+      placeholder: |
+        s4ctl local init
+        s4ctl put ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Tag or commit hash, plus gateway log lines if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Environment
+      description: OS, Rust toolchain, Docker (if used), storage backend.

@@ -1,0 +1,6 @@
+name,email,ssn,card,notes
+Alice,[REDACTED_EMAIL],,,no PII
+Bob,[REDACTED_EMAIL],[REDACTED_SSN],[REDACTED_CARD],has PII
+Charlie,,,[REDACTED_CARD],card only
+Dave,[REDACTED_EMAIL],,,email only
+Eve,,,,"SSN [REDACTED_SSN] card [REDACTED_CARD]"

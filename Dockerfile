@@ -4,7 +4,7 @@
 # Stages:
 #   filters — Wasm components are architecture-independent, built ONCE here
 #   build   — per-arch gateway release binary (TARGETARCH)
-#   runtime — debian:bookworm-slim + binary + components
+#   runtime — debian:trixie-slim + binary + components
 #
 # Multi-arch: buildx platforms linux/amd64,linux/arm64; the gateway is
 # cross-compiled for arm64 (gcc-aarch64-linux-gnu), so both platforms build
@@ -53,7 +53,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         && cp /src/target/release/s4-gateway /src/gateway-bin; \
     fi
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

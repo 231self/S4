@@ -8,7 +8,6 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{delete, get, head, post, put},
 };
-use tower_http::cors::CorsLayer;
 use s4_gateway::plugin_registry::PluginRegistry;
 use s4_gateway::s3_error;
 use s4_gateway::service_storage::{ServiceStorage, parse_service_backends};
@@ -20,6 +19,7 @@ use s4_gateway::{Format, Gateway};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -970,29 +970,30 @@ async fn main() -> anyhow::Result<()> {
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
-    let (keys, has_persistent_keys): (Arc<dyn KeyRepository>, bool) = if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&database_url)
-            .await
-            .expect("failed to connect to DATABASE_URL");
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("failed to run migrations");
-        info!("Key store: Postgres (migrations applied)");
-        (Arc::new(PostgresKeyStore::new(pool)), true)
-    } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
-        info!("Key store: file ({keys_file})");
-        (Arc::new(FileKeyStore::new(PathBuf::from(keys_file))), true)
-    } else if auth_disabled {
-        let path = FileKeyStore::default_path();
-        info!("Key store: file ({}) (local mode)", path.display());
-        (Arc::new(FileKeyStore::new(path)), true)
-    } else {
-        info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
-        (Arc::new(KeyStore::new()), false)
-    };
+    let (keys, has_persistent_keys): (Arc<dyn KeyRepository>, bool) =
+        if let Ok(database_url) = std::env::var("DATABASE_URL") {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&database_url)
+                .await
+                .expect("failed to connect to DATABASE_URL");
+            sqlx::migrate!("../../migrations")
+                .run(&pool)
+                .await
+                .expect("failed to run migrations");
+            info!("Key store: Postgres (migrations applied)");
+            (Arc::new(PostgresKeyStore::new(pool)), true)
+        } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
+            info!("Key store: file ({keys_file})");
+            (Arc::new(FileKeyStore::new(PathBuf::from(keys_file))), true)
+        } else if auth_disabled {
+            let path = FileKeyStore::default_path();
+            info!("Key store: file ({}) (local mode)", path.display());
+            (Arc::new(FileKeyStore::new(path)), true)
+        } else {
+            info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
+            (Arc::new(KeyStore::new()), false)
+        };
 
     let state = Arc::new(AppState {
         gateway: Arc::new(gateway),

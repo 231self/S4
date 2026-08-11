@@ -61,7 +61,7 @@ image-local:
   dagger call image
 
 # Build + publish the deploy image to GHCR (needs: docker login ghcr.io once)
-publish-local TAG=latest:
+publish-local TAG='latest':
   dagger call publish --tag={{TAG}}
 
 # Start local dev environment (Docker Compose + MinIO + gateway)

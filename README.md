@@ -27,13 +27,12 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 
 ## Quickstart (local-only)
 
-No cloud account, no database — everything runs on your machine:
+No cloud account, no database, no repo clone — everything runs on your machine:
 
 ```bash
-cargo install s4ctl          # or: cargo run -p s4ctl (from this repo)
-
-s4ctl local init             # starts MinIO + the gateway (auth disabled)
-s4ctl plugin list            # the pii-default plugin is preloaded
+cargo install s4ctl --git https://github.com/231self/S4
+s4ctl local init                  # runs the published gateway image (Docker)
+s4ctl plugin list                 # the pii-default plugin is preloaded
 
 # Write data through the pipeline; it is transformed before it reaches storage
 s4ctl put ./data.csv ingest/data.csv --bucket s4-local
@@ -42,9 +41,10 @@ s4ctl put ./data.csv ingest/data.csv --bucket s4-local
 s4ctl get ingest/data.csv --bucket s4-local
 ```
 
-`local init` boots the gateway (MinIO on `:9000`, gateway on `:8080`), enables local
-mode (`AUTH_DISABLED=true`, keys persisted to `~/.config/s4/keys.json`), and points
-`s4ctl` at it. `s4ctl local down` stops everything.
+`s4ctl local init` pulls `ghcr.io/231self/s4` and runs the gateway in local mode
+(`AUTH_DISABLED=true`, keys persisted on a volume, in-memory storage). `s4ctl local
+down` stops it. For durable local storage (MinIO), clone the repo and use
+`just dev-up`.
 
 ## Run your own plugin
 

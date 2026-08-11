@@ -59,6 +59,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ env.IMAGE }}:${{ github.ref_name }}, ${{ env.IMAGE }}:latest
           cache-from: type=gha

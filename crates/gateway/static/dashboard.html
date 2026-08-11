@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>S4 — S3-compatible PII filtering gateway</title>
+<title>S4 — pluggable processing gateway for object storage</title>
 <!--SUPABASE-->
 <style>
 :root {
@@ -225,8 +225,8 @@ body {
 <div id="landing">
 <div class="container">
 <div class="hero">
-  <h1>Filter PII <mark>before</mark> it reaches storage</h1>
-  <p>Zero-trust, platform-agnostic PII gateway. Point any S3 client at S4 — automatic redaction of emails, SSNs, credit cards, and custom patterns.</p>
+  <h1>Run your plugins <mark>before</mark> data reaches storage</h1>
+  <p>Platform-agnostic processing gateway. Point any S3 client at S4 — filter, redact, encrypt, or convert every object with your Wasm plugins.</p>
 
   <canvas class="flow-canvas" id="flowCanvas" width="1200" height="320"></canvas>
 
@@ -236,7 +236,7 @@ body {
       <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
       <div class="code-block"># Get an API key from the dashboard or use demo mode
 
-# Upload — PII is automatically filtered
+# Upload — data runs through the plugin pipeline
 curl -X PUT http://localhost:9000/ingest/data.jsonl \
   -H "x-s4-access-key: YOUR_KEY_ID" \
   -H "x-s4-secret-key: YOUR_SECRET" \
@@ -257,7 +257,7 @@ curl http://localhost:9000/ingest/data.jsonl \
 
 <div class="section" id="features" style="border-top:none;padding-top:32px">
   <div class="section-label">Features</div>
-  <div class="section-title">Everything you need to ship PII-safe data</div>
+  <div class="section-title">Everything you need to process data in transit</div>
   <div class="features-grid">
     <div class="feature-card">
       <div class="feature-icon">&#x2601;</div>
@@ -267,7 +267,7 @@ curl http://localhost:9000/ingest/data.jsonl \
     <div class="feature-card">
       <div class="feature-icon">&#x1F4C1;</div>
       <div class="feature-title">Full S3 API</div>
-      <div class="feature-desc">PUT, GET, DELETE, HEAD, LIST — standard S3 operations pass through PII filtering. Drop-in compatible with AWS SDK, boto3, and any S3 tool.</div>
+      <div class="feature-desc">PUT, GET, DELETE, HEAD, LIST — standard S3 operations run through the plugin pipeline. Drop-in compatible with AWS SDK, boto3, and any S3 tool.</div>
     </div>
     <div class="feature-card">
       <div class="feature-icon">&#x1F511;</div>
@@ -282,7 +282,7 @@ curl http://localhost:9000/ingest/data.jsonl \
     <div class="feature-card">
       <div class="feature-icon">&#x1F9E9;</div>
       <div class="feature-title">Plugin system</div>
-      <div class="feature-desc">Wasm filter plugins: import, enable, disable at runtime. Ordered pipeline processes data through multiple filters. Ship custom PII detectors without redeploying.</div>
+      <div class="feature-desc">Wasm filter plugins: import, enable, disable, reorder at runtime. Ordered pipeline processes data through multiple plugins — ship custom transforms without redeploying.</div>
     </div>
     <div class="feature-card">
       <div class="feature-icon">&#x1F6E1;</div>
@@ -492,7 +492,7 @@ echo "https://s3.us-west-004.backblazeb2.com"</div>
 <div class="section">
   <div class="section-label">Usage</div>
   <div class="section-title">Connect your tools</div>
-  <div class="section-subtitle">Generate a presigned URL for your bucket, then pipe it through S4 for PII filtering.</div>
+  <div class="section-subtitle">Generate a presigned URL for your bucket, then pipe it through S4 for plugin processing.</div>
 
   <div class="tab-bar">
     <button class="tab-btn active" onclick="switchTab('bash', this)">Bash</button>
@@ -511,7 +511,7 @@ export S4=http://localhost:9000
 # Generate a presigned PUT URL using your AWS credentials
 PRESIGNED=$(aws s3 presign s3://my-bucket/uploads/data.jsonl --expires-in 604800)
 
-# Send through S4 — PII filtered before reaching your bucket
+# Send through S4 — processed by the plugin pipeline before reaching your bucket
 curl -X PUT "$S4/my-bucket/uploads/data.jsonl" \
   -H "x-s4-access-key: $S4_KEY" \
   -H "x-s4-secret-key: $S4_SECRET" \
@@ -622,7 +622,7 @@ from s4_client.highlevel import S4Client
 client = S4Client("http://localhost:9000", "s4_KEY_ID", "s4s_SECRET")
 
 # One-time: generate a keypair and hand S4 the public half.
-# The gateway encrypts PII on every PUT; only you can decrypt it.
+# The envelope-encrypt plugin encrypts on every PUT; only you can decrypt it.
 private_pem, public_pem = S4Client.generate_keypair()
 client.attach_public_key(public_pem)
 
@@ -674,7 +674,7 @@ const plaintext = new TextDecoder().decode(
 </div>
 
 <footer class="footer container">
-  S4 Gateway &middot; S3-compatible PII filtering &middot; <a href="https://codeberg.org/231self/s4" style="color:var(--text-muted)">codeberg</a>
+  S4 Gateway &middot; pluggable processing &middot; <a href="https://github.com/231self/S4" style="color:var(--text-muted)">github.com/231self/S4</a>
 </footer>
 
 <script>
@@ -1043,7 +1043,7 @@ window.drawFlow = function() {
     ctx.fillText('Your SDK', filterX / 2, labelY);
     ctx.fillText('S4', cx, labelY);
     ctx.font = '10px -apple-system,BlinkMacSystemFont,sans-serif';
-    ctx.fillText('PII Filter', cx, labelY + 14);
+    ctx.fillText('Plugin Pipeline', cx, labelY + 14);
     ctx.font = 'bold 12px -apple-system,BlinkMacSystemFont,sans-serif';
     ctx.fillStyle = textColor;
     ctx.fillText('Your S3 Bucket', filterX + filterW + (W - filterX - filterW) / 2, labelY);

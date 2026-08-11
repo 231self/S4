@@ -1,70 +1,78 @@
-# S4 — PII-cleaning S3 proxy
+# S4 — pluggable processing gateway for object storage
 
-S4 is an S3-compatible gateway that filters personally identifiable information (PII)
-from data in transit. Point your existing S3 SDK at S4; S4 detects PII (emails, credit
-cards, SSNs), redacts or encrypts it per field, and forwards the cleaned object to any
-S3-compatible storage backend — or to a multi-cloud set of backends with dual-write and
-fail-over.
+S4 is an S3-compatible gateway that runs your WebAssembly plugins over every object
+in transit. Point any S3 SDK, CLI, or tool at S4; each object passes through your
+plugin pipeline — filter, redact, encrypt, convert, validate, route — and the result
+is forwarded to any S3-compatible storage backend.
 
-- **Zero-trust by default**: PII never reaches your storage; S4 keeps no decryption keys.
-- **Pluggable Wasm pipeline**: `noop`, `pii-default`, `email/ssn/card-detect`,
-  `envelope-encrypt`, `stable-encrypt` — sandboxed with wasmtime, pure byte-in/byte-out.
-- **Envelope encryption**: per-field AES-256-GCM with a per-field DEK wrapped by RSA-OAEP
-  using your public key. S4 sees ciphertext only; only you can decrypt.
-- **Provider-agnostic storage**: AWS S3, Google Cloud Storage, Backblaze B2, Cloudflare R2,
-  Vultr Object Storage, MinIO, or any S3-compatible endpoint — single or multi-cloud
-  (consistent-hash ring, dual-write, read fail-over).
-- **Runs anywhere**: a single binary — locally, or serverless (Cloud Run, AWS Lambda),
-  or on a plain VPS.
-- **Typed SDKs**: generated Python and TypeScript clients with a high-level API
-  (`put_object` / `get_object` / `generate_keypair` / `decrypt_payload`).
+**Bring your own plugin.** The gateway is a router: plugins are Wasm components
+compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-in.
+
+- **Pluggable pipeline** — plugins run in order; each can emit, drop, or reject. A tiny
+  WIT interface (`begin` / `transform` / `finish`), pure byte-in/byte-out.
+- **Sandboxed** — wasmtime, 64 MiB memory, fuel-limited, no host imports.
+- **BYO plugins** — write in Rust (or any Wasm-capable language), wrap with
+  `wasm-tools component`, `s4ctl plugin upload`. See [docs/plugins.md](docs/plugins.md).
+- **Any S3-compatible storage** — MinIO, AWS S3, Google Cloud Storage, Backblaze B2,
+  Cloudflare R2, Vultr Object Storage — single or multi-cloud (consistent-hash ring,
+  dual-write, read fail-over).
+- **Optional auth** — run with auth disabled locally, or enable API keys (in-memory,
+  a JSON file, or Postgres).
+- **Typed SDKs** — generated Python and TypeScript clients, published with every release.
+
+Filters shipped in-tree (as examples to learn from): `noop`, `pii-default` (redact
+emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
+`envelope-encrypt` (per-field RSA-OAEP / AES-256-GCM), `stable-encrypt`
+(deterministic encryption).
 
 ## Quickstart (local-only)
 
-The fastest path needs no cloud account — S4 stores cleaned data in memory or a local
-MinIO:
+No cloud account, no database — everything runs on your machine:
 
 ```bash
-cargo install s4ctl          # or: cargo run -p s4ctl
-s4ctl local init             # starts the gateway in local mode (AUTH_DISABLED)
+cargo install s4ctl          # or: cargo run -p s4ctl (from this repo)
 
-# Write PII through S4 — it never reaches storage as plaintext
-s4ctl key create --label dev
-s4ctl put ./data.csv ingest/data.csv --bucket dev
+s4ctl local init             # starts MinIO + the gateway (auth disabled)
+s4ctl plugin list            # the pii-default plugin is preloaded
+
+# Write data through the pipeline; it is transformed before it reaches storage
+s4ctl put ./data.csv ingest/data.csv --bucket s4-local
 
 # Read it back
-s4ctl get ingest/data.csv --bucket dev
+s4ctl get ingest/data.csv --bucket s4-local
 ```
 
-`local init` boots the gateway with auth disabled, keys in a local store, and an
-in-memory object store. Point `S3_ENDPOINT` at MinIO (see `local/docker-compose.yml`)
-for durable local storage.
+`local init` boots the gateway (MinIO on `:9000`, gateway on `:8080`), enables local
+mode (`AUTH_DISABLED=true`, keys persisted to `~/.config/s4/keys.json`), and points
+`s4ctl` at it. `s4ctl local down` stops everything.
+
+## Run your own plugin
+
+```bash
+# 1. Write a filter (Rust + wit-bindgen against wit/s4-filter/world.wit)
+# 2. Build it:
+cargo build --release --target wasm32-unknown-unknown
+wasm-tools component new target/wasm32-unknown-unknown/release/my_filter.wasm \
+  -o my-filter.component.wasm
+# 3. Upload and enable it:
+s4ctl plugin upload my-filter.component.wasm
+s4ctl plugin enable <id>
+# 4. Reorder the pipeline — output of one feeds the next:
+s4ctl plugin reorder pii-default my-filter
+```
+
+Full guide: [docs/plugins.md](docs/plugins.md).
 
 ## How it works
 
 ```
-S3 SDK/CLI ──▶ S4 gateway (Wasm pipeline: detect → redact/encrypt) ──▶ storage
-                     │                                                     │
-                     └── PII stays out of the object;                     └── AWS S3, GCS, B2,
-                         only envelopes/redactions                        R2, MinIO, multi-cloud
+S3 SDK / CLI / tool ──▶ S4 gateway (Wasm plugin pipeline) ──▶ storage
+                            │
+                            ├─ filter  → redact, strip fields, validate
+                            ├─ encrypt → per-field envelope encryption
+                            ├─ convert → CSV ⇄ JSONL ⇄ text
+                            └─ ...     → your plugins, in order
 ```
-
-- **Pipeline**: plugins run in order; output of N feeds N+1. A plugin emits, drops, or
-  rejects. Sandbox: 64 MiB memory, fuel-limited (`S4_WASM_FUEL`).
-- **Envelope format** (per encrypted field): `{alg: "RSA-OAEP/AES-256-GCM", iv,
-  enc_dek, ct, tag}`.
-- **Stable encryption** (opt-in): deterministic AES-SIV-style ciphertext for JOIN keys.
-
-## Deploy
-
-- **Local / dev**: `just e2e` spins up MinIO and validates the full data plane.
-- **Cloud Run** (scale-to-zero), **AWS Lambda** (Web Adapter), **Vultr** (Docker
-  Compose + Object Storage), **Fly.io** — see `docs/` for per-provider guides.
-
-## Documentation
-
-- `docs/adr/` — architecture decision records (WIT interface, storage model, …).
-- `AGENTS.md` — development conventions for AI agents and humans.
 
 ## Development
 
@@ -75,6 +83,12 @@ just build-sdks   # regenerate Python/TypeScript SDKs from the OpenAPI spec
 ```
 
 See `CONTRIBUTING.md`.
+
+## Documentation
+
+- `docs/plugins.md` — create and consume your own plugins.
+- `docs/adr/` — architecture decision records.
+- `AGENTS.md` — development conventions.
 
 ## License
 

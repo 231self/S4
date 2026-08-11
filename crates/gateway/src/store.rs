@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
 use uuid::Uuid;
 
@@ -11,7 +12,7 @@ pub struct StoredObject {
     pub etag: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub key_id: String,
     pub secret_hash: String,
@@ -159,6 +160,99 @@ fn build_api_key(
     }
 }
 
+fn generate_api_key(
+    user_id: &str,
+    label: &str,
+    expires_in: u64,
+    public_key_pem: Option<String>,
+) -> (ApiKey, String) {
+    let key_id = format!("s4_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let secret = format!("s4s_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let secret_hash = sha256_hash(&secret);
+    let now = chrono_now().parse::<u64>().unwrap_or(0);
+    let expires_at = if expires_in > 0 {
+        Some(format!("{}", now + expires_in))
+    } else {
+        None
+    };
+    let api_key = build_api_key(
+        &key_id,
+        user_id,
+        label,
+        secret_hash,
+        chrono_now(),
+        expires_at,
+        public_key_pem,
+    );
+    (api_key, secret)
+}
+
+fn set_public_key_in(
+    keys: &RwLock<HashMap<String, ApiKey>>,
+    key_id: &str,
+    user_id: &str,
+    public_key_pem: &str,
+) -> bool {
+    let mut keys = keys.write().unwrap();
+    if let Some(k) = keys.get_mut(key_id)
+        && k.user_id == user_id
+    {
+        k.public_key_pem = Some(public_key_pem.to_string());
+        return true;
+    }
+    false
+}
+
+fn get_key_in(keys: &RwLock<HashMap<String, ApiKey>>, key_id: &str) -> Option<ApiKey> {
+    keys.read().unwrap().get(key_id).cloned()
+}
+
+fn resolve_credentials_in(
+    keys: &RwLock<HashMap<String, ApiKey>>,
+    access_key: &str,
+    secret_key: &str,
+) -> Option<(String, Option<String>)> {
+    let keys = keys.read().unwrap();
+    let key = keys.get(access_key)?;
+    if key.secret_hash != sha256_hash(secret_key) {
+        return None;
+    }
+    if is_expired(key.expires_at.as_deref()) {
+        return None;
+    }
+    Some((key.user_id.clone(), key.public_key_pem.clone()))
+}
+
+fn list_for_user_in(keys: &RwLock<HashMap<String, ApiKey>>, user_id: &str) -> Vec<ApiKey> {
+    keys.read()
+        .unwrap()
+        .values()
+        .filter(|k| k.user_id == user_id)
+        .map(|k| {
+            build_api_key(
+                &k.key_id,
+                &k.user_id,
+                &k.label,
+                String::new(),
+                k.created_at.clone(),
+                k.expires_at.clone(),
+                k.public_key_pem.clone(),
+            )
+        })
+        .collect()
+}
+
+fn delete_key_in(keys: &RwLock<HashMap<String, ApiKey>>, key_id: &str, user_id: &str) -> bool {
+    let mut keys = keys.write().unwrap();
+    if let Some(k) = keys.get(key_id)
+        && k.user_id == user_id
+    {
+        keys.remove(key_id);
+        return true;
+    }
+    false
+}
+
 #[async_trait]
 impl KeyRepository for KeyStore {
     async fn create_key(
@@ -168,42 +262,18 @@ impl KeyRepository for KeyStore {
         expires_in: u64,
         public_key_pem: Option<String>,
     ) -> (String, String) {
-        let key_id = format!("s4_{}", Uuid::new_v4().to_string().replace('-', ""));
-        let secret = format!("s4s_{}", Uuid::new_v4().to_string().replace('-', ""));
-        let secret_hash = sha256_hash(&secret);
-        let now = chrono_now().parse::<u64>().unwrap_or(0);
-        let expires_at = if expires_in > 0 {
-            Some(format!("{}", now + expires_in))
-        } else {
-            None
-        };
-
-        let api_key = build_api_key(
-            &key_id,
-            user_id,
-            label,
-            secret_hash,
-            chrono_now(),
-            expires_at,
-            public_key_pem,
-        );
+        let (api_key, secret) = generate_api_key(user_id, label, expires_in, public_key_pem);
+        let key_id = api_key.key_id.clone();
         self.keys.write().unwrap().insert(key_id.clone(), api_key);
         (key_id, secret)
     }
 
     async fn set_public_key(&self, key_id: &str, user_id: &str, public_key_pem: &str) -> bool {
-        let mut keys = self.keys.write().unwrap();
-        if let Some(k) = keys.get_mut(key_id)
-            && k.user_id == user_id
-        {
-            k.public_key_pem = Some(public_key_pem.to_string());
-            return true;
-        }
-        false
+        set_public_key_in(&self.keys, key_id, user_id, public_key_pem)
     }
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
-        self.keys.read().unwrap().get(key_id).cloned()
+        get_key_in(&self.keys, key_id)
     }
 
     async fn resolve_credentials(
@@ -211,46 +281,121 @@ impl KeyRepository for KeyStore {
         access_key: &str,
         secret_key: &str,
     ) -> Option<(String, Option<String>)> {
-        let keys = self.keys.read().unwrap();
-        let key = keys.get(access_key)?;
-        if key.secret_hash != sha256_hash(secret_key) {
-            return None;
-        }
-        if is_expired(key.expires_at.as_deref()) {
-            return None;
-        }
-        Some((key.user_id.clone(), key.public_key_pem.clone()))
+        resolve_credentials_in(&self.keys, access_key, secret_key)
     }
 
     async fn list_for_user(&self, user_id: &str) -> Vec<ApiKey> {
-        self.keys
-            .read()
-            .unwrap()
-            .values()
-            .filter(|k| k.user_id == user_id)
-            .map(|k| {
-                build_api_key(
-                    &k.key_id,
-                    &k.user_id,
-                    &k.label,
-                    String::new(),
-                    k.created_at.clone(),
-                    k.expires_at.clone(),
-                    k.public_key_pem.clone(),
-                )
-            })
-            .collect()
+        list_for_user_in(&self.keys, user_id)
     }
 
     async fn delete_key(&self, key_id: &str, user_id: &str) -> bool {
-        let mut keys = self.keys.write().unwrap();
-        if let Some(k) = keys.get(key_id)
-            && k.user_id == user_id
-        {
-            keys.remove(key_id);
-            return true;
+        delete_key_in(&self.keys, key_id, user_id)
+    }
+}
+
+/// Persistent key store backed by a JSON file (e.g. `~/.config/s4/keys.json`).
+///
+/// Loads the file once at construction and rewrites it atomically (0600 on
+/// unix) after every mutation, so API keys survive gateway restarts without
+/// Postgres. This is the default in local mode (`AUTH_DISABLED=true` without
+/// `DATABASE_URL`), or opt in explicitly with `S4_KEYS_FILE`.
+#[derive(Debug)]
+pub struct FileKeyStore {
+    keys: RwLock<HashMap<String, ApiKey>>,
+    path: PathBuf,
+}
+
+impl FileKeyStore {
+    pub fn new(path: PathBuf) -> Self {
+        let keys = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self {
+            keys: RwLock::new(keys),
+            path,
         }
-        false
+    }
+
+    /// Default location for the local-mode keys file.
+    pub fn default_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("s4")
+            .join("keys.json")
+    }
+
+    /// Atomically write the current key set to disk (0600 on unix).
+    fn persist(&self) -> anyhow::Result<()> {
+        let data = self.keys.read().unwrap();
+        let json = serde_json::to_string_pretty(&*data)?;
+        drop(data);
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut tmp_name = self.path.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp = PathBuf::from(tmp_name);
+        std::fs::write(&tmp, json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl KeyRepository for FileKeyStore {
+    async fn create_key(
+        &self,
+        user_id: &str,
+        label: &str,
+        expires_in: u64,
+        public_key_pem: Option<String>,
+    ) -> (String, String) {
+        let (api_key, secret) = generate_api_key(user_id, label, expires_in, public_key_pem);
+        let key_id = api_key.key_id.clone();
+        self.keys.write().unwrap().insert(key_id.clone(), api_key);
+        self.persist()
+            .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
+        (key_id, secret)
+    }
+
+    async fn set_public_key(&self, key_id: &str, user_id: &str, public_key_pem: &str) -> bool {
+        let ok = set_public_key_in(&self.keys, key_id, user_id, public_key_pem);
+        if ok {
+            self.persist()
+                .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
+        }
+        ok
+    }
+
+    async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
+        get_key_in(&self.keys, key_id)
+    }
+
+    async fn resolve_credentials(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Option<(String, Option<String>)> {
+        resolve_credentials_in(&self.keys, access_key, secret_key)
+    }
+
+    async fn list_for_user(&self, user_id: &str) -> Vec<ApiKey> {
+        list_for_user_in(&self.keys, user_id)
+    }
+
+    async fn delete_key(&self, key_id: &str, user_id: &str) -> bool {
+        let ok = delete_key_in(&self.keys, key_id, user_id);
+        if ok {
+            self.persist()
+                .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
+        }
+        ok
     }
 }
 
@@ -523,5 +668,48 @@ mod tests {
         assert!(keys[0].secret_hash.is_empty());
         assert!(store.delete_key(&key_id, "u1").await);
         assert!(store.get_key(&key_id).await.is_none());
+    }
+
+    fn temp_keys_file() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("s4-file-keys-{}.json", Uuid::new_v4()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[tokio::test]
+    async fn file_key_store_persists_across_restarts() {
+        let path = temp_keys_file();
+        let store = FileKeyStore::new(path.clone());
+        let (key_id, secret) = store.create_key("u1", "persist", 0, None).await;
+        drop(store);
+
+        // A fresh store on the same path must see the same key.
+        let reloaded = FileKeyStore::new(path.clone());
+        let (uid, _pk) = reloaded
+            .resolve_credentials(&key_id, &secret)
+            .await
+            .expect("credentials survive a restart");
+        assert_eq!(uid, "u1");
+        assert!(reloaded.list_for_user("u1").await.len() == 1);
+        assert!(reloaded.delete_key(&key_id, "u1").await);
+        drop(reloaded);
+
+        let empty = FileKeyStore::new(path);
+        assert!(empty.get_key(&key_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn file_key_store_persists_public_key_and_expiry() {
+        let path = temp_keys_file();
+        let store = FileKeyStore::new(path.clone());
+        let (key_id, _secret) = store.create_key("u1", "enc", 3600, None).await;
+        assert!(store.set_public_key(&key_id, "u1", "pem").await);
+        assert!(!store.set_public_key(&key_id, "u2", "pem").await);
+        drop(store);
+
+        let reloaded = FileKeyStore::new(path);
+        let key = reloaded.get_key(&key_id).await.expect("key exists");
+        assert_eq!(key.public_key_pem.as_deref(), Some("pem"));
+        assert!(key.expires_at.is_some());
     }
 }

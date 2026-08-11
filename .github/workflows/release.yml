@@ -21,31 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install wasm-tools
-        run: cargo install --locked wasm-tools
-
-      - name: Build Wasm filters
-        run: bash scripts/build-filters.sh
-
-      - name: Build gateway
-        run: cargo build --release -p s4-gateway
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p dist/filters
-          cp target/components/*.component.wasm dist/filters/
-          cp target/release/s4-gateway dist/s4-gateway-linux-x86_64
-          tar -czf dist/s4-filters.tar.gz -C dist filters
-          tar -czf dist/s4-python-sdk.tar.gz -C sdks python
-          tar -czf dist/s4-typescript-sdk.tar.gz -C sdks typescript
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -58,6 +33,9 @@ jobs:
         with:
           driver: docker-container
 
+      # Single build: the Dockerfile compiles the wasm filters once (arch
+      # independent) and the gateway per-arch. No separate runner-side Rust
+      # builds — the release artifacts below are extracted from the image.
       - name: Build and push image to GHCR
         uses: docker/build-push-action@v6
         with:
@@ -67,6 +45,17 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ github.ref_name }}, ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha, mode=max
+
+      - name: Extract release artifacts from image
+        run: |
+          mkdir -p dist/filters
+          docker create --name s4-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ github.ref_name }}"
+          docker cp s4-extract:/usr/local/bin/s4-gateway dist/s4-gateway-linux-x86_64
+          docker cp s4-extract:/app/components/. dist/filters/
+          docker rm s4-extract
+          tar -czf dist/s4-filters.tar.gz -C dist filters
+          tar -czf dist/s4-python-sdk.tar.gz -C sdks python
+          tar -czf dist/s4-typescript-sdk.tar.gz -C sdks typescript
 
       - name: Make image public
         env:

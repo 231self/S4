@@ -31,6 +31,7 @@ async-trait.workspace = true
 dirs = "6"
 utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 proptest.workspace = true

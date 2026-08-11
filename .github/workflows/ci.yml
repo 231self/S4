@@ -39,9 +39,11 @@ jobs:
         run: cargo test --workspace
 
       - name: Build SDKs (drift check)
+        if: ${{ !env.ACT }}
         run: |
           bash scripts/generate-sdks.sh
           git diff --exit-code -- sdks/
 
       - name: End-to-end (MinIO)
+        if: ${{ !env.ACT }}
         run: bash scripts/e2e-local.sh

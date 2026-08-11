@@ -1,0 +1,6 @@
+# Local GitHub Actions runner config (nektos/act).
+# Run:  act -W .github/workflows/ci.yml   (or: just ci-local)
+-P ubuntu-latest=ghcr.io/catthehacker/ubuntu:act-latest
+--use-new-action-cache
+--container-architecture=linux/arm64
+--container-daemon-socket=-

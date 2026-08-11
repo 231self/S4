@@ -10,7 +10,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  IMAGE: ghcr.io/${{ github.repository_owner }}/s4
+  # Repo-scoped image: the workflow's GITHUB_TOKEN can manage visibility and
+  # prune old versions of repo-scoped packages (org-scoped packages require
+  # an org-owner PAT). Registry path must be lowercase.
+  IMAGE: ghcr.io/${{ github.repository_owner }}/s4/s4
 
 jobs:
   release:
@@ -64,6 +67,36 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ github.ref_name }}, ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha, mode=max
+
+      - name: Make image public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PATCH "/repos/${{ github.repository }}/packages/container/s4" \
+            -f visibility=public \
+            || echo "warning: could not set image visibility to public"
+
+      - name: Prune old image versions (keep latest + last 3 tags)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          keep=3
+          # Newest-first tagged versions (latest is first); delete everything
+          # past the keep window. Best-effort so it never blocks a release.
+          gh api --paginate "/repos/${{ github.repository }}/packages/container/s4/versions?per_page=100" \
+            --jq '[.[] | select((.metadata.container.tags | length) > 0)
+                   | {id, created: .created_at, tag: .metadata.container.tags[0]}]
+                  | sort_by(.created) | reverse' \
+            | jq -c '.[]' \
+            | tail -n +$((keep + 2)) \
+            | while read -r v; do
+                id=$(echo "$v" | jq -r .id)
+                tag=$(echo "$v" | jq -r .tag)
+                echo "pruning image version $tag ($id)"
+                gh api -X DELETE "/repos/${{ github.repository }}/packages/container/s4/versions/$id" \
+                  || echo "warning: could not delete $tag"
+              done
+          echo "prune done (kept latest + $keep tags)"
 
       - name: Create GitHub Release
         env:

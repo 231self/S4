@@ -762,7 +762,7 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Local { cmd } => {
             const LOCAL_GATEWAY_NAME: &str = "s4-local-gateway";
-            const LOCAL_GATEWAY_IMAGE: &str = "ghcr.io/231self/s4:latest";
+            const LOCAL_GATEWAY_IMAGE: &str = "ghcr.io/231self/s4/s4:latest";
             const LOCAL_GATEWAY_PORT: u16 = 8080;
 
             match cmd {

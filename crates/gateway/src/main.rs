@@ -17,94 +17,12 @@ use s4_gateway::store::{
 };
 use s4_gateway::{Format, Gateway};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
-
-#[derive(Clone)]
-struct WorkspaceCounters {
-    write_count: Arc<AtomicU64>,
-    read_count: Arc<AtomicU64>,
-    bytes_processed: Arc<AtomicU64>,
-}
-
-impl WorkspaceCounters {
-    fn new() -> Self {
-        Self {
-            write_count: Arc::new(AtomicU64::new(0)),
-            read_count: Arc::new(AtomicU64::new(0)),
-            bytes_processed: Arc::new(AtomicU64::new(0)),
-        }
-    }
-}
-
-/// Per-workspace (fallback per-user) usage metering.
-/// The meter key is workspace_id if scoped, or user_id otherwise.
-#[derive(Clone)]
-struct WorkspaceMeter {
-    counters: Arc<RwLock<HashMap<String, WorkspaceCounters>>>,
-}
-
-impl WorkspaceMeter {
-    fn new() -> Self {
-        Self {
-            counters: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    fn get_or_create(&self, dimension: &str) -> WorkspaceCounters {
-        let map = self.counters.read().unwrap();
-        if let Some(c) = map.get(dimension) {
-            return c.clone();
-        }
-        drop(map);
-        let mut map = self.counters.write().unwrap();
-        map.entry(dimension.to_string())
-            .or_insert_with(WorkspaceCounters::new)
-            .clone()
-    }
-
-    fn track_write(&self, dimension: &str, bytes: u64) {
-        let c = self.get_or_create(dimension);
-        c.write_count.fetch_add(1, Ordering::Relaxed);
-        c.bytes_processed.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    fn track_read(&self, dimension: &str) {
-        let c = self.get_or_create(dimension);
-        c.read_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Snapshot all counters, keyed by dimension.
-    fn snapshot(&self) -> HashMap<String, WorkspaceCounters> {
-        self.counters.read().unwrap().clone()
-    }
-
-    /// Atomically drain all counters, returning the previous totals per dimension.
-    fn drain(&self) -> HashMap<String, (u64, u64, u64)> {
-        let map = self.counters.read().unwrap();
-        let dims: Vec<String> = map.keys().cloned().collect();
-        let mut result = HashMap::new();
-        for dim in &dims {
-            let c = map.get(dim).cloned();
-            if let Some(c) = c {
-                let w = c.write_count.swap(0, Ordering::Relaxed);
-                let r = c.read_count.swap(0, Ordering::Relaxed);
-                let b = c.bytes_processed.swap(0, Ordering::Relaxed);
-                if w > 0 || r > 0 || b > 0 {
-                    result.insert(dim.clone(), (w, r, b));
-                }
-            }
-        }
-        result
-    }
-}
 
 #[derive(Clone)]
 struct AppState {
@@ -118,20 +36,12 @@ struct AppState {
     supabase_url: String,
     jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     auth_disabled: bool,
-    pool: Option<sqlx::PgPool>,
-    meter: WorkspaceMeter,
 }
 
 struct Auth {
     user_id: String,
-    workspace_id: Option<String>,
     public_key_pem: Option<String>,
     stable_key: Option<Vec<u8>>,
-    permissions: String,
-}
-
-fn auth_has(auth: &Auth, perm: &str) -> bool {
-    auth.permissions.split(',').any(|p| p.trim() == perm)
 }
 
 /// Derive the deterministic-encryption key for an API key secret:
@@ -185,8 +95,6 @@ struct CreateKeyRequest {
     expires_in: u64,
     #[serde(default)]
     public_key_pem: Option<String>,
-    #[serde(default)]
-    workspace_id: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -233,15 +141,11 @@ fn detect_format(headers: &HeaderMap) -> Format {
     }
 }
 
-async fn get_user_s3_client(state: &AppState, auth: &Auth) -> Option<Client> {
+async fn get_user_s3_client(state: &AppState, uid: &str) -> Option<Client> {
     if let Some(ref s3) = state.s3_client {
         return Some(s3.clone());
     }
-    let cfg = auth
-        .workspace_id
-        .as_deref()
-        .and_then(|ws| state.backends.get(ws))
-        .or_else(|| state.backends.get(&auth.user_id))?;
+    let cfg = state.backends.get(uid)?;
     if !cfg.is_configured() || cfg.endpoint.is_empty() {
         return None;
     }
@@ -269,33 +173,28 @@ async fn authenticate(
     match auth {
         Some(a) if a.starts_with("AWS4-") => Some(Auth {
             user_id: "system".to_string(),
-            workspace_id: None,
             public_key_pem: None,
             stable_key: None,
-            permissions: "read,write,delete".to_string(),
         }),
         Some(a) if a.starts_with("Bearer ") => {
             let token = &a[7..];
+            // Try API key format: Bearer s4_xxx:s4s_xxx
             if let Some((ak, sk)) = token.split_once(':') {
-                let (user_id, public_key_pem, workspace_id, permissions) =
-                    keys.resolve_credentials(ak, sk).await?;
+                let (user_id, public_key_pem) = keys.resolve_credentials(ak, sk).await?;
                 return Some(Auth {
                     user_id,
-                    workspace_id,
                     public_key_pem,
                     stable_key: Some(derive_stable_key(sk)),
-                    permissions,
                 });
             }
+            // Try JWT
             if state.jwt_decoder.is_some() {
                 let uid = get_user_id(headers, state);
                 if uid != "demo-user" {
                     return Some(Auth {
                         user_id: uid,
-                        workspace_id: None,
                         public_key_pem: None,
                         stable_key: None,
-                        permissions: "read,write,delete".to_string(),
                     });
                 }
             }
@@ -311,24 +210,22 @@ async fn authenticate(
         .get("x-s4-secret-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some((user_id, public_key_pem, workspace_id, permissions)) =
-        keys.resolve_credentials(ak, sk).await
-    {
+    if let Some((user_id, public_key_pem)) = keys.resolve_credentials(ak, sk).await {
         return Some(Auth {
             user_id,
-            workspace_id,
             public_key_pem,
             stable_key: Some(derive_stable_key(sk)),
-            permissions,
         });
     }
+    // Allow access in demo mode only when auth is explicitly disabled or
+    // when using an in-memory keystore with no keys (dev/first-run mode).
+    // Never allow unauthenticated access when keys are persisted — this
+    // prevents an empty database from becoming an open door in production.
     if state.auth_disabled {
         return Some(Auth {
             user_id: "demo-user".to_string(),
-            workspace_id: None,
             public_key_pem: None,
             stable_key: None,
-            permissions: "read,write,delete".to_string(),
         });
     }
     None
@@ -401,178 +298,6 @@ fn s3_xml_ok(xml: String) -> axum::response::Response {
         .unwrap()
 }
 
-async fn list_workspaces(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let user_id = get_user_id(&headers, &state);
-    let pool = match &state.pool {
-        Some(p) => p,
-        None => return Json(serde_json::json!({ "workspaces": [] })),
-    };
-
-    let rows = sqlx::query(
-        "SELECT w.id::text, w.name, w.slug, wm.role \
-         FROM workspaces w JOIN workspace_members wm ON w.id = wm.workspace_id \
-         WHERE wm.user_id = $1 ORDER BY w.created_at DESC",
-    )
-    .bind(&user_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let workspaces: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|r| {
-            use sqlx::Row;
-            serde_json::json!({
-                "id": r.get::<String, _>(0),
-                "name": r.get::<&str, _>(1),
-                "slug": r.get::<&str, _>(2),
-                "role": r.get::<&str, _>(3)
-            })
-        })
-        .collect();
-
-    Json(serde_json::json!({ "workspaces": workspaces }))
-}
-
-async fn create_workspace(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let user_id = get_user_id(&headers, &state);
-    let name = body
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("My Workspace");
-    let slug = body
-        .get("slug")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| name.to_lowercase().replace(' ', "-"));
-
-    let pool = match &state.pool {
-        Some(p) => p,
-        None => return (StatusCode::BAD_REQUEST, "DATABASE_URL not configured").into_response(),
-    };
-
-    let row = sqlx::query("INSERT INTO workspaces (name, slug) VALUES ($1, $2) RETURNING id::text")
-        .bind(name)
-        .bind(&slug)
-        .fetch_one(pool)
-        .await;
-
-    let ws_id: String = match row {
-        Ok(r) => {
-            use sqlx::Row;
-            r.get(0)
-        }
-        Err(e) => return (StatusCode::CONFLICT, format!("{}", e)).into_response(),
-    };
-
-    let _ = sqlx::query(
-        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1::uuid, $2, 'owner')",
-    )
-    .bind(&ws_id)
-    .bind(&user_id)
-    .execute(pool)
-    .await;
-
-    Json(serde_json::json!({ "id": ws_id, "name": name, "slug": slug, "role": "owner" }))
-        .into_response()
-}
-
-async fn delete_workspace(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(ws_id): Path<String>,
-) -> impl IntoResponse {
-    let user_id = get_user_id(&headers, &state);
-    let pool = match &state.pool {
-        Some(p) => p,
-        None => return (StatusCode::BAD_REQUEST, "DATABASE_URL not configured").into_response(),
-    };
-
-    let result = sqlx::query(
-        "DELETE FROM workspaces w USING workspace_members wm \
-         WHERE w.id::text = $1 AND wm.workspace_id = w.id AND wm.user_id = $2 AND wm.role = 'owner'",
-    )
-    .bind(&ws_id)
-    .bind(&user_id)
-    .execute(pool)
-    .await;
-
-    match result {
-        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
-    }
-}
-
-async fn get_usage(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let user_id = get_user_id(&headers, &state);
-    // Live in-memory counters: sum across all dimensions
-    let snapshot = state.meter.snapshot();
-    let (live_writes, live_reads, live_bytes): (u64, u64, u64) =
-        snapshot.values().fold((0, 0, 0), |acc, c| {
-            (
-                acc.0 + c.write_count.load(Ordering::Relaxed),
-                acc.1 + c.read_count.load(Ordering::Relaxed),
-                acc.2 + c.bytes_processed.load(Ordering::Relaxed),
-            )
-        });
-    let pool = match &state.pool {
-        Some(p) => p,
-        None => {
-            return Json(serde_json::json!({
-                "usage": {
-                    "write_count": live_writes,
-                    "read_count": live_reads,
-                    "gb_processed": live_bytes as f64 / 1_000_000_000.0,
-                    "live": true
-                }
-            }));
-        }
-    };
-
-    let row = sqlx::query(
-        "SELECT coalesce(sum(write_count), 0)::bigint, \
-                coalesce(sum(read_count), 0)::bigint, \
-                coalesce(sum(gb_processed), 0.0)::double precision \
-         FROM usage_records ur \
-         JOIN workspace_members wm ON ur.workspace_id = wm.workspace_id \
-         WHERE wm.user_id = $1 \
-         AND ur.period_start >= date_trunc('month', now())",
-    )
-    .bind(&user_id)
-    .fetch_one(pool)
-    .await;
-
-    let (db_writes, db_reads, db_gb): (i64, i64, f64) = match row {
-        Ok(r) => {
-            use sqlx::Row;
-            (r.get(0), r.get(1), r.get(2))
-        }
-        Err(_) => (0, 0, 0.0),
-    };
-
-    Json(serde_json::json!({
-        "usage": {
-            "write_count": db_writes,
-            "read_count": db_reads,
-            "gb_processed": db_gb,
-            "live": {
-                "write_count": live_writes,
-                "read_count": live_reads,
-                "gb_processed": live_bytes as f64 / 1_000_000_000.0,
-            }
-        }
-    }))
-}
-
 async fn s3_put(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -582,13 +307,7 @@ async fn s3_put(
     let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
-    if !auth_has(&auth, "write") {
-        return s3_error::access_denied(&key);
-    }
-    let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
     let uid = &auth.user_id;
-
-    state.meter.track_write(dim, body.len() as u64);
 
     let format = detect_format(&headers);
     let stable_fields = headers
@@ -631,7 +350,7 @@ async fn s3_put(
                 s3_error::internal_error(&key, &e.to_string())
             }
         }
-    } else if let Some(s3) = get_user_s3_client(&state, &auth).await {
+    } else if let Some(s3) = get_user_s3_client(&state, uid).await {
         match s3
             .put_object()
             .bucket(&bucket)
@@ -696,12 +415,6 @@ async fn s3_get(
     let Some(_auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
-    if !auth_has(&_auth, "read") {
-        return s3_error::access_denied(&key);
-    }
-
-    let dim = _auth.workspace_id.as_deref().unwrap_or(&_auth.user_id);
-    state.meter.track_read(dim);
 
     if let Some(backend_url) = headers
         .get("x-s4-backend-url")
@@ -798,12 +511,6 @@ async fn s3_head(
     let Some(_auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
-    if !auth_has(&_auth, "read") {
-        return s3_error::access_denied(&key);
-    }
-
-    let dim = _auth.workspace_id.as_deref().unwrap_or(&_auth.user_id);
-    state.meter.track_read(dim);
 
     if let Some(ref s3) = state.s3_client {
         match s3.head_object().bucket(&bucket).key(&key).send().await {
@@ -850,13 +557,7 @@ async fn s3_delete(
     let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
-    if !auth_has(&auth, "write") {
-        return s3_error::access_denied(&key);
-    }
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
-
-    let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
-    state.meter.track_write(dim, 0);
 
     if let Some(ref s3) = state.s3_client {
         match s3.delete_object().bucket(&bucket).key(&key).send().await {
@@ -879,13 +580,7 @@ async fn s3_post(
     let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
-    if !auth_has(&auth, "write") {
-        return s3_error::access_denied(&key);
-    }
     info!("POST /{bucket}/{key} user={}", auth.user_id);
-
-    let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
-    state.meter.track_write(dim, body.len() as u64);
 
     if params.uploads.is_some() {
         return s3_mp_create(&bucket, &key).await;
@@ -995,13 +690,7 @@ async fn create_key(
     let uid = get_user_id(&headers, &state);
     let (key_id, secret) = state
         .keys
-        .create_key(
-            &uid,
-            &body.label,
-            body.expires_in,
-            body.public_key_pem,
-            body.workspace_id,
-        )
+        .create_key(&uid, &body.label, body.expires_in, body.public_key_pem)
         .await;
     let key = state.keys.get_key(&key_id).await;
     let created_at = key
@@ -1040,19 +729,9 @@ async fn delete_key(
     }
 }
 
-#[derive(Deserialize, Default)]
-struct BackendQuery {
-    workspace_id: Option<String>,
-}
-
-async fn get_backend(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(params): Query<BackendQuery>,
-) -> impl IntoResponse {
+async fn get_backend(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let uid = get_user_id(&headers, &state);
-    let key = params.workspace_id.as_deref().unwrap_or(&uid);
-    let config = state.backends.get(key).unwrap_or(BackendConfig {
+    let config = state.backends.get(&uid).unwrap_or(BackendConfig {
         backend_type: String::new(),
         role_arn: String::new(),
         external_id: state.backends.generate_external_id(&uid),
@@ -1067,16 +746,14 @@ async fn get_backend(
 async fn put_backend(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(params): Query<BackendQuery>,
     Json(config): Json<BackendConfig>,
 ) -> impl IntoResponse {
     let uid = get_user_id(&headers, &state);
-    let key = params.workspace_id.as_deref().unwrap_or(&uid);
     let mut config = config;
     if config.external_id.is_empty() {
         config.external_id = state.backends.generate_external_id(&uid);
     }
-    state.backends.set(key, config);
+    state.backends.set(&uid, config);
     StatusCode::OK.into_response()
 }
 
@@ -1283,30 +960,29 @@ async fn main() -> anyhow::Result<()> {
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
-    let (keys, db_pool): (Arc<dyn KeyRepository>, Option<sqlx::PgPool>) =
-        if let Ok(database_url) = std::env::var("DATABASE_URL") {
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(5)
-                .connect(&database_url)
-                .await
-                .expect("failed to connect to DATABASE_URL");
-            sqlx::migrate!("../../migrations")
-                .run(&pool)
-                .await
-                .expect("failed to run migrations");
-            info!("Key store: Postgres (migrations applied)");
-            (Arc::new(PostgresKeyStore::new(pool.clone())), Some(pool))
-        } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
-            info!("Key store: file ({keys_file})");
-            (Arc::new(FileKeyStore::new(PathBuf::from(keys_file))), None)
-        } else if auth_disabled {
-            let path = FileKeyStore::default_path();
-            info!("Key store: file ({}) (local mode)", path.display());
-            (Arc::new(FileKeyStore::new(path)), None)
-        } else {
-            info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
-            (Arc::new(KeyStore::new()), None)
-        };
+    let keys: Arc<dyn KeyRepository> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("failed to connect to DATABASE_URL");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("failed to run migrations");
+        info!("Key store: Postgres (migrations applied)");
+        Arc::new(PostgresKeyStore::new(pool))
+    } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
+        info!("Key store: file ({keys_file})");
+        Arc::new(FileKeyStore::new(PathBuf::from(keys_file)))
+    } else if auth_disabled {
+        let path = FileKeyStore::default_path();
+        info!("Key store: file ({}) (local mode)", path.display());
+        Arc::new(FileKeyStore::new(path))
+    } else {
+        info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
+        Arc::new(KeyStore::new())
+    };
 
     let state = Arc::new(AppState {
         gateway: Arc::new(gateway),
@@ -1319,8 +995,6 @@ async fn main() -> anyhow::Result<()> {
         supabase_url,
         jwt_decoder,
         auth_disabled,
-        pool: db_pool.clone(),
-        meter: WorkspaceMeter::new(),
     });
 
     info!("S4 gateway listening on {listen_addr}");
@@ -1331,40 +1005,6 @@ async fn main() -> anyhow::Result<()> {
         info!("Dashboard: http://localhost:8080");
     }
 
-    // Periodic aggregation: flush in-memory usage counters to usage_records.
-    if let Some(pool) = state.pool.clone() {
-        let meter = state.meter.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                let drained = meter.drain();
-                for (dim, (w, r, b)) in &drained {
-                    let gb = *b as f64 / 1_000_000_000.0;
-                    // dim is workspace_id (UUID) for scoped keys, user_id for unscoped.
-                    // Parse as UUID for workspace-scoped; fall back to NULL.
-                    let ws_id: Option<uuid::Uuid> = uuid::Uuid::parse_str(dim).ok();
-                    let result = sqlx::query(
-                        "INSERT INTO usage_records (workspace_id, period_start, period_end, write_count, read_count, gb_processed) \
-                         VALUES ($1::uuid, date_trunc('hour', now()), date_trunc('hour', now()) + interval '1 hour', $2, $3, $4)"
-                    )
-                    .bind(ws_id)
-                    .bind(*w as i64)
-                    .bind(*r as i64)
-                    .bind(gb)
-                    .execute(&pool)
-                    .await;
-                    match result {
-                        Ok(_) => info!(
-                            "flushed usage [{}]: {} writes, {} reads, {:.4} GB",
-                            dim, w, r, gb
-                        ),
-                        Err(e) => warn!("failed to flush usage [{}]: {e}", dim),
-                    }
-                }
-            }
-        });
-    }
-
     let app = Router::new()
         .route("/health", get(health))
         .route("/", get(|| async { Html(dashboard_html()) }))
@@ -1373,10 +1013,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/dashboard/api/keys", delete(delete_key))
         .route("/dashboard/api/keys/public-key", put(set_public_key))
         .route("/dashboard/api/me", get(get_me))
-        .route("/dashboard/api/workspaces", get(list_workspaces))
-        .route("/dashboard/api/workspaces", post(create_workspace))
-        .route("/dashboard/api/workspaces/{id}", delete(delete_workspace))
-        .route("/dashboard/api/usage", get(get_usage))
         .route("/dashboard/api/backend", get(get_backend))
         .route("/dashboard/api/backend", put(put_backend))
         .route("/dashboard/api/plugins", get(get_plugins))

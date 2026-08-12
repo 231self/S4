@@ -36,6 +36,7 @@ struct AppState {
     supabase_url: String,
     jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     auth_disabled: bool,
+    pool: Option<sqlx::PgPool>,
 }
 
 struct Auth {
@@ -296,6 +297,115 @@ fn s3_xml_ok(xml: String) -> axum::response::Response {
         .header("Content-Type", "application/xml")
         .body(axum::body::Body::from(xml))
         .unwrap()
+}
+
+async fn list_workspaces(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user_id = get_user_id(&headers, &state);
+    let pool = match &state.pool {
+        Some(p) => p,
+        None => return Json(serde_json::json!({ "workspaces": [] })),
+    };
+
+    let rows = sqlx::query(
+        "SELECT w.id::text, w.name, w.slug, wm.role \
+         FROM workspaces w JOIN workspace_members wm ON w.id = wm.workspace_id \
+         WHERE wm.user_id = $1 ORDER BY w.created_at DESC",
+    )
+    .bind(&user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let workspaces: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            use sqlx::Row;
+            serde_json::json!({
+                "id": r.get::<String, _>(0),
+                "name": r.get::<&str, _>(1),
+                "slug": r.get::<&str, _>(2),
+                "role": r.get::<&str, _>(3)
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "workspaces": workspaces }))
+}
+
+async fn create_workspace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let user_id = get_user_id(&headers, &state);
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("My Workspace");
+    let slug = body
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| name.to_lowercase().replace(' ', "-"));
+
+    let pool = match &state.pool {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, "DATABASE_URL not configured").into_response(),
+    };
+
+    let row = sqlx::query(
+        "INSERT INTO workspaces (name, slug) VALUES ($1, $2) RETURNING id::text",
+    )
+    .bind(&name)
+    .bind(&slug)
+    .fetch_one(pool)
+    .await;
+
+    let ws_id: String = match row {
+        Ok(r) => { use sqlx::Row; r.get(0) },
+        Err(e) => return (StatusCode::CONFLICT, format!("{}", e)).into_response(),
+    };
+
+    let _ = sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1::uuid, $2, 'owner')",
+    )
+    .bind(&ws_id)
+    .bind(&user_id)
+    .execute(pool)
+    .await;
+
+    Json(serde_json::json!({ "id": ws_id, "name": name, "slug": slug, "role": "owner" })).into_response()
+}
+
+async fn delete_workspace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(ws_id): Path<String>,
+) -> impl IntoResponse {
+    let user_id = get_user_id(&headers, &state);
+    let pool = match &state.pool {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, "DATABASE_URL not configured").into_response(),
+    };
+
+    let result = sqlx::query(
+        "DELETE FROM workspaces w USING workspace_members wm \
+         WHERE w.id::text = $1 AND wm.workspace_id = w.id AND wm.user_id = $2 AND wm.role = 'owner'",
+    )
+    .bind(&ws_id)
+    .bind(&user_id)
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+    }
 }
 
 async fn s3_put(
@@ -960,29 +1070,29 @@ async fn main() -> anyhow::Result<()> {
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
-    let keys: Arc<dyn KeyRepository> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&database_url)
-            .await
-            .expect("failed to connect to DATABASE_URL");
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("failed to run migrations");
-        info!("Key store: Postgres (migrations applied)");
-        Arc::new(PostgresKeyStore::new(pool))
-    } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
-        info!("Key store: file ({keys_file})");
-        Arc::new(FileKeyStore::new(PathBuf::from(keys_file)))
-    } else if auth_disabled {
-        let path = FileKeyStore::default_path();
-        info!("Key store: file ({}) (local mode)", path.display());
-        Arc::new(FileKeyStore::new(path))
-    } else {
-        info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
-        Arc::new(KeyStore::new())
-    };
+    let (keys, db_pool): (Arc<dyn KeyRepository>, Option<sqlx::PgPool>) = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&database_url)
+                .await
+                .expect("failed to connect to DATABASE_URL");
+            sqlx::migrate!("../../migrations")
+                .run(&pool)
+                .await
+                .expect("failed to run migrations");
+            info!("Key store: Postgres (migrations applied)");
+            (Arc::new(PostgresKeyStore::new(pool.clone())), Some(pool))
+        } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
+            info!("Key store: file ({keys_file})");
+            (Arc::new(FileKeyStore::new(PathBuf::from(keys_file))), None)
+        } else if auth_disabled {
+            let path = FileKeyStore::default_path();
+            info!("Key store: file ({}) (local mode)", path.display());
+            (Arc::new(FileKeyStore::new(path)), None)
+        } else {
+            info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
+            (Arc::new(KeyStore::new()), None)
+        };
 
     let state = Arc::new(AppState {
         gateway: Arc::new(gateway),
@@ -995,6 +1105,7 @@ async fn main() -> anyhow::Result<()> {
         supabase_url,
         jwt_decoder,
         auth_disabled,
+        pool: db_pool,
     });
 
     info!("S4 gateway listening on {listen_addr}");
@@ -1013,6 +1124,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/dashboard/api/keys", delete(delete_key))
         .route("/dashboard/api/keys/public-key", put(set_public_key))
         .route("/dashboard/api/me", get(get_me))
+        .route("/dashboard/api/workspaces", get(list_workspaces))
+        .route("/dashboard/api/workspaces", post(create_workspace))
+        .route("/dashboard/api/workspaces/{id}", delete(delete_workspace))
         .route("/dashboard/api/backend", get(get_backend))
         .route("/dashboard/api/backend", put(put_backend))
         .route("/dashboard/api/plugins", get(get_plugins))

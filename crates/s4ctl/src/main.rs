@@ -767,7 +767,10 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Local { cmd } => {
             const LOCAL_GATEWAY_NAME: &str = "s4-local-gateway";
-            const LOCAL_GATEWAY_IMAGE: &str = "ghcr.io/231self/s4/s4:latest";
+            // Pin the gateway image to the CLI version (v0.3.2 image for
+            // s4ctl 0.3.2) so CLI and gateway always match — never :latest.
+            let local_gateway_image =
+                format!("ghcr.io/231self/s4/s4:v{}", env!("CARGO_PKG_VERSION"));
 
             match cmd {
                 LocalCmd::Init => {
@@ -809,12 +812,14 @@ async fn main() -> anyhow::Result<()> {
                             "AUTH_DISABLED=true",
                             "-e",
                             "S4_KEYS_FILE=/app/data/keys.json",
-                            LOCAL_GATEWAY_IMAGE,
+                            &local_gateway_image,
                         ])
                         .status()?;
                     if !run_status.success() {
                         bail!(
-                            "failed to start gateway container — is {LOCAL_GATEWAY_IMAGE} pullable?"
+                            "failed to start gateway container — is {local_gateway_image} pullable? \
+                             (the image tag must match the s4ctl version; has v{} been released?)",
+                            env!("CARGO_PKG_VERSION")
                         );
                     }
 

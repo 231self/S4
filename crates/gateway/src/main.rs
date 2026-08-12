@@ -360,16 +360,17 @@ async fn create_workspace(
         None => return (StatusCode::BAD_REQUEST, "DATABASE_URL not configured").into_response(),
     };
 
-    let row = sqlx::query(
-        "INSERT INTO workspaces (name, slug) VALUES ($1, $2) RETURNING id::text",
-    )
-    .bind(&name)
-    .bind(&slug)
-    .fetch_one(pool)
-    .await;
+    let row = sqlx::query("INSERT INTO workspaces (name, slug) VALUES ($1, $2) RETURNING id::text")
+        .bind(&name)
+        .bind(&slug)
+        .fetch_one(pool)
+        .await;
 
     let ws_id: String = match row {
-        Ok(r) => { use sqlx::Row; r.get(0) },
+        Ok(r) => {
+            use sqlx::Row;
+            r.get(0)
+        }
         Err(e) => return (StatusCode::CONFLICT, format!("{}", e)).into_response(),
     };
 
@@ -381,7 +382,8 @@ async fn create_workspace(
     .execute(pool)
     .await;
 
-    Json(serde_json::json!({ "id": ws_id, "name": name, "slug": slug, "role": "owner" })).into_response()
+    Json(serde_json::json!({ "id": ws_id, "name": name, "slug": slug, "role": "owner" }))
+        .into_response()
 }
 
 async fn delete_workspace(
@@ -411,10 +413,7 @@ async fn delete_workspace(
     }
 }
 
-async fn get_usage(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn get_usage(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = get_user_id(&headers, &state);
     let pool = match &state.pool {
         Some(p) => p,
@@ -426,7 +425,7 @@ async fn get_usage(
                     "gb_processed": 0.0,
                     "message": "DATABASE_URL not configured — usage tracking is unavailable"
                 }
-            }))
+            }));
         }
     };
 
@@ -1122,7 +1121,8 @@ async fn main() -> anyhow::Result<()> {
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
-    let (keys, db_pool): (Arc<dyn KeyRepository>, Option<sqlx::PgPool>) = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+    let (keys, db_pool): (Arc<dyn KeyRepository>, Option<sqlx::PgPool>) =
+        if let Ok(database_url) = std::env::var("DATABASE_URL") {
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(5)
                 .connect(&database_url)

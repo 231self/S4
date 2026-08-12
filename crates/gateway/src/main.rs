@@ -17,13 +17,94 @@ use s4_gateway::store::{
 };
 use s4_gateway::{Format, Gateway};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
+
+#[derive(Clone)]
+struct WorkspaceCounters {
+    write_count: Arc<AtomicU64>,
+    read_count: Arc<AtomicU64>,
+    bytes_processed: Arc<AtomicU64>,
+}
+
+impl WorkspaceCounters {
+    fn new() -> Self {
+        Self {
+            write_count: Arc::new(AtomicU64::new(0)),
+            read_count: Arc::new(AtomicU64::new(0)),
+            bytes_processed: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// Per-workspace (fallback per-user) usage metering.
+/// The meter key is workspace_id if scoped, or user_id otherwise.
+#[derive(Clone)]
+struct WorkspaceMeter {
+    counters: Arc<RwLock<HashMap<String, WorkspaceCounters>>>,
+}
+
+impl WorkspaceMeter {
+    fn new() -> Self {
+        Self {
+            counters: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn get_or_create(&self, dimension: &str) -> WorkspaceCounters {
+        let map = self.counters.read().unwrap();
+        if let Some(c) = map.get(dimension) {
+            return c.clone();
+        }
+        drop(map);
+        let mut map = self.counters.write().unwrap();
+        map.entry(dimension.to_string())
+            .or_insert_with(WorkspaceCounters::new)
+            .clone()
+    }
+
+    fn track_write(&self, dimension: &str, bytes: u64) {
+        let c = self.get_or_create(dimension);
+        c.write_count.fetch_add(1, Ordering::Relaxed);
+        c.bytes_processed.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn track_read(&self, dimension: &str) {
+        let c = self.get_or_create(dimension);
+        c.read_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot all counters, keyed by dimension.
+    fn snapshot(&self) -> HashMap<String, WorkspaceCounters> {
+        self.counters.read().unwrap().clone()
+    }
+
+    /// Atomically drain all counters, returning the previous totals per dimension.
+    fn drain(&self) -> HashMap<String, (u64, u64, u64)> {
+        let map = self.counters.read().unwrap();
+        let dims: Vec<String> = map.keys().cloned().collect();
+        let mut result = HashMap::new();
+        for dim in &dims {
+            let c = map.get(dim).cloned();
+            if let Some(c) = c {
+                let w = c.write_count.swap(0, Ordering::Relaxed);
+                let r = c.read_count.swap(0, Ordering::Relaxed);
+                let b = c.bytes_processed.swap(0, Ordering::Relaxed);
+                if w > 0 || r > 0 || b > 0 {
+                    result.insert(dim.clone(), (w, r, b));
+                }
+            }
+        }
+        result
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -38,13 +119,12 @@ struct AppState {
     jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     auth_disabled: bool,
     pool: Option<sqlx::PgPool>,
-    write_count: Arc<AtomicU64>,
-    read_count: Arc<AtomicU64>,
-    bytes_processed: Arc<AtomicU64>,
+    meter: WorkspaceMeter,
 }
 
 struct Auth {
     user_id: String,
+    workspace_id: Option<String>,
     public_key_pem: Option<String>,
     stable_key: Option<Vec<u8>>,
 }
@@ -180,26 +260,28 @@ async fn authenticate(
     match auth {
         Some(a) if a.starts_with("AWS4-") => Some(Auth {
             user_id: "system".to_string(),
+            workspace_id: None,
             public_key_pem: None,
             stable_key: None,
         }),
         Some(a) if a.starts_with("Bearer ") => {
             let token = &a[7..];
-            // Try API key format: Bearer s4_xxx:s4s_xxx
             if let Some((ak, sk)) = token.split_once(':') {
-                let (user_id, public_key_pem) = keys.resolve_credentials(ak, sk).await?;
+                let (user_id, public_key_pem, workspace_id) =
+                    keys.resolve_credentials(ak, sk).await?;
                 return Some(Auth {
                     user_id,
+                    workspace_id,
                     public_key_pem,
                     stable_key: Some(derive_stable_key(sk)),
                 });
             }
-            // Try JWT
             if state.jwt_decoder.is_some() {
                 let uid = get_user_id(headers, state);
                 if uid != "demo-user" {
                     return Some(Auth {
                         user_id: uid,
+                        workspace_id: None,
                         public_key_pem: None,
                         stable_key: None,
                     });
@@ -217,20 +299,18 @@ async fn authenticate(
         .get("x-s4-secret-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some((user_id, public_key_pem)) = keys.resolve_credentials(ak, sk).await {
+    if let Some((user_id, public_key_pem, workspace_id)) = keys.resolve_credentials(ak, sk).await {
         return Some(Auth {
             user_id,
+            workspace_id,
             public_key_pem,
             stable_key: Some(derive_stable_key(sk)),
         });
     }
-    // Allow access in demo mode only when auth is explicitly disabled or
-    // when using an in-memory keystore with no keys (dev/first-run mode).
-    // Never allow unauthenticated access when keys are persisted — this
-    // prevents an empty database from becoming an open door in production.
     if state.auth_disabled {
         return Some(Auth {
             user_id: "demo-user".to_string(),
+            workspace_id: None,
             public_key_pem: None,
             stable_key: None,
         });
@@ -418,9 +498,16 @@ async fn delete_workspace(
 
 async fn get_usage(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = get_user_id(&headers, &state);
-    let live_writes = state.write_count.load(Ordering::Relaxed);
-    let live_reads = state.read_count.load(Ordering::Relaxed);
-    let live_bytes = state.bytes_processed.load(Ordering::Relaxed);
+    // Live in-memory counters: sum across all dimensions
+    let snapshot = state.meter.snapshot();
+    let (live_writes, live_reads, live_bytes): (u64, u64, u64) =
+        snapshot.values().fold((0, 0, 0), |acc, c| {
+            (
+                acc.0 + c.write_count.load(Ordering::Relaxed),
+                acc.1 + c.read_count.load(Ordering::Relaxed),
+                acc.2 + c.bytes_processed.load(Ordering::Relaxed),
+            )
+        });
     let pool = match &state.pool {
         Some(p) => p,
         None => {
@@ -479,12 +566,10 @@ async fn s3_put(
     let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
+    let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
     let uid = &auth.user_id;
 
-    state.write_count.fetch_add(1, Ordering::Relaxed);
-    state
-        .bytes_processed
-        .fetch_add(body.len() as u64, Ordering::Relaxed);
+    state.meter.track_write(dim, body.len() as u64);
 
     let format = detect_format(&headers);
     let stable_fields = headers
@@ -593,7 +678,8 @@ async fn s3_get(
         return s3_error::access_denied(&key);
     };
 
-    state.read_count.fetch_add(1, Ordering::Relaxed);
+    let dim = _auth.workspace_id.as_deref().unwrap_or(&_auth.user_id);
+    state.meter.track_read(dim);
 
     if let Some(backend_url) = headers
         .get("x-s4-backend-url")
@@ -691,7 +777,8 @@ async fn s3_head(
         return s3_error::access_denied(&key);
     };
 
-    state.read_count.fetch_add(1, Ordering::Relaxed);
+    let dim = _auth.workspace_id.as_deref().unwrap_or(&_auth.user_id);
+    state.meter.track_read(dim);
 
     if let Some(ref s3) = state.s3_client {
         match s3.head_object().bucket(&bucket).key(&key).send().await {
@@ -740,7 +827,8 @@ async fn s3_delete(
     };
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
 
-    state.write_count.fetch_add(1, Ordering::Relaxed);
+    let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
+    state.meter.track_write(dim, 0);
 
     if let Some(ref s3) = state.s3_client {
         match s3.delete_object().bucket(&bucket).key(&key).send().await {
@@ -765,10 +853,8 @@ async fn s3_post(
     };
     info!("POST /{bucket}/{key} user={}", auth.user_id);
 
-    state.write_count.fetch_add(1, Ordering::Relaxed);
-    state
-        .bytes_processed
-        .fetch_add(body.len() as u64, Ordering::Relaxed);
+    let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
+    state.meter.track_write(dim, body.len() as u64);
 
     if params.uploads.is_some() {
         return s3_mp_create(&bucket, &key).await;
@@ -1190,10 +1276,8 @@ async fn main() -> anyhow::Result<()> {
         supabase_url,
         jwt_decoder,
         auth_disabled,
-        pool: db_pool,
-        write_count: Arc::new(AtomicU64::new(0)),
-        read_count: Arc::new(AtomicU64::new(0)),
-        bytes_processed: Arc::new(AtomicU64::new(0)),
+        pool: db_pool.clone(),
+        meter: WorkspaceMeter::new(),
     });
 
     info!("S4 gateway listening on {listen_addr}");
@@ -1206,32 +1290,30 @@ async fn main() -> anyhow::Result<()> {
 
     // Periodic aggregation: flush in-memory usage counters to usage_records.
     if let Some(pool) = state.pool.clone() {
-        let write_count = state.write_count.clone();
-        let read_count = state.read_count.clone();
-        let bytes_processed = state.bytes_processed.clone();
+        let meter = state.meter.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                let w = write_count.swap(0, Ordering::Relaxed);
-                let r = read_count.swap(0, Ordering::Relaxed);
-                let b = bytes_processed.swap(0, Ordering::Relaxed);
-                if w == 0 && r == 0 && b == 0 {
-                    continue;
-                }
-                let gb = b as f64 / 1_000_000_000.0;
-                if let Err(e) = sqlx::query(
-                    "INSERT INTO usage_records (workspace_id, period_start, period_end, write_count, read_count, gb_processed) \
-                     VALUES (NULL, date_trunc('hour', now()), date_trunc('hour', now()) + interval '1 hour', $1, $2, $3)"
-                )
-                .bind(w as i64)
-                .bind(r as i64)
-                .bind(gb)
-                .execute(&pool)
-                .await
-                {
-                    warn!("failed to flush usage counters: {e}");
-                } else {
-                    info!("flushed usage: {w} writes, {r} reads, {gb:.4} GB");
+                let drained = meter.drain();
+                for (dim, (w, r, b)) in &drained {
+                    let gb = *b as f64 / 1_000_000_000.0;
+                    let result = sqlx::query(
+                        "INSERT INTO usage_records (workspace_id, period_start, period_end, write_count, read_count, gb_processed) \
+                         VALUES ($1::uuid, date_trunc('hour', now()), date_trunc('hour', now()) + interval '1 hour', $2, $3, $4)"
+                    )
+                    .bind(dim.as_str())
+                    .bind(*w as i64)
+                    .bind(*r as i64)
+                    .bind(gb)
+                    .execute(&pool)
+                    .await;
+                    match result {
+                        Ok(_) => info!(
+                            "flushed usage [{}]: {} writes, {} reads, {:.4} GB",
+                            dim, w, r, gb
+                        ),
+                        Err(e) => warn!("failed to flush usage [{}]: {e}", dim),
+                    }
                 }
             }
         });

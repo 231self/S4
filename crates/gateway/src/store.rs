@@ -128,13 +128,13 @@ pub trait KeyRepository: Send + Sync {
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey>;
 
-    /// Validate an access key/secret pair and return the owning user id plus
-    /// the API key's public key PEM (used by the encryption pipeline).
+    /// Validate an access key/secret pair and return the owning user id,
+    /// the API key's public key PEM, and the workspace id if scoped.
     async fn resolve_credentials(
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> Option<(String, Option<String>)>;
+    ) -> Option<(String, Option<String>, Option<String>)>;
 
     /// Keys for a user, with the secret hash stripped.
     async fn list_for_user(&self, user_id: &str) -> Vec<ApiKey>;
@@ -218,7 +218,7 @@ fn resolve_credentials_in(
     keys: &RwLock<HashMap<String, ApiKey>>,
     access_key: &str,
     secret_key: &str,
-) -> Option<(String, Option<String>)> {
+) -> Option<(String, Option<String>, Option<String>)> {
     let keys = keys.read().unwrap();
     let key = keys.get(access_key)?;
     if key.secret_hash != sha256_hash(secret_key) {
@@ -227,7 +227,11 @@ fn resolve_credentials_in(
     if is_expired(key.expires_at.as_deref()) {
         return None;
     }
-    Some((key.user_id.clone(), key.public_key_pem.clone()))
+    Some((
+        key.user_id.clone(),
+        key.public_key_pem.clone(),
+        key.workspace_id.clone(),
+    ))
 }
 
 fn list_for_user_in(keys: &RwLock<HashMap<String, ApiKey>>, user_id: &str) -> Vec<ApiKey> {
@@ -290,7 +294,7 @@ impl KeyRepository for KeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> Option<(String, Option<String>)> {
+    ) -> Option<(String, Option<String>, Option<String>)> {
         resolve_credentials_in(&self.keys, access_key, secret_key)
     }
 
@@ -387,7 +391,7 @@ impl KeyRepository for FileKeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> Option<(String, Option<String>)> {
+    ) -> Option<(String, Option<String>, Option<String>)> {
         resolve_credentials_in(&self.keys, access_key, secret_key)
     }
 
@@ -433,7 +437,7 @@ impl From<KeyRow> for ApiKey {
 }
 
 const KEY_COLUMNS: &str =
-    "key_id, secret_hash, user_id, label, created_at, expires_at, public_key_pem";
+    "key_id, secret_hash, user_id, workspace_id, label, created_at, expires_at, public_key_pem";
 
 async fn fetch_key(pool: &sqlx::PgPool, key_id: &str) -> Option<ApiKey> {
     sqlx::query_as::<_, KeyRow>(&format!(
@@ -499,7 +503,7 @@ impl KeyRepository for PostgresKeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> Option<(String, Option<String>)> {
+    ) -> Option<(String, Option<String>, Option<String>)> {
         let key = fetch_key(&self.pool, access_key).await?;
         if key.secret_hash != sha256_hash(secret_key) {
             return None;
@@ -507,7 +511,7 @@ impl KeyRepository for PostgresKeyStore {
         if is_expired(key.expires_at.as_deref()) {
             return None;
         }
-        Some((key.user_id, key.public_key_pem))
+        Some((key.user_id, key.public_key_pem, key.workspace_id))
     }
 
     async fn list_for_user(&self, user_id: &str) -> Vec<ApiKey> {
@@ -641,7 +645,7 @@ mod tests {
     async fn in_memory_key_roundtrip() {
         let store = KeyStore::new();
         let (key_id, secret) = store.create_key("u1", "test", 0, None, None).await;
-        let (uid, pk) = store
+        let (uid, pk, _ws) = store
             .resolve_credentials(&key_id, &secret)
             .await
             .expect("valid credentials should resolve");
@@ -695,7 +699,7 @@ mod tests {
 
         // A fresh store on the same path must see the same key.
         let reloaded = FileKeyStore::new(path.clone());
-        let (uid, _pk) = reloaded
+        let (uid, _pk, _ws) = reloaded
             .resolve_credentials(&key_id, &secret)
             .await
             .expect("credentials survive a restart");

@@ -1,6 +1,7 @@
 pub mod control;
 pub mod plugin_registry;
 pub mod s3_error;
+pub mod server;
 pub mod service_storage;
 pub mod store;
 

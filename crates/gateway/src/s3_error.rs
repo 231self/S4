@@ -56,3 +56,7 @@ pub fn not_implemented(key: &str) -> axum::response::Response {
 pub fn access_denied(key: &str) -> axum::response::Response {
     s3_error_xml("AccessDenied", "Access Denied", key, StatusCode::FORBIDDEN)
 }
+
+pub fn payment_required(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("PaymentRequired", detail, key, StatusCode::PAYMENT_REQUIRED)
+}

@@ -36,7 +36,6 @@ struct AppState {
     supabase_url: String,
     jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     auth_disabled: bool,
-    has_persistent_keys: bool,
 }
 
 struct Auth {
@@ -223,15 +222,6 @@ async fn authenticate(
     // Never allow unauthenticated access when keys are persisted — this
     // prevents an empty database from becoming an open door in production.
     if state.auth_disabled {
-        return Some(Auth {
-            user_id: "demo-user".to_string(),
-            public_key_pem: None,
-            stable_key: None,
-        });
-    }
-    let demo_keys = keys.list_for_user("demo-user").await;
-    let empty_keys = keys.list_for_user("").await;
-    if !state.has_persistent_keys && demo_keys.is_empty() && empty_keys.is_empty() {
         return Some(Auth {
             user_id: "demo-user".to_string(),
             public_key_pem: None,
@@ -970,8 +960,7 @@ async fn main() -> anyhow::Result<()> {
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
-    let (keys, has_persistent_keys): (Arc<dyn KeyRepository>, bool) =
-        if let Ok(database_url) = std::env::var("DATABASE_URL") {
+    let keys: Arc<dyn KeyRepository> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(5)
                 .connect(&database_url)
@@ -982,17 +971,17 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .expect("failed to run migrations");
             info!("Key store: Postgres (migrations applied)");
-            (Arc::new(PostgresKeyStore::new(pool)), true)
+            Arc::new(PostgresKeyStore::new(pool))
         } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
             info!("Key store: file ({keys_file})");
-            (Arc::new(FileKeyStore::new(PathBuf::from(keys_file))), true)
+            Arc::new(FileKeyStore::new(PathBuf::from(keys_file)))
         } else if auth_disabled {
             let path = FileKeyStore::default_path();
             info!("Key store: file ({}) (local mode)", path.display());
-            (Arc::new(FileKeyStore::new(path)), true)
+            Arc::new(FileKeyStore::new(path))
         } else {
             info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
-            (Arc::new(KeyStore::new()), false)
+            Arc::new(KeyStore::new())
         };
 
     let state = Arc::new(AppState {
@@ -1006,7 +995,6 @@ async fn main() -> anyhow::Result<()> {
         supabase_url,
         jwt_decoder,
         auth_disabled,
-        has_persistent_keys,
     });
 
     info!("S4 gateway listening on {listen_addr}");

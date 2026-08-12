@@ -20,7 +20,6 @@
   --success: #10b981;
   --code-bg: #f3f4f6;
   --code-text: #1f2937;
-  --sidebar-w: 220px;
 }
 [data-theme="dark"] {
   --bg: #0f1117;
@@ -40,51 +39,66 @@
 * { margin:0; padding:0; box-sizing:border-box }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-  background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.6;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.6;
   transition: background .2s, color .2s;
 }
 .nav {
-  position: sticky; top:0; z-index:20;
-  background: var(--bg); border-bottom: 1px solid var(--border);
-  height: 52px; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 20px;
+  position: sticky; top:0; z-index:10;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 0 24px; height: 56px;
+  display: flex; align-items: center; justify-content: space-between;
 }
-.nav-brand { font-size: 16px; font-weight: 700; color: var(--accent); letter-spacing: -0.5px }
+.nav-brand { font-size: 18px; font-weight: 700; color: var(--accent); letter-spacing: -0.5px }
 .nav-brand span { color: var(--text); font-weight: 400 }
-.nav-right { display: flex; align-items: center; gap: 12px; font-size:13px; color:var(--text-muted) }
+.nav-right { display: flex; align-items: center; gap: 14px; font-size:13px; color:var(--text-muted) }
 
-.layout { display: flex; min-height: calc(100vh - 52px) }
-.sidebar {
-  width: var(--sidebar-w); flex-shrink:0;
-  border-right:1px solid var(--border); background: var(--surface);
-  padding: 16px 0; position: sticky; top: 52px; height: calc(100vh - 52px);
-  overflow-y: auto;
+.container { max-width: 880px; margin:0 auto; padding: 0 24px }
+
+.hero { text-align: center; padding: 64px 0 40px }
+.hero h1 {
+  font-size: 44px; font-weight: 800; letter-spacing: -1.5px; line-height: 1.1;
+  margin-bottom: 20px; color: var(--text);
 }
-.sidebar-section { padding: 4px 16px; margin-bottom: 2px }
-.sidebar-heading { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:1.2px; color:var(--text-muted); padding: 10px 16px 6px }
-.sidebar-item {
-  display: flex; align-items: center; gap: 8px; padding: 8px 16px; margin: 2px 8px;
-  border-radius: 6px; font-size:13px; color: var(--text-muted); cursor: pointer;
-  transition: all .12s; border: none; background: none; width: calc(100% - 16px);
-  font-family: inherit; text-align: left;
+.hero h1 mark { background: linear-gradient(135deg, var(--accent), #8b5cf6); -webkit-background-clip:text; -webkit-text-fill-color:transparent }
+.hero p {
+  font-size: 18px; color: var(--text-muted); max-width: 540px; margin:0 auto 40px; line-height:1.65
 }
-.sidebar-item:hover { background: var(--bg); color: var(--text) }
-.sidebar-item.active { background: var(--accent-light); color: var(--accent); font-weight: 600 }
+.hero-cta { display:flex; gap:12px; justify-content:center; flex-wrap:wrap }
+.hero-cta .btn { font-size:15px; padding:12px 28px; border-radius:10px; font-weight:600 }
 
-.content { flex:1; padding: 32px 40px; max-width: 900px; min-width: 0; overflow-x:hidden }
+.quickstart { margin:0 auto 24px; max-width:600px; text-align:left }
 
-.section { display: none }
-.section.active { display: block }
+.features-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:16px; margin-top:24px }
+.feature-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:22px 20px; transition:border-color .2s }
+.feature-card:hover { border-color:var(--accent) }
+.feature-icon { font-size:24px; margin-bottom:10px }
+.feature-title { font-size:15px; font-weight:600; margin-bottom:6px; color:var(--text) }
+.feature-desc { font-size:13px; color:var(--text-muted); line-height:1.55 }
+
+.steps-row { display:flex; gap:20px; margin:0 auto 48px; max-width:780px; padding:0 24px }
+.step-card { flex:1; background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:24px 20px; text-align:center; transition:border-color .2s }
+.step-card:hover { border-color:var(--accent) }
+.step-num { display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; background:var(--accent); color:#fff; font-size:14px; font-weight:700; margin-bottom:12px }
+.step-title { font-size:15px; font-weight:600; margin-bottom:6px; color:var(--text) }
+.step-desc { font-size:13px; color:var(--text-muted); line-height:1.55 }
+
+.flow-canvas { display: block; margin: 0 auto 48px; max-width: 600px; width: 100%; height: 160px }
+
+.section { padding: 48px 0; border-top:1px solid var(--border) }
 .section-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); margin-bottom: 8px }
 .section-title { font-size: 24px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.5px }
-.section-subtitle { font-size: 15px; color: var(--text-muted); margin-bottom: 28px }
+.section-subtitle { font-size: 15px; color: var(--text-muted); margin-bottom: 32px }
 
 .card {
   background: var(--surface); border:1px solid var(--border);
-  border-radius: 10px; padding: 24px; margin-bottom: 16px
+  border-radius: 12px; padding: 28px; margin-bottom: 20px
 }
-.card-title { font-size: 15px; font-weight: 600; margin-bottom: 4px }
-.card-subtitle { font-size: 13px; color: var(--text-muted); margin-bottom: 16px }
+.card-title { font-size: 16px; font-weight: 600; margin-bottom: 4px }
+.card-subtitle { font-size: 13px; color: var(--text-muted); margin-bottom: 20px }
 
 .btn {
   display: inline-flex; align-items: center; justify-content: center;
@@ -101,8 +115,7 @@ body {
 .btn-ghost { background: transparent; border:1px solid var(--border); color: var(--text-muted); font-size:13px; padding:6px 12px }
 .btn-ghost:hover { background: var(--surface); color: var(--text) }
 
-.form-row { display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; max-width:600px }
-.form-row .btn { margin-top: 22px; height: 42px }
+.form-row { display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap }
 .form-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; color:var(--text-muted); margin-bottom:4px }
 .form-input {
   width:100%; padding:10px 14px; border:1px solid var(--border); border-radius:8px;
@@ -111,16 +124,6 @@ body {
 }
 .form-input:focus { border-color:var(--accent) }
 .form-input::placeholder { color:var(--text-muted) }
-
-.file-upload { display: flex; align-items: center; }
-.file-upload input[type="file"] { display: none }
-.file-upload span {
-  display: inline-block; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;
-  font-size: 14px; color: var(--text-muted); background: var(--bg); cursor: pointer;
-  width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  transition: border-color .15s;
-}
-.file-upload span:hover { border-color: var(--accent); color: var(--text) }
 
 .key-list { border-radius:10px; overflow:hidden; border:1px solid var(--border); margin-top:14px }
 .key-item { display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid var(--border); font-size:13px }
@@ -164,6 +167,12 @@ body {
 .tab-content { display:none }
 .tab-content.active { display:block }
 
+.file-list { border-radius:10px; overflow:hidden; border:1px solid var(--border) }
+.file-item { display:flex; justify-content:space-between; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); font-size:13px }
+.file-item:last-child { border-bottom:none }
+.file-name { font-family:'SF Mono','Fira Code',monospace; font-size:12px; color:var(--accent) }
+.file-size { font-size:12px; color:var(--text-muted) }
+
 .empty { text-align:center; color:var(--text-muted); padding:28px; font-size:13px }
 
 .auth-overlay {
@@ -191,14 +200,15 @@ body {
 .auth-btns { display:flex; gap:8px; margin-top:4px }
 .auth-btns button { flex:1 }
 
-.stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; max-width:640px }
-.stat-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:22px 20px; text-align:center }
-.stat-value { font-size:28px; font-weight:700; color:var(--accent) }
-.stat-label { font-size:12px; color:var(--text-muted); margin-top:4px }
+.footer { text-align:center; padding:40px 0; color:var(--text-muted); font-size:12px; border-top:1px solid var(--border); margin-top:60px }
 
-@media(max-width:768px) {
-  .sidebar { display:none }
-  .content { padding: 24px 16px }
+#auth-section { display:none }
+#dashboard-section { display:none }
+
+@media(max-width:640px) {
+  .hero h1 { font-size:32px }
+  .hero p { font-size:16px }
+  .flow-canvas { height: 120px }
 }
 </style>
 </head>
@@ -212,26 +222,107 @@ body {
   </div>
 </nav>
 
-<div class="layout">
-<div class="sidebar" id="sidebar">
-  <div class="sidebar-heading">Manage</div>
-  <button class="sidebar-item active" data-section="keys" onclick="switchSection('keys')">API Keys</button>
-  <button class="sidebar-item" data-section="workspaces" onclick="switchSection('workspaces')">Workspaces</button>
-  <button class="sidebar-item" data-section="usage" onclick="switchSection('usage')">Usage</button>
-  <div class="sidebar-heading">Configure</div>
-  <button class="sidebar-item" data-section="backend" onclick="switchSection('backend')">Backend Storage</button>
-  <button class="sidebar-item" data-section="plugins" onclick="switchSection('plugins')">Plugins</button>
-  <div class="sidebar-heading">Explore</div>
-  <button class="sidebar-item" data-section="objects" onclick="switchSection('objects')">Objects</button>
+<div id="landing">
+<div class="container">
+<div class="hero">
+  <h1>Run your plugins <mark>before</mark> data reaches storage</h1>
+  <p>Platform-agnostic processing gateway. Point any S3 client at S4 — filter, redact, encrypt, or convert every object with your Wasm plugins.</p>
+
+  <canvas class="flow-canvas" id="flowCanvas" width="1200" height="320"></canvas>
+
+  <div class="quickstart">
+    <div class="section-label" style="margin-bottom:12px">Quick Start</div>
+    <div class="code-wrapper">
+      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
+      <div class="code-block"># Get an API key from the dashboard or use demo mode
+
+# Upload — data runs through the plugin pipeline
+curl -X PUT http://localhost:9000/ingest/data.jsonl \
+  -H "x-s4-access-key: YOUR_KEY_ID" \
+  -H "x-s4-secret-key: YOUR_SECRET" \
+  --data-binary @data.jsonl
+
+# Read — filtered data comes back
+curl http://localhost:9000/ingest/data.jsonl \
+  -H "x-s4-access-key: YOUR_KEY_ID" \
+  -H "x-s4-secret-key: YOUR_SECRET"</div>
+    </div>
+  </div>
+
+  <div class="hero-cta">
+    <button class="btn btn-primary" id="btn-started" onclick="openAuth()">Get Started</button>
+    <button class="btn btn-outline" onclick="document.getElementById('features').scrollIntoView({behavior:'smooth'})">See all features</button>
+  </div>
 </div>
 
-<div class="content">
+<div class="section" id="features" style="border-top:none;padding-top:32px">
+  <div class="section-label">Features</div>
+  <div class="section-title">Everything you need to process data in transit</div>
+  <div class="features-grid">
+    <div class="feature-card">
+      <div class="feature-icon">&#x2601;</div>
+      <div class="feature-title">Multi-cloud storage</div>
+      <div class="feature-desc">S4 Service Storage distributes objects across AWS, R2, B2 using consistent hashing. Dual-write to primary + replica. Cross-cloud resilience by default.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F4C1;</div>
+      <div class="feature-title">Full S3 API</div>
+      <div class="feature-desc">PUT, GET, DELETE, HEAD, LIST — standard S3 operations run through the plugin pipeline. Drop-in compatible with AWS SDK, boto3, and any S3 tool.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F511;</div>
+      <div class="feature-title">Simple ACL</div>
+      <div class="feature-desc">S4 API keys (s4_xxx / s4s_xxx) authenticate S3 requests. Create, revoke, set expiry per key. No IAM policy complexity.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F310;</div>
+      <div class="feature-title">Cloud agnostic</div>
+      <div class="feature-desc">Presigned URL proxy works with S3, R2, B2, MinIO — any S3-compatible storage. BYO backend or use S4's managed buckets.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F9E9;</div>
+      <div class="feature-title">Plugin system</div>
+      <div class="feature-desc">Wasm filter plugins: import, enable, disable, reorder at runtime. Ordered pipeline processes data through multiple plugins — ship custom transforms without redeploying.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F6E1;</div>
+      <div class="feature-title">Zero trust</div>
+      <div class="feature-desc">IAM Role assumption (Fivetran/Airbyte model). No long-lived credentials stored. Unique External ID per workspace prevents confused deputy attacks.</div>
+    </div>
+  </div>
+</div>
+</div>
+</div>
 
-<!-- API Keys -->
-<div class="section active" id="section-keys">
-  <div class="section-label">API Keys</div>
-  <div class="section-title">Manage credentials</div>
-  <div class="section-subtitle">S3-compatible keys that authenticate data-plane requests through your plugin pipeline.</div>
+<div id="auth-section">
+  <div class="auth-overlay" onclick="if(event.target===this)closeAuth()">
+    <div class="auth-card">
+      <h2>Get Started</h2>
+      <div class="sub">Create an account or sign in</div>
+      <div class="oauth-btns">
+        <button class="btn btn-outline oauth-btn" onclick="signInWithOAuth('github', this)">Continue with GitHub</button>
+        <button class="btn btn-outline oauth-btn" onclick="signInWithOAuth('google', this)">Continue with Google</button>
+      </div>
+      <div class="auth-divider">or with email</div>
+      <div class="auth-form">
+        <input class="auth-input" id="auth-email" type="email" placeholder="Email address" />
+      <input class="auth-input" id="auth-password" type="password" placeholder="Password" />
+        <div id="auth-msg" style="display:none;font-size:12px;padding:8px 12px;border-radius:6px;margin-top:4px;text-align:left"></div>
+        <div class="auth-btns">          <button class="btn btn-primary" id="btn-signin" onclick="signIn()">Sign In</button>
+          <button class="btn btn-ghost" id="btn-signup" onclick="signUp()">Sign Up</button>
+        </div>
+      </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="dashboard-section" class="container">
+<div class="section" id="how">
+  <div class="section-label">Get started</div>
+  <div class="section-title">Create your first API key</div>
+  <div class="section-subtitle">S3-compatible credentials. Works with AWS SDK, CLI, or any S3 tool.</div>
+
   <div class="form-row">
     <div style="flex:2">
       <div class="form-label">Key label</div>
@@ -246,64 +337,24 @@ body {
         <option value="31536000">1 year</option>
       </select>
     </div>
-    <button class="btn btn-primary" onclick="createKey()">Generate Key</button>
+    <button class="btn btn-primary" id="btn-gen-key" onclick="createKey()" style="height:42px;align-self:flex-end">Generate Key</button>
   </div>
   <div id="key-reveal" style="display:none"></div>
   <div id="keys-list"></div>
 </div>
 
-<!-- Workspaces -->
-<div class="section" id="section-workspaces">
-  <div class="section-label">Workspaces</div>
-  <div class="section-title">Manage your workspaces</div>
-  <div class="section-subtitle">Create workspaces to organize API keys and track usage per project or team.</div>
-  <div class="form-row" style="margin-bottom:16px">
-    <div style="flex:2">
-      <div class="form-label">Workspace name</div>
-      <input class="form-input" id="ws-name" placeholder="My Workspace" />
-    </div>
-    <div style="flex:1">
-      <div class="form-label">Slug (optional)</div>
-      <input class="form-input" id="ws-slug" placeholder="my-workspace" />
-    </div>
-    <button class="btn btn-primary" onclick="createWorkspace()">Create</button>
-  </div>
-  <div id="ws-status" style="font-size:13px;margin-bottom:12px"></div>
-  <div id="workspaces-list"></div>
-</div>
-
-<!-- Usage -->
-<div class="section" id="section-usage">
-  <div class="section-label">Usage</div>
-  <div class="section-title">Current billing period</div>
-  <div class="section-subtitle" id="usage-period">Usage across all your workspaces this month.</div>
-  <div class="stats-grid">
-    <div class="stat-card">
-      <div class="stat-value" id="stat-writes">-</div>
-      <div class="stat-label">Write requests</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-value" id="stat-reads">-</div>
-      <div class="stat-label">Read requests</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-value" id="stat-gb">-</div>
-      <div class="stat-label">GB processed</div>
-    </div>
-  </div>
-</div>
-
-<!-- Backend Storage -->
-<div class="section" id="section-backend">
+<div class="section">
   <div class="section-label">Backend storage</div>
   <div class="section-title">Where should S4 write filtered data?</div>
   <div class="section-subtitle">S4 uses the Fivetran/Airbyte model: you create an IAM role (or API token) granting S4 access to your bucket. No long-lived credentials stored.</div>
+
   <div class="tab-bar" id="backend-tabs">
     <button class="tab-btn active" onclick="switchBackendTab('aws', this)">AWS S3</button>
     <button class="tab-btn" onclick="switchBackendTab('r2', this)">Cloudflare R2</button>
     <button class="tab-btn" onclick="switchBackendTab('b2', this)">Backblaze B2</button>
     <button class="tab-btn" onclick="switchBackendTab('minio', this)">MinIO</button>
   </div>
+
   <div class="tab-content active" id="backend-aws">
     <div class="card" style="margin-top:12px">
       <div class="card-title">Step 1: Create an IAM Role for S4</div>
@@ -339,6 +390,7 @@ aws iam put-role-policy --role-name s4-pii-filter \
 
 echo "Role ARN: $(aws iam get-role --role-name s4-pii-filter --query 'Role.Arn' --output text)"</div>
       </div>
+
       <div class="card-title" style="margin-top:16px">Step 2: Paste your Role ARN</div>
       <div class="card-subtitle">Copy the Role ARN from the output above and paste it below. Your External ID is auto-generated.</div>
       <div class="form-row" style="margin-top:10px">
@@ -356,6 +408,7 @@ echo "Role ARN: $(aws iam get-role --role-name s4-pii-filter --query 'Role.Arn' 
       </div>
     </div>
   </div>
+
   <div class="tab-content" id="backend-r2">
     <div class="card" style="margin-top:12px">
       <div class="card-title">Create an R2 API Token</div>
@@ -381,6 +434,7 @@ echo "https://${ACCOUNT_ID}.r2.cloudflarestorage.com"</div>
       </div>
     </div>
   </div>
+
   <div class="tab-content" id="backend-b2">
     <div class="card" style="margin-top:12px">
       <div class="card-title">Create a B2 Application Key</div>
@@ -409,6 +463,7 @@ echo "https://s3.us-west-004.backblazeb2.com"</div>
       </div>
     </div>
   </div>
+
   <div class="tab-content" id="backend-minio">
     <div class="card" style="margin-top:12px">
       <div class="card-title">Connect to your MinIO instance</div>
@@ -429,78 +484,202 @@ echo "https://s3.us-west-004.backblazeb2.com"</div>
       </div>
     </div>
   </div>
-  <button class="btn btn-primary" onclick="saveBackend()" style="margin-top:12px">Save Backend Config</button>
+
+  <button class="btn btn-primary" id="btn-save-backend" onclick="saveBackend()" style="margin-top:12px">Save Backend Config</button>
   <span id="backend-status" style="margin-left:12px;font-size:13px;color:var(--success);display:none">Saved</span>
 </div>
 
-<!-- Plugins -->
-<div class="section" id="section-plugins">
-  <div class="section-label">Plugins</div>
-  <div class="section-title">Plugin pipeline</div>
-  <div class="section-subtitle">Wasm components that run on every request. Import, enable, disable, reorder.</div>
-  <div id="plugins-list"></div>
-  <div class="form-row" style="margin-top:16px">
-    <div style="flex:2">
-      <div class="form-label">Plugin name</div>
-      <input class="form-input" id="plugin-name" placeholder="my-plugin" />
+<div class="section">
+  <div class="section-label">Usage</div>
+  <div class="section-title">Connect your tools</div>
+  <div class="section-subtitle">Generate a presigned URL for your bucket, then pipe it through S4 for plugin processing.</div>
+
+  <div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('bash', this)">Bash</button>
+    <button class="tab-btn" onclick="switchTab('python', this)">Python</button>
+    <button class="tab-btn" onclick="switchTab('rust', this)">Rust</button>
+    <button class="tab-btn" onclick="switchTab('java', this)">Java</button>
+  </div>
+
+  <div class="tab-content active" id="tab-bash">
+    <div class="code-wrapper">
+      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
+      <div class="code-block">export S4_KEY=s4_YOUR_KEY_ID
+export S4_SECRET=s4s_YOUR_SECRET
+export S4=http://localhost:9000
+
+# Generate a presigned PUT URL using your AWS credentials
+PRESIGNED=$(aws s3 presign s3://my-bucket/uploads/data.jsonl --expires-in 604800)
+
+# Send through S4 — processed by the plugin pipeline before reaching your bucket
+curl -X PUT "$S4/my-bucket/uploads/data.jsonl" \
+  -H "x-s4-access-key: $S4_KEY" \
+  -H "x-s4-secret-key: $S4_SECRET" \
+  -H "x-s4-backend-url: $PRESIGNED" \
+  --data-binary @data.jsonl</div>
     </div>
-    <div style="flex:1">
-      <div class="form-label">.wasm file</div>
-      <label class="file-upload">
-        <span id="file-label">Choose file</span>
-        <input type="file" id="plugin-file" onchange="document.getElementById('file-label').textContent = this.files[0]?.name || 'Choose file'" />
-      </label>
+  </div>
+
+  <div class="tab-content" id="tab-python">
+    <div class="code-wrapper">
+      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
+      <div class="code-block">import boto3, requests
+
+# Generate presigned URL with your AWS credentials
+s3 = boto3.client('s3')
+presigned = s3.generate_presigned_url(
+    'put_object',
+    Params={'Bucket': 'my-bucket', 'Key': 'uploads/data.jsonl'},
+    ExpiresIn=604800
+)
+
+# Send through S4
+r = requests.put(
+    'http://localhost:9000/my-bucket/uploads/data.jsonl',
+    headers={
+        'x-s4-access-key': 's4_YOUR_KEY_ID',
+        'x-s4-secret-key': 's4s_YOUR_SECRET',
+        'x-s4-backend-url': presigned
+    },
+    data=open('data.jsonl', 'rb')
+)</div>
     </div>
-    <button class="btn btn-primary" onclick="importPlugin()">Import</button>
+  </div>
+
+  <div class="tab-content" id="tab-rust">
+    <div class="code-wrapper">
+      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
+      <div class="code-block">use aws_sdk_s3::{Client, presigning::PresigningConfig};
+
+// Generate presigned URL
+let config = aws_config::load_from_env().await;
+let s3 = Client::new(&config);
+let presigned = s3.put_object()
+    .bucket("my-bucket")
+    .key("uploads/data.jsonl")
+    .presigned(PresigningConfig::expires_in(
+        std::time::Duration::from_secs(604800)
+    )).await?;
+
+// Send through S4
+let client = reqwest::Client::new();
+let resp = client.put("http://localhost:9000/my-bucket/uploads/data.jsonl")
+    .header("x-s4-access-key", "s4_YOUR_KEY_ID")
+    .header("x-s4-secret-key", "s4s_YOUR_SECRET")
+    .header("x-s4-backend-url", presigned.uri())
+    .body(std::fs::read("data.jsonl")?)
+    .send().await?;</div>
+    </div>
+  </div>
+
+  <div class="tab-content" id="tab-java">
+    <div class="code-wrapper">
+      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
+      <div class="code-block">// Generate presigned URL
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import java.net.http.*;
+
+var presigner = S3Presigner.create();
+var req = PutObjectRequest.builder()
+    .bucket("my-bucket").key("uploads/data.jsonl").build();
+var presigned = presigner.presignPutObject(p -> p
+    .putObjectRequest(req)
+    .signatureDuration(java.time.Duration.ofDays(7))
+);
+
+// Send through S4
+var client = HttpClient.newHttpClient();
+var httpReq = HttpRequest.newBuilder()
+    .uri(URI.create("http://localhost:9000/my-bucket/uploads/data.jsonl"))
+    .header("x-s4-access-key", "s4_YOUR_KEY_ID")
+    .header("x-s4-secret-key", "s4s_YOUR_SECRET")
+    .header("x-s4-backend-url", presigned.url().toString())
+    .PUT(HttpRequest.BodyPublishers.ofFile(Path.of("data.jsonl")))
+    .build();
+client.send(httpReq, HttpResponse.BodyHandlers.ofString());</div>
+    </div>
   </div>
 </div>
 
-<!-- Objects -->
-<div class="section" id="section-objects">
+<div class="section">
+  <div class="section-label">Client SDKs</div>
+  <div class="section-title">Envelope encryption built in</div>
+  <div class="section-subtitle">Python and TypeScript SDKs ship a high-level client. Generate a keypair, hand S4 the public half once, and every PUT is envelope-encrypted server-side (RSA-OAEP + AES-256-GCM). Read back and decrypt with your private key — S4 never sees it.</div>
+
+  <div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('sdk-python', this)">Python</button>
+    <button class="tab-btn" onclick="switchTab('sdk-ts', this)">TypeScript</button>
+  </div>
+
+  <div class="tab-content active" id="tab-sdk-python">
+    <div class="code-wrapper">
+      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
+      <div class="code-block">pip install -e sdks/python requests cryptography
+
+from s4_client.highlevel import S4Client
+
+client = S4Client("http://localhost:9000", "s4_KEY_ID", "s4s_SECRET")
+
+# One-time: generate a keypair and hand S4 the public half.
+# The envelope-encrypt plugin encrypts on every PUT; only you can decrypt it.
+private_pem, public_pem = S4Client.generate_keypair()
+client.attach_public_key(public_pem)
+
+# Write — PII envelope-encrypted server-side (RSA-OAEP + AES-256-GCM)
+client.put_object("my-bucket", "ingest/data.jsonl", open("data.jsonl", "rb").read())
+
+# Read — decrypt the envelopes back to plaintext with your private key
+raw = client.get_object("my-bucket", "ingest/data.jsonl")
+plaintext = S4Client.decrypt_payload(raw, private_pem)</div>
+    </div>
+  </div>
+
+  <div class="tab-content" id="tab-sdk-ts">
+    <div class="code-wrapper">
+      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
+      <div class="code-block">npm install sdks/typescript   # builds dist/ on install
+
+import { S4Client } from "s4-client/highlevel";
+
+const client = new S4Client({
+  endpoint: "http://localhost:9000",
+  accessKey: "s4_KEY_ID",
+  secretKey: "s4s_SECRET",
+});
+
+// One-time: hand S4 the public half of a fresh keypair
+const { privateKeyPem, publicKeyPem } = await S4Client.generateKeypair();
+await client.attachPublicKey(publicKeyPem);
+
+// Write — PII encrypted server-side (RSA-OAEP + AES-256-GCM)
+await client.putObject("my-bucket", "ingest/data.jsonl",
+  new TextEncoder().encode(JSON.stringify(records)));
+
+// Read — decrypt envelopes client-side
+const raw = await client.getObject("my-bucket", "ingest/data.jsonl");
+const plaintext = new TextDecoder().decode(
+  await S4Client.decryptPayload(raw, privateKeyPem));</div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
   <div class="section-label">Storage</div>
   <div class="section-title">Objects in memory</div>
   <div class="section-subtitle">Objects flowing through the gateway. Upload more via S3 API.</div>
-  <button class="btn btn-ghost" onclick="loadObjects()" style="margin-bottom:14px">Refresh</button>
+  <button class="btn btn-ghost" id="btn-refresh" onclick="loadObjects()" style="margin-bottom:14px">Refresh</button>
   <div id="objects-list"></div>
 </div>
-
-</div>
 </div>
 
-<div id="auth-section">
-  <div class="auth-overlay" onclick="if(event.target===this)closeAuth()">
-    <div class="auth-card">
-      <h2>Get Started</h2>
-      <div class="sub">Create an account or sign in</div>
-      <div class="oauth-btns">
-        <button class="btn btn-outline oauth-btn" onclick="signInWithOAuth('github', this)">Continue with GitHub</button>
-        <button class="btn btn-outline oauth-btn" onclick="signInWithOAuth('google', this)">Continue with Google</button>
-      </div>
-      <div class="auth-divider">or with email</div>
-      <div class="auth-form">
-        <input class="auth-input" id="auth-email" type="email" placeholder="Email address" />
-        <input class="auth-input" id="auth-password" type="password" placeholder="Password" />
-        <div id="auth-msg" style="display:none;font-size:12px;padding:8px 12px;border-radius:6px;margin-top:4px;text-align:left"></div>
-        <div class="auth-btns">
-          <button class="btn btn-primary" id="btn-signin" onclick="signIn()">Sign In</button>
-          <button class="btn btn-ghost" id="btn-signup" onclick="signUp()">Sign Up</button>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
+<footer class="footer container">
+  S4 Gateway &middot; pluggable processing &middot; <a href="https://github.com/231self/S4" style="color:var(--text-muted)">github.com/231self/S4</a>
+</footer>
 
 <script>
 
 var session = null, sessionToken = null, isDemo = false;
-
-window.switchSection = function(name) {
-  document.querySelectorAll('.section').forEach(function(s){ s.classList.remove('active'); });
-  var target = document.getElementById('section-' + name);
-  if (target) target.classList.add('active');
-  document.querySelectorAll('.sidebar-item').forEach(function(b){ b.classList.remove('active'); });
-  document.querySelector('.sidebar-item[data-section="' + name + '"]').classList.add('active');
-};
 
 window.toggleTheme = function() {
   var html = document.documentElement;
@@ -508,6 +687,7 @@ window.toggleTheme = function() {
   html.setAttribute('data-theme', d ? 'light' : 'dark');
   document.getElementById('theme-btn').textContent = d ? 'Dark' : 'Light';
   localStorage.setItem('s4-theme', d ? 'light' : 'dark');
+  drawFlow();
 };
 
 (function initTheme() {
@@ -534,6 +714,14 @@ function api(method, path, body) {
     return r.json();
   });
 }
+
+window.switchTab = function(name, el) {
+  var bar = el.parentElement;
+  bar.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
+  el.classList.add('active');
+  bar.parentElement.querySelectorAll('.tab-content').forEach(function(c){ c.classList.remove('active'); });
+  document.getElementById('tab-' + name).classList.add('active');
+};
 
 window.switchBackendTab = function(name, el) {
   var bar = el.parentElement;
@@ -572,19 +760,43 @@ window.saveBackend = function() {
   var type = active ? active.textContent.trim() : 'AWS S3';
   var config = {};
   if (type === 'AWS S3') {
-    config = { backend_type: 'aws_role', role_arn: document.getElementById('backend-role-arn').value, external_id: document.getElementById('backend-external-id').value };
+    config = {
+      backend_type: 'aws_role',
+      role_arn: document.getElementById('backend-role-arn').value,
+      external_id: document.getElementById('backend-external-id').value
+    };
   } else if (type === 'Cloudflare R2') {
-    config = { backend_type: 's3_compatible', endpoint: document.getElementById('backend-r2-endpoint').value, access_key: document.getElementById('backend-r2-token').value, secret_key: document.getElementById('backend-r2-token').value, region: 'auto' };
+    config = {
+      backend_type: 's3_compatible',
+      endpoint: document.getElementById('backend-r2-endpoint').value,
+      access_key: document.getElementById('backend-r2-token').value,
+      secret_key: document.getElementById('backend-r2-token').value,
+      region: 'auto'
+    };
   } else if (type === 'Backblaze B2') {
-    config = { backend_type: 's3_compatible', endpoint: document.getElementById('backend-b2-endpoint').value, access_key: document.getElementById('backend-b2-key-id').value, secret_key: document.getElementById('backend-b2-app-key').value, region: 'us-west-004' };
+    config = {
+      backend_type: 's3_compatible',
+      endpoint: document.getElementById('backend-b2-endpoint').value,
+      access_key: document.getElementById('backend-b2-key-id').value,
+      secret_key: document.getElementById('backend-b2-app-key').value,
+      region: 'us-west-004'
+    };
   } else if (type === 'MinIO') {
-    config = { backend_type: 's3_compatible', endpoint: document.getElementById('backend-minio-endpoint').value, access_key: document.getElementById('backend-minio-access-key').value, secret_key: document.getElementById('backend-minio-secret-key').value, region: 'us-east-1' };
+    config = {
+      backend_type: 's3_compatible',
+      endpoint: document.getElementById('backend-minio-endpoint').value,
+      access_key: document.getElementById('backend-minio-access-key').value,
+      secret_key: document.getElementById('backend-minio-secret-key').value,
+      region: 'us-east-1'
+    };
   }
   api('PUT', '/dashboard/api/backend', config).then(function() {
     var s = document.getElementById('backend-status');
     s.style.display = 'inline';
     setTimeout(function(){ s.style.display = 'none'; }, 3000);
-  }).catch(function(e) { alert('Failed to save: ' + e.message); });
+  }).catch(function(e) {
+    alert('Failed to save: ' + e.message);
+  });
 };
 
 window.createKey = function() {
@@ -597,7 +809,7 @@ window.createKey = function() {
     reveal.style.display = 'block';
     var expInfo = r.expires_at ? '<div class="reveal-field"><div class="form-label">Expires</div><div class="reveal-secret" style="color:var(--text-muted)">'+new Date(parseInt(r.expires_at)*1000).toLocaleDateString()+'</div></div>' : '';
     reveal.innerHTML =
-      '<div class="reveal-box"><h3>Key Created</h3>' +
+      '<div class="reveal-box"><h3>&#x2713; Key Created</h3>' +
       '<div class="reveal-field"><div class="form-label">Access Key ID</div><div class="reveal-secret">'+r.key_id+'</div></div>' +
       '<div class="reveal-field"><div class="form-label">Secret Access Key</div><div class="reveal-secret">'+r.secret+'</div></div>' +
       expInfo +
@@ -615,8 +827,7 @@ function loadKeys() {
     document.getElementById('keys-list').innerHTML = k.length
       ? '<div class="key-list">'+k.map(function(x){
           var exp = x.expires_at ? ' &middot; expires '+new Date(parseInt(x.expires_at)*1000).toLocaleDateString() : '';
-          var pub = x.public_key_pem ? ' &middot; encryption' : '';
-          return'<div class="key-item"><div><div class="key-id">'+x.key_id+'</div><div class="key-meta">'+x.label+' &middot; created '+new Date(parseInt(x.created_at)*1000).toLocaleDateString()+exp+pub+'</div></div><button class="btn btn-danger" onclick="deleteKey(\''+x.key_id+'\')">Revoke</button></div>'
+          return'<div class="key-item"><div><div class="key-id">'+x.key_id+'</div><div class="key-meta">'+x.label+' &middot; created '+new Date(parseInt(x.created_at)*1000).toLocaleDateString()+exp+'</div></div><button class="btn btn-danger" onclick="deleteKey(\''+x.key_id+'\')">Revoke</button></div>'
         }).join('')+'</div>'
       : '<div class="empty">No keys yet. Generate one above.</div>';
   }).catch(function(){});
@@ -627,117 +838,33 @@ window.deleteKey = function(id) {
   api('DELETE','/dashboard/api/keys',{key_id:id}).then(loadKeys);
 };
 
-var currentWsId = null;
-
-window.loadWorkspaces = function() {
-  api('GET','/dashboard/api/workspaces').then(function(r) {
-    var wss = r.workspaces || [];
-    var list = document.getElementById('workspaces-list');
-    if (!wss.length) {
-      list.innerHTML = '<div class="empty">No workspaces yet. Create one to organize API keys and track usage.</div>';
-    } else {
-      list.innerHTML = wss.map(function(w){
-        return '<div class="card" style="max-width:600px"><div style="display:flex;justify-content:space-between;align-items:center"><div><div class="card-title">'+w.name+'</div><div class="card-subtitle" style="margin-bottom:0">'+w.slug+' &middot; '+w.role+'</div></div><button class="btn btn-danger" onclick="deleteWorkspace(\''+w.id+'\')">Delete</button></div></div>';
-      }).join('');
-    }
-  }).catch(function(){});
-};
-
-window.createWorkspace = function() {
-  var name = document.getElementById('ws-name').value.trim();
-  if (!name) { document.getElementById('ws-status').textContent = 'Enter a workspace name'; return; }
-  var slug = document.getElementById('ws-slug').value.trim();
-  var body = { name: name };
-  if (slug) body.slug = slug;
-  var st = document.getElementById('ws-status');
-  api('POST','/dashboard/api/workspaces', body).then(function(r) {
-    st.style.color = 'var(--success)'; st.textContent = 'Workspace "' + r.name + '" created';
-    document.getElementById('ws-name').value = '';
-    document.getElementById('ws-slug').value = '';
-    loadWorkspaces();
-    setTimeout(function(){ st.textContent='' }, 3000);
-  }).catch(function(e) {
-    st.style.color = 'var(--danger)'; st.textContent = 'Error: ' + e.message;
-  });
-};
-
-window.deleteWorkspace = function(id) {
-  if (!confirm('Delete this workspace? Keys and usage records remain but become orphaned.')) return;
-  api('DELETE','/dashboard/api/workspaces/'+id).then(function() {
-    if (currentWsId === id) currentWsId = null;
-    loadWorkspaces();
-  });
-};
-
-window.loadUsage = function() {
-  api('GET','/dashboard/api/usage').then(function(r) {
-    var u = r.usage;
-    var fmt = function(n) { return n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : n.toString(); };
-    document.getElementById('stat-writes').textContent = fmt(u.write_count||0);
-    document.getElementById('stat-reads').textContent = fmt(u.read_count||0);
-    document.getElementById('stat-gb').textContent = (u.gb_processed||0).toFixed(2) + ' GB';
-    if (u.live === true) {
-      document.getElementById('usage-period').textContent = 'Live in-memory counters (no DATABASE_URL configured).';
-    } else if (u.live && typeof u.live === 'object') {
-      var lw = fmt(u.live.write_count||0);
-      var lr = fmt(u.live.read_count||0);
-      var lg = (u.live.gb_processed||0).toFixed(2);
-      document.getElementById('usage-period').textContent = 'Billing period totals. Live (since last restart): '+lw+' writes, '+lr+' reads, '+lg+' GB.';
-    }
-  }).catch(function(){
-    document.getElementById('stat-writes').textContent = '-';
-    document.getElementById('stat-reads').textContent = '-';
-    document.getElementById('stat-gb').textContent = '-';
-  });
-};
-
 window.loadObjects = function() {
   api('GET','/dashboard/api/objects').then(function(o) {
     document.getElementById('objects-list').innerHTML = o.length
-      ? '<div class="key-list">'+o.map(function(x){return'<div class="key-item"><span class="key-id">'+x.key+'</span><span style="font-size:12px;color:var(--text-muted)">'+x.size+' bytes</span></div>'}).join('')+'</div>'
-      : '<div class="empty">No objects yet. Upload using the S3 API.</div>';
+      ? '<div class="file-list">'+o.map(function(x){return'<div class="file-item"><span class="file-name">'+x.key+'</span><span class="file-size">'+x.size+' bytes</span></div>'}).join('')+'</div>'
+      : '<div class="empty">No objects yet. Upload using the S3 API above.</div>';
   }).catch(function(){});
 };
 
-window.loadPlugins = function() {
-  api('GET','/dashboard/api/plugins').then(function(plugs) {
-    var list = document.getElementById('plugins-list');
-    if (!plugs.length) {
-      list.innerHTML = '<div class="empty">No plugins loaded.</div>';
-    } else {
-      list.innerHTML = plugs.map(function(p){
-        var badge = p.enabled ? '<span style="background:var(--success);color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600">Active</span>' : '<span style="background:var(--text-muted);color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600">Disabled</span>';
-        return '<div class="card" style="max-width:600px"><div style="display:flex;justify-content:space-between;align-items:center"><div><div class="card-title">'+p.name+' <span style="font-weight:400;font-size:11px;color:var(--text-muted)">v'+p.version+'</span></div><div class="card-subtitle" style="margin-bottom:0">'+p.description+'</div></div>'+badge+'</div></div>';
-      }).join('');
-    }
-  }).catch(function(){});
+window.openAuth = function() {
+  document.getElementById('auth-section').style.display = 'block';
 };
 
-window.importPlugin = function() {
-  var name = document.getElementById('plugin-name').value.trim() || 'imported';
-  var file = document.getElementById('plugin-file').files[0];
-  if (!file) return;
-  var reader = new FileReader();
-  reader.onload = function() {
-    fetch('/dashboard/api/plugins', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream', 'x-s4-plugin-name': name },
-      body: reader.result
-    }).then(function(r) { return r.json(); }).then(function() {
-      loadPlugins();
-    }).catch(function(e) { alert('Import failed: ' + e.message); });
-  };
-  reader.readAsArrayBuffer(file);
+window.closeAuth = function() {
+  document.getElementById('auth-section').style.display = 'none';
 };
-
-window.openAuth = function() { document.getElementById('auth-section').style.display = 'block'; };
-window.closeAuth = function() { document.getElementById('auth-section').style.display = 'none'; };
 
 function onAuthReady() {
   document.getElementById('auth-section').style.display = 'none';
+  document.getElementById('landing').style.display = 'none';
+  document.getElementById('dashboard-section').style.display = 'block';
   document.getElementById('user-display').textContent = isDemo ? 'Demo Mode' : (session ? session.user.email : '');
   document.getElementById('user-display').style.cursor = 'pointer';
-  document.getElementById('user-display').onclick = function() { if (!isDemo) closeAuth(); };
+  document.getElementById('user-display').onclick = function() {
+    if (isDemo) return;
+    closeAuth();
+  };
+  // Enrich the greeting with provider info when authenticated.
   if (!isDemo && sessionToken) {
     api('GET','/dashboard/api/me').then(function(me) {
       var label = me.email || me.user_id;
@@ -748,13 +875,14 @@ function onAuthReady() {
   loadKeys();
   loadObjects();
   loadBackend();
-  loadWorkspaces();
-  loadUsage();
-  loadPlugins();
 }
 
 window.signOut = function() {
-  session = null; sessionToken = null; isDemo = false;
+  session = null;
+  sessionToken = null;
+  isDemo = false;
+  document.getElementById('landing').style.display = 'block';
+  document.getElementById('dashboard-section').style.display = 'none';
   document.getElementById('user-display').textContent = '';
   document.getElementById('user-display').style.cursor = 'default';
   document.getElementById('user-display').onclick = null;
@@ -762,9 +890,10 @@ window.signOut = function() {
 
 window.showAuthMsg = function(msg, type) {
   var el = document.getElementById('auth-msg');
-  el.style.display = 'block'; el.textContent = msg;
+  el.style.display = 'block';
+  el.textContent = msg;
   el.style.background = type === 'error' ? 'var(--danger)' : type === 'success' ? 'var(--success)' : 'transparent';
-  el.style.color = '#fff';
+  el.style.color = type === 'error' ? '#fff' : type === 'success' ? '#fff' : 'var(--text-muted)';
   if (type !== 'info') setTimeout(function(){ el.style.display='none' }, 4000);
 };
 
@@ -772,7 +901,9 @@ window.signInWithOAuth = function(provider, btn) {
   if (HAS_SUPABASE === false) { onAuthReady(); return; }
   btn.disabled = true; btn.textContent = 'Redirecting...';
   supabase.auth.signInWithOAuth({ provider: provider }).then(function(r) {
-    if (r.error) { showAuthMsg(r.error.message, 'error'); btn.disabled = false; btn.textContent = 'Continue with ' + provider.charAt(0).toUpperCase() + provider.slice(1); }
+    if (r.error) { showAuthMsg(r.error.message, 'error'); btn.disabled = false; btn.textContent = 'Continue with ' + provider.charAt(0).toUpperCase() + provider.slice(1); return; }
+    // Success: GoTrue redirects the browser to the provider; the callback
+    // reloads this page and the boot getSession() picks up the session.
   });
 };
 
@@ -783,10 +914,12 @@ window.signIn = function() {
   if (!email || !password) { showAuthMsg('Enter email and password', 'error'); return; }
   var btn = document.getElementById('btn-signin');
   btn.disabled = true; btn.textContent = 'Signing in...';
+  showAuthMsg('', 'info');
   supabase.auth.signInWithPassword({email:email,password:password}).then(function(r) {
     btn.disabled = false; btn.textContent = 'Sign In';
     if (r.error) { showAuthMsg(r.error.message, 'error'); return; }
-    session = r.data.session; sessionToken = session.access_token;
+    session = r.data.session;
+    sessionToken = session.access_token;
     onAuthReady();
   });
 };
@@ -798,14 +931,313 @@ window.signUp = function() {
   if (!email || !password) { showAuthMsg('Enter email and password', 'error'); return; }
   var btn = document.getElementById('btn-signup');
   btn.disabled = true; btn.textContent = 'Creating...';
+  showAuthMsg('', 'info');
   supabase.auth.signUp({email:email,password:password}).then(function(r) {
     btn.disabled = false; btn.textContent = 'Sign Up';
     if (r.error) { showAuthMsg(r.error.message, 'error'); return; }
-    if (r.data.session) { session = r.data.session; sessionToken = session.access_token; onAuthReady(); return; }
+    if (r.data.session) {
+      session = r.data.session;
+      sessionToken = session.access_token;
+      onAuthReady();
+      return;
+    }
     showAuthMsg('Check your email for a confirmation link.', 'success');
   });
 };
 
+// === Canvas flow animation ===
+window.drawFlow = function() {
+  var canvas = document.getElementById('flowCanvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  var W = canvas.offsetWidth;
+  var H = canvas.offsetHeight;
+
+  var style = getComputedStyle(document.documentElement);
+  var accent = style.getPropertyValue('--accent').trim();
+  var border = style.getPropertyValue('--border').trim();
+  var textColor = style.getPropertyValue('--text').trim();
+  var muted = style.getPropertyValue('--text-muted').trim();
+  var dangerRgb = style.getPropertyValue('--danger').trim();
+  var successRgb = style.getPropertyValue('--success').trim();
+  var surface = style.getPropertyValue('--surface').trim();
+
+  var piiSamples = ['john@mail.com', '555-0123', '4111-12...', 'Jane Doe', 'SSN: 1234', '@alice', '120 Main St'];
+  var cleanSamples = ['use...@mail.com', '555-****', '****-****', 'Jane D.', 'SSN: ****', '@*****', '*** Main St'];
+
+  var writeDocs = [];
+  var readDocs = [];
+  var particles = [];
+
+  for (var i = 0; i < 7; i++) {
+    var idx = Math.floor(Math.random() * piiSamples.length);
+    writeDocs.push({
+      x: -Math.random() * W,
+      y: 28 + Math.random() * (H / 2 - 56),
+      w: 48 + Math.random() * 36,
+      h: 30 + Math.random() * 18,
+      speed: 0.3 + Math.random() * 0.5,
+      pii: Math.random() < 0.6,
+      idx: idx,
+      piiText: piiSamples[idx],
+      cleanText: cleanSamples[idx]
+    });
+  }
+
+  for (var i = 0; i < 5; i++) {
+    var si = Math.floor(Math.random() * piiSamples.length);
+    readDocs.push({
+      x: W + Math.random() * 100,
+      y: H / 2 + 10 + Math.random() * (H / 2 - 40),
+      w: 44 + Math.random() * 32,
+      h: 26 + Math.random() * 16,
+      speed: 0.25 + Math.random() * 0.4,
+      pii: false,
+      masked: cleanSamples[si],
+      original: piiSamples[si]
+    });
+  }
+
+  var filterLblW = 30;
+  var cx = W / 2;
+  var filterX = cx - filterLblW;
+  var filterW = filterLblW * 2;
+  var filterH = H - 24;
+  var filterY = 12;
+
+  var writeY = H / 4;
+  var readY = H * 3 / 4;
+  var labelY = filterY - 3;
+
+  function step() {
+    ctx.clearRect(0, 0, W, H);
+
+    // === Filter box ===
+    var grad = ctx.createLinearGradient(filterX, 0, filterX + filterW, 0);
+    grad.addColorStop(0, 'rgba(129, 140, 248, 0.05)');
+    grad.addColorStop(0.5, 'rgba(129, 140, 248, 0.12)');
+    grad.addColorStop(1, 'rgba(16, 185, 129, 0.05)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.roundRect(filterX, filterY, filterW, filterH, 10);
+    ctx.fill();
+
+    ctx.strokeStyle = accent;
+    ctx.globalAlpha = 0.3;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.roundRect(filterX, filterY, filterW, filterH, 10);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+
+    // === Section labels ===
+    ctx.font = 'bold 12px -apple-system,BlinkMacSystemFont,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = textColor;
+    ctx.fillText('Your SDK', filterX / 2, labelY);
+    ctx.fillText('S4', cx, labelY);
+    ctx.font = '10px -apple-system,BlinkMacSystemFont,sans-serif';
+    ctx.fillText('Plugin Pipeline', cx, labelY + 14);
+    ctx.font = 'bold 12px -apple-system,BlinkMacSystemFont,sans-serif';
+    ctx.fillStyle = textColor;
+    ctx.fillText('Your S3 Bucket', filterX + filterW + (W - filterX - filterW) / 2, labelY);
+
+    // === Write arrows (top half) ===
+    ctx.strokeStyle = border;
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = 1.5;
+    var arrowInY = writeY;
+
+    ctx.beginPath();
+    ctx.moveTo(8, arrowInY);
+    ctx.lineTo(filterX - 12, arrowInY);
+    ctx.moveTo(filterX + filterW + 12, arrowInY);
+    ctx.lineTo(W - 8, arrowInY);
+    ctx.stroke();
+
+    // Write arrow heads
+    ctx.fillStyle = accent;
+    ctx.beginPath(); ctx.moveTo(filterX - 14, arrowInY - 4); ctx.lineTo(filterX - 14, arrowInY + 4); ctx.lineTo(filterX - 7, arrowInY); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(W - 10, arrowInY - 4); ctx.lineTo(W - 10, arrowInY + 4); ctx.lineTo(W - 4, arrowInY); ctx.fill();
+
+    // === Read arrows (bottom half, reversed) ===
+    ctx.strokeStyle = border;
+    ctx.globalAlpha = 0.5;
+    var arrowOutY = readY;
+    ctx.beginPath();
+    ctx.moveTo(W - 8, arrowOutY);
+    ctx.lineTo(filterX + filterW + 12, arrowOutY);
+    ctx.moveTo(filterX - 12, arrowOutY);
+    ctx.lineTo(8, arrowOutY);
+    ctx.stroke();
+
+    // Read arrow heads (pointing left)
+    ctx.fillStyle = accent;
+    ctx.beginPath(); ctx.moveTo(filterX + filterW + 14, arrowOutY - 4); ctx.lineTo(filterX + filterW + 14, arrowOutY + 4); ctx.lineTo(filterX + filterW + 7, arrowOutY); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(10, arrowOutY - 4); ctx.lineTo(10, arrowOutY + 4); ctx.lineTo(4, arrowOutY); ctx.fill();
+
+    // === Arrow labels ===
+    ctx.font = '8px -apple-system,BlinkMacSystemFont,sans-serif';
+    ctx.fillStyle = muted;
+    ctx.textAlign = 'center';
+    ctx.fillText('PUT /{bucket}/{key}', filterX / 2, writeY - 10);
+    ctx.fillText('PUT /{bucket}/{key}', filterX + filterW + (W - filterX - filterW) / 2, writeY - 10);
+    ctx.fillText('GET /{bucket}/{key}', filterX + filterW + (W - filterX - filterW) / 2, readY + 18);
+    ctx.fillText('GET /{bucket}/{key}', filterX / 2, readY + 18);
+
+    ctx.globalAlpha = 1;
+
+    // === Animate write documents (left -> right, top half) ===
+    for (var i = 0; i < writeDocs.length; i++) {
+      var d = writeDocs[i];
+      d.x += d.speed;
+      if (d.x > W + 60) { d.x = -60; d.y = 28 + Math.random() * (H / 2 - 56); d.pii = Math.random() < 0.6; d.idx = Math.floor(Math.random() * piiSamples.length); d.piiText = piiSamples[d.idx]; d.cleanText = cleanSamples[d.idx]; }
+
+      var inFilter = d.x > filterX - 8 && d.x < filterX + filterW + 8;
+      var passedFilter = d.x > filterX + filterW;
+      var showClean = passedFilter && d.pii;
+
+      ctx.globalAlpha = inFilter ? 0.55 : 0.85;
+
+      ctx.fillStyle = surface;
+      ctx.strokeStyle = inFilter ? accent : border;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(d.x, d.y, d.w, d.h, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.font = '7px monospace';
+      ctx.textAlign = 'left';
+
+      if (d.pii) {
+        if (showClean) {
+          ctx.fillStyle = successRgb;
+          ctx.globalAlpha = 0.7;
+          ctx.fillText(d.cleanText, d.x + 4, d.y + d.h / 2 + 3);
+          ctx.fillStyle = successRgb;
+          ctx.beginPath();
+          ctx.arc(d.x + d.w - 6, d.y + 6, 3, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (!inFilter) {
+          ctx.fillStyle = textColor;
+          ctx.globalAlpha = 0.8;
+          ctx.fillText(d.piiText, d.x + 4, d.y + d.h / 2 + 3);
+          ctx.fillStyle = dangerRgb;
+          ctx.beginPath();
+          ctx.arc(d.x + d.w - 6, d.y + 6, 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else {
+        ctx.fillStyle = textColor;
+        ctx.globalAlpha = 0.55;
+        ctx.fillText(cleanSamples[d.idx], d.x + 4, d.y + d.h / 2 + 3);
+      }
+
+      if (inFilter && d.pii) {
+        for (var j = 0; j < 2; j++) {
+          var px = d.x + 5 + Math.random() * (d.w - 10);
+          var py = d.y + 2 + Math.random() * (d.h - 4);
+          particles.push({x: px, y: py, vx: (Math.random()-0.5)*1.2, vy: (Math.random()-0.7)*0.6, life: 25 + Math.random()*10, color: dangerRgb});
+        }
+      }
+    }
+
+    // === Animate read documents (right -> left, bottom half) ===
+    for (var i = 0; i < readDocs.length; i++) {
+      var rd = readDocs[i];
+      rd.x -= rd.speed;
+      if (rd.x < -60) { rd.x = W + Math.random() * 100; rd.y = H / 2 + 10 + Math.random() * (H / 2 - 40); var si = Math.floor(Math.random() * piiSamples.length); rd.masked = cleanSamples[si]; rd.original = piiSamples[si]; }
+      rd.pii = false;
+
+      var inFilterR = rd.x > filterX - 8 && rd.x < filterX + filterW + 8;
+
+      ctx.globalAlpha = inFilterR ? 0.55 : 0.85;
+
+      ctx.fillStyle = surface;
+      ctx.strokeStyle = inFilterR ? accent : border;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(rd.x, rd.y, rd.w, rd.h, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.font = '7px monospace';
+      ctx.textAlign = 'left';
+
+      var passedFilterR = rd.x < filterX - 8;
+      var beforeFilter = rd.x > filterX + filterW + 8;
+
+      if (passedFilterR) {
+        // After S4: show original (decrypted)
+        ctx.fillStyle = successRgb;
+        ctx.globalAlpha = 0.7;
+        ctx.fillText(rd.original, rd.x + 4, rd.y + rd.h / 2 + 3);
+        ctx.fillStyle = successRgb;
+        ctx.beginPath();
+        ctx.arc(rd.x + rd.w - 6, rd.y + 6, 3, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (beforeFilter) {
+        // From storage: show masked (obfuscated)
+        ctx.fillStyle = textColor;
+        ctx.globalAlpha = 0.55;
+        ctx.fillText(rd.masked, rd.x + 4, rd.y + rd.h / 2 + 3);
+      } else {
+        // In S4 filter: transition — show masked fading, green particles
+        ctx.fillStyle = accent;
+        ctx.globalAlpha = 0.5;
+        ctx.fillText(rd.masked, rd.x + 4, rd.y + rd.h / 2 + 3);
+        // Green decrypt particles
+        for (var k = 0; k < 2; k++) {
+          var dpx = rd.x + 5 + Math.random() * (rd.w - 10);
+          var dpy = rd.y + 2 + Math.random() * (rd.h - 4);
+          particles.push({x: dpx, y: dpy, vx: (Math.random()-0.5)*0.8, vy: -(Math.random()*0.6), life: 20 + Math.random()*10, color: successRgb});
+        }
+      }
+    }
+
+    ctx.globalAlpha = 1;
+
+    // === Particles ===
+    for (var pi = particles.length - 1; pi >= 0; pi--) {
+      var p = particles[pi];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.life--;
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = p.life / 35;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+      ctx.fill();
+      if (p.life <= 0) particles.splice(pi, 1);
+    }
+    ctx.globalAlpha = 1;
+
+    requestAnimationFrame(step);
+  }
+
+  requestAnimationFrame(step);
+};
+
+// Start flow when visible
+var flowStarted = false;
+function startFlow() {
+  if (flowStarted) return;
+  flowStarted = true;
+  drawFlow();
+}
+
+if (document.getElementById('flowCanvas')) {
+  startFlow();
+}
+
+// Boot
 (function() {
   /*BOOT*/
 })();

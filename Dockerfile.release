@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+# Assembly-only image: the gateway binary + Wasm components are built on the
+# GitHub runner (warm cargo cache) and staged in dist/; this Dockerfile just
+# packages them. The release job cross-compiles per architecture, so this
+# builds in seconds (no compilation in Docker).
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY dist/s4-gateway /usr/local/bin/s4-gateway
+COPY dist/components /app/components
+ENV S4_FILTER_COMPONENT=/app/components/pii-default.component.wasm
+ENV S4_PLUGINS_DIR=/app/components
+ENV LISTEN_ADDR=0.0.0.0:8080
+EXPOSE 8080
+ENTRYPOINT ["s4-gateway"]

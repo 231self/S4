@@ -40,10 +40,12 @@ Verify with `jj st` and `jj log` after each mutation.
 - Relational modeling with normalized Postgres relations.
 - JSONB only for opaque provider payloads, signed manifests, and audit details.
 - Store money as integer minor units, byte usage as BIGINT.
-- Use an ORM for all database access: `sqlx` (compile-time checked queries) or `diesel` (type-safe DSL).
-- Never write raw SQL strings inline in application code.
-- All queries must have compile-time verification against the schema.
-- Database migrations must be managed by `sqlx migrate` or `diesel migration`, never applied manually via `psql` or `docker exec`.
+- Use **SeaORM** for all database access: entities in `src/entity/` (derive
+  `DeriveEntityModel`) + the SeaORM query builder. Never raw `sqlx::query(...)`
+  strings in application code.
+- All queries go through `Entity::find`/`insert`/`update`/`delete`/`update_many` etc.
+- Database migrations are `.sql` files (schema only), managed by `sqlx::migrate!` —
+  never applied manually via `psql` or `docker exec`.
 - Migration files live in `migrations/` at the crate or workspace root, versioned sequentially.
 - Run `sqlx migrate run` to apply; test migrations with `sqlx migrate info` before commit.
 
@@ -70,7 +72,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 ### Database
 
 - **Supabase Postgres** (local: supabase CLI Docker containers; cloud: Supabase Pro).
-- ORM: `sqlx`. Queries are runtime-checked (`sqlx::query`/`query_as` + `FromRow`); compile-time checked `query!` macros are deferred until `cargo sqlx prepare` (offline) is set up in CI. `sqlx migrate` for schema migrations.
+- ORM: `sea-orm` (built on `sqlx`). Queries use entities (`crates/gateway/src/entity/`) and the SeaORM query builder — no raw SQL strings in code. `sqlx::migrate!` runs the `.sql` schema migrations.
 - Migration files in workspace-root `migrations/`, versioned sequentially (`YYYYMMDDHHMMSS_description.sql`). The gateway runs `sqlx::migrate!()` at startup.
 - `sqlx migrate run` applies; `sqlx migrate info` checks status. Never use `psql` or `docker exec` directly.
 - **API keys are persisted in Postgres** when `DATABASE_URL` is set (`PostgresKeyStore`); otherwise the in-memory `KeyStore` is used (local dev). Both implement the async `KeyRepository` trait. `PostgresKeyStore` survives restarts / scale-to-zero.

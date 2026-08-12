@@ -30,8 +30,7 @@ class CreateKeyRequest(BaseModel):
     expires_in: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
     label: StrictStr
     public_key_pem: Optional[StrictStr] = None
-    workspace_id: Optional[StrictStr] = None
-    __properties: ClassVar[List[str]] = ["expires_in", "label", "public_key_pem", "workspace_id"]
+    __properties: ClassVar[List[str]] = ["expires_in", "label", "public_key_pem"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -77,11 +76,6 @@ class CreateKeyRequest(BaseModel):
         if self.public_key_pem is None and "public_key_pem" in self.model_fields_set:
             _dict['public_key_pem'] = None
 
-        # set to None if workspace_id (nullable) is None
-        # and model_fields_set contains the field
-        if self.workspace_id is None and "workspace_id" in self.model_fields_set:
-            _dict['workspace_id'] = None
-
         return _dict
 
     @classmethod
@@ -96,8 +90,7 @@ class CreateKeyRequest(BaseModel):
         _obj = cls.model_validate({
             "expires_in": obj.get("expires_in"),
             "label": obj.get("label"),
-            "public_key_pem": obj.get("public_key_pem"),
-            "workspace_id": obj.get("workspace_id")
+            "public_key_pem": obj.get("public_key_pem")
         })
         return _obj
 

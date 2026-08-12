@@ -19,6 +19,7 @@ use s4_gateway::{Format, Gateway};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -37,6 +38,8 @@ struct AppState {
     jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     auth_disabled: bool,
     pool: Option<sqlx::PgPool>,
+    write_count: Arc<AtomicU64>,
+    read_count: Arc<AtomicU64>,
 }
 
 struct Auth {
@@ -405,6 +408,55 @@ async fn delete_workspace(
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+    }
+}
+
+async fn get_usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user_id = get_user_id(&headers, &state);
+    let pool = match &state.pool {
+        Some(p) => p,
+        None => {
+            return Json(serde_json::json!({
+                "usage": {
+                    "write_count": 0,
+                    "read_count": 0,
+                    "gb_processed": 0.0,
+                    "message": "DATABASE_URL not configured — usage tracking is unavailable"
+                }
+            }))
+        }
+    };
+
+    let row = sqlx::query(
+        "SELECT coalesce(sum(write_count), 0)::bigint, \
+                coalesce(sum(read_count), 0)::bigint, \
+                coalesce(sum(gb_processed), 0.0)::double precision \
+         FROM usage_records ur \
+         JOIN workspace_members wm ON ur.workspace_id = wm.workspace_id \
+         WHERE wm.user_id = $1 \
+         AND ur.period_start >= date_trunc('month', now())",
+    )
+    .bind(&user_id)
+    .fetch_one(pool)
+    .await;
+
+    match row {
+        Ok(r) => {
+            use sqlx::Row;
+            Json(serde_json::json!({
+                "usage": {
+                    "write_count": r.get::<i64, _>(0),
+                    "read_count": r.get::<i64, _>(1),
+                    "gb_processed": r.get::<f64, _>(2),
+                }
+            }))
+        }
+        Err(_) => Json(serde_json::json!({
+            "usage": { "write_count": 0, "read_count": 0, "gb_processed": 0.0 }
+        })),
     }
 }
 
@@ -1106,6 +1158,8 @@ async fn main() -> anyhow::Result<()> {
         jwt_decoder,
         auth_disabled,
         pool: db_pool,
+        write_count: Arc::new(AtomicU64::new(0)),
+        read_count: Arc::new(AtomicU64::new(0)),
     });
 
     info!("S4 gateway listening on {listen_addr}");
@@ -1127,6 +1181,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/dashboard/api/workspaces", get(list_workspaces))
         .route("/dashboard/api/workspaces", post(create_workspace))
         .route("/dashboard/api/workspaces/{id}", delete(delete_workspace))
+        .route("/dashboard/api/usage", get(get_usage))
         .route("/dashboard/api/backend", get(get_backend))
         .route("/dashboard/api/backend", put(put_backend))
         .route("/dashboard/api/plugins", get(get_plugins))

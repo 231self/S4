@@ -44,10 +44,12 @@ s4ctl put ./data.csv ingest/data.csv --bucket s4-local
 s4ctl get ingest/data.csv --bucket s4-local
 ```
 
-`s4ctl local init` pulls `ghcr.io/231self/s4/s4` and runs the gateway in local mode
-(`AUTH_DISABLED=true`, keys persisted on a volume, in-memory storage); it picks a
-free port (8080+) and binds the loopback interface only. `s4ctl local down` stops it.
-For durable local storage (MinIO), clone the repo and use `just dev-up`.
+`s4ctl local init` pulls the gateway image tagged with the CLI version
+(`ghcr.io/231self/s4/s4:v0.3.2` for s4ctl 0.3.2 — CLI and gateway always match,
+never `:latest`) and runs it in local mode (`AUTH_DISABLED=true`, keys persisted on a
+volume, in-memory storage); it picks a free port (8080+) and binds the loopback
+interface only. `s4ctl local down` stops it. For durable local storage (MinIO),
+clone the repo and use `just dev-up`.
 
 ## Run your own plugin
 

@@ -19,7 +19,7 @@ use s4_gateway::{Format, Gateway};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -38,7 +38,9 @@ struct AppState {
     jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     auth_disabled: bool,
     pool: Option<sqlx::PgPool>,
+    #[allow(dead_code)]
     write_count: Arc<AtomicU64>,
+    #[allow(dead_code)]
     read_count: Arc<AtomicU64>,
 }
 
@@ -361,7 +363,7 @@ async fn create_workspace(
     };
 
     let row = sqlx::query("INSERT INTO workspaces (name, slug) VALUES ($1, $2) RETURNING id::text")
-        .bind(&name)
+        .bind(name)
         .bind(&slug)
         .fetch_one(pool)
         .await;

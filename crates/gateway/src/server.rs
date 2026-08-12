@@ -243,7 +243,7 @@ async fn authenticate(
     None
 }
 
-pub fn get_user_id(headers: &HeaderMap, state: &AppState) -> String {
+fn get_user_id(headers: &HeaderMap, state: &AppState) -> String {
     match get_user_claims(headers, state) {
         Some(claims) => claims
             .get("sub")
@@ -327,10 +327,6 @@ async fn s3_put(
         return s3_error::payment_required(&key, reason.message);
     }
     let uid = &auth.user_id;
-    state
-        .control
-        .record(&auth.user_id, RequestKind::Write, body.len() as u64)
-        .await;
 
     let format = detect_format(&headers);
     let stable_fields = headers
@@ -362,6 +358,10 @@ async fn s3_put(
             .await
         {
             Ok(_) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+                    .await;
                 info!(
                     "PUT /{bucket}/{key} -> presigned URL ({} records, user={})",
                     output.records_processed, uid
@@ -383,6 +383,10 @@ async fn s3_put(
             .await
         {
             Ok(_) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+                    .await;
                 info!(
                     "PUT /{bucket}/{key} -> S3 ({} records, user={})",
                     output.records_processed, uid
@@ -405,6 +409,10 @@ async fn s3_put(
             .await
         {
             Ok(()) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+                    .await;
                 info!(
                     "PUT /{bucket}/{key} -> service storage ({} records, user={})",
                     output.records_processed, uid
@@ -417,6 +425,10 @@ async fn s3_put(
             }
         }
     } else {
+        state
+            .control
+            .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+            .await;
         let obj = state.store.put(&bucket, &key, output.bytes, "text/plain");
         info!(
             "PUT /{bucket}/{key} -> memory ({} records, {} bytes, user={})",
@@ -435,20 +447,16 @@ async fn s3_get(
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(_auth) = authenticate(&headers, &state.keys, &state).await else {
+    let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
     if let Some(reason) = state
         .control
-        .authorize(&_auth.user_id, RequestKind::Read)
+        .authorize(&auth.user_id, RequestKind::Read)
         .await
     {
         return s3_error::payment_required(&key, reason.message);
     }
-    state
-        .control
-        .record(&_auth.user_id, RequestKind::Read, 0)
-        .await;
 
     if let Some(backend_url) = headers
         .get("x-s4-backend-url")
@@ -456,6 +464,10 @@ async fn s3_get(
     {
         match reqwest::get(backend_url).await {
             Ok(resp) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Read, 0)
+                    .await;
                 let status = resp.status();
                 let ct = resp
                     .headers()
@@ -485,6 +497,10 @@ async fn s3_get(
                 let data = output.body.collect().await;
                 match data {
                     Ok(bytes) => {
+                        state
+                            .control
+                            .record(&auth.user_id, RequestKind::Read, 0)
+                            .await;
                         let bytes = bytes.into_bytes();
                         let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                         if let Some(etag) = output.e_tag.as_deref() {
@@ -516,6 +532,10 @@ async fn s3_get(
             .await
         {
             Some((data, content_type)) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Read, 0)
+                    .await;
                 let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                 resp = resp.header("Content-Type", content_type);
                 resp = resp.header("Content-Length", data.len().to_string());
@@ -526,6 +546,10 @@ async fn s3_get(
     } else {
         match state.store.get(&bucket, &key) {
             Some(obj) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Read, 0)
+                    .await;
                 let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                 resp = resp.header("ETag", &obj.etag);
                 resp = resp.header("Content-Type", &obj.content_type);
@@ -542,24 +566,24 @@ async fn s3_head(
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(_auth) = authenticate(&headers, &state.keys, &state).await else {
+    let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
     if let Some(reason) = state
         .control
-        .authorize(&_auth.user_id, RequestKind::Read)
+        .authorize(&auth.user_id, RequestKind::Read)
         .await
     {
         return s3_error::payment_required(&key, reason.message);
     }
-    state
-        .control
-        .record(&_auth.user_id, RequestKind::Read, 0)
-        .await;
 
     if let Some(ref s3) = state.s3_client {
         match s3.head_object().bucket(&bucket).key(&key).send().await {
             Ok(output) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Read, 0)
+                    .await;
                 let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                 if let Some(etag) = output.e_tag.as_deref() {
                     resp = resp.header("ETag", etag);
@@ -583,6 +607,10 @@ async fn s3_head(
     } else {
         match state.store.head(&bucket, &key) {
             Some(obj) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Read, 0)
+                    .await;
                 let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                 resp = resp.header("ETag", &obj.etag);
                 resp = resp.header("Content-Type", &obj.content_type);
@@ -609,19 +637,25 @@ async fn s3_delete(
     {
         return s3_error::payment_required(&key, reason.message);
     }
-    state
-        .control
-        .record(&auth.user_id, RequestKind::Write, 0)
-        .await;
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
 
     if let Some(ref s3) = state.s3_client {
         match s3.delete_object().bucket(&bucket).key(&key).send().await {
-            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Ok(_) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Write, 0)
+                    .await;
+                StatusCode::NO_CONTENT.into_response()
+            }
             Err(e) => s3_error::internal_error(&key, &e.to_string()),
         }
     } else {
         state.store.delete(&bucket, &key);
+        state
+            .control
+            .record(&auth.user_id, RequestKind::Write, 0)
+            .await;
         StatusCode::NO_CONTENT.into_response()
     }
 }
@@ -643,16 +677,20 @@ async fn s3_post(
     {
         return s3_error::payment_required(&key, reason.message);
     }
-    state
-        .control
-        .record(&auth.user_id, RequestKind::Write, body.len() as u64)
-        .await;
     info!("POST /{bucket}/{key} user={}", auth.user_id);
 
     if params.uploads.is_some() {
+        state
+            .control
+            .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+            .await;
         return s3_mp_create(&bucket, &key).await;
     }
     if params.upload_id.is_some() {
+        state
+            .control
+            .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+            .await;
         return s3_mp_complete(&bucket, &key, &params, body).await;
     }
     s3_error::not_implemented(&key)

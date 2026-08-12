@@ -710,8 +710,13 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Put { file, key, bucket } => {
             let client = Client::new(&cli, &config)?;
-            let data =
-                std::fs::read(file).with_context(|| format!("Cannot read {}", file.display()))?;
+            let data = std::fs::read(file).with_context(|| {
+                format!(
+                    "Cannot read {} — create it first, e.g. `echo \"jane.doe@example.com 4111111111111111\" > {}`",
+                    file.display(),
+                    file.display()
+                )
+            })?;
             let len = data.len();
             let bucket = client.bucket(&cli, bucket.as_deref());
             client.s3_put(&bucket, key, data).await?;

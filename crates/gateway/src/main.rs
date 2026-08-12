@@ -116,7 +116,7 @@ struct S3Query {
 #[openapi(
     info(
         title = "S4 Gateway API",
-        version = "0.3.1",
+        version = "0.3.2",
         description = "Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline."
     ),
     paths(get_keys, create_key, delete_key, list_objects),
@@ -961,28 +961,28 @@ async fn main() -> anyhow::Result<()> {
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
     let keys: Arc<dyn KeyRepository> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(5)
-                .connect(&database_url)
-                .await
-                .expect("failed to connect to DATABASE_URL");
-            sqlx::migrate!("../../migrations")
-                .run(&pool)
-                .await
-                .expect("failed to run migrations");
-            info!("Key store: Postgres (migrations applied)");
-            Arc::new(PostgresKeyStore::new(pool))
-        } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
-            info!("Key store: file ({keys_file})");
-            Arc::new(FileKeyStore::new(PathBuf::from(keys_file)))
-        } else if auth_disabled {
-            let path = FileKeyStore::default_path();
-            info!("Key store: file ({}) (local mode)", path.display());
-            Arc::new(FileKeyStore::new(path))
-        } else {
-            info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
-            Arc::new(KeyStore::new())
-        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("failed to connect to DATABASE_URL");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("failed to run migrations");
+        info!("Key store: Postgres (migrations applied)");
+        Arc::new(PostgresKeyStore::new(pool))
+    } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
+        info!("Key store: file ({keys_file})");
+        Arc::new(FileKeyStore::new(PathBuf::from(keys_file)))
+    } else if auth_disabled {
+        let path = FileKeyStore::default_path();
+        info!("Key store: file ({}) (local mode)", path.display());
+        Arc::new(FileKeyStore::new(path))
+    } else {
+        info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
+        Arc::new(KeyStore::new())
+    };
 
     let state = Arc::new(AppState {
         gateway: Arc::new(gateway),

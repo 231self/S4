@@ -19,9 +19,15 @@ pub struct ApiKey {
     pub user_id: String,
     pub workspace_id: Option<String>,
     pub label: String,
+    #[serde(default = "default_permissions")]
+    pub permissions: String,
     pub created_at: String,
     pub expires_at: Option<String>,
     pub public_key_pem: Option<String>,
+}
+
+fn default_permissions() -> String {
+    "read,write,delete".to_string()
 }
 
 #[derive(Debug)]
@@ -134,7 +140,7 @@ pub trait KeyRepository: Send + Sync {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> Option<(String, Option<String>, Option<String>)>;
+    ) -> Option<(String, Option<String>, Option<String>, String)>;
 
     /// Keys for a user, with the secret hash stripped.
     async fn list_for_user(&self, user_id: &str) -> Vec<ApiKey>;
@@ -159,6 +165,7 @@ fn build_api_key(
         user_id: user_id.to_string(),
         workspace_id,
         label: label.to_string(),
+        permissions: default_permissions(),
         created_at,
         expires_at,
         public_key_pem,
@@ -171,6 +178,7 @@ fn generate_api_key(
     expires_in: u64,
     public_key_pem: Option<String>,
     workspace_id: Option<String>,
+    permissions: Option<String>,
 ) -> (ApiKey, String) {
     let key_id = format!("s4_{}", Uuid::new_v4().to_string().replace('-', ""));
     let secret = format!("s4s_{}", Uuid::new_v4().to_string().replace('-', ""));
@@ -191,6 +199,12 @@ fn generate_api_key(
         public_key_pem,
         workspace_id,
     );
+    // Note: permissions are stored via ApiKey struct default (serde default in JSON,
+    // default_permissions() in code). The ApiKey struct handles it.
+    let mut api_key = api_key;
+    if let Some(perms) = permissions {
+        api_key.permissions = perms;
+    }
     (api_key, secret)
 }
 
@@ -218,7 +232,7 @@ fn resolve_credentials_in(
     keys: &RwLock<HashMap<String, ApiKey>>,
     access_key: &str,
     secret_key: &str,
-) -> Option<(String, Option<String>, Option<String>)> {
+) -> Option<(String, Option<String>, Option<String>, String)> {
     let keys = keys.read().unwrap();
     let key = keys.get(access_key)?;
     if key.secret_hash != sha256_hash(secret_key) {
@@ -231,6 +245,7 @@ fn resolve_credentials_in(
         key.user_id.clone(),
         key.public_key_pem.clone(),
         key.workspace_id.clone(),
+        key.permissions.clone(),
     ))
 }
 
@@ -275,8 +290,14 @@ impl KeyRepository for KeyStore {
         public_key_pem: Option<String>,
         workspace_id: Option<String>,
     ) -> (String, String) {
-        let (api_key, secret) =
-            generate_api_key(user_id, label, expires_in, public_key_pem, workspace_id);
+        let (api_key, secret) = generate_api_key(
+            user_id,
+            label,
+            expires_in,
+            public_key_pem,
+            workspace_id,
+            None,
+        );
         let key_id = api_key.key_id.clone();
         self.keys.write().unwrap().insert(key_id.clone(), api_key);
         (key_id, secret)
@@ -294,7 +315,7 @@ impl KeyRepository for KeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> Option<(String, Option<String>, Option<String>)> {
+    ) -> Option<(String, Option<String>, Option<String>, String)> {
         resolve_credentials_in(&self.keys, access_key, secret_key)
     }
 
@@ -365,8 +386,14 @@ impl KeyRepository for FileKeyStore {
         public_key_pem: Option<String>,
         workspace_id: Option<String>,
     ) -> (String, String) {
-        let (api_key, secret) =
-            generate_api_key(user_id, label, expires_in, public_key_pem, workspace_id);
+        let (api_key, secret) = generate_api_key(
+            user_id,
+            label,
+            expires_in,
+            public_key_pem,
+            workspace_id,
+            None,
+        );
         let key_id = api_key.key_id.clone();
         self.keys.write().unwrap().insert(key_id.clone(), api_key);
         self.persist()
@@ -391,7 +418,7 @@ impl KeyRepository for FileKeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> Option<(String, Option<String>, Option<String>)> {
+    ) -> Option<(String, Option<String>, Option<String>, String)> {
         resolve_credentials_in(&self.keys, access_key, secret_key)
     }
 
@@ -503,7 +530,7 @@ impl KeyRepository for PostgresKeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> Option<(String, Option<String>, Option<String>)> {
+    ) -> Option<(String, Option<String>, Option<String>, String)> {
         let key = fetch_key(&self.pool, access_key).await?;
         if key.secret_hash != sha256_hash(secret_key) {
             return None;
@@ -511,7 +538,12 @@ impl KeyRepository for PostgresKeyStore {
         if is_expired(key.expires_at.as_deref()) {
             return None;
         }
-        Some((key.user_id, key.public_key_pem, key.workspace_id))
+        Some((
+            key.user_id,
+            key.public_key_pem,
+            key.workspace_id,
+            key.permissions,
+        ))
     }
 
     async fn list_for_user(&self, user_id: &str) -> Vec<ApiKey> {
@@ -645,7 +677,7 @@ mod tests {
     async fn in_memory_key_roundtrip() {
         let store = KeyStore::new();
         let (key_id, secret) = store.create_key("u1", "test", 0, None, None).await;
-        let (uid, pk, _ws) = store
+        let (uid, pk, _ws, _p) = store
             .resolve_credentials(&key_id, &secret)
             .await
             .expect("valid credentials should resolve");
@@ -699,7 +731,7 @@ mod tests {
 
         // A fresh store on the same path must see the same key.
         let reloaded = FileKeyStore::new(path.clone());
-        let (uid, _pk, _ws) = reloaded
+        let (uid, _pk, _ws, _p) = reloaded
             .resolve_credentials(&key_id, &secret)
             .await
             .expect("credentials survive a restart");

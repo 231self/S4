@@ -127,6 +127,11 @@ struct Auth {
     workspace_id: Option<String>,
     public_key_pem: Option<String>,
     stable_key: Option<Vec<u8>>,
+    permissions: String,
+}
+
+fn auth_has(auth: &Auth, perm: &str) -> bool {
+    auth.permissions.split(',').any(|p| p.trim() == perm)
 }
 
 /// Derive the deterministic-encryption key for an API key secret:
@@ -228,11 +233,15 @@ fn detect_format(headers: &HeaderMap) -> Format {
     }
 }
 
-async fn get_user_s3_client(state: &AppState, uid: &str) -> Option<Client> {
+async fn get_user_s3_client(state: &AppState, auth: &Auth) -> Option<Client> {
     if let Some(ref s3) = state.s3_client {
         return Some(s3.clone());
     }
-    let cfg = state.backends.get(uid)?;
+    let cfg = auth
+        .workspace_id
+        .as_deref()
+        .and_then(|ws| state.backends.get(ws))
+        .or_else(|| state.backends.get(&auth.user_id))?;
     if !cfg.is_configured() || cfg.endpoint.is_empty() {
         return None;
     }
@@ -263,17 +272,19 @@ async fn authenticate(
             workspace_id: None,
             public_key_pem: None,
             stable_key: None,
+            permissions: "read,write,delete".to_string(),
         }),
         Some(a) if a.starts_with("Bearer ") => {
             let token = &a[7..];
             if let Some((ak, sk)) = token.split_once(':') {
-                let (user_id, public_key_pem, workspace_id) =
+                let (user_id, public_key_pem, workspace_id, permissions) =
                     keys.resolve_credentials(ak, sk).await?;
                 return Some(Auth {
                     user_id,
                     workspace_id,
                     public_key_pem,
                     stable_key: Some(derive_stable_key(sk)),
+                    permissions,
                 });
             }
             if state.jwt_decoder.is_some() {
@@ -284,6 +295,7 @@ async fn authenticate(
                         workspace_id: None,
                         public_key_pem: None,
                         stable_key: None,
+                        permissions: "read,write,delete".to_string(),
                     });
                 }
             }
@@ -299,12 +311,15 @@ async fn authenticate(
         .get("x-s4-secret-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some((user_id, public_key_pem, workspace_id)) = keys.resolve_credentials(ak, sk).await {
+    if let Some((user_id, public_key_pem, workspace_id, permissions)) =
+        keys.resolve_credentials(ak, sk).await
+    {
         return Some(Auth {
             user_id,
             workspace_id,
             public_key_pem,
             stable_key: Some(derive_stable_key(sk)),
+            permissions,
         });
     }
     if state.auth_disabled {
@@ -313,6 +328,7 @@ async fn authenticate(
             workspace_id: None,
             public_key_pem: None,
             stable_key: None,
+            permissions: "read,write,delete".to_string(),
         });
     }
     None
@@ -566,6 +582,9 @@ async fn s3_put(
     let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
+    if !auth_has(&auth, "write") {
+        return s3_error::access_denied(&key);
+    }
     let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
     let uid = &auth.user_id;
 
@@ -612,7 +631,7 @@ async fn s3_put(
                 s3_error::internal_error(&key, &e.to_string())
             }
         }
-    } else if let Some(s3) = get_user_s3_client(&state, uid).await {
+    } else if let Some(s3) = get_user_s3_client(&state, &auth).await {
         match s3
             .put_object()
             .bucket(&bucket)
@@ -677,6 +696,9 @@ async fn s3_get(
     let Some(_auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
+    if !auth_has(&_auth, "read") {
+        return s3_error::access_denied(&key);
+    }
 
     let dim = _auth.workspace_id.as_deref().unwrap_or(&_auth.user_id);
     state.meter.track_read(dim);
@@ -776,6 +798,9 @@ async fn s3_head(
     let Some(_auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
+    if !auth_has(&_auth, "read") {
+        return s3_error::access_denied(&key);
+    }
 
     let dim = _auth.workspace_id.as_deref().unwrap_or(&_auth.user_id);
     state.meter.track_read(dim);
@@ -825,6 +850,9 @@ async fn s3_delete(
     let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
+    if !auth_has(&auth, "write") {
+        return s3_error::access_denied(&key);
+    }
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
 
     let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
@@ -851,6 +879,9 @@ async fn s3_post(
     let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
         return s3_error::access_denied(&key);
     };
+    if !auth_has(&auth, "write") {
+        return s3_error::access_denied(&key);
+    }
     info!("POST /{bucket}/{key} user={}", auth.user_id);
 
     let dim = auth.workspace_id.as_deref().unwrap_or(&auth.user_id);
@@ -1009,9 +1040,19 @@ async fn delete_key(
     }
 }
 
-async fn get_backend(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+#[derive(Deserialize, Default)]
+struct BackendQuery {
+    workspace_id: Option<String>,
+}
+
+async fn get_backend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<BackendQuery>,
+) -> impl IntoResponse {
     let uid = get_user_id(&headers, &state);
-    let config = state.backends.get(&uid).unwrap_or(BackendConfig {
+    let key = params.workspace_id.as_deref().unwrap_or(&uid);
+    let config = state.backends.get(key).unwrap_or(BackendConfig {
         backend_type: String::new(),
         role_arn: String::new(),
         external_id: state.backends.generate_external_id(&uid),
@@ -1026,14 +1067,16 @@ async fn get_backend(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 async fn put_backend(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<BackendQuery>,
     Json(config): Json<BackendConfig>,
 ) -> impl IntoResponse {
     let uid = get_user_id(&headers, &state);
+    let key = params.workspace_id.as_deref().unwrap_or(&uid);
     let mut config = config;
     if config.external_id.is_empty() {
         config.external_id = state.backends.generate_external_id(&uid);
     }
-    state.backends.set(&uid, config);
+    state.backends.set(key, config);
     StatusCode::OK.into_response()
 }
 

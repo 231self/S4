@@ -767,8 +767,8 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Local { cmd } => {
             const LOCAL_GATEWAY_NAME: &str = "s4-local-gateway";
-            // Pin the gateway image to the CLI version (v0.3.2 image for
-            // s4ctl 0.3.2) so CLI and gateway always match — never :latest.
+            // Pin the gateway image to the CLI version (v0.3.3 image for
+            // s4ctl 0.3.3) so CLI and gateway always match — never :latest.
             let local_gateway_image =
                 format!("ghcr.io/231self/s4/s4:v{}", env!("CARGO_PKG_VERSION"));
 

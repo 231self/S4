@@ -34,6 +34,9 @@ cargo install s4ctl --git https://github.com/231self/S4
 s4ctl local init                  # runs the published gateway image (Docker)
 s4ctl plugin list                 # the pii-default plugin is preloaded
 
+# A sample file to push through the pipeline:
+echo "jane.doe@example.com 4111111111111111" > data.csv
+
 # Write data through the pipeline; it is transformed before it reaches storage
 s4ctl put ./data.csv ingest/data.csv --bucket s4-local
 
@@ -42,9 +45,9 @@ s4ctl get ingest/data.csv --bucket s4-local
 ```
 
 `s4ctl local init` pulls `ghcr.io/231self/s4/s4` and runs the gateway in local mode
-(`AUTH_DISABLED=true`, keys persisted on a volume, in-memory storage). `s4ctl local
-down` stops it. For durable local storage (MinIO), clone the repo and use
-`just dev-up`.
+(`AUTH_DISABLED=true`, keys persisted on a volume, in-memory storage); it picks a
+free port (8080+) and binds the loopback interface only. `s4ctl local down` stops it.
+For durable local storage (MinIO), clone the repo and use `just dev-up`.
 
 ## Run your own plugin
 
@@ -62,6 +65,64 @@ s4ctl plugin reorder pii-default my-filter
 ```
 
 Full guide: [docs/plugins.md](docs/plugins.md).
+
+## Usage examples
+
+Everything below is copy-paste runnable.
+
+**Redaction — PII filtered on write**
+
+```bash
+# Local gateway (published image, Docker, in-memory storage):
+s4ctl local init
+s4ctl put ./data.csv ingest/data.csv --bucket s4-local
+s4ctl get ingest/data.csv --bucket s4-local     # emails/SSNs/cards redacted
+
+# Durable local storage (MinIO) from a repo clone:
+just dev-up
+s4ctl put ./data.csv ingest/data.csv --bucket s4-local
+
+# End-to-end validation:
+just e2e
+```
+
+**Encryption — per-field envelope encryption, decryptable only by you**
+
+```bash
+# Round-trip against any S3-compatible bucket: pre-encrypt fixture →
+# encrypted bytes fetched straight from the bucket → decrypted through S4:
+export B2_S3_ENDPOINT=https://s3.us-east-005.backblazeb2.com
+export B2_REGION=us-east-005
+export B2_BUCKET=your-bucket
+export B2_ACCESS_KEY_ID=your-key-id
+export B2_SECRET_ACCESS_KEY=your-application-key
+bash examples/b2-encrypt-demo.sh
+```
+
+**Plugins — bring your own transform**
+
+```bash
+s4ctl plugin list                              # pipeline order
+s4ctl plugin upload my-filter.component.wasm   # runtime import, no rebuild
+s4ctl plugin enable <id>
+s4ctl plugin reorder pii-default my-filter     # output of one feeds the next
+```
+
+**SDKs — Python**
+
+```python
+from s4_client import S4Client
+client = S4Client(gateway="http://localhost:8080")
+pub, priv = client.generate_keypair()                  # RSA-2048
+client.attach_public_key(pub)                          # bind to your API key
+client.put_object("bucket", "key", b"jane@example.com 4111111111111111")
+blob = client.get_object("bucket", "key")
+assert "jane@example.com" not in blob.decode()          # stored encrypted
+print(client.decrypt_payload(blob, priv))              # you hold the key
+```
+
+Full details: [examples/README.md](examples/README.md) and
+[docs/plugins.md](docs/plugins.md).
 
 ## How it works
 
@@ -98,9 +159,26 @@ See `CONTRIBUTING.md`.
 
 ## Documentation
 
+- `examples/` — runnable end-to-end demos (B2 encryption round-trip).
 - `docs/plugins.md` — create and consume your own plugins.
 - `docs/adr/` — architecture decision records.
 - `AGENTS.md` — development conventions.
+
+## LLM agents
+
+Coding agents (Claude Code, Kilo, Cursor, …) read `AGENTS.md` from the repo root
+automatically. For reusable, domain-specific S4 context, install the bundled skill:
+
+```bash
+# Claude Code (user-global):
+mkdir -p ~/.claude/skills && ln -s "$(pwd)/skills/s4" ~/.claude/skills/s4
+# Kilo (user-global):
+mkdir -p ~/.kilo/skills && ln -s "$(pwd)/skills/s4" ~/.kilo/skills/s4
+```
+
+The skill teaches agents what S4 is, the plugin pipeline, build/test/run commands,
+crate layout, and the CI/release gotchas (BuildKit cache mounts, act/colima,
+multi-arch builds).
 
 ## License
 

@@ -117,7 +117,7 @@ struct S3Query {
 #[openapi(
     info(
         title = "S4 Gateway API",
-        version = "0.3.0",
+        version = "0.3.1",
         description = "Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline."
     ),
     paths(get_keys, create_key, delete_key, list_objects),

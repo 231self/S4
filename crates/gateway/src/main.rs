@@ -308,6 +308,141 @@ fn s3_xml_ok(xml: String) -> axum::response::Response {
         .unwrap()
 }
 
+async fn demo_redact(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let _user_id = get_user_id(&headers, &state);
+    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let redacted = redact_pii(text);
+    Json(serde_json::json!({ "redacted": redacted }))
+}
+
+fn redact_pii(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let len = bytes.len();
+    while i < len {
+        if let Some(end) = match_email(bytes, i) {
+            out.push_str("***@***.***");
+            i = end;
+        } else if let Some(end) = match_ssn(bytes, i) {
+            out.push_str("***-**-****");
+            i = end;
+        } else if let Some(end) = match_card(bytes, i) {
+            out.push_str("****-****-****-****");
+            i = end;
+        } else if let Some(end) = match_phone(bytes, i) {
+            out.push_str("***-***-****");
+            i = end;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn match_email(s: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < s.len() && (s[i].is_ascii_alphanumeric() || b"._%+-".contains(&s[i])) {
+        i += 1;
+    }
+    if i == start || i >= s.len() || s[i] != b'@' {
+        return None;
+    }
+    i += 1;
+    if i >= s.len() {
+        return None;
+    }
+    while i < s.len() && (s[i].is_ascii_alphanumeric() || b".-".contains(&s[i])) {
+        i += 1;
+    }
+    if i == start + 1 || i >= s.len() || s[i] != b'.' {
+        return None;
+    }
+    i += 1;
+    if i >= s.len() {
+        return None;
+    }
+    while i < s.len() && s[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i < s.len() && i >= 3 { Some(i) } else { None }
+}
+
+fn match_ssn(s: &[u8], start: usize) -> Option<usize> {
+    if start + 11 > s.len() {
+        return None;
+    }
+    if s[start].is_ascii_digit()
+        && s[start + 1].is_ascii_digit()
+        && s[start + 2].is_ascii_digit()
+        && s[start + 3] == b'-'
+        && s[start + 4].is_ascii_digit()
+        && s[start + 5].is_ascii_digit()
+        && s[start + 6] == b'-'
+        && s[start + 7].is_ascii_digit()
+        && s[start + 8].is_ascii_digit()
+        && s[start + 9].is_ascii_digit()
+        && s[start + 10].is_ascii_digit()
+    {
+        return Some(start + 11);
+    }
+    None
+}
+
+fn match_card(s: &[u8], start: usize) -> Option<usize> {
+    if start + 19 > s.len() {
+        return None;
+    }
+    let sep = |i: usize| s[i] == b' ' || s[i] == b'-' || s[i].is_ascii_digit();
+    let is_digit_block = |pos: usize, n: usize| -> bool {
+        for j in 0..n {
+            if !s[pos + j].is_ascii_digit() {
+                return false;
+            }
+        }
+        true
+    };
+    if is_digit_block(start, 4)
+        && sep(start + 4)
+        && is_digit_block(start + 5, 4)
+        && sep(start + 9)
+        && is_digit_block(start + 10, 4)
+        && sep(start + 14)
+        && is_digit_block(start + 15, 4)
+    {
+        return Some(start + 19);
+    }
+    None
+}
+
+fn match_phone(s: &[u8], start: usize) -> Option<usize> {
+    if start + 12 > s.len() {
+        return None;
+    }
+    let is_digit_block = |pos: usize, n: usize| -> bool {
+        for j in 0..n {
+            if !s[pos + j].is_ascii_digit() {
+                return false;
+            }
+        }
+        true
+    };
+    if is_digit_block(start, 3)
+        && (s[start + 3] == b'-' || s[start + 3] == b' ')
+        && is_digit_block(start + 4, 3)
+        && (s[start + 8] == b'-' || s[start + 8] == b' ')
+        && is_digit_block(start + 9, 4)
+    {
+        return Some(start + 13);
+    }
+    None
+}
+
 async fn s3_put(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -1020,6 +1155,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/", get(|| async { Html(dashboard_html()) }))
+        .route("/dashboard/api/demo/redact", post(demo_redact))
         .route("/dashboard/api/keys", get(get_keys))
         .route("/dashboard/api/keys", post(create_key))
         .route("/dashboard/api/keys", delete(delete_key))

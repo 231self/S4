@@ -1,4 +1,5 @@
 pub mod control;
+pub mod entity;
 pub mod plugin_registry;
 pub mod s3_error;
 pub mod server;

@@ -1,9 +1,16 @@
 use async_trait::async_trait;
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    SqlxPostgresConnector,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use uuid::Uuid;
+
+use crate::entity::api_key;
 
 #[derive(Debug, Clone)]
 pub struct StoredObject {
@@ -99,12 +106,13 @@ impl KeyStore {
 
 #[derive(Debug, Clone)]
 pub struct PostgresKeyStore {
-    pool: sqlx::PgPool,
+    db: DatabaseConnection,
 }
 
 impl PostgresKeyStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+        let db = SqlxPostgresConnector::from_sqlx_postgres_pool(pool);
+        Self { db }
     }
 }
 
@@ -399,44 +407,28 @@ impl KeyRepository for FileKeyStore {
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct KeyRow {
-    key_id: String,
-    secret_hash: String,
-    user_id: String,
-    label: String,
-    created_at: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
-    expires_at: Option<i64>,
-    public_key_pem: Option<String>,
-}
-
-impl From<KeyRow> for ApiKey {
-    fn from(r: KeyRow) -> Self {
+impl From<api_key::Model> for ApiKey {
+    fn from(m: api_key::Model) -> Self {
         build_api_key(
-            &r.key_id,
-            &r.user_id,
-            &r.label,
-            r.secret_hash,
-            r.created_at.timestamp().to_string(),
-            r.expires_at.map(|e| e.to_string()),
-            r.public_key_pem,
+            &m.key_id,
+            &m.user_id,
+            &m.label,
+            m.secret_hash,
+            m.created_at.timestamp().to_string(),
+            m.expires_at.map(|e| e.to_string()),
+            m.public_key_pem,
         )
     }
 }
 
-const KEY_COLUMNS: &str =
-    "key_id, secret_hash, user_id, label, created_at, expires_at, public_key_pem";
-
-async fn fetch_key(pool: &sqlx::PgPool, key_id: &str) -> Option<ApiKey> {
-    sqlx::query_as::<_, KeyRow>(&format!(
-        "SELECT {KEY_COLUMNS} FROM api_keys WHERE key_id = $1"
-    ))
-    .bind(key_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .map(Into::into)
+async fn fetch_key(db: &DatabaseConnection, key_id: &str) -> Option<ApiKey> {
+    api_key::Entity::find()
+        .filter(api_key::Column::KeyId.eq(key_id.to_string()))
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(Into::into)
 }
 
 #[async_trait]
@@ -454,35 +446,34 @@ impl KeyRepository for PostgresKeyStore {
         let now = chrono_now().parse::<u64>().unwrap_or(0);
         let expires_at = (expires_in > 0).then_some((now + expires_in) as i64);
 
-        let _ = sqlx::query(
-            "INSERT INTO api_keys (user_id, key_id, secret_hash, label, expires_at, public_key_pem) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(user_id)
-        .bind(&key_id)
-        .bind(&secret_hash)
-        .bind(label)
-        .bind(expires_at)
-        .bind(&public_key_pem)
-        .execute(&self.pool)
-        .await;
+        let model = api_key::ActiveModel {
+            user_id: Set(user_id.to_string()),
+            key_id: Set(key_id.clone()),
+            secret_hash: Set(secret_hash),
+            label: Set(label.to_string()),
+            expires_at: Set(expires_at),
+            public_key_pem: Set(public_key_pem),
+            ..Default::default()
+        };
+        let _ = model.insert(&self.db).await;
         (key_id, secret)
     }
 
     async fn set_public_key(&self, key_id: &str, user_id: &str, public_key_pem: &str) -> bool {
-        let result = sqlx::query(
-            "UPDATE api_keys SET public_key_pem = $3 WHERE key_id = $1 AND user_id = $2",
-        )
-        .bind(key_id)
-        .bind(user_id)
-        .bind(public_key_pem)
-        .execute(&self.pool)
-        .await;
-        matches!(result, Ok(r) if r.rows_affected() == 1)
+        let result = api_key::Entity::update_many()
+            .col_expr(
+                api_key::Column::PublicKeyPem,
+                Expr::value(Some(public_key_pem.to_string())),
+            )
+            .filter(api_key::Column::KeyId.eq(key_id.to_string()))
+            .filter(api_key::Column::UserId.eq(user_id.to_string()))
+            .exec(&self.db)
+            .await;
+        matches!(result, Ok(r) if r.rows_affected == 1)
     }
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
-        fetch_key(&self.pool, key_id).await
+        fetch_key(&self.db, key_id).await
     }
 
     async fn resolve_credentials(
@@ -490,7 +481,7 @@ impl KeyRepository for PostgresKeyStore {
         access_key: &str,
         secret_key: &str,
     ) -> Option<(String, Option<String>)> {
-        let key = fetch_key(&self.pool, access_key).await?;
+        let key = fetch_key(&self.db, access_key).await?;
         if key.secret_hash != sha256_hash(secret_key) {
             return None;
         }
@@ -501,17 +492,16 @@ impl KeyRepository for PostgresKeyStore {
     }
 
     async fn list_for_user(&self, user_id: &str) -> Vec<ApiKey> {
-        match sqlx::query_as::<_, KeyRow>(&format!(
-            "SELECT {KEY_COLUMNS} FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC"
-        ))
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
+        match api_key::Entity::find()
+            .filter(api_key::Column::UserId.eq(user_id.to_string()))
+            .order_by_desc(api_key::Column::CreatedAt)
+            .all(&self.db)
+            .await
         {
             Ok(rows) => rows
                 .into_iter()
-                .map(|r| {
-                    let mut k: ApiKey = r.into();
+                .map(|m| {
+                    let mut k: ApiKey = m.into();
                     k.secret_hash = String::new();
                     k
                 })
@@ -524,12 +514,12 @@ impl KeyRepository for PostgresKeyStore {
     }
 
     async fn delete_key(&self, key_id: &str, user_id: &str) -> bool {
-        let result = sqlx::query("DELETE FROM api_keys WHERE key_id = $1 AND user_id = $2")
-            .bind(key_id)
-            .bind(user_id)
-            .execute(&self.pool)
+        let result = api_key::Entity::delete_many()
+            .filter(api_key::Column::KeyId.eq(key_id.to_string()))
+            .filter(api_key::Column::UserId.eq(user_id.to_string()))
+            .exec(&self.db)
             .await;
-        matches!(result, Ok(r) if r.rows_affected() == 1)
+        matches!(result, Ok(r) if r.rows_affected == 1)
     }
 }
 

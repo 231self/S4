@@ -63,6 +63,64 @@ s4ctl plugin reorder pii-default my-filter
 
 Full guide: [docs/plugins.md](docs/plugins.md).
 
+## Usage examples
+
+Everything below is copy-paste runnable.
+
+**Redaction — PII filtered on write**
+
+```bash
+# Local gateway (published image, Docker, in-memory storage):
+s4ctl local init
+s4ctl put ./data.csv ingest/data.csv --bucket s4-local
+s4ctl get ingest/data.csv --bucket s4-local     # emails/SSNs/cards redacted
+
+# Durable local storage (MinIO) from a repo clone:
+just dev-up
+s4ctl put ./data.csv ingest/data.csv --bucket s4-local
+
+# End-to-end validation:
+just e2e
+```
+
+**Encryption — per-field envelope encryption, decryptable only by you**
+
+```bash
+# Round-trip against any S3-compatible bucket: pre-encrypt fixture →
+# encrypted bytes fetched straight from the bucket → decrypted through S4:
+export B2_S3_ENDPOINT=https://s3.us-east-005.backblazeb2.com
+export B2_REGION=us-east-005
+export B2_BUCKET=your-bucket
+export B2_ACCESS_KEY_ID=your-key-id
+export B2_SECRET_ACCESS_KEY=your-application-key
+bash examples/b2-encrypt-demo.sh
+```
+
+**Plugins — bring your own transform**
+
+```bash
+s4ctl plugin list                              # pipeline order
+s4ctl plugin upload my-filter.component.wasm   # runtime import, no rebuild
+s4ctl plugin enable <id>
+s4ctl plugin reorder pii-default my-filter     # output of one feeds the next
+```
+
+**SDKs — Python**
+
+```python
+from s4_client import S4Client
+client = S4Client(gateway="http://localhost:8080")
+pub, priv = client.generate_keypair()                  # RSA-2048
+client.attach_public_key(pub)                          # bind to your API key
+client.put_object("bucket", "key", b"jane@example.com 4111111111111111")
+blob = client.get_object("bucket", "key")
+assert "jane@example.com" not in blob.decode()          # stored encrypted
+print(client.decrypt_payload(blob, priv))              # you hold the key
+```
+
+Full details: [examples/README.md](examples/README.md) and
+[docs/plugins.md](docs/plugins.md).
+
 ## How it works
 
 ```
@@ -98,6 +156,7 @@ See `CONTRIBUTING.md`.
 
 ## Documentation
 
+- `examples/` — runnable end-to-end demos (B2 encryption round-trip).
 - `docs/plugins.md` — create and consume your own plugins.
 - `docs/adr/` — architecture decision records.
 - `AGENTS.md` — development conventions.

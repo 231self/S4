@@ -1297,11 +1297,14 @@ async fn main() -> anyhow::Result<()> {
                 let drained = meter.drain();
                 for (dim, (w, r, b)) in &drained {
                     let gb = *b as f64 / 1_000_000_000.0;
+                    // dim is workspace_id (UUID) for scoped keys, user_id for unscoped.
+                    // Parse as UUID for workspace-scoped; fall back to NULL.
+                    let ws_id: Option<uuid::Uuid> = uuid::Uuid::parse_str(dim).ok();
                     let result = sqlx::query(
                         "INSERT INTO usage_records (workspace_id, period_start, period_end, write_count, read_count, gb_processed) \
                          VALUES ($1::uuid, date_trunc('hour', now()), date_trunc('hour', now()) + interval '1 hour', $2, $3, $4)"
                     )
-                    .bind(dim.as_str())
+                    .bind(ws_id)
                     .bind(*w as i64)
                     .bind(*r as i64)
                     .bind(gb)

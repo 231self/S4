@@ -1,0 +1,14 @@
+#!/bin/sh
+# Run the same checks that CI runs before allowing a commit.
+# Matches .github/workflows/ci.yml exactly.
+# Fails fast: any error blocks the commit.
+# Override with: git commit --no-verify
+set -e
+
+echo "==> cargo fmt --check"
+cargo fmt --check
+
+echo "==> cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "All checks passed"

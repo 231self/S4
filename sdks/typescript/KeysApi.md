@@ -29,6 +29,7 @@ const request: KeysApiCreateKeyRequest = {
     expiresIn: 0,
     label: "label_example",
     publicKeyPem: "publicKeyPem_example",
+    workspaceId: "workspaceId_example",
   },
 };
 

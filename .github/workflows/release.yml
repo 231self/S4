@@ -10,13 +10,85 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Repo-scoped image: the workflow's GITHUB_TOKEN can manage visibility and
-  # prune old versions of repo-scoped packages (org-scoped packages require
-  # an org-owner PAT). Registry path must be lowercase.
+  CARGO_BUILD_JOBS: 2
   IMAGE: ghcr.io/${{ github.repository_owner }}/s4/s4
 
 jobs:
+  # Compile the gateway ONCE per architecture on the runner (reusing the
+  # warm rust-cache from CI), then assemble the image with COPYs — no
+  # compilation inside Docker. The two arch jobs run in parallel.
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            rust_target: x86_64-unknown-linux-gnu
+            suffix: amd64
+          - platform: linux/arm64
+            rust_target: aarch64-unknown-linux-gnu
+            suffix: arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, ${{ matrix.rust_target }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # zig cross-compiles Rust + C deps (ring, aws-lc-sys, openssl-sys) to
+      # aarch64 with no apt cross-packages — reliable where gcc-aarch64 +
+      # dpkg --add-architecture kept failing on the runner.
+      - name: Install cross toolchain (zig + cargo-zigbuild, arm64)
+        if: matrix.platform == 'linux/arm64'
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild
+
+      - name: Install wasm-tools + build filters
+        run: |
+          cargo install --locked wasm-tools
+          bash scripts/build-filters.sh
+
+      - name: Build gateway release (${{ matrix.suffix }})
+        run: |
+          mkdir -p dist/components
+          if [ "${{ matrix.platform }}" = "linux/arm64" ]; then
+            cargo zigbuild --release --target aarch64-unknown-linux-gnu -p s4-gateway
+            cp target/aarch64-unknown-linux-gnu/release/s4-gateway dist/s4-gateway
+          else
+            cargo build --release -p s4-gateway
+            cp target/release/s4-gateway dist/s4-gateway
+          fi
+          cp -r target/components/. dist/components/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      # Assembly-only build (seconds): COPYs the runner-built artifacts.
+      - name: Build + push image (${{ matrix.suffix }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
+
   release:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,23 +105,18 @@ jobs:
         with:
           driver: docker-container
 
-      # Single build: the Dockerfile compiles the wasm filters once (arch
-      # independent) and the gateway per-arch. No separate runner-side Rust
-      # builds — the release artifacts below are extracted from the image.
-      - name: Build and push image to GHCR
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ github.ref_name }}, ${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha, mode=max
+      - name: Merge multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:${{ github.ref_name }} \
+            -t ${{ env.IMAGE }}:latest \
+            ${{ env.IMAGE }}:${{ github.ref_name }}-amd64 \
+            ${{ env.IMAGE }}:${{ github.ref_name }}-arm64
 
       - name: Extract release artifacts from image
         run: |
           mkdir -p dist/filters
-          docker create --name s4-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ github.ref_name }}"
+          docker create --name s4-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ github.ref_name }}-amd64"
           docker cp s4-extract:/usr/local/bin/s4-gateway dist/s4-gateway-linux-x86_64
           docker cp s4-extract:/app/components/. dist/filters/
           docker rm s4-extract
@@ -70,8 +137,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           keep=3
-          # Newest-first tagged versions (latest is first); delete everything
-          # past the keep window. Best-effort so it never blocks a release.
           gh api --paginate "/repos/${{ github.repository }}/packages/container/s4/versions?per_page=100" \
             --jq '[.[] | select((.metadata.container.tags | length) > 0)
                    | {id, created: .created_at, tag: .metadata.container.tags[0]}]

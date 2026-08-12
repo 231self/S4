@@ -126,11 +126,23 @@ echo
 echo "===== VERIFY ====="
 python3 - "$INPUT" "$DECRYPTED" <<'EOF'
 import re, sys
+
+def luhn(n):
+    digits = [int(d) for d in str(n)]
+    checksum = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        checksum += d
+    return checksum % 10 == 0
+
 orig = open(sys.argv[1]).read()
 dec = open(sys.argv[2]).read()
 want = (set(re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+', orig))
         | set(re.findall(r'\b\d{3}-\d{2}-\d{4}\b', orig))
-        | set(re.findall(r'\b\d{13,19}\b', orig)))
+        | {c for c in re.findall(r'\b\d{13,19}\b', orig) if luhn(c)})
 got = set(dec.splitlines())
 missing = want - got
 if missing:

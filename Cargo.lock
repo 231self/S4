@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "card-detect"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "pii-shared",
  "wit-bindgen 0.60.0",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "email-detect"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "pii-shared",
  "wit-bindgen 0.60.0",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-encrypt"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -2788,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "noop"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "wit-bindgen 0.60.0",
 ]
@@ -3035,7 +3035,7 @@ dependencies = [
 
 [[package]]
 name = "pii-default"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "pii-shared",
  "wit-bindgen 0.60.0",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "pii-shared"
-version = "0.3.4"
+version = "0.3.5"
 
 [[package]]
 name = "pin-project-lite"
@@ -3765,14 +3765,14 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s4-error"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "s4-gateway"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "aes-gcm",
  "aes-siv",
@@ -3812,7 +3812,7 @@ dependencies = [
 
 [[package]]
 name = "s4-policy"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
@@ -3825,7 +3825,7 @@ dependencies = [
 
 [[package]]
 name = "s4-wasm-runtime"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "rand 0.8.7",
@@ -3836,7 +3836,7 @@ dependencies = [
 
 [[package]]
 name = "s4ctl"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -4366,7 +4366,7 @@ dependencies = [
 
 [[package]]
 name = "ssn-detect"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "pii-shared",
  "wit-bindgen 0.60.0",
@@ -4374,7 +4374,7 @@ dependencies = [
 
 [[package]]
 name = "stable-encrypt"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "aes-siv",
  "base64",

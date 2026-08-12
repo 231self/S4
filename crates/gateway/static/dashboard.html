@@ -298,12 +298,9 @@ curl http://localhost:9000/ingest/data.jsonl \
   <div class="auth-overlay" onclick="if(event.target===this)closeAuth()">
     <div class="auth-card">
       <h2>Get Started</h2>
-      <div class="sub">Create an account or sign in</div>
+      <div class="sub">Sign in to manage your keys and plugins</div>
       <div class="oauth-btns">
-        <button class="btn btn-outline oauth-btn" onclick="signInWithOAuth('github', this)">Continue with GitHub</button>
-        <button class="btn btn-outline oauth-btn" onclick="signInWithOAuth('google', this)">Continue with Google</button>
       </div>
-      <div class="auth-divider">or with email</div>
       <div class="auth-form">
         <input class="auth-input" id="auth-email" type="email" placeholder="Email address" />
       <input class="auth-input" id="auth-password" type="password" placeholder="Password" />

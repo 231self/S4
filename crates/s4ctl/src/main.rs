@@ -763,7 +763,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Local { cmd } => {
             const LOCAL_GATEWAY_NAME: &str = "s4-local-gateway";
             const LOCAL_GATEWAY_IMAGE: &str = "ghcr.io/231self/s4/s4:latest";
-            const LOCAL_GATEWAY_PORT: u16 = 8080;
 
             match cmd {
                 LocalCmd::Init => {
@@ -780,8 +779,16 @@ async fn main() -> anyhow::Result<()> {
                         bail!("docker is not running — start Docker/colima first");
                     }
 
+                    // Pick a free host port (8080 is commonly taken) and
+                    // publish on the loopback interface only.
+                    let port = (8080u16..=8180u16)
+                        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+                        .expect("no free port in 8080..8180");
+
                     let _ = std::process::Command::new("docker")
                         .args(["rm", "-f", LOCAL_GATEWAY_NAME])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
                         .status();
                     let run_status = std::process::Command::new("docker")
                         .args([
@@ -790,7 +797,7 @@ async fn main() -> anyhow::Result<()> {
                             "--name",
                             LOCAL_GATEWAY_NAME,
                             "-p",
-                            &format!("{LOCAL_GATEWAY_PORT}:8080"),
+                            &format!("127.0.0.1:{port}:8080"),
                             "-v",
                             "s4-local-keys:/app/data",
                             "-e",
@@ -806,7 +813,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
 
-                    let url = format!("http://localhost:{LOCAL_GATEWAY_PORT}");
+                    let url = format!("http://127.0.0.1:{port}");
                     let mut healthy = false;
                     for _ in 0..30 {
                         if reqwest::get(format!("{url}/health"))
@@ -820,6 +827,15 @@ async fn main() -> anyhow::Result<()> {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                     if !healthy {
+                        // Surface the container logs so a broken image is easy to diagnose.
+                        let logs = std::process::Command::new("docker")
+                            .args(["logs", LOCAL_GATEWAY_NAME])
+                            .output()
+                            .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                            .unwrap_or_default();
+                        if !logs.is_empty() {
+                            eprintln!("gateway logs:\n{logs}");
+                        }
                         bail!("gateway did not become healthy at {url}/health");
                     }
 

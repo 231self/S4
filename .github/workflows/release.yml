@@ -39,12 +39,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cross linker + libs (arm64)
+      # zig cross-compiles Rust + C deps (ring, aws-lc-sys, openssl-sys) to
+      # aarch64 with no apt cross-packages — reliable where gcc-aarch64 +
+      # dpkg --add-architecture kept failing on the runner.
+      - name: Install cross toolchain (zig + cargo-zigbuild, arm64)
         if: matrix.platform == 'linux/arm64'
         run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross libssl-dev:arm64 pkg-config-aarch64-linux-gnu
+          pip install ziglang
+          cargo install cargo-zigbuild
 
       - name: Install wasm-tools + build filters
         run: |
@@ -52,14 +54,10 @@ jobs:
           bash scripts/build-filters.sh
 
       - name: Build gateway release (${{ matrix.suffix }})
-        env:
-          # openssl-sys cross-compile: allow pkg-config to find the aarch64 OpenSSL
-          PKG_CONFIG_ALLOW_CROSS: "1"
         run: |
           mkdir -p dist/components
           if [ "${{ matrix.platform }}" = "linux/arm64" ]; then
-            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-              cargo build --release --target aarch64-unknown-linux-gnu -p s4-gateway
+            cargo zigbuild --release --target aarch64-unknown-linux-gnu -p s4-gateway
             cp target/aarch64-unknown-linux-gnu/release/s4-gateway dist/s4-gateway
           else
             cargo build --release -p s4-gateway

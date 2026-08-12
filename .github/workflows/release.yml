@@ -36,6 +36,10 @@ jobs:
       # Single build: the Dockerfile compiles the wasm filters once (arch
       # independent) and the gateway per-arch. No separate runner-side Rust
       # builds — the release artifacts below are extracted from the image.
+      # mode=min: export only the final image layers, not the multi-GB cargo
+      # cache mounts. mode=max made releases take ~3h on the free runner
+      # (2h+ uploading the cargo target dirs to the GHA cache). The build
+      # itself (~40-50 min cold) is the floor; releases now finish in ~1h.
       - name: Build and push image to GHCR
         uses: docker/build-push-action@v6
         with:
@@ -44,7 +48,7 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}:${{ github.ref_name }}, ${{ env.IMAGE }}:latest
           cache-from: type=gha
-          cache-to: type=gha, mode=max
+          cache-to: type=gha, mode=min
 
       - name: Extract release artifacts from image
         run: |

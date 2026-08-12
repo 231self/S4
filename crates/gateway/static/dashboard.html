@@ -217,6 +217,7 @@ body {
 <nav class="nav">
   <div class="nav-brand">S4<span>&nbsp;gateway</span></div>
   <div class="nav-right">
+    <select id="workspace-picker" onchange="switchWorkspace(this.value)" style="display:none;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit;cursor:pointer;max-width:180px"></select>
     <span id="user-display"></span>
     <button class="btn btn-outline" id="theme-btn" onclick="toggleTheme()" style="font-size:12px;padding:4px 12px">Dark</button>
   </div>
@@ -673,6 +674,50 @@ const plaintext = new TextDecoder().decode(
 </div>
 </div>
 
+<div class="section">
+  <div class="section-label">Workspaces</div>
+  <div class="section-title">Manage your workspaces</div>
+  <div class="section-subtitle">Create workspaces to organize API keys and track usage per project or team.</div>
+
+  <div class="form-row" style="margin-bottom:16px">
+    <div style="flex:2">
+      <div class="form-label">Workspace name</div>
+      <input class="form-input" id="ws-name" placeholder="My Workspace" />
+    </div>
+    <div style="flex:1">
+      <div class="form-label">Slug (optional)</div>
+      <input class="form-input" id="ws-slug" placeholder="my-workspace" />
+    </div>
+    <button class="btn btn-primary" onclick="createWorkspace()" style="height:42px;align-self:flex-end">Create</button>
+  </div>
+  <div id="ws-status" style="font-size:13px;margin-bottom:12px"></div>
+  <div id="workspaces-list"></div>
+</div>
+
+<div class="section">
+  <div class="section-label">Usage</div>
+  <div class="section-title">Current billing period</div>
+  <div class="section-subtitle" id="usage-period">Real-time usage across all your workspaces this month.</div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px" id="usage-stats">
+    <div class="card" style="text-align:center;padding:24px">
+      <div style="font-size:32px;font-weight:700;color:var(--accent)" id="stat-writes">-</div>
+      <div style="font-size:13px;color:var(--text-muted);margin-top:4px">Write requests</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:2px">(PUT, DELETE, POST)</div>
+    </div>
+    <div class="card" style="text-align:center;padding:24px">
+      <div style="font-size:32px;font-weight:700;color:var(--accent)" id="stat-reads">-</div>
+      <div style="font-size:13px;color:var(--text-muted);margin-top:4px">Read requests</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:2px">(GET, HEAD)</div>
+    </div>
+    <div class="card" style="text-align:center;padding:24px">
+      <div style="font-size:32px;font-weight:700;color:var(--accent)" id="stat-gb">-</div>
+      <div style="font-size:13px;color:var(--text-muted);margin-top:4px">GB processed</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-top:2px">data through pipeline</div>
+    </div>
+  </div>
+</div>
+
 <footer class="footer container">
   S4 Gateway &middot; pluggable processing &middot; <a href="https://github.com/231self/S4" style="color:var(--text-muted)">github.com/231self/S4</a>
 </footer>
@@ -875,7 +920,89 @@ function onAuthReady() {
   loadKeys();
   loadObjects();
   loadBackend();
+  loadWorkspaces();
+  loadUsage();
 }
+
+var currentWsId = null;
+
+window.loadWorkspaces = function() {
+  api('GET','/dashboard/api/workspaces').then(function(r) {
+    var wss = r.workspaces || [];
+    var list = document.getElementById('workspaces-list');
+    if (!wss.length) {
+      list.innerHTML = '<div class="empty">No workspaces yet. Create one to organize API keys and track usage.</div>';
+    } else {
+      list.innerHTML = '<div class="key-list">'+wss.map(function(w){
+        return '<div class="key-item"><div><div class="key-id">'+w.name+'</div><div class="key-meta">'+w.slug+' &middot; '+w.role+'</div></div><button class="btn btn-danger" onclick="deleteWorkspace(\''+w.id+'\')">Delete</button></div>';
+      }).join('')+'</div>';
+    }
+
+    var picker = document.getElementById('workspace-picker');
+    if (wss.length > 0) {
+      picker.style.display = 'inline-block';
+      picker.innerHTML = '<option value="">All workspaces</option>' + wss.map(function(w){
+        return '<option value="'+w.id+'">'+w.name+'</option>';
+      }).join('');
+      if (currentWsId) picker.value = currentWsId;
+    } else {
+      picker.style.display = 'none';
+    }
+  }).catch(function(){});
+};
+
+window.createWorkspace = function() {
+  var name = document.getElementById('ws-name').value.trim();
+  if (!name) { document.getElementById('ws-status').textContent = 'Enter a workspace name'; return; }
+  var slug = document.getElementById('ws-slug').value.trim();
+  var body = { name: name };
+  if (slug) body.slug = slug;
+  var st = document.getElementById('ws-status');
+  api('POST','/dashboard/api/workspaces', body).then(function(r) {
+    st.style.color = 'var(--success)'; st.textContent = 'Workspace "' + r.name + '" created';
+    document.getElementById('ws-name').value = '';
+    document.getElementById('ws-slug').value = '';
+    loadWorkspaces();
+    setTimeout(function(){ st.textContent='' }, 3000);
+  }).catch(function(e) {
+    st.style.color = 'var(--danger)'; st.textContent = 'Error: ' + e.message;
+  });
+};
+
+window.deleteWorkspace = function(id) {
+  if (!confirm('Delete this workspace? Keys and usage records remain but become orphaned.')) return;
+  api('DELETE','/dashboard/api/workspaces/'+id).then(function() {
+    if (currentWsId === id) currentWsId = null;
+    loadWorkspaces();
+  });
+};
+
+window.switchWorkspace = function(id) {
+  currentWsId = id || null;
+  loadUsage();
+};
+
+window.loadUsage = function() {
+  api('GET','/dashboard/api/usage').then(function(r) {
+    var u = r.usage;
+    var fmt = function(n) { return n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : n.toString(); };
+    document.getElementById('stat-writes').textContent = fmt(u.write_count||0);
+    document.getElementById('stat-reads').textContent = fmt(u.read_count||0);
+    document.getElementById('stat-gb').textContent = (u.gb_processed||0).toFixed(2) + ' GB';
+    if (u.live === true) {
+      document.getElementById('usage-period').textContent = 'Live in-memory counters (no DATABASE_URL configured).';
+    } else if (u.live && typeof u.live === 'object') {
+      var lw = fmt(u.live.write_count||0);
+      var lr = fmt(u.live.read_count||0);
+      var lg = (u.live.gb_processed||0).toFixed(2);
+      document.getElementById('usage-period').textContent = 'Billing period totals. Live (since last restart): '+lw+' writes, '+lr+' reads, '+lg+' GB.';
+    }
+  }).catch(function(){
+    document.getElementById('stat-writes').textContent = '-';
+    document.getElementById('stat-reads').textContent = '-';
+    document.getElementById('stat-gb').textContent = '-';
+  });
+};
 
 window.signOut = function() {
   session = null;

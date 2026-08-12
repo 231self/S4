@@ -19,7 +19,7 @@ use s4_gateway::{Format, Gateway};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -38,10 +38,9 @@ struct AppState {
     jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     auth_disabled: bool,
     pool: Option<sqlx::PgPool>,
-    #[allow(dead_code)]
     write_count: Arc<AtomicU64>,
-    #[allow(dead_code)]
     read_count: Arc<AtomicU64>,
+    bytes_processed: Arc<AtomicU64>,
 }
 
 struct Auth {
@@ -101,6 +100,8 @@ struct CreateKeyRequest {
     expires_in: u64,
     #[serde(default)]
     public_key_pem: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -417,15 +418,18 @@ async fn delete_workspace(
 
 async fn get_usage(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = get_user_id(&headers, &state);
+    let live_writes = state.write_count.load(Ordering::Relaxed);
+    let live_reads = state.read_count.load(Ordering::Relaxed);
+    let live_bytes = state.bytes_processed.load(Ordering::Relaxed);
     let pool = match &state.pool {
         Some(p) => p,
         None => {
             return Json(serde_json::json!({
                 "usage": {
-                    "write_count": 0,
-                    "read_count": 0,
-                    "gb_processed": 0.0,
-                    "message": "DATABASE_URL not configured — usage tracking is unavailable"
+                    "write_count": live_writes,
+                    "read_count": live_reads,
+                    "gb_processed": live_bytes as f64 / 1_000_000_000.0,
+                    "live": true
                 }
             }));
         }
@@ -444,21 +448,26 @@ async fn get_usage(State(state): State<Arc<AppState>>, headers: HeaderMap) -> im
     .fetch_one(pool)
     .await;
 
-    match row {
+    let (db_writes, db_reads, db_gb): (i64, i64, f64) = match row {
         Ok(r) => {
             use sqlx::Row;
-            Json(serde_json::json!({
-                "usage": {
-                    "write_count": r.get::<i64, _>(0),
-                    "read_count": r.get::<i64, _>(1),
-                    "gb_processed": r.get::<f64, _>(2),
-                }
-            }))
+            (r.get(0), r.get(1), r.get(2))
         }
-        Err(_) => Json(serde_json::json!({
-            "usage": { "write_count": 0, "read_count": 0, "gb_processed": 0.0 }
-        })),
-    }
+        Err(_) => (0, 0, 0.0),
+    };
+
+    Json(serde_json::json!({
+        "usage": {
+            "write_count": db_writes,
+            "read_count": db_reads,
+            "gb_processed": db_gb,
+            "live": {
+                "write_count": live_writes,
+                "read_count": live_reads,
+                "gb_processed": live_bytes as f64 / 1_000_000_000.0,
+            }
+        }
+    }))
 }
 
 async fn s3_put(
@@ -471,6 +480,11 @@ async fn s3_put(
         return s3_error::access_denied(&key);
     };
     let uid = &auth.user_id;
+
+    state.write_count.fetch_add(1, Ordering::Relaxed);
+    state
+        .bytes_processed
+        .fetch_add(body.len() as u64, Ordering::Relaxed);
 
     let format = detect_format(&headers);
     let stable_fields = headers
@@ -579,6 +593,8 @@ async fn s3_get(
         return s3_error::access_denied(&key);
     };
 
+    state.read_count.fetch_add(1, Ordering::Relaxed);
+
     if let Some(backend_url) = headers
         .get("x-s4-backend-url")
         .and_then(|v| v.to_str().ok())
@@ -675,6 +691,8 @@ async fn s3_head(
         return s3_error::access_denied(&key);
     };
 
+    state.read_count.fetch_add(1, Ordering::Relaxed);
+
     if let Some(ref s3) = state.s3_client {
         match s3.head_object().bucket(&bucket).key(&key).send().await {
             Ok(output) => {
@@ -722,6 +740,8 @@ async fn s3_delete(
     };
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
 
+    state.write_count.fetch_add(1, Ordering::Relaxed);
+
     if let Some(ref s3) = state.s3_client {
         match s3.delete_object().bucket(&bucket).key(&key).send().await {
             Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -744,6 +764,11 @@ async fn s3_post(
         return s3_error::access_denied(&key);
     };
     info!("POST /{bucket}/{key} user={}", auth.user_id);
+
+    state.write_count.fetch_add(1, Ordering::Relaxed);
+    state
+        .bytes_processed
+        .fetch_add(body.len() as u64, Ordering::Relaxed);
 
     if params.uploads.is_some() {
         return s3_mp_create(&bucket, &key).await;
@@ -853,7 +878,13 @@ async fn create_key(
     let uid = get_user_id(&headers, &state);
     let (key_id, secret) = state
         .keys
-        .create_key(&uid, &body.label, body.expires_in, body.public_key_pem)
+        .create_key(
+            &uid,
+            &body.label,
+            body.expires_in,
+            body.public_key_pem,
+            body.workspace_id,
+        )
         .await;
     let key = state.keys.get_key(&key_id).await;
     let created_at = key
@@ -1162,6 +1193,7 @@ async fn main() -> anyhow::Result<()> {
         pool: db_pool,
         write_count: Arc::new(AtomicU64::new(0)),
         read_count: Arc::new(AtomicU64::new(0)),
+        bytes_processed: Arc::new(AtomicU64::new(0)),
     });
 
     info!("S4 gateway listening on {listen_addr}");
@@ -1170,6 +1202,39 @@ async fn main() -> anyhow::Result<()> {
     } else {
         info!("Storage mode: in-memory");
         info!("Dashboard: http://localhost:8080");
+    }
+
+    // Periodic aggregation: flush in-memory usage counters to usage_records.
+    if let Some(pool) = state.pool.clone() {
+        let write_count = state.write_count.clone();
+        let read_count = state.read_count.clone();
+        let bytes_processed = state.bytes_processed.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let w = write_count.swap(0, Ordering::Relaxed);
+                let r = read_count.swap(0, Ordering::Relaxed);
+                let b = bytes_processed.swap(0, Ordering::Relaxed);
+                if w == 0 && r == 0 && b == 0 {
+                    continue;
+                }
+                let gb = b as f64 / 1_000_000_000.0;
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO usage_records (workspace_id, period_start, period_end, write_count, read_count, gb_processed) \
+                     VALUES (NULL, date_trunc('hour', now()), date_trunc('hour', now()) + interval '1 hour', $1, $2, $3)"
+                )
+                .bind(w as i64)
+                .bind(r as i64)
+                .bind(gb)
+                .execute(&pool)
+                .await
+                {
+                    warn!("failed to flush usage counters: {e}");
+                } else {
+                    info!("flushed usage: {w} writes, {r} reads, {gb:.4} GB");
+                }
+            }
+        });
     }
 
     let app = Router::new()

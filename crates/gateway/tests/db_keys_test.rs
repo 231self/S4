@@ -41,7 +41,7 @@ fn postgres_key_roundtrip() {
     with_pool(|pool| async move {
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store.create_key(&user, "roundtrip", 0, None).await;
+        let (key_id, secret) = store.create_key(&user, "roundtrip", 0, None, None).await;
         let (uid, pk) = store
             .resolve_credentials(&key_id, &secret)
             .await
@@ -77,7 +77,7 @@ fn postgres_public_key_binding() {
     with_pool(|pool| async move {
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store.create_key(&user, "enc", 0, None).await;
+        let (key_id, secret) = store.create_key(&user, "enc", 0, None, None).await;
         assert!(
             store
                 .set_public_key(&key_id, &user, "-----BEGIN PUBLIC KEY-----\npem")
@@ -99,7 +99,7 @@ fn postgres_expired_key_rejected() {
     with_pool(|pool| async move {
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store.create_key(&user, "exp", 1, None).await;
+        let (key_id, secret) = store.create_key(&user, "exp", 1, None, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         assert!(
             store.resolve_credentials(&key_id, &secret).await.is_none(),

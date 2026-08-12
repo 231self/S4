@@ -34,6 +34,9 @@ cargo install s4ctl --git https://github.com/231self/S4
 s4ctl local init                  # runs the published gateway image (Docker)
 s4ctl plugin list                 # the pii-default plugin is preloaded
 
+# A sample file to push through the pipeline:
+echo "jane.doe@example.com 4111111111111111" > data.csv
+
 # Write data through the pipeline; it is transformed before it reaches storage
 s4ctl put ./data.csv ingest/data.csv --bucket s4-local
 
@@ -42,9 +45,9 @@ s4ctl get ingest/data.csv --bucket s4-local
 ```
 
 `s4ctl local init` pulls `ghcr.io/231self/s4/s4` and runs the gateway in local mode
-(`AUTH_DISABLED=true`, keys persisted on a volume, in-memory storage). `s4ctl local
-down` stops it. For durable local storage (MinIO), clone the repo and use
-`just dev-up`.
+(`AUTH_DISABLED=true`, keys persisted on a volume, in-memory storage); it picks a
+free port (8080+) and binds the loopback interface only. `s4ctl local down` stops it.
+For durable local storage (MinIO), clone the repo and use `just dev-up`.
 
 ## Run your own plugin
 
@@ -160,6 +163,22 @@ See `CONTRIBUTING.md`.
 - `docs/plugins.md` — create and consume your own plugins.
 - `docs/adr/` — architecture decision records.
 - `AGENTS.md` — development conventions.
+
+## LLM agents
+
+Coding agents (Claude Code, Kilo, Cursor, …) read `AGENTS.md` from the repo root
+automatically. For reusable, domain-specific S4 context, install the bundled skill:
+
+```bash
+# Claude Code (user-global):
+mkdir -p ~/.claude/skills && ln -s "$(pwd)/skills/s4" ~/.claude/skills/s4
+# Kilo (user-global):
+mkdir -p ~/.kilo/skills && ln -s "$(pwd)/skills/s4" ~/.kilo/skills/s4
+```
+
+The skill teaches agents what S4 is, the plugin pipeline, build/test/run commands,
+crate layout, and the CI/release gotchas (BuildKit cache mounts, act/colima,
+multi-arch builds).
 
 ## License
 

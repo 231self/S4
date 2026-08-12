@@ -8,7 +8,6 @@ Name | Type | Description | Notes
 **expires_in** | **int** |  | [optional] 
 **label** | **str** |  | 
 **public_key_pem** | **str** |  | [optional] 
-**workspace_id** | **str** |  | [optional] 
 
 ## Example
 

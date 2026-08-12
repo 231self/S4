@@ -16,7 +16,6 @@ export class CreateKeyRequest {
     'expiresIn'?: number;
     'label': string;
     'publicKeyPem'?: string | null;
-    'workspaceId'?: string | null;
 
     static readonly discriminator: string | undefined = undefined;
 
@@ -38,12 +37,6 @@ export class CreateKeyRequest {
         {
             "name": "publicKeyPem",
             "baseName": "public_key_pem",
-            "type": "string",
-            "format": ""
-        },
-        {
-            "name": "workspaceId",
-            "baseName": "workspace_id",
             "type": "string",
             "format": ""
         }    ];

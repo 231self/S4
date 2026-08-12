@@ -37,8 +37,7 @@ class TestCreateKeyRequest(unittest.TestCase):
             return CreateKeyRequest(
                 expires_in = 0,
                 label = '',
-                public_key_pem = '',
-                workspace_id = ''
+                public_key_pem = ''
             )
         else:
             return CreateKeyRequest(

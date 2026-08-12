@@ -14,39 +14,30 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/s4/s4
 
 jobs:
-  # Compile the gateway ONCE per architecture on the runner (reusing the
-  # warm rust-cache from CI), then assemble the image with COPYs — no
-  # compilation inside Docker. The two arch jobs run in parallel.
+  # Native per-arch builds: amd64 on the x64 runner, arm64 on the native
+  # arm64 runner. No cross-compilation, so ring/aws-lc-sys/openssl-sys build
+  # against each runner's own native libs. Both legs run in parallel.
   build:
     strategy:
       matrix:
         include:
           - platform: linux/amd64
-            rust_target: x86_64-unknown-linux-gnu
             suffix: amd64
+            runs-on: ubuntu-latest
           - platform: linux/arm64
-            rust_target: aarch64-unknown-linux-gnu
             suffix: arm64
-    runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown, ${{ matrix.rust_target }}
+          targets: wasm32-unknown-unknown
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      # zig cross-compiles Rust + C deps (ring, aws-lc-sys, openssl-sys) to
-      # aarch64 with no apt cross-packages — reliable where gcc-aarch64 +
-      # dpkg --add-architecture kept failing on the runner.
-      - name: Install cross toolchain (zig + cargo-zigbuild, arm64)
-        if: matrix.platform == 'linux/arm64'
-        run: |
-          pip install ziglang
-          cargo install cargo-zigbuild
 
       - name: Install wasm-tools + build filters
         run: |
@@ -56,13 +47,8 @@ jobs:
       - name: Build gateway release (${{ matrix.suffix }})
         run: |
           mkdir -p dist/components
-          if [ "${{ matrix.platform }}" = "linux/arm64" ]; then
-            cargo zigbuild --release --target aarch64-unknown-linux-gnu -p s4-gateway
-            cp target/aarch64-unknown-linux-gnu/release/s4-gateway dist/s4-gateway
-          else
-            cargo build --release -p s4-gateway
-            cp target/release/s4-gateway dist/s4-gateway
-          fi
+          cargo build --release -p s4-gateway
+          cp target/release/s4-gateway dist/s4-gateway
           cp -r target/components/. dist/components/
 
       - name: Log in to GHCR

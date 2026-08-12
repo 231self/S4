@@ -41,7 +41,10 @@ jobs:
 
       - name: Install cross linker + libs (arm64)
         if: matrix.platform == 'linux/arm64'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross libssl-dev:arm64 pkg-config-aarch64-linux-gnu
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross libssl-dev:arm64 pkg-config-aarch64-linux-gnu
 
       - name: Install wasm-tools + build filters
         run: |

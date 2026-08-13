@@ -1068,10 +1068,12 @@ pub async fn build_state(control: Arc<dyn ControlPlane>) -> anyhow::Result<Arc<A
             .connect(&database_url)
             .await
             .expect("failed to connect to DATABASE_URL");
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("failed to run migrations");
+        let mut migrator = sqlx::migrate!("../../migrations");
+        // The SaaS control plane applies its own migrations (workspaces, usage,
+        // billing) to the same database and shares the `_sqlx_migrations` table.
+        // Ignore migrations we don't know about so both binaries can coexist.
+        migrator.set_ignore_missing(true);
+        migrator.run(&pool).await.expect("failed to run migrations");
         info!("Key store: Postgres (migrations applied)");
         Arc::new(PostgresKeyStore::new(pool))
     } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {

@@ -16,6 +16,12 @@ axum.workspace = true
 tokio.workspace = true
 aws-sdk-s3.workspace = true
 aws-config.workspace = true
+aws-sigv4.workspace = true
+aws-credential-types.workspace = true
+aws-smithy-runtime-api.workspace = true
+md-5.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true

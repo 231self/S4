@@ -7,10 +7,12 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use crate::entity::api_key;
+use crate::entity::mcp_token;
+use crate::key_cipher::SecretCipher;
 
 #[derive(Debug, Clone)]
 pub struct StoredObject {
@@ -23,11 +25,24 @@ pub struct StoredObject {
 pub struct ApiKey {
     pub key_id: String,
     pub secret_hash: String,
+    #[serde(default)]
+    pub secret_encrypted: Option<String>,
     pub user_id: String,
     pub label: String,
     pub created_at: String,
     pub expires_at: Option<String>,
     pub public_key_pem: Option<String>,
+}
+
+/// MCP bearer token (`s4m_...`). The full token is the credential; only its
+/// SHA-256 hash is stored.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct McpToken {
+    pub token_hash: String,
+    pub user_id: String,
+    pub label: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -94,12 +109,25 @@ impl Default for MemoryStore {
 #[derive(Debug)]
 pub struct KeyStore {
     keys: RwLock<HashMap<String, ApiKey>>,
+    mcp_tokens: RwLock<HashMap<String, McpToken>>,
+    cipher: Option<Arc<SecretCipher>>,
 }
 
 impl KeyStore {
     pub fn new() -> Self {
         Self {
             keys: RwLock::new(HashMap::new()),
+            mcp_tokens: RwLock::new(HashMap::new()),
+            cipher: None,
+        }
+    }
+
+    /// A keystore that can also encrypt/decrypt secrets for SigV4 verification.
+    pub fn with_cipher(cipher: Arc<SecretCipher>) -> Self {
+        Self {
+            keys: RwLock::new(HashMap::new()),
+            mcp_tokens: RwLock::new(HashMap::new()),
+            cipher: Some(cipher),
         }
     }
 }
@@ -107,12 +135,21 @@ impl KeyStore {
 #[derive(Debug, Clone)]
 pub struct PostgresKeyStore {
     db: DatabaseConnection,
+    cipher: Option<Arc<SecretCipher>>,
 }
 
 impl PostgresKeyStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
         let db = SqlxPostgresConnector::from_sqlx_postgres_pool(pool);
-        Self { db }
+        Self { db, cipher: None }
+    }
+
+    pub fn with_cipher(pool: sqlx::PgPool, cipher: Arc<SecretCipher>) -> Self {
+        let db = SqlxPostgresConnector::from_sqlx_postgres_pool(pool);
+        Self {
+            db,
+            cipher: Some(cipher),
+        }
     }
 }
 
@@ -134,6 +171,10 @@ pub trait KeyRepository: Send + Sync {
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey>;
 
+    /// Decrypt the stored plaintext secret for `key_id` (used to verify SigV4
+    /// signatures). Returns `None` for legacy keys that only have a hash.
+    async fn decrypt_secret(&self, key_id: &str) -> Option<String>;
+
     /// Validate an access key/secret pair and return the owning user id plus
     /// the API key's public key PEM (used by the encryption pipeline).
     async fn resolve_credentials(
@@ -146,13 +187,27 @@ pub trait KeyRepository: Send + Sync {
     async fn list_for_user(&self, user_id: &str) -> Vec<ApiKey>;
 
     async fn delete_key(&self, key_id: &str, user_id: &str) -> bool;
+
+    /// Create an MCP bearer token (`s4m_...`) and return the plaintext token
+    /// (shown once). Only its SHA-256 hash is stored.
+    async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String;
+
+    /// Validate an MCP bearer token and return the owning user id.
+    async fn resolve_mcp_token(&self, token: &str) -> Option<String>;
+
+    /// MCP tokens for a user (hashes only).
+    async fn list_mcp_tokens(&self, user_id: &str) -> Vec<McpToken>;
+
+    async fn delete_mcp_token(&self, token_hash: &str, user_id: &str) -> bool;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_api_key(
     key_id: &str,
     user_id: &str,
     label: &str,
     secret_hash: String,
+    secret_encrypted: Option<String>,
     created_at: String,
     expires_at: Option<String>,
     public_key_pem: Option<String>,
@@ -160,6 +215,7 @@ fn build_api_key(
     ApiKey {
         key_id: key_id.to_string(),
         secret_hash,
+        secret_encrypted,
         user_id: user_id.to_string(),
         label: label.to_string(),
         created_at,
@@ -173,10 +229,15 @@ fn generate_api_key(
     label: &str,
     expires_in: u64,
     public_key_pem: Option<String>,
+    cipher: Option<&SecretCipher>,
 ) -> (ApiKey, String) {
     let key_id = format!("s4_{}", Uuid::new_v4().to_string().replace('-', ""));
     let secret = format!("s4s_{}", Uuid::new_v4().to_string().replace('-', ""));
     let secret_hash = sha256_hash(&secret);
+    let secret_encrypted = cipher.and_then(|c| c.encrypt(&secret).ok()).or_else(|| {
+        tracing::warn!("secret encryption unavailable; key {key_id} will not support SigV4");
+        None
+    });
     let now = chrono_now().parse::<u64>().unwrap_or(0);
     let expires_at = if expires_in > 0 {
         Some(format!("{}", now + expires_in))
@@ -188,6 +249,7 @@ fn generate_api_key(
         user_id,
         label,
         secret_hash,
+        secret_encrypted,
         chrono_now(),
         expires_at,
         public_key_pem,
@@ -242,6 +304,7 @@ fn list_for_user_in(keys: &RwLock<HashMap<String, ApiKey>>, user_id: &str) -> Ve
                 &k.user_id,
                 &k.label,
                 String::new(),
+                None,
                 k.created_at.clone(),
                 k.expires_at.clone(),
                 k.public_key_pem.clone(),
@@ -270,7 +333,13 @@ impl KeyRepository for KeyStore {
         expires_in: u64,
         public_key_pem: Option<String>,
     ) -> (String, String) {
-        let (api_key, secret) = generate_api_key(user_id, label, expires_in, public_key_pem);
+        let (api_key, secret) = generate_api_key(
+            user_id,
+            label,
+            expires_in,
+            public_key_pem,
+            self.cipher.as_deref(),
+        );
         let key_id = api_key.key_id.clone();
         self.keys.write().unwrap().insert(key_id.clone(), api_key);
         (key_id, secret)
@@ -282,6 +351,18 @@ impl KeyRepository for KeyStore {
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
         get_key_in(&self.keys, key_id)
+    }
+
+    async fn decrypt_secret(&self, key_id: &str) -> Option<String> {
+        let cipher = self.cipher.as_deref()?;
+        let blob = self
+            .keys
+            .read()
+            .unwrap()
+            .get(key_id)?
+            .secret_encrypted
+            .clone()?;
+        cipher.decrypt(&blob)
     }
 
     async fn resolve_credentials(
@@ -299,6 +380,56 @@ impl KeyRepository for KeyStore {
     async fn delete_key(&self, key_id: &str, user_id: &str) -> bool {
         delete_key_in(&self.keys, key_id, user_id)
     }
+
+    async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String {
+        let token = format!("s4m_{}", Uuid::new_v4().to_string().replace('-', ""));
+        let now = chrono_now().parse::<u64>().unwrap_or(0);
+        let token_hash = sha256_hash(&token);
+        let mcp = McpToken {
+            token_hash: token_hash.clone(),
+            user_id: user_id.to_string(),
+            label: label.to_string(),
+            created_at: chrono_now(),
+            expires_at: if expires_in > 0 {
+                Some(format!("{}", now + expires_in))
+            } else {
+                None
+            },
+        };
+        self.mcp_tokens.write().unwrap().insert(token_hash, mcp);
+        token
+    }
+
+    async fn resolve_mcp_token(&self, token: &str) -> Option<String> {
+        let hash = sha256_hash(token);
+        let tokens = self.mcp_tokens.read().unwrap();
+        let t = tokens.get(&hash)?;
+        if is_expired(t.expires_at.as_deref()) {
+            return None;
+        }
+        Some(t.user_id.clone())
+    }
+
+    async fn list_mcp_tokens(&self, user_id: &str) -> Vec<McpToken> {
+        self.mcp_tokens
+            .read()
+            .unwrap()
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect()
+    }
+
+    async fn delete_mcp_token(&self, token_hash: &str, user_id: &str) -> bool {
+        let mut tokens = self.mcp_tokens.write().unwrap();
+        if let Some(t) = tokens.get(token_hash)
+            && t.user_id == user_id
+        {
+            tokens.remove(token_hash);
+            return true;
+        }
+        false
+    }
 }
 
 /// Persistent key store backed by a JSON file (e.g. `~/.config/s4/keys.json`).
@@ -310,18 +441,29 @@ impl KeyRepository for KeyStore {
 #[derive(Debug)]
 pub struct FileKeyStore {
     keys: RwLock<HashMap<String, ApiKey>>,
+    mcp_tokens: RwLock<HashMap<String, McpToken>>,
     path: PathBuf,
+    cipher: Option<Arc<SecretCipher>>,
 }
 
 impl FileKeyStore {
     pub fn new(path: PathBuf) -> Self {
-        let keys = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let (keys, mcp_tokens) = load_file_store(&path);
         Self {
             keys: RwLock::new(keys),
+            mcp_tokens: RwLock::new(mcp_tokens),
             path,
+            cipher: None,
+        }
+    }
+
+    pub fn with_cipher(path: PathBuf, cipher: Arc<SecretCipher>) -> Self {
+        let (keys, mcp_tokens) = load_file_store(&path);
+        Self {
+            keys: RwLock::new(keys),
+            mcp_tokens: RwLock::new(mcp_tokens),
+            path,
+            cipher: Some(cipher),
         }
     }
 
@@ -335,9 +477,16 @@ impl FileKeyStore {
 
     /// Atomically write the current key set to disk (0600 on unix).
     fn persist(&self) -> anyhow::Result<()> {
-        let data = self.keys.read().unwrap();
-        let json = serde_json::to_string_pretty(&*data)?;
-        drop(data);
+        #[derive(serde::Serialize)]
+        struct Persisted {
+            keys: HashMap<String, ApiKey>,
+            mcp_tokens: HashMap<String, McpToken>,
+        }
+        let data = Persisted {
+            keys: self.keys.read().unwrap().clone(),
+            mcp_tokens: self.mcp_tokens.read().unwrap().clone(),
+        };
+        let json = serde_json::to_string_pretty(&data)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -364,7 +513,13 @@ impl KeyRepository for FileKeyStore {
         expires_in: u64,
         public_key_pem: Option<String>,
     ) -> (String, String) {
-        let (api_key, secret) = generate_api_key(user_id, label, expires_in, public_key_pem);
+        let (api_key, secret) = generate_api_key(
+            user_id,
+            label,
+            expires_in,
+            public_key_pem,
+            self.cipher.as_deref(),
+        );
         let key_id = api_key.key_id.clone();
         self.keys.write().unwrap().insert(key_id.clone(), api_key);
         self.persist()
@@ -383,6 +538,18 @@ impl KeyRepository for FileKeyStore {
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
         get_key_in(&self.keys, key_id)
+    }
+
+    async fn decrypt_secret(&self, key_id: &str) -> Option<String> {
+        let cipher = self.cipher.as_deref()?;
+        let blob = self
+            .keys
+            .read()
+            .unwrap()
+            .get(key_id)?
+            .secret_encrypted
+            .clone()?;
+        cipher.decrypt(&blob)
     }
 
     async fn resolve_credentials(
@@ -405,6 +572,60 @@ impl KeyRepository for FileKeyStore {
         }
         ok
     }
+
+    async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String {
+        let token = format!("s4m_{}", Uuid::new_v4().to_string().replace('-', ""));
+        let now = chrono_now().parse::<u64>().unwrap_or(0);
+        let token_hash = sha256_hash(&token);
+        let mcp = McpToken {
+            token_hash: token_hash.clone(),
+            user_id: user_id.to_string(),
+            label: label.to_string(),
+            created_at: chrono_now(),
+            expires_at: if expires_in > 0 {
+                Some(format!("{}", now + expires_in))
+            } else {
+                None
+            },
+        };
+        self.mcp_tokens.write().unwrap().insert(token_hash, mcp);
+        self.persist()
+            .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
+        token
+    }
+
+    async fn resolve_mcp_token(&self, token: &str) -> Option<String> {
+        let hash = sha256_hash(token);
+        let tokens = self.mcp_tokens.read().unwrap();
+        let t = tokens.get(&hash)?;
+        if is_expired(t.expires_at.as_deref()) {
+            return None;
+        }
+        Some(t.user_id.clone())
+    }
+
+    async fn list_mcp_tokens(&self, user_id: &str) -> Vec<McpToken> {
+        self.mcp_tokens
+            .read()
+            .unwrap()
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect()
+    }
+
+    async fn delete_mcp_token(&self, token_hash: &str, user_id: &str) -> bool {
+        let mut tokens = self.mcp_tokens.write().unwrap();
+        if let Some(t) = tokens.get(token_hash)
+            && t.user_id == user_id
+        {
+            tokens.remove(token_hash);
+            self.persist()
+                .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
+            return true;
+        }
+        false
+    }
 }
 
 impl From<api_key::Model> for ApiKey {
@@ -414,6 +635,7 @@ impl From<api_key::Model> for ApiKey {
             &m.user_id,
             &m.label,
             m.secret_hash,
+            m.secret_encrypted,
             m.created_at.timestamp().to_string(),
             m.expires_at.map(|e| e.to_string()),
             m.public_key_pem,
@@ -440,23 +662,25 @@ impl KeyRepository for PostgresKeyStore {
         expires_in: u64,
         public_key_pem: Option<String>,
     ) -> (String, String) {
-        let key_id = format!("s4_{}", Uuid::new_v4().to_string().replace('-', ""));
-        let secret = format!("s4s_{}", Uuid::new_v4().to_string().replace('-', ""));
-        let secret_hash = sha256_hash(&secret);
-        let now = chrono_now().parse::<u64>().unwrap_or(0);
-        let expires_at = (expires_in > 0).then_some((now + expires_in) as i64);
-
+        let (api_key, secret) = generate_api_key(
+            user_id,
+            label,
+            expires_in,
+            public_key_pem,
+            self.cipher.as_deref(),
+        );
         let model = api_key::ActiveModel {
-            user_id: Set(user_id.to_string()),
-            key_id: Set(key_id.clone()),
-            secret_hash: Set(secret_hash),
-            label: Set(label.to_string()),
-            expires_at: Set(expires_at),
-            public_key_pem: Set(public_key_pem),
+            user_id: Set(api_key.user_id.clone()),
+            key_id: Set(api_key.key_id.clone()),
+            secret_hash: Set(api_key.secret_hash.clone()),
+            secret_encrypted: Set(api_key.secret_encrypted.clone()),
+            label: Set(api_key.label.clone()),
+            expires_at: Set(api_key.expires_at.as_ref().and_then(|e| e.parse().ok())),
+            public_key_pem: Set(api_key.public_key_pem.clone()),
             ..Default::default()
         };
         let _ = model.insert(&self.db).await;
-        (key_id, secret)
+        (api_key.key_id, secret)
     }
 
     async fn set_public_key(&self, key_id: &str, user_id: &str, public_key_pem: &str) -> bool {
@@ -474,6 +698,12 @@ impl KeyRepository for PostgresKeyStore {
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
         fetch_key(&self.db, key_id).await
+    }
+
+    async fn decrypt_secret(&self, key_id: &str) -> Option<String> {
+        let cipher = self.cipher.as_deref()?;
+        let blob = fetch_key(&self.db, key_id).await?.secret_encrypted?;
+        cipher.decrypt(&blob)
     }
 
     async fn resolve_credentials(
@@ -503,6 +733,7 @@ impl KeyRepository for PostgresKeyStore {
                 .map(|m| {
                     let mut k: ApiKey = m.into();
                     k.secret_hash = String::new();
+                    k.secret_encrypted = None;
                     k
                 })
                 .collect(),
@@ -521,6 +752,94 @@ impl KeyRepository for PostgresKeyStore {
             .await;
         matches!(result, Ok(r) if r.rows_affected == 1)
     }
+
+    async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String {
+        let token = format!("s4m_{}", Uuid::new_v4().to_string().replace('-', ""));
+        let now = chrono_now().parse::<u64>().unwrap_or(0);
+        let token_hash = sha256_hash(&token);
+        let model = mcp_token::ActiveModel {
+            user_id: Set(user_id.to_string()),
+            token_hash: Set(token_hash),
+            label: Set(label.to_string()),
+            expires_at: Set(if expires_in > 0 {
+                Some((now + expires_in) as i64)
+            } else {
+                None
+            }),
+            ..Default::default()
+        };
+        let _ = model.insert(&self.db).await;
+        token
+    }
+
+    async fn resolve_mcp_token(&self, token: &str) -> Option<String> {
+        let hash = sha256_hash(token);
+        let row = mcp_token::Entity::find()
+            .filter(mcp_token::Column::TokenHash.eq(hash))
+            .one(&self.db)
+            .await
+            .ok()?;
+        let row = row?;
+        if is_expired(row.expires_at.as_ref().map(|e| e.to_string()).as_deref()) {
+            return None;
+        }
+        Some(row.user_id)
+    }
+
+    async fn list_mcp_tokens(&self, user_id: &str) -> Vec<McpToken> {
+        match mcp_token::Entity::find()
+            .filter(mcp_token::Column::UserId.eq(user_id.to_string()))
+            .order_by_desc(mcp_token::Column::CreatedAt)
+            .all(&self.db)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|m| McpToken {
+                    token_hash: m.token_hash,
+                    user_id: m.user_id,
+                    label: m.label,
+                    created_at: m.created_at.to_string(),
+                    expires_at: m.expires_at.map(|e| e.to_string()),
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("list_mcp_tokens failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn delete_mcp_token(&self, token_hash: &str, user_id: &str) -> bool {
+        let result = mcp_token::Entity::delete_many()
+            .filter(mcp_token::Column::TokenHash.eq(token_hash.to_string()))
+            .filter(mcp_token::Column::UserId.eq(user_id.to_string()))
+            .exec(&self.db)
+            .await;
+        matches!(result, Ok(r) if r.rows_affected == 1)
+    }
+}
+
+/// Load a persisted FileKeyStore payload (keys + mcp_tokens), tolerating the
+/// legacy keys-only JSON shape.
+fn load_file_store(path: &PathBuf) -> (HashMap<String, ApiKey>, HashMap<String, McpToken>) {
+    #[derive(serde::Deserialize)]
+    struct Persisted {
+        keys: Option<HashMap<String, ApiKey>>,
+        mcp_tokens: Option<HashMap<String, McpToken>>,
+    }
+    let Some(s) = std::fs::read_to_string(path).ok() else {
+        return (HashMap::new(), HashMap::new());
+    };
+    if let Ok(data) = serde_json::from_str::<Persisted>(&s) {
+        return (
+            data.keys.unwrap_or_default(),
+            data.mcp_tokens.unwrap_or_default(),
+        );
+    }
+    // Legacy shape: bare keys map.
+    let keys: HashMap<String, ApiKey> = serde_json::from_str(&s).unwrap_or_default();
+    (keys, HashMap::new())
 }
 
 fn is_expired(expires_at: Option<&str>) -> bool {
@@ -539,7 +858,7 @@ impl Default for KeyStore {
     }
 }
 
-fn sha256_hash(s: &str) -> String {
+pub fn sha256_hash(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(s.as_bytes());

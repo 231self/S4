@@ -144,6 +144,31 @@ impl PluginRegistry {
         stable_fields: Option<&str>,
         records: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+        self.process_all_with(
+            format,
+            content_type,
+            public_key_pem,
+            stable_key,
+            stable_fields,
+            records,
+            &[],
+        )
+    }
+
+    /// Like `process_all`, but skips plugins named in `skip` (e.g. redaction
+    /// filters when the caller wants stable-encrypted, joinable output instead
+    /// of redacted output).
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_all_with(
+        &self,
+        format: super::Format,
+        content_type: &str,
+        public_key_pem: Option<&str>,
+        stable_key: Option<&[u8]>,
+        stable_fields: Option<&str>,
+        records: &[Vec<u8>],
+        skip: &[&str],
+    ) -> Result<Vec<Vec<u8>>, anyhow::Error> {
         let mut current = records.to_vec();
         let order = self.order.read().unwrap();
         let plugins = self.plugins.read().unwrap();
@@ -151,6 +176,11 @@ impl PluginRegistry {
         for id in order.iter() {
             if let Some(plugin) = plugins.get(id) {
                 if !plugin.info.enabled {
+                    continue;
+                }
+                if skip.contains(&plugin.info.name.as_str())
+                    || skip.contains(&plugin.info.name.split('.').next().unwrap_or(""))
+                {
                     continue;
                 }
                 let engine = FilterEngine::with_fuel(&plugin.component_bytes, self.fuel)?;

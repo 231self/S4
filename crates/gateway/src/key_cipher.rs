@@ -1,0 +1,237 @@
+//! Envelope encryption for API key secrets.
+//!
+//! The gateway never stores plaintext API key secrets. Each secret is
+//! encrypted with a fresh 256-bit data key (DEK) using AES-256-GCM, and the
+//! DEK itself is wrapped by a [`KeyWrapping`] implementation so the master
+//! key can live elsewhere (operator-provided `S4_SECRET_KEK`, or a KMS key in
+//! a follow-up). Decryption only happens in memory, on demand, to recompute a
+//! SigV4 signature.
+//!
+//! Envelope format (`v1`):
+//! `v1:{base64(wrapped_dek)}:{base64(nonce)}:{base64(ciphertext+tag)}`
+
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use rand::RngCore;
+use rand::rngs::OsRng;
+use std::fmt::Debug;
+use std::sync::Arc;
+use tracing::warn;
+
+const ENVELOPE_VERSION: &str = "v1";
+const KEY_LEN: usize = 32;
+const NONCE_LEN: usize = 12;
+
+/// Wraps (encrypts) and unwraps (decrypts) the per-secret data key (DEK).
+///
+/// The OSS self-host binary uses [`LocalKeyWrapping`] with an operator
+/// provided KEK. A KMS-backed implementation (AWS KMS `GenerateDataKey` /
+/// `Decrypt`) can be added behind this trait so the gateway never holds the
+/// master key.
+pub trait KeyWrapping: Send + Sync + Debug {
+    fn wrap(&self, dek: &[u8]) -> Result<Vec<u8>>;
+    fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Wraps the DEK with a static 256-bit KEK using AES-256-GCM. The per-wrap
+/// nonce is prepended to the ciphertext so the blob is self-describing.
+#[derive(Debug)]
+pub struct LocalKeyWrapping {
+    kek: [u8; KEY_LEN],
+}
+
+impl LocalKeyWrapping {
+    /// Read the KEK from `S4_SECRET_KEK` (base64, 32 bytes).
+    pub fn from_env() -> Result<Option<Self>> {
+        match std::env::var("S4_SECRET_KEK") {
+            Ok(v) => {
+                let kek = B64
+                    .decode(v.trim())
+                    .context("S4_SECRET_KEK must be base64")?;
+                let kek: [u8; KEY_LEN] = kek
+                    .try_into()
+                    .map_err(|_| anyhow!("S4_SECRET_KEK must decode to 32 bytes"))?;
+                Ok(Some(Self { kek }))
+            }
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(e) => Err(e).context("failed to read S4_SECRET_KEK"),
+        }
+    }
+
+    /// A KEK supplied directly (tests, key material from elsewhere).
+    pub fn with_kek(kek: [u8; KEY_LEN]) -> Self {
+        Self { kek }
+    }
+
+    /// A random in-memory KEK. Used when no KEK is configured: secrets cannot
+    /// be decrypted after a restart (SigV4 verification is lost; hash-based
+    /// SDK auth still works).
+    pub fn ephemeral() -> Self {
+        let mut kek = [0u8; KEY_LEN];
+        OsRng.fill_bytes(&mut kek);
+        Self { kek }
+    }
+}
+
+impl KeyWrapping for LocalKeyWrapping {
+    fn wrap(&self, dek: &[u8]) -> Result<Vec<u8>> {
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let cipher = Aes256Gcm::new_from_slice(&self.kek).map_err(anyhow::Error::msg)?;
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), dek)
+            .map_err(|_| anyhow!("DEK wrap failed"))?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>> {
+        if wrapped.len() < NONCE_LEN {
+            return Err(anyhow!("wrapped DEK too short"));
+        }
+        let (nonce, ct) = wrapped.split_at(NONCE_LEN);
+        let cipher = Aes256Gcm::new_from_slice(&self.kek).map_err(anyhow::Error::msg)?;
+        cipher
+            .decrypt(Nonce::from_slice(nonce), ct)
+            .map_err(|_| anyhow!("DEK unwrap failed"))
+    }
+}
+
+/// Resolve the OSS self-host wrapping: `S4_SECRET_KEK` if set, otherwise an
+/// ephemeral key with a warning that SigV4 verification will not survive a
+/// restart. KMS/Vault wrappers are injected by callers that construct their
+/// own [`KeyWrapping`] and pass it to `build_state`.
+pub fn default_wrapping() -> Result<Arc<dyn KeyWrapping>> {
+    match LocalKeyWrapping::from_env()? {
+        Some(wrapping) => Ok(Arc::new(wrapping)),
+        None => {
+            warn!(
+                "S4_SECRET_KEK is not set; API key secrets use an ephemeral key and SigV4 verification will not survive a restart"
+            );
+            Ok(Arc::new(LocalKeyWrapping::ephemeral()))
+        }
+    }
+}
+
+/// Encrypts and decrypts API key secrets at rest (envelope encryption).
+#[derive(Debug)]
+pub struct SecretCipher {
+    wrapping: Arc<dyn KeyWrapping>,
+}
+
+impl SecretCipher {
+    pub fn new(wrapping: Arc<dyn KeyWrapping>) -> Self {
+        Self { wrapping }
+    }
+
+    /// Encrypt `secret`, returning the `v1` envelope string.
+    pub fn encrypt(&self, secret: &str) -> Result<String> {
+        let mut dek = [0u8; KEY_LEN];
+        OsRng.fill_bytes(&mut dek);
+        let wrapped = self.wrapping.wrap(&dek)?;
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let cipher = Aes256Gcm::new_from_slice(&dek).map_err(anyhow::Error::msg)?;
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), secret.as_bytes())
+            .map_err(|_| anyhow!("secret encryption failed"))?;
+        Ok(format!(
+            "{ENVELOPE_VERSION}:{}:{}:{}",
+            B64.encode(wrapped),
+            B64.encode(nonce),
+            B64.encode(ct)
+        ))
+    }
+
+    /// Decrypt a `v1` envelope, returning the plaintext secret.
+    pub fn decrypt(&self, blob: &str) -> Option<String> {
+        let parts: Vec<&str> = blob.splitn(4, ':').collect();
+        if parts.len() != 4 || parts[0] != ENVELOPE_VERSION {
+            return None;
+        }
+        let wrapped = B64.decode(parts[1]).ok()?;
+        let nonce = B64.decode(parts[2]).ok()?;
+        let ct = B64.decode(parts[3]).ok()?;
+        let dek = self.wrapping.unwrap(&wrapped).ok()?;
+        let cipher = Aes256Gcm::new_from_slice(&dek).ok()?;
+        cipher
+            .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+            .ok()
+            .and_then(|p| String::from_utf8(p).ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    // env mutations must be serialized across tests.
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn cipher_with_kek(kek: u8) -> SecretCipher {
+        SecretCipher::new(Arc::new(LocalKeyWrapping::with_kek([kek; KEY_LEN])))
+    }
+
+    #[test]
+    fn roundtrip_local_kek() {
+        let cipher = cipher_with_kek(7);
+        let blob = cipher.encrypt("s4s_secret_value_1234").unwrap();
+        assert!(blob.starts_with("v1:"));
+        assert_eq!(
+            cipher.decrypt(&blob).as_deref(),
+            Some("s4s_secret_value_1234")
+        );
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails() {
+        let cipher = cipher_with_kek(7);
+        let blob = cipher.encrypt("secret").unwrap();
+        let mut parts: Vec<String> = blob.split(':').map(|s| s.to_string()).collect();
+        let ct = B64.decode(&parts[3]).unwrap();
+        let mut tampered = ct.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        parts[3] = B64.encode(tampered);
+        assert_eq!(cipher.decrypt(&parts.join(":")), None);
+    }
+
+    #[test]
+    fn wrong_kek_fails() {
+        let blob = cipher_with_kek(7).encrypt("secret").unwrap();
+        let other = cipher_with_kek(9);
+        assert_eq!(other.decrypt(&blob), None);
+    }
+
+    #[test]
+    fn malformed_blob_returns_none() {
+        let cipher = cipher_with_kek(7);
+        assert_eq!(cipher.decrypt("v1:not-base64:abc"), None);
+        assert_eq!(cipher.decrypt("v9:abc:def:ghi"), None);
+        assert_eq!(cipher.decrypt(""), None);
+    }
+
+    #[test]
+    fn env_kek_parses() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("S4_SECRET_KEK", B64.encode([3u8; KEY_LEN])) };
+        let w = LocalKeyWrapping::from_env()
+            .expect("no env error")
+            .expect("Some");
+        let cipher = SecretCipher::new(Arc::new(w));
+        let blob = cipher.encrypt("x").unwrap();
+        assert_eq!(cipher.decrypt(&blob).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn env_kek_rejects_short_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("S4_SECRET_KEK", B64.encode([1u8; 8])) };
+        assert!(LocalKeyWrapping::from_env().is_err());
+    }
+}

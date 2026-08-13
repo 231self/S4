@@ -4,8 +4,10 @@ wasmtime::component::bindgen!({
 });
 
 use s4_error::{S4Error, codes};
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store};
+use wasmtime_wasi::p2::add_to_linker_sync as add_wasi_to_linker;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
 #[derive(Debug, Default)]
 struct S4ResourceLimiter {
@@ -45,9 +47,19 @@ impl ResourceLimiter for S4ResourceLimiter {
     }
 }
 
-#[derive(Debug, Default)]
 struct S4HostState {
     resource_limiter: S4ResourceLimiter,
+    wasi: WasiCtx,
+    table: ResourceTable,
+}
+
+impl WasiView for S4HostState {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,10 +100,16 @@ impl FilterEngine {
     }
 
     fn create_store(&self) -> Result<Store<S4HostState>, S4Error> {
+        let wasi = WasiCtxBuilder::new()
+            .inherit_stdout()
+            .inherit_stderr()
+            .build();
         let state = S4HostState {
             resource_limiter: S4ResourceLimiter {
                 memory_limit: 67_108_864,
             },
+            wasi,
+            table: ResourceTable::new(),
         };
         let mut store = Store::new(&self.engine, state);
         store
@@ -109,7 +127,9 @@ impl FilterEngine {
         let mut store = self
             .create_store()
             .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
-        let linker = Linker::new(&self.engine);
+        let mut linker = Linker::new(&self.engine);
+        add_wasi_to_linker(&mut linker)
+            .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
         let instance = linker
             .instantiate(&mut store, &self.component)
             .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;

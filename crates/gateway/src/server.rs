@@ -6,32 +6,43 @@
 //! [`crate::control::NoopControlPlane`]; the private SaaS crate builds it with
 //! its own control-plane implementation.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
+use aws_credential_types::Credentials as SigV4Credentials;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sigv4::http_request::{
+    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningParams,
+    SigningSettings, UriPathNormalizationMode, sign,
+};
+use aws_sigv4::sign::v4;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{Html, IntoResponse},
     routing::{delete, get, head, post, put},
 };
+use md5::{Digest as Md5Digest, Md5};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::control::{ControlPlane, RequestKind};
+use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::plugin_registry::PluginRegistry;
 use crate::s3_error;
 use crate::service_storage::{ServiceStorage, parse_service_backends};
 use crate::store::{
     BackendConfig, BackendRegistry, FileKeyStore, KeyRepository, KeyStore, MemoryStore,
-    PostgresKeyStore,
+    PostgresKeyStore, sha256_hash,
 };
 use crate::{Format, Gateway};
 
@@ -48,12 +59,128 @@ pub struct AppState {
     pub jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     pub auth_disabled: bool,
     pub control: Arc<dyn ControlPlane>,
+    /// In-flight multipart uploads (upload_id -> parts). Buffered gateway-side
+    /// so the filter pipeline runs on the assembled object at Complete time.
+    pub multipart: Arc<Mutex<HashMap<String, MultipartUpload>>>,
 }
 
 pub struct Auth {
     user_id: String,
     public_key_pem: Option<String>,
     stable_key: Option<Vec<u8>>,
+}
+
+/// S3 multipart upload parts, buffered in memory keyed by upload id.
+/// Parts are concatenated in order at Complete time and then passed through
+/// the same filter pipeline as a single PUT.
+#[derive(Debug, Default)]
+pub struct MultipartUpload {
+    bucket: String,
+    key: String,
+    parts: BTreeMap<u32, Vec<u8>>,
+    etags: HashMap<u32, String>,
+}
+
+/// `(part_number, size, etag)` for ListParts responses.
+pub type MultipartPart = (u32, usize, String);
+
+/// All parts except the last must be at least this large (S3 spec).
+const MULTIPART_MIN_PART_BYTES: usize = 5 * 1024 * 1024;
+
+/// Upper bound for a single PUT body / multipart part (S3 single-PUT max).
+const S3_MAX_PUT_BYTES: usize = 5 * 1024 * 1024 * 1024;
+
+fn mp_init(state: &AppState, bucket: &str, key: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    state.multipart.lock().unwrap().insert(
+        id.clone(),
+        MultipartUpload {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            ..Default::default()
+        },
+    );
+    id
+}
+
+fn mp_put_part(state: &AppState, upload_id: &str, part_number: u32, data: &[u8]) -> Option<String> {
+    if !(1..=10_000).contains(&part_number) {
+        return None;
+    }
+    let mut uploads = state.multipart.lock().unwrap();
+    let upload = uploads.get_mut(upload_id)?;
+    let etag = format!("\"{:x}\"", Md5::digest(data));
+    upload.parts.insert(part_number, data.to_vec());
+    upload.etags.insert(part_number, etag.clone());
+    Some(etag)
+}
+
+fn mp_abort(state: &AppState, upload_id: &str) -> bool {
+    state.multipart.lock().unwrap().remove(upload_id).is_some()
+}
+
+fn mp_list_parts(
+    state: &AppState,
+    upload_id: &str,
+) -> Option<(String, String, Vec<MultipartPart>)> {
+    let uploads = state.multipart.lock().unwrap();
+    let upload = uploads.get(upload_id)?;
+    let parts: Vec<MultipartPart> = upload
+        .parts
+        .iter()
+        .map(|(n, data)| {
+            let etag = upload.etags.get(n).cloned().unwrap_or_default();
+            (*n, data.len(), etag)
+        })
+        .collect();
+    Some((upload.bucket.clone(), upload.key.clone(), parts))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CompleteError {
+    NoSuchUpload,
+    InvalidPart,
+    InvalidPartOrder,
+    PartTooSmall(u32),
+}
+
+/// Assemble the parts listed in the CompleteMultipartUpload body in order,
+/// returning `(bucket, key, assembled_bytes)` and dropping the upload state.
+fn mp_complete(
+    state: &AppState,
+    upload_id: &str,
+    requested: &[u32],
+) -> Result<(String, String, Vec<u8>), CompleteError> {
+    let mut uploads = state.multipart.lock().unwrap();
+    let upload = uploads.get(upload_id).ok_or(CompleteError::NoSuchUpload)?;
+    if requested.is_empty() {
+        return Err(CompleteError::InvalidPart);
+    }
+    let mut prev = 0u32;
+    for n in requested {
+        if *n <= prev {
+            return Err(CompleteError::InvalidPartOrder);
+        }
+        prev = *n;
+    }
+    let mut total = 0usize;
+    for (i, n) in requested.iter().enumerate() {
+        let data = upload.parts.get(n).ok_or(CompleteError::InvalidPart)?;
+        if i + 1 < requested.len() && data.len() < MULTIPART_MIN_PART_BYTES {
+            return Err(CompleteError::PartTooSmall(*n));
+        }
+        total += data.len();
+    }
+    let mut assembled = Vec::with_capacity(total);
+    for n in requested {
+        if let Some(data) = upload.parts.get(n) {
+            assembled.extend_from_slice(data);
+        }
+    }
+    let bucket = upload.bucket.clone();
+    let key = upload.key.clone();
+    uploads.remove(upload_id);
+    Ok((bucket, key, assembled))
 }
 
 /// Derive the deterministic-encryption key for an API key secret:
@@ -114,14 +241,56 @@ struct DeleteKeyRequest {
     key_id: String,
 }
 
+#[derive(Serialize, ToSchema)]
+struct McpTokenResponse {
+    token_hash: String,
+    label: String,
+    created_at: String,
+    expires_at: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct McpTokenCreatedResponse {
+    token: String,
+    label: String,
+    created_at: String,
+    expires_at: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct CreateMcpTokenRequest {
+    label: String,
+    #[serde(default)]
+    expires_in: u64,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct DeleteMcpTokenRequest {
+    token_hash: String,
+}
+
 #[derive(serde::Deserialize, Default)]
 struct S3Query {
+    #[serde(rename = "uploads")]
     uploads: Option<String>,
     #[serde(rename = "uploadId")]
     upload_id: Option<String>,
     #[serde(rename = "partNumber")]
+    part_number: Option<u32>,
+    #[serde(rename = "list-type")]
+    list_type: Option<String>,
+    prefix: Option<String>,
+    delimiter: Option<String>,
+    #[serde(rename = "continuation-token")]
+    continuation_token: Option<String>,
+    #[serde(rename = "start-after")]
+    start_after: Option<String>,
+    #[serde(rename = "max-keys")]
+    max_keys: Option<u32>,
+    #[serde(rename = "encoding-type")]
+    encoding_type: Option<String>,
     #[allow(dead_code)]
-    part_number: Option<String>,
+    marker: Option<String>,
 }
 
 #[derive(OpenApi)]
@@ -154,6 +323,243 @@ fn detect_format(headers: &HeaderMap) -> Format {
     }
 }
 
+/// Escape a value for inclusion in an S3 XML document.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// URL-encode a key for `encoding-type=url` list responses (S3 url-encoding:
+/// everything except unreserved `A-Za-z0-9-_.~`).
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+struct SigV4Auth {
+    access_key: String,
+    region: String,
+    service: String,
+    signed_headers: Vec<String>,
+    signature: String,
+}
+
+/// Parse the components of an `Authorization: AWS4-HMAC-SHA256 ...` header.
+fn parse_sigv4(auth: &str) -> Option<SigV4Auth> {
+    let rest = auth.strip_prefix("AWS4-HMAC-SHA256 ")?;
+    let mut credential: Option<(String, String, String)> = None;
+    let mut signed_headers: Option<Vec<String>> = None;
+    let mut signature: Option<String> = None;
+    for part in rest.split(',') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("Credential=") {
+            let mut it = v.splitn(5, '/');
+            let access_key = it.next()?.to_string();
+            it.next()?; // scope date
+            let region = it.next()?.to_string();
+            let service = it.next()?.to_string();
+            it.next()?; // "aws4_request"
+            credential = Some((access_key, region, service));
+        } else if let Some(v) = part.strip_prefix("SignedHeaders=") {
+            signed_headers = Some(v.split(';').map(|s| s.to_string()).collect());
+        } else if let Some(v) = part.strip_prefix("Signature=") {
+            signature = Some(v.to_string());
+        }
+    }
+    Some(SigV4Auth {
+        access_key: credential.as_ref()?.0.clone(),
+        region: credential.as_ref()?.1.clone(),
+        service: credential.as_ref()?.2.clone(),
+        signed_headers: signed_headers?,
+        signature: signature?,
+    })
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Hinnant algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse `YYYYMMDD'T'HHMMSS'Z'` (the SigV4 `x-amz-date` format).
+fn parse_sigv4_timestamp(s: &str) -> Option<SystemTime> {
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    let two = |i: usize| -> Option<u64> {
+        let hi = b[i].checked_sub(b'0')? as u64;
+        let lo = b[i + 1].checked_sub(b'0')? as u64;
+        Some(hi * 10 + lo)
+    };
+    let year = two(0)? * 100 + two(2)?;
+    let month = two(4)?;
+    let day = two(6)?;
+    let hour = two(9)?;
+    let minute = two(11)?;
+    let second = two(13)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let total = days_from_civil(year as i64, month as i64, day as i64) * 86_400
+        + hour as i64 * 3_600
+        + minute as i64 * 60
+        + second as i64;
+    if total < 0 {
+        return None;
+    }
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(total as u64))
+}
+
+/// Lowercase hex SHA-256 of `bytes` (for `x-amz-content-sha256` comparison).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64);
+    for b in Sha256::digest(bytes) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Recompute the SigV4 signature for the incoming request using the same
+/// signing settings the AWS SDK applies for S3 (single percent-encoding, no
+/// URI path normalization, `x-amz-content-sha256` payload hash) and compare
+/// against the client-provided signature.
+fn verify_sigv4(
+    method: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    secret: &str,
+    sigv4: &SigV4Auth,
+) -> bool {
+    let Some(x_amz_date) = headers.get("x-amz-date").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(time) = parse_sigv4_timestamp(x_amz_date) else {
+        return false;
+    };
+
+    let mut settings = SigningSettings::default();
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+
+    let identity: aws_smithy_runtime_api::client::identity::Identity = SigV4Credentials::new(
+        sigv4.access_key.clone(),
+        secret.to_string(),
+        None,
+        None,
+        "s4-front-door",
+    )
+    .into();
+    let params: SigningParams = match v4::SigningParams::builder()
+        .identity(&identity)
+        .region(&sigv4.region)
+        .name(&sigv4.service)
+        .time(time)
+        .settings(settings)
+        .build()
+    {
+        Ok(p) => p.into(),
+        Err(_) => return false,
+    };
+
+    // Feed exactly the headers the client signed — any extra header changes
+    // the canonical request and the signature would not match.
+    let mut signed_headers = Vec::with_capacity(sigv4.signed_headers.len());
+    for name in &sigv4.signed_headers {
+        let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) else {
+            return false;
+        };
+        signed_headers.push((name.as_str(), value));
+    }
+
+    let target = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(uri.path());
+    let payload = match headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("UNSIGNED-PAYLOAD") => SignableBody::UnsignedPayload,
+        Some(hash) if !hash.is_empty() => {
+            // Never trust the claimed hash for a non-empty body: recompute
+            // against the actual bytes so body tampering is detected even when
+            // the attacker keeps the original x-amz-content-sha256 header.
+            if !body.is_empty() {
+                let actual = sha256_hex(body);
+                if !actual.eq_ignore_ascii_case(hash) {
+                    return false;
+                }
+            }
+            SignableBody::Precomputed(hash.to_string())
+        }
+        _ => SignableBody::Bytes(body),
+    };
+
+    let request = match SignableRequest::new(
+        method,
+        target.to_string(),
+        signed_headers.into_iter(),
+        payload,
+    ) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    match sign(request, &params) {
+        Ok(output) => output.signature().eq_ignore_ascii_case(&sigv4.signature),
+        Err(_) => false,
+    }
+}
+
+/// Parse the `<Part><PartNumber>N</PartNumber>...` list from a
+/// CompleteMultipartUpload XML body, returning part numbers in document order.
+fn parse_complete_xml(body: &[u8]) -> Option<Vec<u32>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<Part>") {
+        let after = &rest[start + 6..];
+        let end = after.find("</Part>")?;
+        let part = &after[..end];
+        rest = &after[end + 7..];
+        let n = part
+            .split("<PartNumber>")
+            .nth(1)?
+            .split("</PartNumber>")
+            .next()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        parts.push(n);
+    }
+    Some(parts)
+}
+
 async fn get_user_s3_client(state: &AppState, uid: &str) -> Option<Client> {
     if let Some(ref s3) = state.s3_client {
         return Some(s3.clone());
@@ -178,19 +584,52 @@ async fn get_user_s3_client(state: &AppState, uid: &str) -> Option<Client> {
 }
 
 async fn authenticate(
+    method: &str,
+    uri: &Uri,
     headers: &HeaderMap,
+    body: &[u8],
     keys: &Arc<dyn KeyRepository>,
     state: &AppState,
 ) -> Option<Auth> {
     let auth = headers.get("Authorization").and_then(|v| v.to_str().ok());
     match auth {
-        Some(a) if a.starts_with("AWS4-") => Some(Auth {
-            user_id: "system".to_string(),
-            public_key_pem: None,
-            stable_key: None,
-        }),
+        Some(a) if a.starts_with("AWS4-") => {
+            // Local/demo mode skips signature verification entirely.
+            if state.auth_disabled {
+                return Some(Auth {
+                    user_id: "demo-user".to_string(),
+                    public_key_pem: None,
+                    stable_key: None,
+                });
+            }
+            let sigv4 = parse_sigv4(a)?;
+            let key = keys.get_key(&sigv4.access_key).await?;
+            if key_expired(key.expires_at.as_deref()) {
+                return None;
+            }
+            let secret = keys.decrypt_secret(&sigv4.access_key).await?;
+            if !verify_sigv4(method, uri, headers, body, &secret, &sigv4) {
+                return None;
+            }
+            return Some(Auth {
+                user_id: key.user_id.clone(),
+                public_key_pem: key.public_key_pem.clone(),
+                stable_key: Some(derive_stable_key(&secret)),
+            });
+        }
         Some(a) if a.starts_with("Bearer ") => {
             let token = &a[7..];
+            // MCP bearer token (s4m_...): a self-contained credential.
+            if token.starts_with("s4m_") {
+                if let Some(user_id) = keys.resolve_mcp_token(token).await {
+                    return Some(Auth {
+                        user_id,
+                        public_key_pem: None,
+                        stable_key: None,
+                    });
+                }
+                return None;
+            }
             // Try API key format: Bearer s4_xxx:s4s_xxx
             if let Some((ak, sk)) = token.split_once(':') {
                 let (user_id, public_key_pem) = keys.resolve_credentials(ak, sk).await?;
@@ -213,8 +652,21 @@ async fn authenticate(
             }
             return None;
         }
-        _ => None,
+        _ => None::<Auth>,
     };
+    // x-s4-mcp-token header: MCP bearer token.
+    if let Some(tok) = headers.get("x-s4-mcp-token").and_then(|v| v.to_str().ok()) {
+        if tok.starts_with("s4m_")
+            && let Some(user_id) = keys.resolve_mcp_token(tok).await
+        {
+            return Some(Auth {
+                user_id,
+                public_key_pem: None,
+                stable_key: None,
+            });
+        }
+        return None;
+    }
     let ak = headers
         .get("x-s4-access-key")
         .and_then(|v| v.to_str().ok())
@@ -244,6 +696,19 @@ async fn authenticate(
     None
 }
 
+fn key_expired(expires_at: Option<&str>) -> bool {
+    if let Some(exp) = expires_at {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if exp.parse::<u64>().is_ok_and(|ts| now >= ts) {
+            return true;
+        }
+    }
+    false
+}
+
 fn get_user_id(headers: &HeaderMap, state: &AppState) -> String {
     match get_user_claims(headers, state) {
         Some(claims) => claims
@@ -255,6 +720,153 @@ fn get_user_id(headers: &HeaderMap, state: &AppState) -> String {
     }
 }
 
+fn supabase_jwt_validation(
+    algorithm: jsonwebtoken::Algorithm,
+    issuer: &str,
+) -> jsonwebtoken::Validation {
+    let mut validation = jsonwebtoken::Validation::new(algorithm);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&["authenticated"]);
+    validation.validate_exp = true;
+    validation
+}
+
+/// Resolve and validate the authenticated user's Supabase claims.
+pub async fn require_user_claims(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<serde_json::Value> {
+    if state.auth_disabled {
+        return Some(serde_json::json!({
+            "sub": "demo-user",
+            "email": "",
+            "app_metadata": { "provider": "demo" },
+        }));
+    }
+    if let Some(claims) = verify_jwks_claims(headers, state).await {
+        return Some(claims);
+    }
+    get_user_claims(headers, state)
+}
+
+/// Resolve the authenticated user id, or `None` when the request is not
+/// authenticated. When auth is disabled (local/demo mode) this is permissive
+/// and returns the demo user. When auth is enabled (production SaaS) an
+/// unauthenticated request returns `None` so callers can reject with 401.
+/// Accepts both ES256 (Supabase OAuth access tokens, via JWKS) and HS256
+/// (email/password sessions, via the JWT secret).
+pub async fn require_user_id(headers: &HeaderMap, state: &AppState) -> Option<String> {
+    let claims = require_user_claims(headers, state).await?;
+    let sub = claims.get("sub")?.as_str()?;
+    if sub.is_empty() {
+        return None;
+    }
+    Some(sub.to_string())
+}
+
+/// Verify a Supabase ES256 access token against the project JWKS and return
+/// its `sub`. Uses the async client (safe in tokio handlers).
+#[allow(clippy::type_complexity)]
+async fn verify_jwks_claims(headers: &HeaderMap, state: &AppState) -> Option<serde_json::Value> {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static CACHE: OnceLock<std::sync::Mutex<Option<(String, Vec<serde_json::Value>, Instant)>>> =
+        OnceLock::new();
+
+    let auth = headers.get("Authorization").and_then(|v| v.to_str().ok())?;
+    let token = auth.strip_prefix("Bearer ")?;
+    let header = jsonwebtoken::decode_header(token).ok()?;
+    let kid = header.kid.as_deref()?;
+    let issuer = format!("{}/auth/v1", state.supabase_url.trim_end_matches('/'));
+    let jwks_url = format!("{}/.well-known/jwks.json", issuer);
+
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    {
+        let stale = {
+            let guard = cache.lock().ok()?;
+            match &*guard {
+                Some((url, _, at)) => {
+                    url != &jwks_url || at.elapsed() > Duration::from_secs(6 * 60 * 60)
+                }
+                None => true,
+            }
+        };
+        if stale {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .ok()?;
+            let resp = client.get(&jwks_url).send().await.ok()?;
+            let body: serde_json::Value = resp.json().await.ok()?;
+            let keys = body.get("keys")?.as_array()?.clone();
+            let mut guard = cache.lock().ok()?;
+            *guard = Some((jwks_url, keys, Instant::now()));
+        }
+    }
+    let guard = cache.lock().ok()?;
+    let (_, keys, _) = guard.as_ref()?;
+    let key = keys
+        .iter()
+        .find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(kid))?;
+    let x = key.get("x")?.as_str()?;
+    let y = key.get("y")?.as_str()?;
+    let pem = engine_ec_pem(x, y)?;
+
+    let decoding_key = jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes()).ok()?;
+    let validation = supabase_jwt_validation(jsonwebtoken::Algorithm::ES256, &issuer);
+    let data = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation).ok()?;
+    Some(data.claims)
+}
+
+/// Build an EC public-key PEM (SPKI) from base64url JWK x/y coordinates.
+fn engine_ec_pem(x: &str, y: &str) -> Option<String> {
+    use base64::Engine;
+    let xb = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(x)
+        .ok()?;
+    let yb = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(y)
+        .ok()?;
+    if xb.len() != 32 || yb.len() != 32 {
+        return None;
+    }
+    let alg_id = [
+        0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+    ];
+    let mut bit_string = vec![0x00];
+    bit_string.push(0x04);
+    bit_string.extend_from_slice(&xb);
+    bit_string.extend_from_slice(&yb);
+    let bit_len = bit_string.len();
+    let mut bit_tlv = vec![0x03];
+    bit_tlv.push(if bit_len < 128 {
+        bit_len as u8
+    } else {
+        return None;
+    });
+    bit_tlv.extend_from_slice(&bit_string);
+    let body_len = alg_id.len() + bit_tlv.len();
+    let mut spki = vec![0x30];
+    spki.push(if body_len < 128 {
+        body_len as u8
+    } else {
+        return None;
+    });
+    spki.extend_from_slice(&alg_id);
+    spki.extend_from_slice(&bit_tlv);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&spki);
+    Some(format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        b64.as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
+
 /// Decode and validate the Supabase JWT, returning its claims.
 fn get_user_claims(headers: &HeaderMap, state: &AppState) -> Option<serde_json::Value> {
     let auth = headers.get("Authorization").and_then(|v| v.to_str().ok());
@@ -264,9 +876,8 @@ fn get_user_claims(headers: &HeaderMap, state: &AppState) -> Option<serde_json::
     };
 
     let key = state.jwt_decoder.as_ref()?;
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    validation.set_issuer(&[&format!("{}/auth/v1", state.supabase_url)]);
-    validation.validate_exp = true;
+    let issuer = format!("{}/auth/v1", state.supabase_url.trim_end_matches('/'));
+    let validation = supabase_jwt_validation(jsonwebtoken::Algorithm::HS256, &issuer);
     match jsonwebtoken::decode::<serde_json::Value>(token, key, &validation) {
         Ok(data) => Some(data.claims),
         Err(e) => {
@@ -277,30 +888,144 @@ fn get_user_claims(headers: &HeaderMap, state: &AppState) -> Option<serde_json::
 }
 
 async fn get_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let user_id = get_user_id(&headers, &state);
-    let (email, provider) = match get_user_claims(&headers, &state) {
-        Some(claims) => (
-            claims
-                .get("email")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            claims
-                .get("app_metadata")
-                .and_then(|m| m.get("provider"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("email")
-                .to_string(),
-        ),
-        None => (String::new(), "demo".to_string()),
+    let Some(claims) = require_user_claims(&headers, &state).await else {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     };
-    let keys = state.keys.list_for_user(&user_id).await;
+    let Some(user_id) = claims.get("sub").and_then(|v| v.as_str()) else {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    };
+    let email = claims
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provider = claims
+        .get("app_metadata")
+        .and_then(|m| m.get("provider"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("email")
+        .to_string();
+    let keys = state.keys.list_for_user(user_id).await;
     Json(serde_json::json!({
         "user_id": user_id,
         "email": email,
         "provider": provider,
         "keys": keys.len(),
     }))
+    .into_response()
+}
+
+/// Interactive demo: run the WASM PII pipeline over the submitted text and
+/// return the redacted output. Uses the demo-user identity (no storage write);
+/// rate limited in the client (5 trials).
+#[derive(Deserialize, ToSchema)]
+struct DemoRedactRequest {
+    text: String,
+}
+
+async fn demo_redact(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DemoRedactRequest>,
+) -> impl IntoResponse {
+    if body.text.len() > 64 * 1024 {
+        return (StatusCode::BAD_REQUEST, "demo input must be <= 64KB").into_response();
+    }
+    // Run the engine's default pipeline (PII redaction). No public key, no
+    // stable key: this is the pure "detect + redact" path.
+    match state.gateway.process(
+        body.text.as_bytes(),
+        Format::Text,
+        "text/plain",
+        None,
+        None,
+        None,
+    ) {
+        Ok(out) => Json(serde_json::json!({
+            "redacted": String::from_utf8_lossy(&out.bytes),
+            "records_processed": out.records_processed,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("pipeline error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Demo store: persist a batch of demo records (shared join keys allowed) in
+/// the in-memory store under a fixed demo namespace. No auth — this is the
+/// landing-page "store raw data" step. The store is in-memory, so it resets on
+/// gateway restart.
+#[derive(Deserialize, ToSchema)]
+struct DemoStoreRequest {
+    records: Vec<serde_json::Value>,
+}
+
+async fn demo_store(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DemoStoreRequest>,
+) -> impl IntoResponse {
+    if body.records.is_empty() || body.records.len() > 10 {
+        return (StatusCode::BAD_REQUEST, "store 1-10 records").into_response();
+    }
+    for (i, record) in body.records.iter().enumerate() {
+        let data = serde_json::to_vec(record).unwrap_or_default();
+        state.store.put(
+            "__demo",
+            &format!("record-{}.json", i + 1),
+            data,
+            "application/json",
+        );
+    }
+    Json(serde_json::json!({ "stored": body.records.len(), "namespace": "__demo" })).into_response()
+}
+
+/// Demo read: fetch a stored demo record and return it in one of three modes.
+/// `mode`:
+/// - `raw`  -> the bytes at rest (as your app sees them)
+/// - `safe` -> x-s4-process: read (PII redacted)
+/// - `join` -> x-s4-process: read + x-s4-stable-fields: email (stable-encrypted,
+///   deterministic ciphertext, joinable)
+#[derive(Deserialize, ToSchema)]
+struct DemoReadQuery {
+    id: Option<u32>,      // 1-based record number; default 1
+    mode: Option<String>, // raw | safe | join
+}
+
+async fn demo_read(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DemoReadQuery>,
+) -> impl IntoResponse {
+    let id = q.id.unwrap_or(1);
+    let Some(obj) = state.store.get("__demo", &format!("record-{id}.json")) else {
+        return (StatusCode::NOT_FOUND, "no demo record stored yet").into_response();
+    };
+    let mode = q.mode.as_deref().unwrap_or("raw");
+    let mut headers = HeaderMap::new();
+    let auth = Auth {
+        user_id: "demo-user".to_string(),
+        public_key_pem: None,
+        stable_key: Some(derive_stable_key("demo-stable-secret")),
+    };
+    let bytes = match mode {
+        "join" => {
+            headers.insert("x-s4-process", "read".parse().unwrap());
+            headers.insert("x-s4-stable-fields", "email".parse().unwrap());
+            maybe_process_read(&state, &headers, &auth, &obj.content_type, obj.data)
+        }
+        "safe" => {
+            headers.insert("x-s4-process", "read".parse().unwrap());
+            maybe_process_read(&state, &headers, &auth, &obj.content_type, obj.data)
+        }
+        _ => obj.data,
+    };
+    Json(serde_json::json!({
+        "mode": mode,
+        "record": id,
+        "body": String::from_utf8_lossy(&bytes),
+    }))
+    .into_response()
 }
 
 fn s3_xml_ok(xml: String) -> axum::response::Response {
@@ -311,43 +1036,99 @@ fn s3_xml_ok(xml: String) -> axum::response::Response {
         .unwrap()
 }
 
-async fn s3_put(
-    State(state): State<Arc<AppState>>,
-    Path((bucket, key)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
-        return s3_error::access_denied(&key);
-    };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.user_id, RequestKind::Write)
-        .await
-    {
-        return s3_error::payment_required(&key, reason.message);
+/// Read-time pipeline: when the caller sets `x-s4-process: read` (or `true`),
+/// run the WASM pipeline over the fetched bytes before returning them. This is
+/// the "agents never see PII" path: the object at rest stays raw, and S4
+/// scrubs it on the way out to the caller. Used by AI agents that only need
+/// the safe projection of a dataset. Falls back to raw bytes on any pipeline
+/// error (logging it) so reads never break.
+fn maybe_process_read(
+    state: &AppState,
+    headers: &HeaderMap,
+    auth: &Auth,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> Vec<u8> {
+    let wants_process = headers
+        .get("x-s4-process")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("read") || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !wants_process {
+        return bytes;
     }
-    let uid = &auth.user_id;
-
-    let format = detect_format(&headers);
+    let format = detect_format(headers);
     let stable_fields = headers
         .get("x-s4-stable-fields")
         .and_then(|v| v.to_str().ok());
-    let output = match state.gateway.process(
-        &body,
+    // Joinable-read mode: when the caller asks for stable fields, run
+    // stable-encrypt instead of redaction so the join keys come back as
+    // deterministic ciphertext (AES-SIV). Skip the redaction filters —
+    // otherwise they redact the field before stable-encrypt can see it.
+    let skip: &[&str] = if stable_fields.is_some() {
+        &[
+            "pii-default",
+            "email-detect",
+            "ssn-detect",
+            "card-detect",
+            "pii-default.component",
+        ]
+    } else {
+        &[]
+    };
+    if let Some(plugins) = state.gateway.plugins.as_ref() {
+        match plugins
+            .process_all_with(
+                format,
+                content_type,
+                auth.public_key_pem.as_deref(),
+                auth.stable_key.as_deref(),
+                stable_fields,
+                std::slice::from_ref(&bytes),
+                skip,
+            )
+            .map(|mut out| out.pop().unwrap_or_default())
+        {
+            Ok(out) => return out,
+            Err(e) => warn!("read-time pipeline skipped ({e}); returning raw bytes"),
+        }
+    }
+    bytes
+}
+
+/// Run the filter pipeline over `body`.
+fn process_input(
+    state: &AppState,
+    headers: &HeaderMap,
+    auth: &Auth,
+    body: &[u8],
+) -> Result<crate::TransformOutput, s4_error::S4Error> {
+    let format = detect_format(headers);
+    let stable_fields = headers
+        .get("x-s4-stable-fields")
+        .and_then(|v| v.to_str().ok());
+    state.gateway.process(
+        body,
         format,
         "text/plain",
         auth.public_key_pem.as_deref(),
         auth.stable_key.as_deref(),
         stable_fields,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("filter failed for /{bucket}/{key}: {e}");
-            return s3_error::internal_error(&key, &e.to_string());
-        }
-    };
+    )
+}
 
+/// Store already-filtered bytes via the configured backend, following the same
+/// priority as a plain PUT (presigned URL header → S3 backend → service
+/// storage → in-memory).
+async fn store_processed(
+    state: &AppState,
+    auth: &Auth,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    output: crate::TransformOutput,
+    input_len: usize,
+) -> axum::response::Response {
     if let Some(backend_url) = headers
         .get("x-s4-backend-url")
         .and_then(|v| v.to_str().ok())
@@ -361,24 +1142,24 @@ async fn s3_put(
             Ok(_) => {
                 state
                     .control
-                    .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+                    .record(&auth.user_id, RequestKind::Write, input_len as u64)
                     .await;
                 info!(
                     "PUT /{bucket}/{key} -> presigned URL ({} records, user={})",
-                    output.records_processed, uid
+                    output.records_processed, auth.user_id
                 );
                 StatusCode::OK.into_response()
             }
             Err(e) => {
                 warn!("backend put failed: {e}");
-                s3_error::internal_error(&key, &e.to_string())
+                s3_error::internal_error(key, &e.to_string())
             }
         }
-    } else if let Some(s3) = get_user_s3_client(&state, uid).await {
+    } else if let Some(s3) = get_user_s3_client(state, &auth.user_id).await {
         match s3
             .put_object()
-            .bucket(&bucket)
-            .key(&key)
+            .bucket(bucket)
+            .key(key)
             .body(ByteStream::from(output.bytes))
             .send()
             .await
@@ -386,24 +1167,24 @@ async fn s3_put(
             Ok(_) => {
                 state
                     .control
-                    .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+                    .record(&auth.user_id, RequestKind::Write, input_len as u64)
                     .await;
                 info!(
                     "PUT /{bucket}/{key} -> S3 ({} records, user={})",
-                    output.records_processed, uid
+                    output.records_processed, auth.user_id
                 );
                 StatusCode::OK.into_response()
             }
             Err(e) => {
                 warn!("upstream put failed: {e}");
-                s3_error::internal_error(&key, &e.to_string())
+                s3_error::internal_error(key, &e.to_string())
             }
         }
     } else if !state.service_storage.is_empty() {
         match state
             .service_storage
             .put(
-                &format!("{}/{}/{}", uid, bucket, key),
+                &format!("{}/{bucket}/{key}", auth.user_id),
                 output.bytes.to_vec(),
                 "text/plain",
             )
@@ -412,30 +1193,30 @@ async fn s3_put(
             Ok(()) => {
                 state
                     .control
-                    .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+                    .record(&auth.user_id, RequestKind::Write, input_len as u64)
                     .await;
                 info!(
                     "PUT /{bucket}/{key} -> service storage ({} records, user={})",
-                    output.records_processed, uid
+                    output.records_processed, auth.user_id
                 );
                 StatusCode::OK.into_response()
             }
             Err(e) => {
                 warn!("service storage put failed: {e}");
-                s3_error::internal_error(&key, &e.to_string())
+                s3_error::internal_error(key, &e.to_string())
             }
         }
     } else {
         state
             .control
-            .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+            .record(&auth.user_id, RequestKind::Write, input_len as u64)
             .await;
-        let obj = state.store.put(&bucket, &key, output.bytes, "text/plain");
+        let obj = state.store.put(bucket, key, output.bytes, "text/plain");
         info!(
             "PUT /{bucket}/{key} -> memory ({} records, {} bytes, user={})",
             output.records_processed,
             obj.data.len(),
-            uid
+            auth.user_id
         );
         let mut resp = axum::response::Response::builder().status(StatusCode::OK);
         resp = resp.header("ETag", &obj.etag);
@@ -443,12 +1224,65 @@ async fn s3_put(
     }
 }
 
+async fn s3_put(
+    State(state): State<Arc<AppState>>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<S3Query>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let Some(auth) =
+        authenticate(method.as_str(), &uri, &headers, &body, &state.keys, &state).await
+    else {
+        return s3_error::access_denied(&key);
+    };
+    if let Some(reason) = state
+        .control
+        .authorize(&auth.user_id, RequestKind::Write)
+        .await
+    {
+        return s3_error::payment_required(&key, reason.message);
+    }
+
+    // UploadPart (multipart): store the raw part, filter at Complete time.
+    if let (Some(part_number), Some(upload_id)) = (params.part_number, params.upload_id.as_deref())
+    {
+        state
+            .control
+            .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+            .await;
+        return match mp_put_part(&state, upload_id, part_number, &body) {
+            Some(etag) => {
+                let mut resp = axum::response::Response::builder().status(StatusCode::OK);
+                resp = resp.header("ETag", etag);
+                resp.body(axum::body::Body::empty()).unwrap()
+            }
+            None => s3_error::no_such_upload(&key),
+        };
+    }
+
+    let output = match process_input(&state, &headers, &auth, &body) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("filter failed for /{bucket}/{key}: {e}");
+            return s3_error::internal_error(&key, &e.to_string());
+        }
+    };
+    store_processed(&state, &auth, &bucket, &key, &headers, output, body.len()).await
+}
+
 async fn s3_get(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<S3Query>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
+    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
+    else {
         return s3_error::access_denied(&key);
     };
     if let Some(reason) = state
@@ -457,6 +1291,11 @@ async fn s3_get(
         .await
     {
         return s3_error::payment_required(&key, reason.message);
+    }
+
+    // ListParts (multipart)
+    if let Some(upload_id) = params.upload_id.as_deref() {
+        return s3_list_parts(&state, &bucket, &key, upload_id);
     }
 
     if let Some(backend_url) = headers
@@ -473,13 +1312,14 @@ async fn s3_get(
                 let ct = resp
                     .headers()
                     .get("content-type")
-                    .map(|v| v.to_str().unwrap_or("application/octet-stream").to_string());
+                    .map(|v| v.to_str().unwrap_or("application/octet-stream").to_string())
+                    .unwrap_or_else(|| "text/plain".to_string());
                 let body_bytes = resp.bytes().await.unwrap_or_default();
+                let body_bytes =
+                    maybe_process_read(&state, &headers, &auth, &ct, body_bytes.to_vec());
                 let mut builder = axum::response::Response::builder()
                     .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
-                if let Some(ct_val) = ct {
-                    builder = builder.header("Content-Type", ct_val);
-                }
+                builder = builder.header("Content-Type", &ct);
                 builder = builder.header("Content-Length", body_bytes.len().to_string());
                 builder.body(axum::body::Body::from(body_bytes)).unwrap()
             }
@@ -503,16 +1343,18 @@ async fn s3_get(
                             .record(&auth.user_id, RequestKind::Read, 0)
                             .await;
                         let bytes = bytes.into_bytes();
+                        let ct = output
+                            .content_type
+                            .clone()
+                            .unwrap_or_else(|| "text/plain".to_string());
+                        let bytes =
+                            maybe_process_read(&state, &headers, &auth, &ct, bytes.to_vec());
                         let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                         if let Some(etag) = output.e_tag.as_deref() {
                             resp = resp.header("ETag", etag);
                         }
-                        if let Some(ct) = output.content_type.as_deref() {
-                            resp = resp.header("Content-Type", ct);
-                        }
-                        if let Some(cl) = output.content_length {
-                            resp = resp.header("Content-Length", cl.to_string());
-                        }
+                        resp = resp.header("Content-Type", &ct);
+                        resp = resp.header("Content-Length", bytes.len().to_string());
                         resp.body(axum::body::Body::from(bytes)).unwrap()
                     }
                     Err(e) => s3_error::internal_error(&key, &e.to_string()),
@@ -529,7 +1371,7 @@ async fn s3_get(
     } else if !state.service_storage.is_empty() {
         match state
             .service_storage
-            .get(&format!("{}/{}/{}", auth.user_id, bucket, key))
+            .get(&format!("{}/{bucket}/{key}", auth.user_id))
             .await
         {
             Some((data, content_type)) => {
@@ -537,6 +1379,7 @@ async fn s3_get(
                     .control
                     .record(&auth.user_id, RequestKind::Read, 0)
                     .await;
+                let data = maybe_process_read(&state, &headers, &auth, &content_type, data);
                 let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                 resp = resp.header("Content-Type", content_type);
                 resp = resp.header("Content-Length", data.len().to_string());
@@ -551,11 +1394,12 @@ async fn s3_get(
                     .control
                     .record(&auth.user_id, RequestKind::Read, 0)
                     .await;
+                let data = maybe_process_read(&state, &headers, &auth, &obj.content_type, obj.data);
                 let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                 resp = resp.header("ETag", &obj.etag);
                 resp = resp.header("Content-Type", &obj.content_type);
-                resp = resp.header("Content-Length", obj.data.len().to_string());
-                resp.body(axum::body::Body::from(obj.data)).unwrap()
+                resp = resp.header("Content-Length", data.len().to_string());
+                resp.body(axum::body::Body::from(data)).unwrap()
             }
             None => s3_error::no_such_key(&key),
         }
@@ -565,9 +1409,12 @@ async fn s3_get(
 async fn s3_head(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
+    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
+    else {
         return s3_error::access_denied(&key);
     };
     if let Some(reason) = state
@@ -626,9 +1473,13 @@ async fn s3_head(
 async fn s3_delete(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<S3Query>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
+    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
+    else {
         return s3_error::access_denied(&key);
     };
     if let Some(reason) = state
@@ -639,6 +1490,14 @@ async fn s3_delete(
         return s3_error::payment_required(&key, reason.message);
     }
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
+
+    // AbortMultipartUpload
+    if let Some(upload_id) = params.upload_id.as_deref() {
+        if mp_abort(&state, upload_id) {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        return s3_error::no_such_upload(&key);
+    }
 
     if let Some(ref s3) = state.s3_client {
         match s3.delete_object().bucket(&bucket).key(&key).send().await {
@@ -665,10 +1524,14 @@ async fn s3_post(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<S3Query>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let Some(auth) = authenticate(&headers, &state.keys, &state).await else {
+    let Some(auth) =
+        authenticate(method.as_str(), &uri, &headers, &body, &state.keys, &state).await
+    else {
         return s3_error::access_denied(&key);
     };
     if let Some(reason) = state
@@ -683,38 +1546,457 @@ async fn s3_post(
     if params.uploads.is_some() {
         state
             .control
-            .record(&auth.user_id, RequestKind::Write, body.len() as u64)
+            .record(&auth.user_id, RequestKind::Write, 0)
             .await;
-        return s3_mp_create(&bucket, &key).await;
+        return s3_mp_create(&state, &bucket, &key).await;
     }
-    if params.upload_id.is_some() {
-        state
-            .control
-            .record(&auth.user_id, RequestKind::Write, body.len() as u64)
-            .await;
-        return s3_mp_complete(&bucket, &key, &params, body).await;
+    if let Some(upload_id) = params.upload_id.as_deref() {
+        return s3_mp_complete(&state, &auth, &bucket, &key, &headers, upload_id, &body).await;
     }
     s3_error::not_implemented(&key)
 }
 
-async fn s3_mp_create(bucket: &str, key: &str) -> axum::response::Response {
-    let upload_id = uuid::Uuid::new_v4().to_string();
+async fn s3_mp_create(state: &AppState, bucket: &str, key: &str) -> axum::response::Response {
+    let upload_id = mp_init(state, bucket, key);
     let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>{bucket}</Bucket><Key>{key}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"#
+        r#"<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>"#,
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(&upload_id)
     );
     s3_xml_ok(xml)
 }
 
 async fn s3_mp_complete(
-    bucket: &str,
+    state: &AppState,
+    auth: &Auth,
+    _bucket: &str,
     key: &str,
-    _params: &S3Query,
-    _body: axum::body::Bytes,
+    headers: &HeaderMap,
+    upload_id: &str,
+    body: &[u8],
 ) -> axum::response::Response {
+    let Some(part_numbers) = parse_complete_xml(body) else {
+        return s3_error::invalid_part(key, "malformed CompleteMultipartUpload XML");
+    };
+    let (bucket, key, data) = match mp_complete(state, upload_id, &part_numbers) {
+        Ok(ok) => ok,
+        Err(CompleteError::NoSuchUpload) => return s3_error::no_such_upload(key),
+        Err(CompleteError::InvalidPart) => {
+            return s3_error::invalid_part(
+                key,
+                "one or more of the specified parts could not be found",
+            );
+        }
+        Err(CompleteError::InvalidPartOrder) => return s3_error::invalid_part_order(key),
+        Err(CompleteError::PartTooSmall(n)) => {
+            return s3_error::invalid_part(
+                key,
+                &format!(
+                    "all parts except the last must be at least 5 MiB (part {n} is too small)"
+                ),
+            );
+        }
+    };
+
+    let output = match process_input(state, headers, auth, &data) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("filter failed for multipart complete /{bucket}/{key}: {e}");
+            return s3_error::internal_error(&key, &e.to_string());
+        }
+    };
+    let etag = format!("\"{:x}\"", Md5::digest(&output.bytes));
+    let input_len = data.len();
+    let resp = store_processed(state, auth, &bucket, &key, headers, output, input_len).await;
+    if resp.status() != StatusCode::OK {
+        return resp;
+    }
     let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Bucket>{bucket}</Bucket><Key>{key}</Key></CompleteMultipartUploadResult>"#
+        r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>"#,
+        xml_escape(&bucket),
+        xml_escape(&key),
+        xml_escape(&etag)
     );
     s3_xml_ok(xml)
+}
+
+fn s3_list_parts(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> axum::response::Response {
+    match mp_list_parts(state, upload_id) {
+        Some((_, _, parts)) => {
+            let mut xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><StorageClass>STANDARD</StorageClass><IsTruncated>false</IsTruncated><MaxParts>1000</MaxParts>"#,
+                xml_escape(bucket),
+                xml_escape(key),
+                xml_escape(upload_id)
+            );
+            for (n, size, etag) in parts {
+                xml.push_str(&format!(
+                    "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag><Size>{size}</Size></Part>"
+                ));
+            }
+            xml.push_str("</ListPartsResult>");
+            s3_xml_ok(xml)
+        }
+        None => s3_error::no_such_upload(key),
+    }
+}
+
+/// ListObjectsV2/ListObjectsV1 — `GET /{bucket}`.
+async fn s3_list_objects(
+    State(state): State<Arc<AppState>>,
+    Path(bucket): Path<String>,
+    Query(params): Query<S3Query>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
+    else {
+        return s3_error::access_denied(&bucket);
+    };
+    if let Some(reason) = state
+        .control
+        .authorize(&auth.user_id, RequestKind::Read)
+        .await
+    {
+        return s3_error::payment_required(&bucket, reason.message);
+    }
+
+    // Prefer a configured S3 backend, then the in-memory store.
+    let mut client = state.s3_client.clone();
+    if client.is_none() {
+        client = get_user_s3_client(&state, &auth.user_id).await;
+    }
+    if let Some(s3) = client {
+        return match list_from_s3(&s3, &bucket, &params).await {
+            Ok(xml) => s3_xml_ok(xml),
+            Err(e) => {
+                warn!("list from S3 backend failed for {bucket}: {e}");
+                s3_error::internal_error(&bucket, &e.to_string())
+            }
+        };
+    }
+    if !state.service_storage.is_empty() {
+        warn!(
+            "listing is not supported against service storage; returning an empty page for {bucket}"
+        );
+    }
+    s3_xml_ok(list_from_memory(&state, &bucket, &params))
+}
+
+/// Forward a ListObjectsV2 request to an S3 backend.
+async fn list_from_s3(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Result<String> {
+    let mut req = s3.list_objects_v2().bucket(bucket);
+    if let Some(p) = params.prefix.as_deref() {
+        req = req.prefix(p);
+    }
+    if let Some(d) = params.delimiter.as_deref() {
+        req = req.delimiter(d);
+    }
+    if let Some(t) = params.continuation_token.as_deref() {
+        req = req.continuation_token(t);
+    }
+    if let Some(s) = params.start_after.as_deref() {
+        req = req.start_after(s);
+    }
+    if let Some(m) = params.max_keys {
+        req = req.max_keys(m.min(1000) as i32);
+    }
+    let out = req.send().await?;
+
+    let encoding = params.encoding_type.as_deref() == Some("url");
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    );
+    xml.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
+    xml.push_str(&format!(
+        "<Prefix>{}</Prefix>",
+        xml_escape(params.prefix.as_deref().unwrap_or(""))
+    ));
+    if let Some(d) = params.delimiter.as_deref() {
+        xml.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+    }
+    xml.push_str(&format!(
+        "<KeyCount>{}</KeyCount>",
+        out.key_count().unwrap_or(0)
+    ));
+    xml.push_str(&format!(
+        "<MaxKeys>{}</MaxKeys>",
+        out.max_keys().unwrap_or(1000)
+    ));
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        out.is_truncated().unwrap_or(false)
+    ));
+    if let Some(token) = out.continuation_token() {
+        xml.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            xml_escape(token)
+        ));
+    }
+    if let Some(token) = out.next_continuation_token() {
+        xml.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            xml_escape(token)
+        ));
+    }
+    if let Some(start) = params.start_after.as_deref() {
+        xml.push_str(&format!("<StartAfter>{}</StartAfter>", xml_escape(start)));
+    }
+    for c in out.contents().iter() {
+        let k = c.key().unwrap_or_default();
+        let display = if encoding {
+            url_encode(k)
+        } else {
+            k.to_string()
+        };
+        let etag = c.e_tag().unwrap_or_default();
+        let size = c.size().unwrap_or(0);
+        let lm = c.last_modified().map(|d| d.to_string()).unwrap_or_default();
+        xml.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>{lm}</LastModified><ETag>{}</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            xml_escape(&display),
+            xml_escape(etag)
+        ));
+    }
+    for cp in out.common_prefixes() {
+        if let Some(p) = cp.prefix() {
+            let display = if encoding {
+                url_encode(p)
+            } else {
+                p.to_string()
+            };
+            xml.push_str(&format!(
+                "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+                xml_escape(&display)
+            ));
+        }
+    }
+    xml.push_str("</ListBucketResult>");
+    Ok(xml)
+}
+
+/// ListObjectsV2 against the in-memory store.
+fn list_from_memory(state: &AppState, bucket: &str, params: &S3Query) -> String {
+    let prefix = params.prefix.as_deref().unwrap_or("");
+    let delimiter = params.delimiter.as_deref();
+    let max_keys = params.max_keys.unwrap_or(1000).min(1000) as usize;
+    let encoding = params.encoding_type.as_deref() == Some("url");
+    let resume_after = params
+        .continuation_token
+        .as_deref()
+        .or(params.start_after.as_deref())
+        .or(params.marker.as_deref());
+
+    let bucket_prefix = format!("{bucket}/");
+    let mut keys: Vec<String> = state
+        .store
+        .list_keys()
+        .into_iter()
+        .filter_map(|full| full.strip_prefix(&bucket_prefix).map(|k| k.to_string()))
+        .filter(|k| k.starts_with(prefix))
+        .collect();
+    keys.sort();
+    keys.retain(|k| match resume_after {
+        Some(t) => k.as_str() > t,
+        None => true,
+    });
+
+    enum Output {
+        Content((String, String, u64)),
+        Common(String),
+    }
+    let mut outputs: Vec<Output> = Vec::new();
+    let mut prev_common: Option<String> = None;
+    for k in keys {
+        if let Some(delim) = delimiter.filter(|d| !d.is_empty())
+            && let Some(rel) = k.strip_prefix(prefix)
+            && let Some(idx) = rel.find(delim)
+        {
+            let cp = format!("{prefix}{}", &rel[..=idx]);
+            if prev_common.as_deref() != Some(cp.as_str()) {
+                prev_common = Some(cp.clone());
+                outputs.push(Output::Common(cp));
+            }
+            continue;
+        }
+        prev_common = None;
+        let obj = state.store.get(bucket, &k);
+        let (etag, size) = obj
+            .map(|o| (o.etag, o.data.len() as u64))
+            .unwrap_or_default();
+        outputs.push(Output::Content((k, etag, size)));
+    }
+
+    let mut contents: Vec<(String, String, u64)> = Vec::new();
+    let mut commons: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+    for out in outputs.iter().take(max_keys) {
+        match out {
+            Output::Content(entry) => contents.push(entry.clone()),
+            Output::Common(cp) => commons.push(cp.clone()),
+        }
+        seen += 1;
+    }
+    let truncated = outputs.len() > seen;
+    let next_token = if truncated {
+        outputs.get(seen - 1).map(|out| match out {
+            Output::Content((k, _, _)) => k.clone(),
+            Output::Common(cp) => cp.clone(),
+        })
+    } else {
+        None
+    };
+
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    );
+    xml.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
+    xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
+    if let Some(d) = delimiter {
+        xml.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+    }
+    let is_v2 = params.list_type.as_deref() == Some("2");
+    xml.push_str(&format!(
+        "<KeyCount>{}</KeyCount>",
+        contents.len() + commons.len()
+    ));
+    xml.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if let Some(t) = resume_after {
+        let elem = if is_v2 {
+            format!("<ContinuationToken>{}</ContinuationToken>", xml_escape(t))
+        } else {
+            format!("<Marker>{}</Marker>", xml_escape(t))
+        };
+        xml.push_str(&elem);
+    }
+    if let Some(t) = next_token {
+        let elem = if is_v2 {
+            format!(
+                "<NextContinuationToken>{}</NextContinuationToken>",
+                xml_escape(&t)
+            )
+        } else {
+            format!("<NextMarker>{}</NextMarker>", xml_escape(&t))
+        };
+        xml.push_str(&elem);
+    }
+    for (k, etag, size) in &contents {
+        let display = if encoding { url_encode(k) } else { k.clone() };
+        xml.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>1970-01-01T00:00:00.000Z</LastModified><ETag>{}</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            xml_escape(&display),
+            xml_escape(etag)
+        ));
+    }
+    for cp in &commons {
+        let display = if encoding { url_encode(cp) } else { cp.clone() };
+        xml.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            xml_escape(&display)
+        ));
+    }
+    xml.push_str("</ListBucketResult>");
+    xml
+}
+
+/// `GET /` — serve the dashboard to browsers, ListBuckets to S3 clients.
+async fn root(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let is_s3 = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.starts_with("AWS4-"))
+        .unwrap_or(false)
+        || headers.contains_key("x-s4-access-key");
+    if !is_s3 {
+        return Html(dashboard_html()).into_response();
+    }
+    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
+    else {
+        return s3_error::access_denied("").into_response();
+    };
+    match list_buckets(&state, &auth).await {
+        Ok(xml) => s3_xml_ok(xml).into_response(),
+        Err(e) => s3_error::internal_error("", &e.to_string()).into_response(),
+    }
+}
+
+async fn list_buckets(state: &AppState, auth: &Auth) -> anyhow::Result<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(s3) = get_user_s3_client(state, &auth.user_id).await {
+        let out = s3.list_buckets().send().await?;
+        for b in out.buckets().iter() {
+            if let Some(n) = b.name() {
+                names.push(n.to_string());
+            }
+        }
+    } else {
+        let mut set = std::collections::BTreeSet::new();
+        for full in state.store.list_keys() {
+            if let Some((b, _)) = full.split_once('/') {
+                set.insert(b.to_string());
+            }
+        }
+        names.extend(set);
+    }
+    names.sort();
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>s4</ID><DisplayName>s4</DisplayName></Owner><Buckets>"#,
+    );
+    for n in names {
+        xml.push_str(&format!(
+            "<Bucket><Name>{}</Name><CreationDate>1970-01-01T00:00:00.000Z</CreationDate></Bucket>",
+            xml_escape(&n)
+        ));
+    }
+    xml.push_str("</Buckets></ListAllMyBucketsResult>");
+    Ok(xml)
+}
+
+/// CreateBucket is not allowed — buckets map to configured backends.
+async fn s3_bucket_put(
+    State(state): State<Arc<AppState>>,
+    Path(bucket): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state)
+        .await
+        .is_none()
+    {
+        return s3_error::access_denied(&bucket);
+    }
+    s3_error::bucket_not_allowed(&bucket)
+}
+
+/// DeleteBucket is not allowed for the same reason as CreateBucket.
+async fn s3_bucket_delete(
+    State(state): State<Arc<AppState>>,
+    Path(bucket): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state)
+        .await
+        .is_none()
+    {
+        return s3_error::access_denied(&bucket);
+    }
+    s3_error::bucket_not_allowed(&bucket)
 }
 
 fn dashboard_html() -> String {
@@ -764,8 +2046,13 @@ async fn health() -> impl IntoResponse {
     responses((status = 200, description = "API keys", body = Vec<ListKeyResponse>)),
     tag = "keys"
 )]
-async fn get_keys(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let uid = get_user_id(&headers, &state);
+async fn get_keys(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let Some(uid) = require_user_id(&headers, &state).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let keys = state.keys.list_for_user(&uid).await;
     let resp: Vec<ListKeyResponse> = keys
         .into_iter()
@@ -777,7 +2064,7 @@ async fn get_keys(State(state): State<Arc<AppState>>, headers: HeaderMap) -> imp
             public_key_pem: k.public_key_pem,
         })
         .collect();
-    Json(resp)
+    Json(resp).into_response()
 }
 
 /// Create a new API key
@@ -793,7 +2080,9 @@ async fn create_key(
     headers: HeaderMap,
     Json(body): Json<CreateKeyRequest>,
 ) -> impl IntoResponse {
-    let uid = get_user_id(&headers, &state);
+    let Some(uid) = require_user_id(&headers, &state).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let (key_id, secret) = state
         .keys
         .create_key(&uid, &body.label, body.expires_in, body.public_key_pem)
@@ -812,6 +2101,7 @@ async fn create_key(
         expires_at,
         public_key_pem,
     })
+    .into_response()
 }
 
 /// Revoke an API key
@@ -827,7 +2117,9 @@ async fn delete_key(
     headers: HeaderMap,
     Json(body): Json<DeleteKeyRequest>,
 ) -> impl IntoResponse {
-    let uid = get_user_id(&headers, &state);
+    let Some(uid) = require_user_id(&headers, &state).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     if state.keys.delete_key(&body.key_id, &uid).await {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -835,8 +2127,102 @@ async fn delete_key(
     }
 }
 
-async fn get_backend(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let uid = get_user_id(&headers, &state);
+/// List MCP bearer tokens for the authenticated user (hashes only).
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/mcp-tokens",
+    responses((status = 200, description = "MCP tokens", body = Vec<McpTokenResponse>)),
+    tag = "mcp"
+)]
+async fn get_mcp_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let Some(uid) = require_user_id(&headers, &state).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let tokens = state.keys.list_mcp_tokens(&uid).await;
+    let resp: Vec<McpTokenResponse> = tokens
+        .into_iter()
+        .map(|t| McpTokenResponse {
+            token_hash: t.token_hash,
+            label: t.label,
+            created_at: t.created_at,
+            expires_at: t.expires_at,
+        })
+        .collect();
+    Json(resp).into_response()
+}
+
+/// Create an MCP bearer token (`s4m_...`). The plaintext token is returned
+/// once and only its hash is stored.
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/mcp-tokens",
+    request_body = CreateMcpTokenRequest,
+    responses((status = 200, description = "Created MCP token", body = McpTokenCreatedResponse)),
+    tag = "mcp"
+)]
+async fn create_mcp_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateMcpTokenRequest>,
+) -> impl IntoResponse {
+    let Some(uid) = require_user_id(&headers, &state).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let token = state
+        .keys
+        .create_mcp_token(&uid, &body.label, body.expires_in)
+        .await;
+    let hash = sha256_hash(&token);
+    let created_at = state
+        .keys
+        .list_mcp_tokens(&uid)
+        .await
+        .into_iter()
+        .find(|t| t.token_hash == hash)
+        .map(|t| t.created_at)
+        .unwrap_or_default();
+    Json(McpTokenCreatedResponse {
+        token,
+        label: body.label,
+        created_at,
+        expires_at: None,
+    })
+    .into_response()
+}
+
+/// Revoke an MCP bearer token.
+#[utoipa::path(
+    delete,
+    path = "/dashboard/api/mcp-tokens",
+    request_body = DeleteMcpTokenRequest,
+    responses((status = 204, description = "Token revoked"), (status = 404, description = "Token not found")),
+    tag = "mcp"
+)]
+async fn delete_mcp_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteMcpTokenRequest>,
+) -> impl IntoResponse {
+    let Some(uid) = require_user_id(&headers, &state).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if state.keys.delete_mcp_token(&body.token_hash, &uid).await {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "token not found").into_response()
+    }
+}
+
+async fn get_backend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let Some(uid) = require_user_id(&headers, &state).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let config = state.backends.get(&uid).unwrap_or(BackendConfig {
         backend_type: String::new(),
         role_arn: String::new(),
@@ -846,7 +2232,7 @@ async fn get_backend(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         secret_key: String::new(),
         region: String::new(),
     });
-    Json(config)
+    Json(config).into_response()
 }
 
 async fn put_backend(
@@ -1002,9 +2388,14 @@ fn component_path() -> PathBuf {
 }
 
 /// Build the engine state from environment variables, injecting the given
-/// control plane. This is the shared construction path for both the OSS
-/// self-host binary (`NoopControlPlane`) and the private SaaS control plane.
-pub async fn build_state(control: Arc<dyn ControlPlane>) -> anyhow::Result<Arc<AppState>> {
+/// control plane and key-wrapping backend. This is the shared construction
+/// path for both the OSS self-host binary (`NoopControlPlane` +
+/// [`crate::key_cipher::default_wrapping`]) and the private SaaS control
+/// plane (KMS/Vault-backed wrapping).
+pub async fn build_state(
+    control: Arc<dyn ControlPlane>,
+    wrapping: Arc<dyn KeyWrapping>,
+) -> anyhow::Result<Arc<AppState>> {
     let s3_endpoint = std::env::var("S3_ENDPOINT").ok();
 
     let component_bytes = std::fs::read(component_path())?;
@@ -1028,16 +2419,41 @@ pub async fn build_state(control: Arc<dyn ControlPlane>) -> anyhow::Result<Arc<A
 
     let gateway = Gateway::with_registry(engine, plugins.clone());
 
+    // Envelope encryption for API key secrets (needed to verify SigV4).
+    // The wrapping backend is injected by the caller so the engine stays
+    // policy-free: OSS uses `default_wrapping()`, SaaS injects KMS/Vault.
+    let cipher = Arc::new(SecretCipher::new(wrapping));
+
     let s3_client = match &s3_endpoint {
         Some(endpoint) => {
-            let creds = Credentials::new("minioadmin", "minioadmin", None, None, "static");
-            let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .endpoint_url(endpoint)
-                .credentials_provider(creds)
-                .load()
-                .await;
-            Some(Client::new(&config))
+            let access_key = std::env::var("S3_ACCESS_KEY_ID")
+                .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+                .ok();
+            let secret_key = std::env::var("S3_SECRET_ACCESS_KEY")
+                .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+                .ok();
+            let region = std::env::var("S3_REGION")
+                .or_else(|_| std::env::var("AWS_REGION"))
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_string());
+            match (access_key, secret_key) {
+                (Some(ak), Some(sk)) => {
+                    let creds = Credentials::new(ak, sk, None, None, "env");
+                    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                        .region(Region::new(region))
+                        .endpoint_url(endpoint)
+                        .credentials_provider(creds)
+                        .load()
+                        .await;
+                    Some(Client::new(&config))
+                }
+                _ => {
+                    warn!(
+                        "S3_ENDPOINT is set but S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY are missing; falling back to in-memory storage"
+                    );
+                    None
+                }
+            }
         }
         None => None,
     };
@@ -1076,18 +2492,37 @@ pub async fn build_state(control: Arc<dyn ControlPlane>) -> anyhow::Result<Arc<A
         migrator.set_ignore_missing(true);
         migrator.run(&pool).await.expect("failed to run migrations");
         info!("Key store: Postgres (migrations applied)");
-        Arc::new(PostgresKeyStore::new(pool))
+        Arc::new(PostgresKeyStore::with_cipher(pool, cipher.clone()))
     } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
         info!("Key store: file ({keys_file})");
-        Arc::new(FileKeyStore::new(PathBuf::from(keys_file)))
+        Arc::new(FileKeyStore::with_cipher(
+            PathBuf::from(keys_file),
+            cipher.clone(),
+        ))
     } else if auth_disabled {
         let path = FileKeyStore::default_path();
         info!("Key store: file ({}) (local mode)", path.display());
-        Arc::new(FileKeyStore::new(path))
+        Arc::new(FileKeyStore::with_cipher(path, cipher))
     } else {
         info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
-        Arc::new(KeyStore::new())
+        Arc::new(KeyStore::with_cipher(cipher))
     };
+
+    // Local mode: ensure a demo key exists and print it so SDK demos and
+    // `aws s3 --endpoint-url` work out of the box.
+    if auth_disabled {
+        let existing = keys.list_for_user("demo-user").await;
+        if existing.is_empty() {
+            let (key_id, secret) = keys.create_key("demo-user", "local-default", 0, None).await;
+            println!("S4_ACCESS_KEY={key_id}");
+            println!("S4_SECRET_KEY={secret}");
+        } else if let Some(k) = existing.into_iter().find(|k| k.label == "local-default")
+            && let Some(secret) = keys.decrypt_secret(&k.key_id).await
+        {
+            println!("S4_ACCESS_KEY={}", k.key_id);
+            println!("S4_SECRET_KEY={secret}");
+        }
+    }
 
     Ok(Arc::new(AppState {
         gateway: Arc::new(gateway),
@@ -1101,6 +2536,7 @@ pub async fn build_state(control: Arc<dyn ControlPlane>) -> anyhow::Result<Arc<A
         jwt_decoder,
         auth_disabled,
         control,
+        multipart: Arc::new(Mutex::new(HashMap::new())),
     }))
 }
 
@@ -1109,12 +2545,18 @@ pub async fn build_state(control: Arc<dyn ControlPlane>) -> anyhow::Result<Arc<A
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/", get(|| async { Html(dashboard_html()) }))
+        .route("/", get(root))
         .route("/dashboard/api/keys", get(get_keys))
         .route("/dashboard/api/keys", post(create_key))
         .route("/dashboard/api/keys", delete(delete_key))
         .route("/dashboard/api/keys/public-key", put(set_public_key))
+        .route("/dashboard/api/mcp-tokens", get(get_mcp_tokens))
+        .route("/dashboard/api/mcp-tokens", post(create_mcp_token))
+        .route("/dashboard/api/mcp-tokens", delete(delete_mcp_token))
         .route("/dashboard/api/me", get(get_me))
+        .route("/dashboard/api/demo/redact", post(demo_redact))
+        .route("/dashboard/api/demo/store", post(demo_store))
+        .route("/dashboard/api/demo/read", get(demo_read))
         .route("/dashboard/api/backend", get(get_backend))
         .route("/dashboard/api/backend", put(put_backend))
         .route("/dashboard/api/plugins", get(get_plugins))
@@ -1123,12 +2565,52 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/dashboard/api/plugins/{id}", put(update_plugin))
         .route("/dashboard/api/plugins/{id}", delete(delete_plugin))
         .route("/dashboard/api/objects", get(list_objects))
-        .route("/{bucket}/{*key}", put(s3_put))
+        .route("/{bucket}", get(s3_list_objects))
+        .route("/{bucket}", put(s3_bucket_put))
+        .route("/{bucket}", delete(s3_bucket_delete))
+        .route(
+            "/{bucket}/{*key}",
+            put(s3_put).layer(DefaultBodyLimit::max(S3_MAX_PUT_BYTES)),
+        )
         .route("/{bucket}/{*key}", get(s3_get))
         .route("/{bucket}/{*key}", head(s3_head))
         .route("/{bucket}/{*key}", delete(s3_delete))
-        .route("/{bucket}/{*key}", post(s3_post))
+        .route(
+            "/{bucket}/{*key}",
+            post(s3_post).layer(DefaultBodyLimit::max(S3_MAX_PUT_BYTES)),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::supabase_jwt_validation;
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, decode, encode};
+
+    #[test]
+    fn accepts_supabase_authenticated_audience() {
+        let secret = b"test-secret";
+        let issuer = "https://example.supabase.co/auth/v1";
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "iss": issuer,
+            "aud": "authenticated",
+            "exp": u64::MAX,
+        });
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .expect("encode token");
+        let validation = supabase_jwt_validation(Algorithm::HS256, issuer);
+
+        let decoded =
+            decode::<serde_json::Value>(&token, &DecodingKey::from_secret(secret), &validation)
+                .expect("valid Supabase token");
+
+        assert_eq!(decoded.claims["sub"], "user-123");
+    }
 }

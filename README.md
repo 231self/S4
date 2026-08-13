@@ -16,6 +16,9 @@ compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-i
 - **Any S3-compatible storage** — MinIO, AWS S3, Google Cloud Storage, Backblaze B2,
   Cloudflare R2, Vultr Object Storage — single or multi-cloud (consistent-hash ring,
   dual-write, read fail-over).
+- **Agent-safe reads** — read data through S4 with `x-s4-process: read`: the pipeline
+  runs on the way *out*, so AI agents get redacted/encrypted output while the object
+  at rest stays raw. No second cleaned copy to keep in sync.
 - **Optional auth** — run with auth disabled locally, or enable API keys (in-memory,
   a JSON file, or Postgres).
 - **Typed SDKs** — generated Python and TypeScript clients, published with every release.
@@ -87,6 +90,25 @@ s4ctl put ./data.csv ingest/data.csv --bucket s4-local
 # End-to-end validation:
 just e2e
 ```
+
+**Agent-safe reads — raw at rest, scrubbed on the way out**
+
+```bash
+# Data at rest stays raw (your app owns the originals).
+s4ctl put ./customers.json customers/c1.json --bucket s4-local
+
+# An AI agent reads THROUGH S4: PII is redacted before the agent sees it.
+curl -H "x-s4-process: read" http://localhost:8080/customers/c1.json
+# → {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]","note":"hi"}
+
+# Same object, no header: the raw bytes your app owns.
+curl http://localhost:8080/customers/c1.json
+# → {"email":"alice@example.com","card":"4111111111111111","note":"hi"}
+```
+
+One source of truth, two projections: the app gets full fidelity, the agent
+gets only what you allow. Works on any GET path (S3 backend, presigned
+backend URL, managed storage, in-memory).
 
 **Encryption — per-field envelope encryption, decryptable only by you**
 

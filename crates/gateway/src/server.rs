@@ -149,6 +149,7 @@ fn detect_format(headers: &HeaderMap) -> Format {
         "application/x-ndjson" | "application/jsonlines" => Format::Jsonl,
         "application/json" => Format::Json,
         "text/csv" => Format::Csv,
+        "text/tab-separated-values" => Format::Tsv,
         _ => Format::Text,
     }
 }
@@ -402,7 +403,7 @@ async fn s3_put(
         match state
             .service_storage
             .put(
-                &format!("{}/{}", bucket, key),
+                &format!("{}/{}/{}", uid, bucket, key),
                 output.bytes.to_vec(),
                 "text/plain",
             )
@@ -528,7 +529,7 @@ async fn s3_get(
     } else if !state.service_storage.is_empty() {
         match state
             .service_storage
-            .get(&format!("{}/{}", bucket, key))
+            .get(&format!("{}/{}/{}", auth.user_id, bucket, key))
             .await
         {
             Some((data, content_type)) => {

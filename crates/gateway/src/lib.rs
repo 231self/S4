@@ -21,6 +21,7 @@ pub enum Format {
     Jsonl,
     Json,
     Csv,
+    Tsv,
     Text,
 }
 
@@ -30,6 +31,7 @@ impl Format {
             Format::Jsonl => "jsonl",
             Format::Json => "json",
             Format::Csv => "csv",
+            Format::Tsv => "tsv",
             Format::Text => "text",
         }
     }
@@ -39,6 +41,7 @@ impl Format {
             "jsonl" => Some(Self::Jsonl),
             "json" => Some(Self::Json),
             "csv" => Some(Self::Csv),
+            "tsv" => Some(Self::Tsv),
             "text" => Some(Self::Text),
             _ => None,
         }
@@ -123,6 +126,7 @@ pub fn split_records(input: &[u8], format: Format) -> Result<Vec<Vec<u8>>, S4Err
     match format {
         Format::Jsonl => split_lines(input),
         Format::Text => split_lines(input),
+        Format::Tsv => split_lines(input),
         Format::Json => {
             let s = std::str::from_utf8(input)
                 .map_err(|e| S4Error::new(codes::DECODE_ENCODING, e.to_string()))?;
@@ -192,7 +196,10 @@ fn is_empty_or_whitespace(b: &[u8]) -> bool {
 }
 
 fn needs_newline(format: Format) -> bool {
-    matches!(format, Format::Jsonl | Format::Text | Format::Csv)
+    matches!(
+        format,
+        Format::Jsonl | Format::Text | Format::Csv | Format::Tsv
+    )
 }
 
 #[cfg(test)]
@@ -238,10 +245,12 @@ mod tests {
         assert_eq!(Format::parse("jsonl"), Some(Format::Jsonl));
         assert_eq!(Format::parse("json"), Some(Format::Json));
         assert_eq!(Format::parse("csv"), Some(Format::Csv));
+        assert_eq!(Format::parse("tsv"), Some(Format::Tsv));
     }
 
     #[test]
     fn format_parse_invalid() {
         assert_eq!(Format::parse("pdf"), None);
+        assert_eq!(Format::parse("parquet"), None);
     }
 }

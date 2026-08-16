@@ -224,26 +224,19 @@ fn find_digit_token(bytes: &[u8], start: usize, len: usize) -> Option<(usize, us
 }
 
 fn find_email_boundary(bytes: &[u8], at_pos: usize, len: usize) -> Option<(usize, usize)> {
+    // Terminate the email token at whitespace / quote / comma / `&` (the
+    // query-string separator). `=` and `;` stay greedy on both sides so the
+    // original adversarial redaction semantics hold (e.g. SQL injection
+    // payloads like `email='admin@example.com'; DROP` redact as one span).
+    // `&` must be a boundary on the RIGHT so `email=alice@example.com&card=...`
+    // redacts just the address instead of swallowing the whole line.
+    let is_boundary = |b: u8| matches!(b, b' ' | b'\n' | b'\r' | b'\t' | b',' | b'"' | b'&');
     let mut s = at_pos;
-    while s > 0
-        && bytes[s - 1] != b' '
-        && bytes[s - 1] != b'\n'
-        && bytes[s - 1] != b'\r'
-        && bytes[s - 1] != b'\t'
-        && bytes[s - 1] != b','
-        && bytes[s - 1] != b'"'
-    {
+    while s > 0 && !is_boundary(bytes[s - 1]) {
         s -= 1;
     }
     let mut e = at_pos + 1;
-    while e < len
-        && bytes[e] != b' '
-        && bytes[e] != b'\n'
-        && bytes[e] != b'\r'
-        && bytes[e] != b'\t'
-        && bytes[e] != b','
-        && bytes[e] != b'"'
-    {
+    while e < len && !is_boundary(bytes[e]) {
         e += 1;
     }
     if s < at_pos && e > at_pos + 1 {
@@ -503,6 +496,18 @@ mod tests {
     #[test]
     fn email_on_word_boundary() {
         assert_eq!(redact_pii("a@b.co is email"), "[REDACTED_EMAIL] is email");
+    }
+
+    #[test]
+    fn query_string_multiple_fields_preserved() {
+        // Regression: `&` must terminate the email token, otherwise the whole
+        // line becomes one email span (no spaces) and card/ssn/note are lost.
+        let input = "email=alice@example.com&card=4111-1111-1111-1111&ssn=078-05-1120&note=hi";
+        let result = redact_pii(input);
+        assert_eq!(
+            result,
+            "[REDACTED_EMAIL]&card=[REDACTED_CARD]&ssn=[REDACTED_SSN]&note=hi"
+        );
     }
 
     #[test]

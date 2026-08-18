@@ -13,9 +13,7 @@ use s4_gateway::entity::api_key;
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
 use s4_gateway::store::{KeyRepository, PostgresKeyStore, sha256_hash};
 use sea_orm::sea_query::Expr;
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, SqlxPostgresConnector,
-};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, SqlxPostgresConnector};
 use sqlx::PgPool;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -143,9 +141,9 @@ where
 fn postgres_secret_envelope_roundtrip() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
-        let cipher = Arc::new(SecretCipher::new(Arc::new(
-            LocalKeyWrapping::with_kek(TEST_KEK),
-        )));
+        let cipher = Arc::new(SecretCipher::new(Arc::new(LocalKeyWrapping::with_kek(
+            TEST_KEK,
+        ))));
         let store = PostgresKeyStore::with_cipher(pool, cipher);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
         let (key_id, secret) = store
@@ -169,9 +167,9 @@ fn postgres_secret_envelope_roundtrip() {
 fn postgres_v1_secret_is_rewrapped_to_identity_bound_v2() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
-        let cipher = Arc::new(SecretCipher::new(Arc::new(
-            LocalKeyWrapping::with_kek(TEST_KEK),
-        )));
+        let cipher = Arc::new(SecretCipher::new(Arc::new(LocalKeyWrapping::with_kek(
+            TEST_KEK,
+        ))));
         let store = PostgresKeyStore::with_cipher(pool, cipher.clone());
         let user = format!("unit-v1-{}", uuid::Uuid::new_v4());
         let (key_id, secret) = store
@@ -203,9 +201,9 @@ fn postgres_v1_secret_is_rewrapped_to_identity_bound_v2() {
 fn postgres_v1_hash_mismatch_returns_none_without_rewrap() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
-        let cipher = Arc::new(SecretCipher::new(Arc::new(
-            LocalKeyWrapping::with_kek(TEST_KEK),
-        )));
+        let cipher = Arc::new(SecretCipher::new(Arc::new(LocalKeyWrapping::with_kek(
+            TEST_KEK,
+        ))));
         let store = PostgresKeyStore::with_cipher(pool, cipher);
         let user = format!("unit-v1-hash-{}", uuid::Uuid::new_v4());
         let (key_id, secret) = store

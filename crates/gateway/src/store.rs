@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use anyhow::Context;
+use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
@@ -276,7 +276,10 @@ fn decrypt_verified_secret(
 ) -> Option<(String, Option<String>)> {
     let secret = cipher.decrypt(key_id, blob)?;
     if sha256_hash(&secret) != secret_hash {
-        tracing::warn!(key_id = key_id, "decrypted API key secret failed hash verification");
+        tracing::warn!(
+            key_id = key_id,
+            "decrypted API key secret failed hash verification"
+        );
         return None;
     }
     let rewrapped = if SecretCipher::is_legacy_envelope(blob) {
@@ -453,8 +456,7 @@ impl KeyRepository for KeyStore {
             let key = keys.get(key_id)?;
             (key.secret_hash.clone(), key.secret_encrypted.clone()?)
         };
-        let (secret, rewrapped) =
-            decrypt_verified_secret(cipher, key_id, &secret_hash, &blob)?;
+        let (secret, rewrapped) = decrypt_verified_secret(cipher, key_id, &secret_hash, &blob)?;
         if let Some(rewrapped) = rewrapped {
             replace_or_accept_rewrapped_envelope(
                 &self.keys,
@@ -678,8 +680,7 @@ impl KeyRepository for FileKeyStore {
             let key = keys.get(key_id)?;
             (key.secret_hash.clone(), key.secret_encrypted.clone()?)
         };
-        let (secret, rewrapped) =
-            decrypt_verified_secret(cipher, key_id, &secret_hash, &blob)?;
+        let (secret, rewrapped) = decrypt_verified_secret(cipher, key_id, &secret_hash, &blob)?;
         if let Some(rewrapped) = rewrapped {
             let _rewrap_guard = self.rewrap_lock.lock().ok()?;
             match replace_or_accept_rewrapped_envelope(
@@ -693,12 +694,7 @@ impl KeyRepository for FileKeyStore {
             )? {
                 EnvelopeUpdate::Replaced => {
                     if let Err(error) = self.persist() {
-                        let _ = compare_and_swap_envelope(
-                            &self.keys,
-                            key_id,
-                            &rewrapped,
-                            blob,
-                        );
+                        let _ = compare_and_swap_envelope(&self.keys, key_id, &rewrapped, blob);
                         tracing::warn!(
                             key_id = key_id,
                             "FileKeyStore legacy secret rewrap persist failed: {error}"
@@ -867,8 +863,7 @@ impl KeyRepository for PostgresKeyStore {
         let cipher = self.cipher.as_deref()?;
         let key = fetch_key(&self.db, key_id).await?;
         let blob = key.secret_encrypted?;
-        let (secret, rewrapped) =
-            decrypt_verified_secret(cipher, key_id, &key.secret_hash, &blob)?;
+        let (secret, rewrapped) = decrypt_verified_secret(cipher, key_id, &key.secret_hash, &blob)?;
         if let Some(rewrapped) = rewrapped {
             let result = api_key::Entity::update_many()
                 .col_expr(
@@ -900,13 +895,8 @@ impl KeyRepository for PostgresKeyStore {
             };
             if reread {
                 let current = fetch_key(&self.db, key_id).await?;
-                if !key_has_matching_v2_secret(
-                    cipher,
-                    &current,
-                    key_id,
-                    &key.secret_hash,
-                    &secret,
-                ) {
+                if !key_has_matching_v2_secret(cipher, &current, key_id, &key.secret_hash, &secret)
+                {
                     return None;
                 }
             }
@@ -1328,10 +1318,7 @@ mod tests {
     async fn in_memory_v1_secret_is_verified_and_rewrapped() {
         let cipher = test_cipher();
         let store = KeyStore::with_cipher(cipher.clone());
-        let (key_id, secret) = store
-            .create_key("u1", "legacy", 0, None)
-            .await
-            .unwrap();
+        let (key_id, secret) = store.create_key("u1", "legacy", 0, None).await.unwrap();
         let legacy = cipher.encrypt_v1(&secret).unwrap();
         store
             .keys
@@ -1362,10 +1349,7 @@ mod tests {
     async fn hash_mismatch_never_returns_or_rewraps_secret() {
         let cipher = test_cipher();
         let store = KeyStore::with_cipher(cipher.clone());
-        let (key_id, secret) = store
-            .create_key("u1", "legacy", 0, None)
-            .await
-            .unwrap();
+        let (key_id, secret) = store.create_key("u1", "legacy", 0, None).await.unwrap();
         let legacy = cipher.encrypt_v1(&secret).unwrap();
         {
             let mut keys = store.keys.write().unwrap();
@@ -1433,10 +1417,7 @@ mod tests {
     async fn file_key_store_persists_across_restarts() {
         let path = temp_keys_file();
         let store = FileKeyStore::new(path.clone());
-        let (key_id, secret) = store
-            .create_key("u1", "persist", 0, None)
-            .await
-            .unwrap();
+        let (key_id, secret) = store.create_key("u1", "persist", 0, None).await.unwrap();
         drop(store);
 
         // A fresh store on the same path must see the same key.
@@ -1521,10 +1502,7 @@ mod tests {
     async fn file_key_store_persists_public_key_and_expiry() {
         let path = temp_keys_file();
         let store = FileKeyStore::new(path.clone());
-        let (key_id, _secret) = store
-            .create_key("u1", "enc", 3600, None)
-            .await
-            .unwrap();
+        let (key_id, _secret) = store.create_key("u1", "enc", 3600, None).await.unwrap();
         assert!(store.set_public_key(&key_id, "u1", "pem").await);
         assert!(!store.set_public_key(&key_id, "u2", "pem").await);
         drop(store);
@@ -1540,10 +1518,7 @@ mod tests {
         let path = temp_keys_file();
         let cipher = test_cipher();
         let store = FileKeyStore::with_cipher(path.clone(), cipher.clone());
-        let (key_id, secret) = store
-            .create_key("u1", "legacy", 0, None)
-            .await
-            .unwrap();
+        let (key_id, secret) = store.create_key("u1", "legacy", 0, None).await.unwrap();
         let legacy = cipher.encrypt_v1(&secret).unwrap();
         store
             .keys

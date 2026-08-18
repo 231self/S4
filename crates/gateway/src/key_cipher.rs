@@ -170,8 +170,7 @@ impl SecretCipher {
     /// Decrypt a v1 or v2 envelope. v2 must match `key_id`'s AAD binding.
     pub fn decrypt(&self, key_id: &str, blob: &str) -> Option<String> {
         let parts: Vec<&str> = blob.splitn(4, ':').collect();
-        if parts.len() != 4
-            || (parts[0] != ENVELOPE_VERSION && parts[0] != LEGACY_ENVELOPE_VERSION)
+        if parts.len() != 4 || (parts[0] != ENVELOPE_VERSION && parts[0] != LEGACY_ENVELOPE_VERSION)
         {
             return None;
         }
@@ -195,9 +194,7 @@ impl SecretCipher {
         } else {
             cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref())
         };
-        plaintext
-            .ok()
-            .and_then(|p| String::from_utf8(p).ok())
+        plaintext.ok().and_then(|p| String::from_utf8(p).ok())
     }
 
     pub fn is_legacy_envelope(blob: &str) -> bool {

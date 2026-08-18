@@ -50,10 +50,8 @@ async fn router() -> (Router, Arc<AppState>) {
 #[tokio::test]
 async fn create_key_persistence_failure_returns_internal_error_without_secret() {
     let mut state = test_state().await;
-    let blocking_parent = std::env::temp_dir().join(format!(
-        "s4-create-key-failure-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let blocking_parent =
+        std::env::temp_dir().join(format!("s4-create-key-failure-{}", uuid::Uuid::new_v4()));
     std::fs::write(&blocking_parent, "not a directory").unwrap();
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.keys = Arc::new(FileKeyStore::new(blocking_parent.join("keys.json")));
@@ -1100,9 +1098,9 @@ async fn demo_transformed_read_modes_are_rejected() {
                 .uri("/dashboard/api/demo/read?id=1&mode=join")
                 .body(Body::empty())
                 .unwrap(),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
     assert_eq!(j1.status(), StatusCode::NOT_IMPLEMENTED);
     let j2 = app
         .clone()

@@ -91,9 +91,7 @@ fn legacy_max_object_bytes() -> usize {
 }
 
 fn effective_legacy_max_object_bytes(state: &AppState) -> usize {
-    state
-        .legacy_max_object_bytes
-        .min(LEGACY_MAX_OBJECT_BYTES)
+    state.legacy_max_object_bytes.min(LEGACY_MAX_OBJECT_BYTES)
 }
 
 #[derive(Debug)]
@@ -118,15 +116,14 @@ async fn collect_http_body(
     mut response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, BoundedReadError> {
-    if response.content_length().is_some_and(|size| size > max_bytes as u64) {
+    if response
+        .content_length()
+        .is_some_and(|size| size > max_bytes as u64)
+    {
         return Err(BoundedReadError::EntityTooLarge);
     }
-    let mut data = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or(0)
-            .min(max_bytes as u64) as usize,
-    );
+    let mut data =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(max_bytes as u64) as usize);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -185,7 +182,7 @@ struct ApiKeyResponse {
     public_key_pem: Option<String>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize)]
 struct InternalErrorResponse {
     error: String,
 }
@@ -279,7 +276,7 @@ struct S3Query {
         description = "Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline."
     ),
     paths(get_keys, create_key, delete_key, list_objects),
-    components(schemas(ApiKeyResponse, InternalErrorResponse, ListKeyResponse, CreateKeyRequest, DeleteKeyRequest, ObjectResponse)),
+    components(schemas(ApiKeyResponse, ListKeyResponse, CreateKeyRequest, DeleteKeyRequest, ObjectResponse)),
     tags(
         (name = "keys", description = "API key management"),
         (name = "objects", description = "Object store listing")
@@ -1301,10 +1298,7 @@ async fn s3_get(
     } else if !state.service_storage.is_empty() {
         match state
             .service_storage
-            .get(
-                &format!("{}/{bucket}/{key}", auth.user_id),
-                max_bytes,
-            )
+            .get(&format!("{}/{bucket}/{key}", auth.user_id), max_bytes)
             .await
         {
             Ok(Some((data, content_type))) => {
@@ -1912,10 +1906,7 @@ async fn get_keys(
     post,
     path = "/dashboard/api/keys",
     request_body = CreateKeyRequest,
-    responses(
-        (status = 200, description = "Created key with secret", body = ApiKeyResponse),
-        (status = 500, description = "Key persistence failed", body = InternalErrorResponse)
-    ),
+    responses((status = 200, description = "Created key with secret", body = ApiKeyResponse)),
     tag = "keys"
 )]
 async fn create_key(

@@ -18,10 +18,7 @@ enum CollectBodyError {
     Backend,
 }
 
-async fn collect_body(
-    mut body: ByteStream,
-    max_bytes: usize,
-) -> Result<Vec<u8>, CollectBodyError> {
+async fn collect_body(mut body: ByteStream, max_bytes: usize) -> Result<Vec<u8>, CollectBodyError> {
     let (_, upper) = body.size_hint();
     if upper.is_some_and(|size| size > max_bytes as u64) {
         return Err(CollectBodyError::EntityTooLarge);

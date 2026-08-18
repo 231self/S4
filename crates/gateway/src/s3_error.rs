@@ -44,6 +44,33 @@ pub fn internal_error(key: &str, detail: &str) -> axum::response::Response {
     )
 }
 
+pub fn transformed_read_not_supported(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "NotImplemented",
+        "Transformed reads are disabled until the streaming disclosure model is available.",
+        key,
+        StatusCode::NOT_IMPLEMENTED,
+    )
+}
+
+pub fn entity_too_large(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "EntityTooLarge",
+        "The object exceeds the maximum allowed size.",
+        key,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+pub fn multipart_not_supported(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "NotImplemented",
+        "Multipart operations are disabled until staged multipart storage is available.",
+        key,
+        StatusCode::NOT_IMPLEMENTED,
+    )
+}
+
 pub fn not_implemented(key: &str) -> axum::response::Response {
     s3_error_xml(
         "NotImplemented",

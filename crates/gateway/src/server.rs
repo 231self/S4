@@ -6,9 +6,8 @@
 //! [`crate::control::NoopControlPlane`]; the private SaaS crate builds it with
 //! its own control-plane implementation.
 
-use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aws_credential_types::Credentials as SigV4Credentials;
@@ -22,12 +21,11 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{Html, IntoResponse},
     routing::{delete, get, head, post, put},
 };
-use md5::{Digest as Md5Digest, Md5};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tower_http::cors::CorsLayer;
@@ -59,9 +57,7 @@ pub struct AppState {
     pub jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     pub auth_disabled: bool,
     pub control: Arc<dyn ControlPlane>,
-    /// In-flight multipart uploads (upload_id -> parts). Buffered gateway-side
-    /// so the filter pipeline runs on the assembled object at Complete time.
-    pub multipart: Arc<Mutex<HashMap<String, MultipartUpload>>>,
+    pub legacy_max_object_bytes: usize,
 }
 
 pub struct Auth {
@@ -70,117 +66,94 @@ pub struct Auth {
     stable_key: Option<Vec<u8>>,
 }
 
-/// S3 multipart upload parts, buffered in memory keyed by upload id.
-/// Parts are concatenated in order at Complete time and then passed through
-/// the same filter pipeline as a single PUT.
-#[derive(Debug, Default)]
-pub struct MultipartUpload {
-    bucket: String,
-    key: String,
-    parts: BTreeMap<u32, Vec<u8>>,
-    etags: HashMap<u32, String>,
-}
+const LEGACY_MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 
-/// `(part_number, size, etag)` for ListParts responses.
-pub type MultipartPart = (u32, usize, String);
-
-/// All parts except the last must be at least this large (S3 spec).
-const MULTIPART_MIN_PART_BYTES: usize = 5 * 1024 * 1024;
-
-/// Upper bound for a single PUT body / multipart part (S3 single-PUT max).
-const S3_MAX_PUT_BYTES: usize = 5 * 1024 * 1024 * 1024;
-
-fn mp_init(state: &AppState, bucket: &str, key: &str) -> String {
-    let id = uuid::Uuid::new_v4().to_string();
-    state.multipart.lock().unwrap().insert(
-        id.clone(),
-        MultipartUpload {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            ..Default::default()
+fn legacy_max_object_bytes() -> usize {
+    let configured = match std::env::var("S4_LEGACY_MAX_OBJECT_BYTES") {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                warn!(
+                    "invalid S4_LEGACY_MAX_OBJECT_BYTES={raw:?}; using {LEGACY_MAX_OBJECT_BYTES}"
+                );
+                LEGACY_MAX_OBJECT_BYTES
+            }
         },
+        Err(_) => LEGACY_MAX_OBJECT_BYTES,
+    };
+    let bounded = configured.min(LEGACY_MAX_OBJECT_BYTES);
+    if bounded != configured {
+        warn!(
+            "S4_LEGACY_MAX_OBJECT_BYTES={configured} exceeds the immutable 16 MiB limit; using {bounded}"
+        );
+    }
+    bounded
+}
+
+fn effective_legacy_max_object_bytes(state: &AppState) -> usize {
+    state
+        .legacy_max_object_bytes
+        .min(LEGACY_MAX_OBJECT_BYTES)
+}
+
+#[derive(Debug)]
+enum BoundedReadError {
+    EntityTooLarge,
+    Backend(String),
+}
+
+fn append_bounded(
+    data: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), BoundedReadError> {
+    if chunk.len() > max_bytes.saturating_sub(data.len()) {
+        return Err(BoundedReadError::EntityTooLarge);
+    }
+    data.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn collect_http_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
+    if response.content_length().is_some_and(|size| size > max_bytes as u64) {
+        return Err(BoundedReadError::EntityTooLarge);
+    }
+    let mut data = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(max_bytes as u64) as usize,
     );
-    id
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| BoundedReadError::Backend(error.to_string()))?
+    {
+        append_bounded(&mut data, &chunk, max_bytes)?;
+    }
+    Ok(data)
 }
 
-fn mp_put_part(state: &AppState, upload_id: &str, part_number: u32, data: &[u8]) -> Option<String> {
-    if !(1..=10_000).contains(&part_number) {
-        return None;
+async fn collect_s3_body(
+    mut body: ByteStream,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
+    let (_, upper) = body.size_hint();
+    if upper.is_some_and(|size| size > max_bytes as u64) {
+        return Err(BoundedReadError::EntityTooLarge);
     }
-    let mut uploads = state.multipart.lock().unwrap();
-    let upload = uploads.get_mut(upload_id)?;
-    let etag = format!("\"{:x}\"", Md5::digest(data));
-    upload.parts.insert(part_number, data.to_vec());
-    upload.etags.insert(part_number, etag.clone());
-    Some(etag)
-}
-
-fn mp_abort(state: &AppState, upload_id: &str) -> bool {
-    state.multipart.lock().unwrap().remove(upload_id).is_some()
-}
-
-fn mp_list_parts(
-    state: &AppState,
-    upload_id: &str,
-) -> Option<(String, String, Vec<MultipartPart>)> {
-    let uploads = state.multipart.lock().unwrap();
-    let upload = uploads.get(upload_id)?;
-    let parts: Vec<MultipartPart> = upload
-        .parts
-        .iter()
-        .map(|(n, data)| {
-            let etag = upload.etags.get(n).cloned().unwrap_or_default();
-            (*n, data.len(), etag)
-        })
-        .collect();
-    Some((upload.bucket.clone(), upload.key.clone(), parts))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum CompleteError {
-    NoSuchUpload,
-    InvalidPart,
-    InvalidPartOrder,
-    PartTooSmall(u32),
-}
-
-/// Assemble the parts listed in the CompleteMultipartUpload body in order,
-/// returning `(bucket, key, assembled_bytes)` and dropping the upload state.
-fn mp_complete(
-    state: &AppState,
-    upload_id: &str,
-    requested: &[u32],
-) -> Result<(String, String, Vec<u8>), CompleteError> {
-    let mut uploads = state.multipart.lock().unwrap();
-    let upload = uploads.get(upload_id).ok_or(CompleteError::NoSuchUpload)?;
-    if requested.is_empty() {
-        return Err(CompleteError::InvalidPart);
+    let mut data = Vec::with_capacity(upper.unwrap_or(0).min(max_bytes as u64) as usize);
+    while let Some(chunk) = body
+        .try_next()
+        .await
+        .map_err(|error| BoundedReadError::Backend(error.to_string()))?
+    {
+        append_bounded(&mut data, &chunk, max_bytes)?;
     }
-    let mut prev = 0u32;
-    for n in requested {
-        if *n <= prev {
-            return Err(CompleteError::InvalidPartOrder);
-        }
-        prev = *n;
-    }
-    let mut total = 0usize;
-    for (i, n) in requested.iter().enumerate() {
-        let data = upload.parts.get(n).ok_or(CompleteError::InvalidPart)?;
-        if i + 1 < requested.len() && data.len() < MULTIPART_MIN_PART_BYTES {
-            return Err(CompleteError::PartTooSmall(*n));
-        }
-        total += data.len();
-    }
-    let mut assembled = Vec::with_capacity(total);
-    for n in requested {
-        if let Some(data) = upload.parts.get(n) {
-            assembled.extend_from_slice(data);
-        }
-    }
-    let bucket = upload.bucket.clone();
-    let key = upload.key.clone();
-    uploads.remove(upload_id);
-    Ok((bucket, key, assembled))
+    Ok(data)
 }
 
 /// Derive the deterministic-encryption key for an API key secret:
@@ -210,6 +183,11 @@ struct ApiKeyResponse {
     created_at: String,
     expires_at: Option<String>,
     public_key_pem: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct InternalErrorResponse {
+    error: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -301,7 +279,7 @@ struct S3Query {
         description = "Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline."
     ),
     paths(get_keys, create_key, delete_key, list_objects),
-    components(schemas(ApiKeyResponse, ListKeyResponse, CreateKeyRequest, DeleteKeyRequest, ObjectResponse)),
+    components(schemas(ApiKeyResponse, InternalErrorResponse, ListKeyResponse, CreateKeyRequest, DeleteKeyRequest, ObjectResponse)),
     tags(
         (name = "keys", description = "API key management"),
         (name = "objects", description = "Object store listing")
@@ -534,30 +512,6 @@ fn verify_sigv4(
         Ok(output) => output.signature().eq_ignore_ascii_case(&sigv4.signature),
         Err(_) => false,
     }
-}
-
-/// Parse the `<Part><PartNumber>N</PartNumber>...` list from a
-/// CompleteMultipartUpload XML body, returning part numbers in document order.
-fn parse_complete_xml(body: &[u8]) -> Option<Vec<u32>> {
-    let text = std::str::from_utf8(body).ok()?;
-    let mut parts = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("<Part>") {
-        let after = &rest[start + 6..];
-        let end = after.find("</Part>")?;
-        let part = &after[..end];
-        rest = &after[end + 7..];
-        let n = part
-            .split("<PartNumber>")
-            .nth(1)?
-            .split("</PartNumber>")
-            .next()?
-            .trim()
-            .parse::<u32>()
-            .ok()?;
-        parts.push(n);
-    }
-    Some(parts)
 }
 
 async fn get_user_s3_client(state: &AppState, uid: &str) -> Option<Client> {
@@ -981,12 +935,11 @@ async fn demo_store(
     Json(serde_json::json!({ "stored": body.records.len(), "namespace": "__demo" })).into_response()
 }
 
-/// Demo read: fetch a stored demo record and return it in one of three modes.
+/// Demo read: fetch a stored demo record in raw mode. Transformed modes remain
+/// unavailable until the streaming disclosure model is implemented.
 /// `mode`:
 /// - `raw`  -> the bytes at rest (as your app sees them)
-/// - `safe` -> x-s4-process: read (PII redacted)
-/// - `join` -> x-s4-process: read + x-s4-stable-fields: email (stable-encrypted,
-///   deterministic ciphertext, joinable)
+/// - `safe` / `join` -> rejected
 #[derive(Deserialize, ToSchema)]
 struct DemoReadQuery {
     id: Option<u32>,      // 1-based record number; default 1
@@ -998,32 +951,17 @@ async fn demo_read(
     Query(q): Query<DemoReadQuery>,
 ) -> impl IntoResponse {
     let id = q.id.unwrap_or(1);
+    let mode = q.mode.as_deref().unwrap_or("raw");
+    if mode != "raw" {
+        return s3_error::transformed_read_not_supported(&format!("record-{id}.json"));
+    }
     let Some(obj) = state.store.get("__demo", &format!("record-{id}.json")) else {
         return (StatusCode::NOT_FOUND, "no demo record stored yet").into_response();
-    };
-    let mode = q.mode.as_deref().unwrap_or("raw");
-    let mut headers = HeaderMap::new();
-    let auth = Auth {
-        user_id: "demo-user".to_string(),
-        public_key_pem: None,
-        stable_key: Some(derive_stable_key("demo-stable-secret")),
-    };
-    let bytes = match mode {
-        "join" => {
-            headers.insert("x-s4-process", "read".parse().unwrap());
-            headers.insert("x-s4-stable-fields", "email".parse().unwrap());
-            maybe_process_read(&state, &headers, &auth, &obj.content_type, obj.data)
-        }
-        "safe" => {
-            headers.insert("x-s4-process", "read".parse().unwrap());
-            maybe_process_read(&state, &headers, &auth, &obj.content_type, obj.data)
-        }
-        _ => obj.data,
     };
     Json(serde_json::json!({
         "mode": mode,
         "record": id,
-        "body": String::from_utf8_lossy(&bytes),
+        "body": String::from_utf8_lossy(&obj.data),
     }))
     .into_response()
 }
@@ -1036,64 +974,22 @@ fn s3_xml_ok(xml: String) -> axum::response::Response {
         .unwrap()
 }
 
-/// Read-time pipeline: when the caller sets `x-s4-process: read` (or `true`),
-/// run the WASM pipeline over the fetched bytes before returning them. This is
-/// the "agents never see PII" path: the object at rest stays raw, and S4
-/// scrubs it on the way out to the caller. Used by AI agents that only need
-/// the safe projection of a dataset. Falls back to raw bytes on any pipeline
-/// error (logging it) so reads never break.
-fn maybe_process_read(
-    state: &AppState,
-    headers: &HeaderMap,
-    auth: &Auth,
-    content_type: &str,
-    bytes: Vec<u8>,
-) -> Vec<u8> {
-    let wants_process = headers
+fn wants_transformed_read(headers: &HeaderMap) -> bool {
+    headers
         .get("x-s4-process")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("read") || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !wants_process {
-        return bytes;
-    }
-    let format = detect_format(headers);
-    let stable_fields = headers
-        .get("x-s4-stable-fields")
-        .and_then(|v| v.to_str().ok());
-    // Joinable-read mode: when the caller asks for stable fields, run
-    // stable-encrypt instead of redaction so the join keys come back as
-    // deterministic ciphertext (AES-SIV). Skip the redaction filters —
-    // otherwise they redact the field before stable-encrypt can see it.
-    let skip: &[&str] = if stable_fields.is_some() {
-        &[
-            "pii-default",
-            "email-detect",
-            "ssn-detect",
-            "card-detect",
-            "pii-default.component",
-        ]
-    } else {
-        &[]
-    };
-    if let Some(plugins) = state.gateway.plugins.as_ref() {
-        match plugins
-            .process_all_with(
-                format,
-                content_type,
-                auth.public_key_pem.as_deref(),
-                auth.stable_key.as_deref(),
-                stable_fields,
-                std::slice::from_ref(&bytes),
-                skip,
-            )
-            .map(|mut out| out.pop().unwrap_or_default())
-        {
-            Ok(out) => return out,
-            Err(e) => warn!("read-time pipeline skipped ({e}); returning raw bytes"),
+        .unwrap_or(false)
+}
+
+fn bounded_read_error(key: &str, error: BoundedReadError) -> axum::response::Response {
+    match error {
+        BoundedReadError::EntityTooLarge => s3_error::entity_too_large(key),
+        BoundedReadError::Backend(detail) => {
+            warn!("backend read failed for {key}: {detail}");
+            s3_error::internal_error(key, &detail)
         }
     }
-    bytes
 }
 
 /// Run the filter pipeline over `body`.
@@ -1228,13 +1124,45 @@ async fn s3_put(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<S3Query>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
+    request: Request,
 ) -> impl IntoResponse {
-    let Some(auth) =
-        authenticate(method.as_str(), &uri, &headers, &body, &state.keys, &state).await
+    let (parts, request_body) = request.into_parts();
+    if params.part_number.is_some() || params.upload_id.is_some() {
+        let Some(auth) = authenticate(
+            parts.method.as_str(),
+            &parts.uri,
+            &parts.headers,
+            &[],
+            &state.keys,
+            &state,
+        )
+        .await
+        else {
+            return s3_error::access_denied(&key);
+        };
+        if let Some(reason) = state
+            .control
+            .authorize(&auth.user_id, RequestKind::Write)
+            .await
+        {
+            return s3_error::payment_required(&key, reason.message);
+        }
+        return s3_error::multipart_not_supported(&key);
+    }
+    let max_bytes = effective_legacy_max_object_bytes(&state);
+    let body = match axum::body::to_bytes(request_body, max_bytes).await {
+        Ok(body) => body,
+        Err(_) => return s3_error::entity_too_large(&key),
+    };
+    let Some(auth) = authenticate(
+        parts.method.as_str(),
+        &parts.uri,
+        &parts.headers,
+        &body,
+        &state.keys,
+        &state,
+    )
+    .await
     else {
         return s3_error::access_denied(&key);
     };
@@ -1246,31 +1174,32 @@ async fn s3_put(
         return s3_error::payment_required(&key, reason.message);
     }
 
-    // UploadPart (multipart): store the raw part, filter at Complete time.
-    if let (Some(part_number), Some(upload_id)) = (params.part_number, params.upload_id.as_deref())
-    {
-        state
-            .control
-            .record(&auth.user_id, RequestKind::Write, body.len() as u64)
-            .await;
-        return match mp_put_part(&state, upload_id, part_number, &body) {
-            Some(etag) => {
-                let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-                resp = resp.header("ETag", etag);
-                resp.body(axum::body::Body::empty()).unwrap()
-            }
-            None => s3_error::no_such_upload(&key),
-        };
-    }
-
-    let output = match process_input(&state, &headers, &auth, &body) {
+    let output = match process_input(&state, &parts.headers, &auth, &body) {
         Ok(o) => o,
         Err(e) => {
             warn!("filter failed for /{bucket}/{key}: {e}");
             return s3_error::internal_error(&key, &e.to_string());
         }
     };
-    store_processed(&state, &auth, &bucket, &key, &headers, output, body.len()).await
+    if output.bytes.len() > max_bytes {
+        warn!(
+            input_bytes = body.len(),
+            output_bytes = output.bytes.len(),
+            max_bytes,
+            "filtered output exceeds the legacy object limit"
+        );
+        return s3_error::entity_too_large(&key);
+    }
+    store_processed(
+        &state,
+        &auth,
+        &bucket,
+        &key,
+        &parts.headers,
+        output,
+        body.len(),
+    )
+    .await
 }
 
 async fn s3_get(
@@ -1293,10 +1222,13 @@ async fn s3_get(
         return s3_error::payment_required(&key, reason.message);
     }
 
-    // ListParts (multipart)
-    if let Some(upload_id) = params.upload_id.as_deref() {
-        return s3_list_parts(&state, &bucket, &key, upload_id);
+    if wants_transformed_read(&headers) {
+        return s3_error::transformed_read_not_supported(&key);
     }
+    if params.upload_id.is_some() {
+        return s3_error::multipart_not_supported(&key);
+    }
+    let max_bytes = effective_legacy_max_object_bytes(&state);
 
     if let Some(backend_url) = headers
         .get("x-s4-backend-url")
@@ -1314,9 +1246,10 @@ async fn s3_get(
                     .get("content-type")
                     .map(|v| v.to_str().unwrap_or("application/octet-stream").to_string())
                     .unwrap_or_else(|| "text/plain".to_string());
-                let body_bytes = resp.bytes().await.unwrap_or_default();
-                let body_bytes =
-                    maybe_process_read(&state, &headers, &auth, &ct, body_bytes.to_vec());
+                let body_bytes = match collect_http_body(resp, max_bytes).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => return bounded_read_error(&key, error),
+                };
                 let mut builder = axum::response::Response::builder()
                     .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
                 builder = builder.header("Content-Type", &ct);
@@ -1335,29 +1268,26 @@ async fn s3_get(
         }
         match req.send().await {
             Ok(output) => {
-                let data = output.body.collect().await;
-                match data {
+                let ct = output
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "text/plain".to_string());
+                let etag = output.e_tag.clone();
+                match collect_s3_body(output.body, max_bytes).await {
                     Ok(bytes) => {
                         state
                             .control
                             .record(&auth.user_id, RequestKind::Read, 0)
                             .await;
-                        let bytes = bytes.into_bytes();
-                        let ct = output
-                            .content_type
-                            .clone()
-                            .unwrap_or_else(|| "text/plain".to_string());
-                        let bytes =
-                            maybe_process_read(&state, &headers, &auth, &ct, bytes.to_vec());
                         let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-                        if let Some(etag) = output.e_tag.as_deref() {
+                        if let Some(etag) = etag.as_deref() {
                             resp = resp.header("ETag", etag);
                         }
                         resp = resp.header("Content-Type", &ct);
                         resp = resp.header("Content-Length", bytes.len().to_string());
                         resp.body(axum::body::Body::from(bytes)).unwrap()
                     }
-                    Err(e) => s3_error::internal_error(&key, &e.to_string()),
+                    Err(error) => bounded_read_error(&key, error),
                 }
             }
             Err(e) => {
@@ -1371,35 +1301,42 @@ async fn s3_get(
     } else if !state.service_storage.is_empty() {
         match state
             .service_storage
-            .get(&format!("{}/{bucket}/{key}", auth.user_id))
+            .get(
+                &format!("{}/{bucket}/{key}", auth.user_id),
+                max_bytes,
+            )
             .await
         {
-            Some((data, content_type)) => {
+            Ok(Some((data, content_type))) => {
                 state
                     .control
                     .record(&auth.user_id, RequestKind::Read, 0)
                     .await;
-                let data = maybe_process_read(&state, &headers, &auth, &content_type, data);
                 let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                 resp = resp.header("Content-Type", content_type);
                 resp = resp.header("Content-Length", data.len().to_string());
                 resp.body(axum::body::Body::from(data)).unwrap()
             }
-            None => s3_error::no_such_key(&key),
+            Ok(None) => s3_error::no_such_key(&key),
+            Err(crate::service_storage::ServiceStorageReadError::EntityTooLarge) => {
+                s3_error::entity_too_large(&key)
+            }
         }
     } else {
         match state.store.get(&bucket, &key) {
             Some(obj) => {
+                if obj.data.len() > max_bytes {
+                    return s3_error::entity_too_large(&key);
+                }
                 state
                     .control
                     .record(&auth.user_id, RequestKind::Read, 0)
                     .await;
-                let data = maybe_process_read(&state, &headers, &auth, &obj.content_type, obj.data);
                 let mut resp = axum::response::Response::builder().status(StatusCode::OK);
                 resp = resp.header("ETag", &obj.etag);
                 resp = resp.header("Content-Type", &obj.content_type);
-                resp = resp.header("Content-Length", data.len().to_string());
-                resp.body(axum::body::Body::from(data)).unwrap()
+                resp = resp.header("Content-Length", obj.data.len().to_string());
+                resp.body(axum::body::Body::from(obj.data)).unwrap()
             }
             None => s3_error::no_such_key(&key),
         }
@@ -1491,12 +1428,8 @@ async fn s3_delete(
     }
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
 
-    // AbortMultipartUpload
-    if let Some(upload_id) = params.upload_id.as_deref() {
-        if mp_abort(&state, upload_id) {
-            return StatusCode::NO_CONTENT.into_response();
-        }
-        return s3_error::no_such_upload(&key);
+    if params.upload_id.is_some() {
+        return s3_error::multipart_not_supported(&key);
     }
 
     if let Some(ref s3) = state.s3_client {
@@ -1524,13 +1457,18 @@ async fn s3_post(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<S3Query>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
+    request: Request,
 ) -> impl IntoResponse {
-    let Some(auth) =
-        authenticate(method.as_str(), &uri, &headers, &body, &state.keys, &state).await
+    let (parts, _body) = request.into_parts();
+    let Some(auth) = authenticate(
+        parts.method.as_str(),
+        &parts.uri,
+        &parts.headers,
+        &[],
+        &state.keys,
+        &state,
+    )
+    .await
     else {
         return s3_error::access_denied(&key);
     };
@@ -1543,108 +1481,10 @@ async fn s3_post(
     }
     info!("POST /{bucket}/{key} user={}", auth.user_id);
 
-    if params.uploads.is_some() {
-        state
-            .control
-            .record(&auth.user_id, RequestKind::Write, 0)
-            .await;
-        return s3_mp_create(&state, &bucket, &key).await;
-    }
-    if let Some(upload_id) = params.upload_id.as_deref() {
-        return s3_mp_complete(&state, &auth, &bucket, &key, &headers, upload_id, &body).await;
+    if params.uploads.is_some() || params.upload_id.is_some() {
+        return s3_error::multipart_not_supported(&key);
     }
     s3_error::not_implemented(&key)
-}
-
-async fn s3_mp_create(state: &AppState, bucket: &str, key: &str) -> axum::response::Response {
-    let upload_id = mp_init(state, bucket, key);
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>"#,
-        xml_escape(bucket),
-        xml_escape(key),
-        xml_escape(&upload_id)
-    );
-    s3_xml_ok(xml)
-}
-
-async fn s3_mp_complete(
-    state: &AppState,
-    auth: &Auth,
-    _bucket: &str,
-    key: &str,
-    headers: &HeaderMap,
-    upload_id: &str,
-    body: &[u8],
-) -> axum::response::Response {
-    let Some(part_numbers) = parse_complete_xml(body) else {
-        return s3_error::invalid_part(key, "malformed CompleteMultipartUpload XML");
-    };
-    let (bucket, key, data) = match mp_complete(state, upload_id, &part_numbers) {
-        Ok(ok) => ok,
-        Err(CompleteError::NoSuchUpload) => return s3_error::no_such_upload(key),
-        Err(CompleteError::InvalidPart) => {
-            return s3_error::invalid_part(
-                key,
-                "one or more of the specified parts could not be found",
-            );
-        }
-        Err(CompleteError::InvalidPartOrder) => return s3_error::invalid_part_order(key),
-        Err(CompleteError::PartTooSmall(n)) => {
-            return s3_error::invalid_part(
-                key,
-                &format!(
-                    "all parts except the last must be at least 5 MiB (part {n} is too small)"
-                ),
-            );
-        }
-    };
-
-    let output = match process_input(state, headers, auth, &data) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("filter failed for multipart complete /{bucket}/{key}: {e}");
-            return s3_error::internal_error(&key, &e.to_string());
-        }
-    };
-    let etag = format!("\"{:x}\"", Md5::digest(&output.bytes));
-    let input_len = data.len();
-    let resp = store_processed(state, auth, &bucket, &key, headers, output, input_len).await;
-    if resp.status() != StatusCode::OK {
-        return resp;
-    }
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>"#,
-        xml_escape(&bucket),
-        xml_escape(&key),
-        xml_escape(&etag)
-    );
-    s3_xml_ok(xml)
-}
-
-fn s3_list_parts(
-    state: &AppState,
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-) -> axum::response::Response {
-    match mp_list_parts(state, upload_id) {
-        Some((_, _, parts)) => {
-            let mut xml = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><StorageClass>STANDARD</StorageClass><IsTruncated>false</IsTruncated><MaxParts>1000</MaxParts>"#,
-                xml_escape(bucket),
-                xml_escape(key),
-                xml_escape(upload_id)
-            );
-            for (n, size, etag) in parts {
-                xml.push_str(&format!(
-                    "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag><Size>{size}</Size></Part>"
-                ));
-            }
-            xml.push_str("</ListPartsResult>");
-            s3_xml_ok(xml)
-        }
-        None => s3_error::no_such_upload(key),
-    }
 }
 
 /// ListObjectsV2/ListObjectsV1 — `GET /{bucket}`.
@@ -2072,7 +1912,10 @@ async fn get_keys(
     post,
     path = "/dashboard/api/keys",
     request_body = CreateKeyRequest,
-    responses((status = 200, description = "Created key with secret", body = ApiKeyResponse)),
+    responses(
+        (status = 200, description = "Created key with secret", body = ApiKeyResponse),
+        (status = 500, description = "Key persistence failed", body = InternalErrorResponse)
+    ),
     tag = "keys"
 )]
 async fn create_key(
@@ -2083,10 +1926,27 @@ async fn create_key(
     let Some(uid) = require_user_id(&headers, &state).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let (key_id, secret) = state
+    let result = state
         .keys
         .create_key(&uid, &body.label, body.expires_in, body.public_key_pem)
         .await;
+    let (key_id, secret) = match result {
+        Ok(created) => created,
+        Err(error) => {
+            tracing::error!(
+                user_id = uid,
+                error = %error,
+                "API key creation persistence failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(InternalErrorResponse {
+                    error: "internal_error".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
     let key = state.keys.get_key(&key_id).await;
     let created_at = key
         .as_ref()
@@ -2513,7 +2373,9 @@ pub async fn build_state(
     if auth_disabled {
         let existing = keys.list_for_user("demo-user").await;
         if existing.is_empty() {
-            let (key_id, secret) = keys.create_key("demo-user", "local-default", 0, None).await;
+            let (key_id, secret) = keys
+                .create_key("demo-user", "local-default", 0, None)
+                .await?;
             println!("S4_ACCESS_KEY={key_id}");
             println!("S4_SECRET_KEY={secret}");
         } else if let Some(k) = existing.into_iter().find(|k| k.label == "local-default")
@@ -2536,7 +2398,7 @@ pub async fn build_state(
         jwt_decoder,
         auth_disabled,
         control,
-        multipart: Arc::new(Mutex::new(HashMap::new())),
+        legacy_max_object_bytes: legacy_max_object_bytes(),
     }))
 }
 
@@ -2568,17 +2430,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/{bucket}", get(s3_list_objects))
         .route("/{bucket}", put(s3_bucket_put))
         .route("/{bucket}", delete(s3_bucket_delete))
-        .route(
-            "/{bucket}/{*key}",
-            put(s3_put).layer(DefaultBodyLimit::max(S3_MAX_PUT_BYTES)),
-        )
+        .route("/{bucket}/{*key}", put(s3_put))
         .route("/{bucket}/{*key}", get(s3_get))
         .route("/{bucket}/{*key}", head(s3_head))
         .route("/{bucket}/{*key}", delete(s3_delete))
-        .route(
-            "/{bucket}/{*key}",
-            post(s3_post).layer(DefaultBodyLimit::max(S3_MAX_PUT_BYTES)),
-        )
+        .route("/{bucket}/{*key}", post(s3_post))
         .layer(CorsLayer::permissive())
         .with_state(state)
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))

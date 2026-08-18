@@ -5,9 +5,9 @@ Thanks for considering a contribution to S4.
 ## Getting started
 
 1. Fork the repo and clone it.
-2. Install Rust (see `rust-toolchain.toml`) with the `wasm32-unknown-unknown` target:
-   `rustup target add wasm32-unknown-unknown`
-3. Install `wasm-tools` (`cargo install --locked wasm-tools`) and `just`.
+2. Install Rust 1.97.0 (see `rust-toolchain.toml`) with the `wasm32-wasip1` target:
+   `rustup target add wasm32-wasip1`
+3. Install `wasm-tools` (`cargo install --locked wasm-tools --version 1.255.0`) and `just`.
 4. Run `just check` — it must pass locally before opening a PR.
 
 ## Conventions
@@ -42,8 +42,8 @@ just e2e          # MinIO end-to-end (Docker)
 cargo test --workspace
 ```
 
-Integration tests that need `DATABASE_URL` skip themselves when it is unset, so local
-runs and CI stay green without a database.
+Integration tests that need `DATABASE_URL` skip themselves when it is unset. CI provides
+Postgres and requires these tests to run successfully.
 
 ## Security
 

@@ -2,7 +2,7 @@
 # Optimized deploy image for S4 gateway.
 # Pre-built Wasm components committed to components/; single arch (amd64).
 
-FROM rust:1-bookworm AS build
+FROM rust:1.97.0-trixie@sha256:b92b8c8574f8f3b207fcb0912fb3e2de4041580b5934d90312d53938c9a038a9 AS build
 WORKDIR /src
 
 # Dependencies first — this layer caches across source changes.
@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p s4-gateway \
     && cp /src/target/release/s4-gateway /src/gateway-bin
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

@@ -11,6 +11,7 @@ use axum::http::{Request, StatusCode, header};
 use s4_gateway::control::NoopControlPlane;
 use s4_gateway::key_cipher::default_wrapping;
 use s4_gateway::server::{AppState, build_router, build_state};
+use s4_gateway::store::FileKeyStore;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -24,6 +25,9 @@ async fn test_state() -> Arc<AppState> {
         std::env::remove_var("S3_ENDPOINT");
         std::env::remove_var("S4_SECRET_KEK");
         std::env::remove_var("S4_SERVICE_BUCKETS");
+        std::env::remove_var("S4_LEGACY_MAX_OBJECT_BYTES");
+        std::env::remove_var("S4_STREAMING_READ_MODE");
+        std::env::remove_var("S4_MULTIPART_MODE");
         // Load the built filter components so the full pipeline (including
         // stable-encrypt) is available for joinable-read tests.
         let components =
@@ -43,11 +47,42 @@ async fn router() -> (Router, Arc<AppState>) {
     (build_router(state.clone()), state)
 }
 
+#[tokio::test]
+async fn create_key_persistence_failure_returns_internal_error_without_secret() {
+    let mut state = test_state().await;
+    let blocking_parent = std::env::temp_dir().join(format!(
+        "s4-create-key-failure-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&blocking_parent, "not a directory").unwrap();
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.keys = Arc::new(FileKeyStore::new(blocking_parent.join("keys.json")));
+    state_mut.auth_disabled = true;
+    let app = build_router(state);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/dashboard/api/keys")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"label":"failure-test"}"#))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), br#"{"error":"internal_error"}"#);
+    assert!(!String::from_utf8_lossy(&body).contains("s4s_"));
+    std::fs::remove_file(blocking_parent).unwrap();
+}
+
 async fn make_key(state: &Arc<AppState>) -> (String, String) {
     state
         .keys
         .create_key("test-user", "sigv4-test", 0, None)
         .await
+        .expect("create test API key")
 }
 
 fn auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
@@ -235,188 +270,108 @@ async fn create_bucket_is_rejected() {
 }
 
 #[tokio::test]
-async fn multipart_upload_assembles_and_filters() {
+async fn head_and_delete_remain_available() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
 
-    // Initiate
-    let init = add_headers(
+    let put = add_headers(
         Request::builder()
-            .method("POST")
-            .uri("/bkt/big.txt?uploads")
+            .method("PUT")
+            .uri("/bkt/lifecycle.txt")
+            .body(Body::from("payload"))
+            .unwrap(),
+        &hdrs,
+    );
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let head = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri("/bkt/lifecycle.txt")
             .body(Body::empty())
             .unwrap(),
         &hdrs,
     );
-    let resp = app.clone().oneshot(init).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let xml = String::from_utf8_lossy(&body);
-    let upload_id = xml
-        .split("<UploadId>")
-        .nth(1)
-        .and_then(|s| s.split("</UploadId>").next())
-        .expect("upload id in init XML")
-        .to_string();
+    let head_response = app.clone().oneshot(head).await.unwrap();
+    assert_eq!(head_response.status(), StatusCode::OK);
+    assert!(head_response.headers().contains_key(header::CONTENT_LENGTH));
 
-    // Upload part 1 (>= 5 MiB) and part 2 (last part, any size).
-    let part1 = vec![b'a'; 5 * 1024 * 1024];
-    let part2 = b"\ncontact b@c.com now".to_vec();
-    for (n, data) in [(1, &part1), (2, &part2)] {
-        let uri = format!("/bkt/big.txt?partNumber={n}&uploadId={upload_id}");
-        let put = add_headers(
-            Request::builder()
-                .method("PUT")
-                .uri(uri)
-                .body(Body::from(data.clone()))
-                .unwrap(),
-            &hdrs,
-        );
-        let resp = app.clone().oneshot(put).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "upload part {n}");
-        let etag = resp.headers().get("ETag").cloned();
-        assert!(etag.is_some(), "part {n} must return an ETag");
-    }
-
-    // Complete
-    let complete_xml = r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"x"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"x"</ETag></Part></CompleteMultipartUpload>"#;
-    let complete = add_headers(
+    let delete = add_headers(
         Request::builder()
-            .method("POST")
-            .uri(format!("/bkt/big.txt?uploadId={upload_id}"))
-            .header(header::CONTENT_TYPE, "application/xml")
-            .body(Body::from(complete_xml))
+            .method("DELETE")
+            .uri("/bkt/lifecycle.txt")
+            .body(Body::empty())
             .unwrap(),
         &hdrs,
     );
-    let resp = app.clone().oneshot(complete).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "complete should succeed");
+    assert_eq!(
+        app.clone().oneshot(delete).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
 
-    // Read back: assembled bytes must have gone through the filter pipeline.
     let get = add_headers(
         Request::builder()
             .method("GET")
-            .uri("/bkt/big.txt")
+            .uri("/bkt/lifecycle.txt")
             .body(Body::empty())
             .unwrap(),
         &hdrs,
     );
-    let resp = app.oneshot(get).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(
-        body.len() >= part1.len() + part2.len() - 2,
-        "assembled content preserved"
+    assert_eq!(
+        app.oneshot(get).await.unwrap().status(),
+        StatusCode::NOT_FOUND
     );
-    let text = String::from_utf8_lossy(&body);
-    assert!(
-        text.contains("[REDACTED_EMAIL]"),
-        "filtered at complete: {text}"
-    );
-    assert!(!text.contains("b@c.com"), "raw email must not be stored");
 }
 
 #[tokio::test]
-async fn multipart_abort_drops_parts() {
-    let (app, state) = router().await;
+async fn all_multipart_operations_are_rejected() {
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .legacy_max_object_bytes = 1;
+    let app = build_router(state.clone());
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
 
-    let init = add_headers(
-        Request::builder()
-            .method("POST")
-            .uri("/bkt/abort.txt?uploads")
-            .body(Body::empty())
-            .unwrap(),
-        &hdrs,
-    );
-    let resp = app.clone().oneshot(init).await.unwrap();
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let xml = String::from_utf8_lossy(&body);
-    let upload_id = xml
-        .split("<UploadId>")
-        .nth(1)
-        .and_then(|s| s.split("</UploadId>").next())
-        .unwrap()
-        .to_string();
-
-    let abort = add_headers(
-        Request::builder()
-            .method("DELETE")
-            .uri(format!("/bkt/abort.txt?uploadId={upload_id}"))
-            .body(Body::empty())
-            .unwrap(),
-        &hdrs,
-    );
-    let resp = app.oneshot(abort).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-}
-
-#[tokio::test]
-async fn multipart_too_small_part_rejected() {
-    let (app, state) = router().await;
-    let (ak, sk) = make_key(&state).await;
-    let hdrs = auth_headers(&ak, &sk);
-
-    let init = add_headers(
-        Request::builder()
-            .method("POST")
-            .uri("/bkt/small.txt?uploads")
-            .body(Body::empty())
-            .unwrap(),
-        &hdrs,
-    );
-    let resp = app.clone().oneshot(init).await.unwrap();
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let xml = String::from_utf8_lossy(&body);
-    let upload_id = xml
-        .split("<UploadId>")
-        .nth(1)
-        .and_then(|s| s.split("</UploadId>").next())
-        .unwrap()
-        .to_string();
-
-    // Two tiny parts: the first must be >= 5 MiB, so Complete fails.
-    for n in 1..=2 {
-        let uri = format!("/bkt/small.txt?partNumber={n}&uploadId={upload_id}");
-        let put = add_headers(
+    for (method, uri, body) in [
+        ("POST", "/bkt/object?uploads", "create"),
+        (
+            "PUT",
+            "/bkt/object?partNumber=1&uploadId=untrusted",
+            "raw part must not be stored",
+        ),
+        ("GET", "/bkt/object?uploadId=untrusted", ""),
+        (
+            "POST",
+            "/bkt/object?uploadId=untrusted",
+            "complete body must not be consumed",
+        ),
+        ("DELETE", "/bkt/object?uploadId=untrusted", ""),
+    ] {
+        let request = add_headers(
             Request::builder()
-                .method("PUT")
+                .method(method)
                 .uri(uri)
-                .body(Body::from("tiny"))
+                .body(Body::from(body))
                 .unwrap(),
             &hdrs,
         );
-        assert_eq!(
-            app.clone().oneshot(put).await.unwrap().status(),
-            StatusCode::OK
+        let resp = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
+        let response_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&response_body).contains("<Code>NotImplemented</Code>"),
+            "{method} {uri}"
         );
     }
-    let complete = add_headers(
-        Request::builder()
-            .method("POST")
-            .uri(format!("/bkt/small.txt?uploadId={upload_id}"))
-            .body(Body::from(
-                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part><Part><PartNumber>2</PartNumber></Part></CompleteMultipartUpload>",
-            ))
-            .unwrap(),
-        &hdrs,
-    );
-    let resp = app.oneshot(complete).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("InvalidPart"));
+
+    assert!(state.store.get("bkt", "object").is_none());
 }
 
 fn signed_request(
@@ -591,8 +546,16 @@ async fn managed_storage_isolates_users() {
     // can act as the other. The namespace prefix itself is exercised
     // end-to-end against real B2 by e2e-b2.sh / e2e-hosted.sh.
     let (app, state) = router().await;
-    let (ak1, sk1) = state.keys.create_key("user-one", "ns-test", 0, None).await;
-    let (ak2, sk2) = state.keys.create_key("user-two", "ns-test", 0, None).await;
+    let (ak1, sk1) = state
+        .keys
+        .create_key("user-one", "ns-test", 0, None)
+        .await
+        .expect("create user-one API key");
+    let (ak2, sk2) = state
+        .keys
+        .create_key("user-two", "ns-test", 0, None)
+        .await
+        .expect("create user-two API key");
     let h1 = auth_headers(&ak1, &sk1);
     let h2 = auth_headers(&ak2, &sk2);
 
@@ -693,7 +656,11 @@ async fn sigv4_tampered_body_rejected() {
 async fn non_expiring_key_works() {
     let (app, state) = router().await;
     // expires_in=0 means never expires.
-    let (ak, sk) = state.keys.create_key("never-exp", "exp", 0, None).await;
+    let (ak, sk) = state
+        .keys
+        .create_key("never-exp", "exp", 0, None)
+        .await
+        .expect("create non-expiring API key");
     let hdrs = auth_headers(&ak, &sk);
     let put = add_headers(
         Request::builder()
@@ -825,7 +792,7 @@ async fn demo_redact_runs_pipeline() {
 }
 
 #[tokio::test]
-async fn read_time_processing_scrubs_agent_output() {
+async fn transformed_read_is_rejected_without_exposing_raw_data() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
@@ -858,8 +825,7 @@ async fn read_time_processing_scrubs_agent_output() {
         "raw read keeps PII: {raw}"
     );
 
-    // GET with x-s4-process: read scrubs the output for agents.
-    let get_scrubbed = add_headers(
+    let transformed_get = add_headers(
         Request::builder()
             .method("GET")
             .uri("/rawbkt/doc.json")
@@ -868,33 +834,140 @@ async fn read_time_processing_scrubs_agent_output() {
             .unwrap(),
         &hdrs,
     );
-    let resp = app.oneshot(get_scrubbed).await.unwrap();
+    let resp = app.oneshot(transformed_get).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let scrubbed = String::from_utf8_lossy(&body);
+    let rejected = String::from_utf8_lossy(&body);
     assert!(
-        scrubbed.contains("[REDACTED_EMAIL]"),
-        "email scrubbed: {scrubbed}"
+        rejected.contains("<Code>NotImplemented</Code>"),
+        "typed rejection: {rejected}"
     );
     assert!(
-        scrubbed.contains("[REDACTED_CARD]"),
-        "card scrubbed: {scrubbed}"
+        !rejected.contains("alice@example.com") && !rejected.contains("4111111111111111"),
+        "rejection must not leak raw PII: {rejected}"
     );
-    assert!(
-        !scrubbed.contains("alice@example.com"),
-        "no raw PII leaks: {scrubbed}"
-    );
-    assert!(scrubbed.contains("note"), "non-PII preserved: {scrubbed}");
 }
 
 #[tokio::test]
-async fn read_time_stable_encrypt_is_joinable() {
-    // The joinable-read story: an agent reads two records through S4 with
-    // x-s4-process: read AND x-s4-stable-fields set. Stable-encrypt (AES-SIV,
-    // zero nonce) turns the join field into deterministic ciphertext: the same
-    // email yields the same ciphertext across records, so the agent can JOIN
-    // on it without ever seeing the plaintext.
+async fn transformed_read_is_rejected_before_object_lookup() {
+    let (app, state) = router().await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+
+    let get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/rawbkt/does-not-exist.json")
+            .header("x-s4-process", "true")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let resp = app.oneshot(get).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Code>NotImplemented</Code>"), "{xml}");
+    assert!(!xml.contains("NoSuchKey"), "lookup must not run: {xml}");
+}
+
+#[tokio::test]
+async fn legacy_body_limit_never_exceeds_hard_ceiling() {
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .legacy_max_object_bytes = usize::MAX;
+    let app = build_router(state.clone());
+    let (ak, sk) = make_key(&state).await;
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/limits/default.txt")
+            .body(Body::from(vec![b'x'; 16 * 1024 * 1024 + 1]))
+            .unwrap(),
+        &auth_headers(&ak, &sk),
+    );
+
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Code>EntityTooLarge</Code>"), "{xml}");
+}
+
+#[tokio::test]
+async fn custom_legacy_body_limit_caps_put_and_passthrough_get() {
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .legacy_max_object_bytes = 8;
+    let app = build_router(state.clone());
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+
+    let put = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/limits/custom.txt")
+            .body(Body::from("123456789"))
+            .unwrap(),
+        &hdrs,
+    );
+    let resp = app.clone().oneshot(put).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>EntityTooLarge</Code>"));
+
+    // The line-oriented pipeline appends a separator, so an input exactly at
+    // the cap must still be rejected when transformed output exceeds it.
+    let expanded = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/limits/expanded.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("12345678"))
+            .unwrap(),
+        &hdrs,
+    );
+    let resp = app.clone().oneshot(expanded).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>EntityTooLarge</Code>"));
+
+    state.store.put(
+        "limits",
+        "upstream.txt",
+        b"123456789".to_vec(),
+        "text/plain",
+    );
+    let get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/limits/upstream.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let resp = app.oneshot(get).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>EntityTooLarge</Code>"));
+}
+
+#[tokio::test]
+async fn stable_transformed_reads_are_rejected_without_disclosure() {
     let (app, state) = router().await;
 
     let (ak, sk) = make_key(&state).await;
@@ -929,6 +1002,8 @@ async fn read_time_stable_encrypt_is_joinable() {
 
     let ra = app.clone().oneshot(get("a.json")).await.unwrap();
     let rb = app.clone().oneshot(get("b.json")).await.unwrap();
+    assert_eq!(ra.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(rb.status(), StatusCode::NOT_IMPLEMENTED);
     let ta = String::from_utf8_lossy(
         &axum::body::to_bytes(ra.into_body(), usize::MAX)
             .await
@@ -942,27 +1017,14 @@ async fn read_time_stable_encrypt_is_joinable() {
     )
     .to_string();
 
-    // Neither leaks the plaintext email.
     assert!(!ta.contains("alice@example.com"), "a leaks PII: {ta}");
     assert!(!tb.contains("alice@example.com"), "b leaks PII: {tb}");
-
-    // The email field is present (stable-encrypted), not redacted away.
-    assert!(ta.contains("email"), "a keeps the join field: {ta}");
-    assert!(tb.contains("email"), "b keeps the join field: {tb}");
-
-    // Deterministic: the ciphertext of the shared email is identical in both.
-    let extract = |t: &str| {
-        let v: serde_json::Value = serde_json::from_str(t).unwrap();
-        v["email"].as_str().unwrap().to_string()
-    };
-    let ea = extract(&ta);
-    let eb = extract(&tb);
-    assert_eq!(ea, eb, "same value must join: '{ea}' vs '{eb}'");
-    assert_ne!(ea, "alice@example.com", "must be ciphertext, not plaintext");
+    assert!(ta.contains("<Code>NotImplemented</Code>"), "{ta}");
+    assert!(tb.contains("<Code>NotImplemented</Code>"), "{tb}");
 }
 
 #[tokio::test]
-async fn demo_store_read_safe_and_joinable() {
+async fn demo_transformed_read_modes_are_rejected() {
     let (app, _state) = router().await;
 
     // 1. Store two records sharing an email.
@@ -1006,7 +1068,7 @@ async fn demo_store_read_safe_and_joinable() {
         "raw keeps PII: {raw_text}"
     );
 
-    // 3. Safe read redacts.
+    // 3. Safe and join modes are rejected before reading stored data.
     let safe = app
         .clone()
         .oneshot(
@@ -1018,16 +1080,18 @@ async fn demo_store_read_safe_and_joinable() {
         )
         .await
         .unwrap();
+    assert_eq!(safe.status(), StatusCode::NOT_IMPLEMENTED);
     let safe_body = axum::body::to_bytes(safe.into_body(), usize::MAX)
         .await
         .unwrap();
     let safe_text = String::from_utf8_lossy(&safe_body);
     assert!(
-        safe_text.contains("[REDACTED_EMAIL]"),
-        "safe redacts: {safe_text}"
+        safe_text.contains("<Code>NotImplemented</Code>")
+            && !safe_text.contains("alice@example.com"),
+        "safe mode must fail without disclosure: {safe_text}"
     );
 
-    // 4. Joinable read: same email ciphertext across both records, no leak.
+    // 4. Joinable reads are also unavailable until Phase 8.
     let j1 = app
         .clone()
         .oneshot(
@@ -1036,9 +1100,10 @@ async fn demo_store_read_safe_and_joinable() {
                 .uri("/dashboard/api/demo/read?id=1&mode=join")
                 .body(Body::empty())
                 .unwrap(),
-        )
-        .await
-        .unwrap();
+    )
+    .await
+    .unwrap();
+    assert_eq!(j1.status(), StatusCode::NOT_IMPLEMENTED);
     let j2 = app
         .clone()
         .oneshot(
@@ -1050,6 +1115,7 @@ async fn demo_store_read_safe_and_joinable() {
         )
         .await
         .unwrap();
+    assert_eq!(j2.status(), StatusCode::NOT_IMPLEMENTED);
     let t1 = String::from_utf8_lossy(
         &axum::body::to_bytes(j1.into_body(), usize::MAX)
             .await
@@ -1066,17 +1132,6 @@ async fn demo_store_read_safe_and_joinable() {
         !t1.contains("alice@example.com") && !t2.contains("alice@example.com"),
         "join leaks PII"
     );
-    let email_of = |t: &str| -> String {
-        let brace = t.find('{').unwrap_or(0);
-        let v: serde_json::Value =
-            serde_json::from_str(&t[brace..]).unwrap_or(serde_json::Value::Null);
-        let body_str = v["body"].as_str().unwrap_or("{}");
-        let body: serde_json::Value =
-            serde_json::from_str(body_str).unwrap_or(serde_json::Value::Null);
-        body["email"].as_str().unwrap_or("").to_string()
-    };
-    let e1 = email_of(&t1);
-    let e2 = email_of(&t2);
-    assert_eq!(e1, e2, "joinable emails must match: '{e1}' vs '{e2}'");
-    assert_ne!(e1, "alice@example.com", "must be ciphertext");
+    assert!(t1.contains("<Code>NotImplemented</Code>"), "{t1}");
+    assert!(t2.contains("<Code>NotImplemented</Code>"), "{t2}");
 }

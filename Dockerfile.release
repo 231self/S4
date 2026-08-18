@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 # Assembly-only image: the gateway binary + Wasm components are built on the
 # GitHub runner (warm cargo cache) and staged in dist/; this Dockerfile just
-# packages them. The release job cross-compiles per architecture, so this
+# packages them. The release job builds natively per architecture, so this
 # builds in seconds (no compilation in Docker).
-FROM debian:bookworm-slim
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

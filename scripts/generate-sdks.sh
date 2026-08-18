@@ -6,10 +6,13 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SDK_DIR="$PROJECT_DIR/sdks"
 GATEWAY_PORT=19001
 GATEWAY_URL="http://127.0.0.1:$GATEWAY_PORT"
+GATEWAY_PID=""
 
 cleanup() {
-    kill "$GATEWAY_PID" 2>/dev/null || true
-    wait "$GATEWAY_PID" 2>/dev/null || true
+    if [ -n "$GATEWAY_PID" ]; then
+        kill "$GATEWAY_PID" 2>/dev/null || true
+        wait "$GATEWAY_PID" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -27,18 +30,32 @@ echo "→ Starting gateway on port $GATEWAY_PORT..."
 GATEWAY_PID=$!
 
 # Wait for gateway to be ready
+GATEWAY_READY=false
 for i in $(seq 1 30); do
-    if curl -s "$GATEWAY_URL/health" >/dev/null 2>&1; then
+    if curl --fail --silent "$GATEWAY_URL/health" >/dev/null 2>&1; then
+        GATEWAY_READY=true
         break
+    fi
+    if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+        EXITED_GATEWAY_PID="$GATEWAY_PID"
+        GATEWAY_PID=""
+        GATEWAY_STATUS=0
+        wait "$EXITED_GATEWAY_PID" || GATEWAY_STATUS=$?
+        echo "ERROR: gateway exited before becoming ready (status $GATEWAY_STATUS)" >&2
+        exit 1
     fi
     sleep 0.5
 done
+if [ "$GATEWAY_READY" != true ]; then
+    echo "ERROR: gateway did not become ready at $GATEWAY_URL within 15 seconds" >&2
+    exit 1
+fi
 
 echo "→ Extracting OpenAPI spec..."
-curl -s "$GATEWAY_URL/openapi.json" > "$SDK_DIR/openapi.json"
+curl --fail --silent --show-error "$GATEWAY_URL/openapi.json" > "$SDK_DIR/openapi.json"
 echo "   Saved to $SDK_DIR/openapi.json"
 
-GENERATOR_IMAGE="openapitools/openapi-generator-cli:v7.14.0"
+GENERATOR_IMAGE="openapitools/openapi-generator-cli:v7.14.0@sha256:a620610d9fabf7ce05310c648417ba168125aac2f4517580030e115921ac1a52"
 
 generate() {
     local lang=$1
@@ -75,5 +92,4 @@ apply_overlay typescript
 echo "→ Generated SDKs:"
 ls -la "$SDK_DIR/python/" "$SDK_DIR/typescript/" | head -5
 
-cleanup
 echo "Done. SDKs in $SDK_DIR/"

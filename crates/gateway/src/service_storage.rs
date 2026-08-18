@@ -8,6 +8,38 @@ use tracing::{info, warn};
 
 pub const VIRTUAL_NODES: usize = 150;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServiceStorageReadError {
+    EntityTooLarge,
+}
+
+enum CollectBodyError {
+    EntityTooLarge,
+    Backend,
+}
+
+async fn collect_body(
+    mut body: ByteStream,
+    max_bytes: usize,
+) -> Result<Vec<u8>, CollectBodyError> {
+    let (_, upper) = body.size_hint();
+    if upper.is_some_and(|size| size > max_bytes as u64) {
+        return Err(CollectBodyError::EntityTooLarge);
+    }
+    let mut data = Vec::with_capacity(upper.unwrap_or(0).min(max_bytes as u64) as usize);
+    while let Some(chunk) = body
+        .try_next()
+        .await
+        .map_err(|_| CollectBodyError::Backend)?
+    {
+        if chunk.len() > max_bytes.saturating_sub(data.len()) {
+            return Err(CollectBodyError::EntityTooLarge);
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceBackend {
     pub provider: String,
@@ -174,27 +206,40 @@ impl ServiceStorage {
         Ok(())
     }
 
-    pub async fn get(&self, key: &str) -> Option<(Vec<u8>, String)> {
+    pub async fn get(
+        &self,
+        key: &str,
+        max_bytes: usize,
+    ) -> Result<Option<(Vec<u8>, String)>, ServiceStorageReadError> {
         let (primary, replica_opt) = self.get_backend_ids(key);
 
         let try_get = |index: usize| async move {
-            let client = self.client_for(index).await?;
-            let resp = client
+            let Some(client) = self.client_for(index).await else {
+                return Ok(None);
+            };
+            let Ok(resp) = client
                 .get_object()
                 .bucket(&self.backends[index].bucket)
                 .key(key)
                 .send()
                 .await
-                .ok()?;
-            let data = resp.body.collect().await.ok()?.into_bytes().to_vec();
+            else {
+                return Ok(None);
+            };
             let ct = resp
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            Some((data, ct))
+            match collect_body(resp.body, max_bytes).await {
+                Ok(data) => Ok(Some((data, ct))),
+                Err(CollectBodyError::EntityTooLarge) => {
+                    Err(ServiceStorageReadError::EntityTooLarge)
+                }
+                Err(CollectBodyError::Backend) => Ok(None),
+            }
         };
 
-        if let Some(result) = try_get(primary).await {
-            return Some(result);
+        if let Some(result) = try_get(primary).await? {
+            return Ok(Some(result));
         }
 
         info!("primary miss for {key}, trying replica");
@@ -202,7 +247,7 @@ impl ServiceStorage {
             return try_get(ri).await;
         }
 
-        None
+        Ok(None)
     }
 
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {

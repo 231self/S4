@@ -10,14 +10,42 @@ OUT_DIR="$ROOT/target/components"
 TARGET="wasm32-wasip1"
 BIN_DIR="$ROOT/target/$TARGET/release"
 
-# The reactor adapter ships with the wasi-preview1-component-adapter-provider
-# crate (a dev-dependency of this repo); fall back to the wit-bindgen-cli one.
+# Keep the adapter aligned with the workspace's Wasmtime major and verify the
+# release asset instead of depending on arbitrary Cargo registry cache state.
+ADAPTER_VERSION="47.0.0"
+ADAPTER_SHA256="cdecdb3d5c06cd7cf585c865c6615dc9463777f0b45b74cc1b42ce630e2788e2"
+ADAPTER_URL="https://github.com/bytecodealliance/wasmtime/releases/download/v${ADAPTER_VERSION}/wasi_snapshot_preview1.reactor.wasm"
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d ' ' -f 1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d ' ' -f 1
+  else
+    echo "ERROR: sha256sum or shasum is required" >&2
+    return 1
+  fi
+}
+
 ADAPTER="${S4_WASI_ADAPTER:-}"
 if [ -z "$ADAPTER" ]; then
-  ADAPTER=$(find "$HOME/.cargo/registry/src" -name "wasi_snapshot_preview1.reactor.wasm" 2>/dev/null | head -1)
-fi
-if [ -z "$ADAPTER" ]; then
-  echo "ERROR: wasi_snapshot_preview1.reactor.wasm adapter not found; install wasi-preview1-component-adapter-provider" >&2
+  ADAPTER_DIR="$ROOT/target/wasi-preview1-adapter-v${ADAPTER_VERSION}"
+  ADAPTER="$ADAPTER_DIR/wasi_snapshot_preview1.reactor.wasm"
+  mkdir -p "$ADAPTER_DIR"
+
+  if [ ! -f "$ADAPTER" ] || [ "$(sha256_file "$ADAPTER")" != "$ADAPTER_SHA256" ]; then
+    ADAPTER_TMP="${ADAPTER}.tmp"
+    rm -f "$ADAPTER_TMP"
+    curl --fail --location --retry 3 --silent --show-error "$ADAPTER_URL" -o "$ADAPTER_TMP"
+    if [ "$(sha256_file "$ADAPTER_TMP")" != "$ADAPTER_SHA256" ]; then
+      rm -f "$ADAPTER_TMP"
+      echo "ERROR: checksum mismatch for WASI preview1 reactor adapter v${ADAPTER_VERSION}" >&2
+      exit 1
+    fi
+    mv "$ADAPTER_TMP" "$ADAPTER"
+  fi
+elif [ ! -f "$ADAPTER" ]; then
+  echo "ERROR: S4_WASI_ADAPTER does not exist: $ADAPTER" >&2
   exit 1
 fi
 

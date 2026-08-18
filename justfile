@@ -70,7 +70,7 @@ dev-up: build-filters
   echo "Local dev environment ready:"
   echo "  MinIO:     http://localhost:9000 (API) / :9001 (Console)"
   echo "  Gateway:   http://localhost:8080/health"
-  docker run --rm --network host minio/mc --no-color mb local/s4-local --ignore-existing 2>/dev/null || true
+  docker run --rm --network host minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 --no-color mb local/s4-local --ignore-existing 2>/dev/null || true
   echo "  S3 bucket: s4-local (created)"
 
 # Stop local dev environment

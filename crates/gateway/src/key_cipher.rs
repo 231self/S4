@@ -7,10 +7,14 @@
 //! a follow-up). Decryption only happens in memory, on demand, to recompute a
 //! SigV4 signature.
 //!
-//! Envelope format (`v1`):
-//! `v1:{base64(wrapped_dek)}:{base64(nonce)}:{base64(ciphertext+tag)}`
+//! Envelope formats:
+//! - `v1:{base64(wrapped_dek)}:{base64(nonce)}:{base64(ciphertext+tag)}`
+//! - `v2:{base64(wrapped_dek)}:{base64(nonce)}:{base64(ciphertext+tag)}`
+//!
+//! v2 authenticates the API key identity as AES-GCM additional authenticated
+//! data (AAD), preventing an encrypted secret from being moved to another key.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -21,7 +25,9 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::warn;
 
-const ENVELOPE_VERSION: &str = "v1";
+const LEGACY_ENVELOPE_VERSION: &str = "v1";
+const ENVELOPE_VERSION: &str = "v2";
+const AAD_DOMAIN: &[u8] = b"s4.api-key.secret.v2\0";
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 
@@ -128,41 +134,87 @@ impl SecretCipher {
         Self { wrapping }
     }
 
-    /// Encrypt `secret`, returning the `v1` envelope string.
-    pub fn encrypt(&self, secret: &str) -> Result<String> {
+    /// Encrypt `secret`, returning a v2 envelope bound to `key_id`.
+    pub fn encrypt(&self, key_id: &str, secret: &str) -> Result<String> {
+        self.encrypt_with_version(ENVELOPE_VERSION, key_id, secret)
+    }
+
+    fn encrypt_with_version(&self, version: &str, key_id: &str, secret: &str) -> Result<String> {
         let mut dek = [0u8; KEY_LEN];
         OsRng.fill_bytes(&mut dek);
         let wrapped = self.wrapping.wrap(&dek)?;
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
         let cipher = Aes256Gcm::new_from_slice(&dek).map_err(anyhow::Error::msg)?;
-        let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), secret.as_bytes())
-            .map_err(|_| anyhow!("secret encryption failed"))?;
+        let ct = if version == ENVELOPE_VERSION {
+            let aad = envelope_aad(key_id);
+            cipher.encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: secret.as_bytes(),
+                    aad: &aad,
+                },
+            )
+        } else {
+            cipher.encrypt(Nonce::from_slice(&nonce), secret.as_bytes())
+        }
+        .map_err(|_| anyhow!("secret encryption failed"))?;
         Ok(format!(
-            "{ENVELOPE_VERSION}:{}:{}:{}",
+            "{version}:{}:{}:{}",
             B64.encode(wrapped),
             B64.encode(nonce),
             B64.encode(ct)
         ))
     }
 
-    /// Decrypt a `v1` envelope, returning the plaintext secret.
-    pub fn decrypt(&self, blob: &str) -> Option<String> {
+    /// Decrypt a v1 or v2 envelope. v2 must match `key_id`'s AAD binding.
+    pub fn decrypt(&self, key_id: &str, blob: &str) -> Option<String> {
         let parts: Vec<&str> = blob.splitn(4, ':').collect();
-        if parts.len() != 4 || parts[0] != ENVELOPE_VERSION {
+        if parts.len() != 4
+            || (parts[0] != ENVELOPE_VERSION && parts[0] != LEGACY_ENVELOPE_VERSION)
+        {
             return None;
         }
         let wrapped = B64.decode(parts[1]).ok()?;
         let nonce = B64.decode(parts[2]).ok()?;
+        if nonce.len() != NONCE_LEN {
+            return None;
+        }
         let ct = B64.decode(parts[3]).ok()?;
         let dek = self.wrapping.unwrap(&wrapped).ok()?;
         let cipher = Aes256Gcm::new_from_slice(&dek).ok()?;
-        cipher
-            .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+        let plaintext = if parts[0] == ENVELOPE_VERSION {
+            let aad = envelope_aad(key_id);
+            cipher.decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: ct.as_ref(),
+                    aad: &aad,
+                },
+            )
+        } else {
+            cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+        };
+        plaintext
             .ok()
             .and_then(|p| String::from_utf8(p).ok())
     }
+
+    pub fn is_legacy_envelope(blob: &str) -> bool {
+        blob.starts_with("v1:")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encrypt_v1(&self, secret: &str) -> Result<String> {
+        self.encrypt_with_version(LEGACY_ENVELOPE_VERSION, "", secret)
+    }
+}
+
+fn envelope_aad(key_id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(AAD_DOMAIN.len() + key_id.len());
+    aad.extend_from_slice(AAD_DOMAIN);
+    aad.extend_from_slice(key_id.as_bytes());
+    aad
 }
 
 #[cfg(test)]
@@ -178,42 +230,84 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_local_kek() {
+    fn v2_roundtrip_local_kek() {
         let cipher = cipher_with_kek(7);
-        let blob = cipher.encrypt("s4s_secret_value_1234").unwrap();
-        assert!(blob.starts_with("v1:"));
+        let blob = cipher
+            .encrypt("s4_key_identity", "s4s_secret_value_1234")
+            .unwrap();
+        assert!(blob.starts_with("v2:"));
         assert_eq!(
-            cipher.decrypt(&blob).as_deref(),
+            cipher.decrypt("s4_key_identity", &blob).as_deref(),
             Some("s4s_secret_value_1234")
         );
     }
 
     #[test]
-    fn tampered_ciphertext_fails() {
+    fn v1_envelope_remains_compatible() {
         let cipher = cipher_with_kek(7);
-        let blob = cipher.encrypt("secret").unwrap();
+        let blob = cipher.encrypt_v1("legacy-secret").unwrap();
+
+        assert!(SecretCipher::is_legacy_envelope(&blob));
+        assert_eq!(
+            cipher.decrypt("any-key-id", &blob).as_deref(),
+            Some("legacy-secret")
+        );
+    }
+
+    #[test]
+    fn v2_wrong_identity_fails() {
+        let cipher = cipher_with_kek(7);
+        let blob = cipher.encrypt("key-a", "secret").unwrap();
+
+        assert_eq!(cipher.decrypt("key-b", &blob), None);
+    }
+
+    #[test]
+    fn swapped_v2_envelopes_fail() {
+        let cipher = cipher_with_kek(7);
+        let envelope_a = cipher.encrypt("key-a", "secret-a").unwrap();
+        let envelope_b = cipher.encrypt("key-b", "secret-b").unwrap();
+
+        assert_eq!(cipher.decrypt("key-a", &envelope_b), None);
+        assert_eq!(cipher.decrypt("key-b", &envelope_a), None);
+    }
+
+    #[test]
+    fn tampered_v2_ciphertext_fails() {
+        let cipher = cipher_with_kek(7);
+        let blob = cipher.encrypt("key-a", "secret").unwrap();
         let mut parts: Vec<String> = blob.split(':').map(|s| s.to_string()).collect();
         let ct = B64.decode(&parts[3]).unwrap();
         let mut tampered = ct.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
         parts[3] = B64.encode(tampered);
-        assert_eq!(cipher.decrypt(&parts.join(":")), None);
+        assert_eq!(cipher.decrypt("key-a", &parts.join(":")), None);
     }
 
     #[test]
     fn wrong_kek_fails() {
-        let blob = cipher_with_kek(7).encrypt("secret").unwrap();
+        let blob = cipher_with_kek(7).encrypt("key-a", "secret").unwrap();
         let other = cipher_with_kek(9);
-        assert_eq!(other.decrypt(&blob), None);
+        assert_eq!(other.decrypt("key-a", &blob), None);
     }
 
     #[test]
     fn malformed_blob_returns_none() {
         let cipher = cipher_with_kek(7);
-        assert_eq!(cipher.decrypt("v1:not-base64:abc"), None);
-        assert_eq!(cipher.decrypt("v9:abc:def:ghi"), None);
-        assert_eq!(cipher.decrypt(""), None);
+        assert_eq!(cipher.decrypt("key-a", "v1:not-base64:abc"), None);
+        assert_eq!(cipher.decrypt("key-a", "v9:abc:def:ghi"), None);
+        assert_eq!(cipher.decrypt("key-a", ""), None);
+    }
+
+    #[test]
+    fn malformed_nonce_returns_none() {
+        let cipher = cipher_with_kek(7);
+        let blob = cipher.encrypt("key-a", "secret").unwrap();
+        let mut parts: Vec<String> = blob.split(':').map(str::to_string).collect();
+        parts[2] = B64.encode([0u8; NONCE_LEN - 1]);
+
+        assert_eq!(cipher.decrypt("key-a", &parts.join(":")), None);
     }
 
     #[test]
@@ -224,8 +318,8 @@ mod tests {
             .expect("no env error")
             .expect("Some");
         let cipher = SecretCipher::new(Arc::new(w));
-        let blob = cipher.encrypt("x").unwrap();
-        assert_eq!(cipher.decrypt(&blob).as_deref(), Some("x"));
+        let blob = cipher.encrypt("key-a", "x").unwrap();
+        assert_eq!(cipher.decrypt("key-a", &blob).as_deref(), Some("x"));
     }
 
     #[test]

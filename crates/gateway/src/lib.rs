@@ -2,6 +2,7 @@ pub mod control;
 pub mod entity;
 pub mod key_cipher;
 pub mod plugin_registry;
+pub mod record;
 pub mod s3_error;
 pub mod server;
 pub mod service_storage;
@@ -124,68 +125,17 @@ impl Gateway {
 }
 
 pub fn split_records(input: &[u8], format: Format) -> Result<Vec<Vec<u8>>, S4Error> {
-    match format {
-        Format::Jsonl => split_lines(input),
-        Format::Text => split_lines(input),
-        Format::Json => {
-            let s = std::str::from_utf8(input)
-                .map_err(|e| S4Error::new(codes::DECODE_ENCODING, e.to_string()))?;
-            Ok(vec![s.as_bytes().to_vec()])
-        }
-        Format::Csv => split_csv_records(input),
-        Format::Tsv => split_lines(input),
-    }
-}
-
-fn split_lines(input: &[u8]) -> Result<Vec<Vec<u8>>, S4Error> {
-    let s = std::str::from_utf8(input)
-        .map_err(|e| S4Error::new(codes::DECODE_ENCODING, e.to_string()))?;
-    let records: Vec<Vec<u8>> = s
-        .lines()
-        .map(|l| l.as_bytes().to_vec())
-        .filter(|b| !is_empty_or_whitespace(b))
+    let decoded = record::decode_all(input, format, record::DecoderLimits::default())?;
+    let mut records: Vec<Vec<u8>> = decoded
+        .into_iter()
+        .map(|record| record.payload.to_vec())
         .collect();
-    if records.is_empty() {
-        Ok(vec![s.as_bytes().to_vec()])
-    } else {
-        Ok(records)
-    }
-}
 
-fn split_csv_records(input: &[u8]) -> Result<Vec<Vec<u8>>, S4Error> {
-    let s = std::str::from_utf8(input)
-        .map_err(|e| S4Error::new(codes::DECODE_ENCODING, e.to_string()))?;
-    let mut records = Vec::new();
-    let mut current = Vec::new();
-    let mut in_quotes = false;
-
-    for ch in s.chars() {
-        current.push(ch as u8);
-        if ch == '"' {
-            in_quotes = !in_quotes;
+    if matches!(format, Format::Text | Format::Jsonl | Format::Tsv) {
+        records.retain(|record| !is_empty_or_whitespace(record));
+        if records.is_empty() {
+            records.push(input.to_vec());
         }
-        if ch == '\n' && !in_quotes {
-            let record: Vec<u8> = std::mem::take(&mut current);
-            let record = std::str::from_utf8(&record)
-                .map_err(|e| S4Error::new(codes::DECODE_CSV, e.to_string()))?;
-            let trimmed = record.trim_end_matches('\n');
-            if !trimmed.is_empty() {
-                records.push(trimmed.as_bytes().to_vec());
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        let record = std::str::from_utf8(&current)
-            .map_err(|e| S4Error::new(codes::DECODE_CSV, e.to_string()))?;
-        let trimmed = record.trim();
-        if !trimmed.is_empty() {
-            records.push(trimmed.as_bytes().to_vec());
-        }
-    }
-
-    if records.is_empty() {
-        return Err(S4Error::new(codes::DECODE_CSV, "no CSV records found"));
     }
     Ok(records)
 }

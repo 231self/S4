@@ -38,6 +38,8 @@ jsonwebtoken.workspace = true
 reqwest.workspace = true
 hmac = "0.12"
 sha2 = "0.10"
+sha1 = "0.10"
+crc = "3.4"
 hex.workspace = true
 sqlx.workspace = true
 sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-uuid"] }

@@ -119,6 +119,14 @@ pub fn signature_mismatch(key: &str) -> axum::response::Response {
     )
 }
 
+pub fn bad_digest(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("BadDigest", detail, key, StatusCode::BAD_REQUEST)
+}
+
+pub fn invalid_request(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("InvalidRequest", detail, key, StatusCode::BAD_REQUEST)
+}
+
 pub fn bucket_not_allowed(bucket: &str) -> axum::response::Response {
     s3_error_xml(
         "AccessDenied",

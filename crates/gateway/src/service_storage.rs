@@ -1,6 +1,7 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
+use bytes::Bytes;
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use tokio::sync::RwLock;
@@ -152,7 +153,7 @@ impl ServiceStorage {
         client
     }
 
-    pub async fn put(&self, key: &str, data: Vec<u8>, content_type: &str) -> anyhow::Result<()> {
+    pub async fn put(&self, key: &str, data: Bytes, content_type: &str) -> anyhow::Result<()> {
         let (primary, replica_opt) = self.get_backend_ids(key);
         info!(
             "service storage PUT {key} -> primary={} replica={:?}",
@@ -201,6 +202,35 @@ impl ServiceStorage {
         }
 
         Ok(())
+    }
+
+    pub async fn open(
+        &self,
+        key: &str,
+        range: Option<&str>,
+    ) -> Option<aws_sdk_s3::operation::get_object::GetObjectOutput> {
+        let (primary, replica_opt) = self.get_backend_ids(key);
+
+        let try_get = |index: usize| async move {
+            let client = self.client_for(index).await?;
+            let mut request = client
+                .get_object()
+                .bucket(&self.backends[index].bucket)
+                .key(key);
+            if let Some(range) = range {
+                request = request.range(range);
+            }
+            request.send().await.ok()
+        };
+
+        if let Some(output) = try_get(primary).await {
+            return Some(output);
+        }
+        info!("primary miss for {key}, trying replica");
+        if let Some(replica) = replica_opt {
+            return try_get(replica).await;
+        }
+        None
     }
 
     pub async fn get(
@@ -294,6 +324,30 @@ impl ServiceStorage {
         }
         if let Some(ri) = replica_opt {
             return try_head(ri).await;
+        }
+        None
+    }
+
+    pub async fn head_output(
+        &self,
+        key: &str,
+    ) -> Option<aws_sdk_s3::operation::head_object::HeadObjectOutput> {
+        let (primary, replica_opt) = self.get_backend_ids(key);
+        let try_head = |index: usize| async move {
+            let client = self.client_for(index).await?;
+            client
+                .head_object()
+                .bucket(&self.backends[index].bucket)
+                .key(key)
+                .send()
+                .await
+                .ok()
+        };
+        if let Some(output) = try_head(primary).await {
+            return Some(output);
+        }
+        if let Some(replica) = replica_opt {
+            return try_head(replica).await;
         }
         None
     }

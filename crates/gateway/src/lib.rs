@@ -1,6 +1,8 @@
+pub mod backend;
 pub mod control;
 pub mod entity;
 pub mod key_cipher;
+pub mod object;
 pub mod plugin_registry;
 pub mod record;
 pub mod s3_error;

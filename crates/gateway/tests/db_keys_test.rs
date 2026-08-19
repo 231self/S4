@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 const TEST_KEK: [u8; 32] = [7; 32];
+static DB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn sea_db(pool: PgPool) -> DatabaseConnection {
     SqlxPostgresConnector::from_sqlx_postgres_pool(pool)
@@ -120,6 +121,7 @@ where
     F: FnOnce(PgPool) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    let _guard = DB_TEST_LOCK.lock().expect("database test lock");
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
         let Ok(url) = std::env::var("DATABASE_URL") else {

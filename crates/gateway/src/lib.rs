@@ -8,14 +8,16 @@ pub mod server;
 pub mod service_storage;
 pub mod store;
 
-use plugin_registry::PluginRegistry;
-use s4_error::{S4Error, codes};
-use s4_wasm_runtime::FilterEngine;
+use bytes::Bytes;
+use plugin_registry::{PipelineSession, PluginRegistry};
+use s4_error::S4Error;
+use s4_wasm_runtime::{CancellationToken, ExecutorConfig, FilterEngine, WasmExecutor};
 use std::sync::Arc;
 
 pub struct Gateway {
-    pub engine: FilterEngine,
+    pub engine: Arc<FilterEngine>,
     pub plugins: Option<Arc<PluginRegistry>>,
+    fallback_executor: Option<Arc<WasmExecutor>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,15 +62,17 @@ impl Gateway {
     pub fn new(component_bytes: &[u8]) -> anyhow::Result<Self> {
         let engine = FilterEngine::new(component_bytes)?;
         Ok(Self {
-            engine,
+            engine: Arc::new(engine),
             plugins: None,
+            fallback_executor: Some(Arc::new(WasmExecutor::new(ExecutorConfig::default())?)),
         })
     }
 
     pub fn with_registry(engine: FilterEngine, plugins: Arc<PluginRegistry>) -> Self {
         Self {
-            engine,
+            engine: Arc::new(engine),
             plugins: Some(plugins),
+            fallback_executor: None,
         }
     }
 
@@ -85,16 +89,14 @@ impl Gateway {
         let record_count = records.len();
 
         let transformed = if let Some(ref plugins) = self.plugins {
-            plugins
-                .process_all(
-                    format,
-                    content_type,
-                    public_key_pem,
-                    stable_key,
-                    stable_fields,
-                    &records,
-                )
-                .map_err(|e| S4Error::new(codes::INTERNAL, e.to_string()))?
+            plugins.process_all(
+                format,
+                content_type,
+                public_key_pem,
+                stable_key,
+                stable_fields,
+                &records,
+            )?
         } else {
             let session = s4_wasm_runtime::Session {
                 format: format.as_str().to_string(),
@@ -104,7 +106,33 @@ impl Gateway {
                 stable_key: stable_key.map(|k| k.to_vec()),
                 stable_fields: stable_fields.map(|s| s.to_string()),
             };
-            self.engine.run_session(&session, &records)?
+            let executor = self
+                .fallback_executor
+                .as_ref()
+                .expect("gateway without a registry must own a Wasm executor");
+            let engine = Arc::clone(&self.engine);
+            let reservation = engine.guest_memory_limit();
+            let cancellation = CancellationToken::new();
+            let task_cancellation = cancellation.clone();
+            executor.execute(reservation, &cancellation, move || {
+                let filter = engine.start_session_with_cancellation(&session, task_cancellation)?;
+                let mut pipeline = PipelineSession::from_filter("default", filter);
+                let mut output = Vec::new();
+                for payload in records {
+                    if let Some(record) =
+                        pipeline.process(record::Record::new(Bytes::from(payload), Bytes::new()))?
+                    {
+                        output.push(record.payload.to_vec());
+                    }
+                }
+                output.extend(
+                    pipeline
+                        .finish()?
+                        .into_iter()
+                        .map(|record| record.payload.to_vec()),
+                );
+                Ok::<_, S4Error>(output)
+            })??
         };
 
         let mut output = Vec::new();

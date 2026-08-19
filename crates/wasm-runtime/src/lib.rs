@@ -3,15 +3,32 @@ wasmtime::component::bindgen!({
     path: "../../wit/s4-filter/world.wit",
 });
 
+mod executor;
+
+pub use executor::{
+    CancellationToken, ExecutorConfig, MemoryAdmission, MemoryPermit, WasmExecutor,
+};
+
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
+
 use s4_error::{S4Error, codes};
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Engine, ResourceLimiter, Store};
+use wasmtime::{Engine, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::p2::add_to_linker_sync as add_wasi_to_linker;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
-#[derive(Debug, Default)]
+const DEFAULT_GUEST_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_MEMORIES: usize = 4;
+const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
+const EPOCH_TICK: Duration = Duration::from_millis(10);
+
+#[derive(Debug)]
 struct S4ResourceLimiter {
     memory_limit: usize,
+    memory_used: usize,
+    max_memories: usize,
+    table_elements: usize,
 }
 
 impl ResourceLimiter for S4ResourceLimiter {
@@ -21,13 +38,15 @@ impl ResourceLimiter for S4ResourceLimiter {
         desired: usize,
         _maximum: Option<usize>,
     ) -> Result<bool, wasmtime::Error> {
-        let _ = current;
-        if desired > self.memory_limit {
+        let growth = desired.saturating_sub(current);
+        let aggregate = self.memory_used.saturating_add(growth);
+        if aggregate > self.memory_limit {
             return Err(wasmtime::Error::msg(format!(
-                "memory limit exceeded: {} > {}",
-                desired, self.memory_limit
+                "aggregate memory limit exceeded: {} > {}",
+                aggregate, self.memory_limit
             )));
         }
+        self.memory_used = aggregate;
         Ok(true)
     }
 
@@ -38,12 +57,16 @@ impl ResourceLimiter for S4ResourceLimiter {
         _maximum: Option<usize>,
     ) -> Result<bool, wasmtime::Error> {
         let _ = current;
-        if desired > 10_000 {
+        if desired > self.table_elements {
             return Err(wasmtime::Error::msg(format!(
                 "table limit exceeded: {desired}"
             )));
         }
         Ok(true)
+    }
+
+    fn memories(&self) -> usize {
+        self.max_memories
     }
 }
 
@@ -73,9 +96,180 @@ pub struct Session {
 }
 
 pub struct FilterEngine {
-    engine: Engine,
+    epoch_engine: Arc<EpochEngine>,
     component: Component,
-    fuel: u64,
+    limits: RuntimeLimits,
+}
+
+struct EpochEngine {
+    engine: Engine,
+}
+
+static EPOCH_ENGINES: OnceLock<Mutex<Vec<Weak<EpochEngine>>>> = OnceLock::new();
+static EPOCH_THREAD: OnceLock<()> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+pub struct RuntimeLimits {
+    pub guest_memory_bytes: usize,
+    pub max_memories: usize,
+    pub table_elements: usize,
+    pub cumulative_fuel: u64,
+    pub per_call_fuel: u64,
+    pub per_call_timeout: Duration,
+    pub object_timeout: Duration,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        Self {
+            guest_memory_bytes: DEFAULT_GUEST_MEMORY_BYTES,
+            max_memories: DEFAULT_MAX_MEMORIES,
+            table_elements: DEFAULT_TABLE_ELEMENTS,
+            cumulative_fuel: DEFAULT_FUEL,
+            per_call_fuel: DEFAULT_FUEL,
+            per_call_timeout: Duration::from_secs(30),
+            object_timeout: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransformOutcome {
+    Emit(Vec<u8>),
+    Drop,
+}
+
+pub struct FilterSession {
+    store: Store<S4HostState>,
+    funcs: Filter,
+    cancellation: CancellationToken,
+    control: Arc<CallControl>,
+    limits: RuntimeLimits,
+    object_deadline: Instant,
+    fuel_consumed: u64,
+}
+
+#[derive(Debug)]
+struct CallControl {
+    deadline: Mutex<Instant>,
+    cancellation: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FuelWindow {
+    total_before: u64,
+    call_budget: u64,
+}
+
+impl FilterSession {
+    pub fn transform(&mut self, payload: &[u8]) -> Result<TransformOutcome, S4Error> {
+        self.transform_with_fuel_limit(payload, u64::MAX)
+    }
+
+    pub fn transform_with_fuel_limit(
+        &mut self,
+        payload: &[u8],
+        fuel_limit: u64,
+    ) -> Result<TransformOutcome, S4Error> {
+        let window = self.prepare_call(fuel_limit)?;
+        let result = self.funcs.call_transform(&mut self.store, payload);
+        let decision = self.complete_call(window, result, "transform", codes::WASM_TRAP)?;
+        let decision = decision.map_err(|error| S4Error::new(codes::WASM_TRAP, error))?;
+        match decision {
+            Decision::Emit(data) => Ok(TransformOutcome::Emit(data)),
+            Decision::Drop => Ok(TransformOutcome::Drop),
+            Decision::Reject(reason) => Err(S4Error::new(codes::WASM_REJECT, reason)),
+        }
+    }
+
+    pub fn finish(self) -> Result<Vec<u8>, S4Error> {
+        self.finish_with_fuel_limit(u64::MAX)
+            .map(|(output, _)| output)
+    }
+
+    pub fn finish_with_fuel_limit(mut self, fuel_limit: u64) -> Result<(Vec<u8>, u64), S4Error> {
+        let window = self.prepare_call(fuel_limit)?;
+        let result = self.funcs.call_finish(&mut self.store);
+        let output = self
+            .complete_call(window, result, "finish", codes::WASM_TRAP)?
+            .map_err(|error| S4Error::new(codes::WASM_TRAP, error))?;
+        Ok((output, self.fuel_consumed))
+    }
+
+    pub fn fuel_consumed(&self) -> u64 {
+        self.fuel_consumed
+    }
+
+    fn call_begin(&mut self, context: &Context, fuel_limit: u64) -> Result<(), S4Error> {
+        let window = self.prepare_call(fuel_limit)?;
+        let result = self.funcs.call_begin(&mut self.store, context);
+        self.complete_call(window, result, "begin", codes::WASM_INIT)?
+            .map_err(|error| S4Error::new(codes::WASM_INIT, error))
+    }
+
+    fn prepare_call(&mut self, fuel_limit: u64) -> Result<FuelWindow, S4Error> {
+        if self.cancellation.is_cancelled() {
+            return Err(S4Error::new(
+                codes::WASM_CANCELLED,
+                "Wasm execution was cancelled",
+            ));
+        }
+        let object_remaining = self
+            .object_deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| S4Error::new(codes::WASM_DEADLINE, "Wasm object deadline exceeded"))?;
+        let call_timeout = self.limits.per_call_timeout.min(object_remaining);
+        *self.control.deadline.lock().unwrap() = Instant::now() + call_timeout;
+        self.store.set_epoch_deadline(1);
+
+        let total_before = self
+            .store
+            .get_fuel()
+            .map_err(|error| S4Error::new(codes::WASM_FUEL, error.to_string()))?;
+        let call_budget = total_before.min(self.limits.per_call_fuel).min(fuel_limit);
+        if call_budget == 0 {
+            return Err(S4Error::new(
+                codes::WASM_FUEL,
+                "Wasm cumulative fuel budget exhausted",
+            ));
+        }
+        self.store
+            .set_fuel(call_budget)
+            .map_err(|error| S4Error::new(codes::WASM_FUEL, error.to_string()))?;
+        Ok(FuelWindow {
+            total_before,
+            call_budget,
+        })
+    }
+
+    fn complete_call<T>(
+        &mut self,
+        window: FuelWindow,
+        result: wasmtime::Result<T>,
+        stage: &str,
+        default_code: &'static str,
+    ) -> Result<T, S4Error> {
+        let call_remaining = self.store.get_fuel().unwrap_or(0);
+        let consumed = window.call_budget.saturating_sub(call_remaining);
+        self.fuel_consumed = self.fuel_consumed.saturating_add(consumed);
+        let total_remaining = window.total_before.saturating_sub(consumed);
+        self.store
+            .set_fuel(total_remaining)
+            .map_err(|error| S4Error::new(codes::WASM_FUEL, error.to_string()))?;
+
+        result.map_err(|error| {
+            let code = if self.cancellation.is_cancelled() {
+                codes::WASM_CANCELLED
+            } else if Instant::now() >= *self.control.deadline.lock().unwrap() {
+                codes::WASM_DEADLINE
+            } else if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+                codes::WASM_FUEL
+            } else {
+                default_code
+            };
+            S4Error::new(code, format!("{stage}: {error}"))
+        })
+    }
 }
 
 const DEFAULT_FUEL: u64 = 10_000_000;
@@ -86,37 +280,88 @@ impl FilterEngine {
     }
 
     pub fn with_fuel(component_bytes: &[u8], fuel: u64) -> anyhow::Result<Self> {
+        Self::with_limits(
+            component_bytes,
+            RuntimeLimits {
+                cumulative_fuel: fuel,
+                per_call_fuel: fuel,
+                ..RuntimeLimits::default()
+            },
+        )
+    }
+
+    pub fn with_limits(component_bytes: &[u8], limits: RuntimeLimits) -> anyhow::Result<Self> {
+        if limits.guest_memory_bytes == 0
+            || limits.max_memories == 0
+            || limits.table_elements == 0
+            || limits.cumulative_fuel == 0
+            || limits.per_call_fuel == 0
+            || limits.per_call_timeout.is_zero()
+            || limits.object_timeout.is_zero()
+        {
+            anyhow::bail!("Wasm runtime limits must be greater than zero");
+        }
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         config.consume_fuel(true);
+        config.epoch_interruption(true);
         config.max_wasm_stack(512 * 1024);
         let engine = Engine::new(&config)?;
         let component = Component::new(&engine, component_bytes)?;
+        let epoch_engine = Arc::new(EpochEngine { engine });
+        register_epoch_engine(&epoch_engine);
         Ok(Self {
-            engine,
+            epoch_engine,
             component,
-            fuel,
+            limits,
         })
     }
 
-    fn create_store(&self) -> Result<Store<S4HostState>, S4Error> {
+    pub fn guest_memory_limit(&self) -> usize {
+        self.limits.guest_memory_bytes
+    }
+
+    fn create_store(
+        &self,
+        cancellation: &CancellationToken,
+        object_deadline: Instant,
+    ) -> Result<(Store<S4HostState>, Arc<CallControl>), S4Error> {
         let wasi = WasiCtxBuilder::new()
             .inherit_stdout()
             .inherit_stderr()
             .build();
         let state = S4HostState {
             resource_limiter: S4ResourceLimiter {
-                memory_limit: 67_108_864,
+                memory_limit: self.limits.guest_memory_bytes,
+                memory_used: 0,
+                max_memories: self.limits.max_memories,
+                table_elements: self.limits.table_elements,
             },
             wasi,
             table: ResourceTable::new(),
         };
-        let mut store = Store::new(&self.engine, state);
+        let mut store = Store::new(&self.epoch_engine.engine, state);
         store
-            .set_fuel(self.fuel)
+            .set_fuel(self.limits.cumulative_fuel)
             .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
         store.limiter(|s| &mut s.resource_limiter);
-        Ok(store)
+        let control = Arc::new(CallControl {
+            deadline: Mutex::new(object_deadline),
+            cancellation: cancellation.clone(),
+        });
+        let callback_control = Arc::clone(&control);
+        store.epoch_deadline_callback(move |_| {
+            if callback_control.cancellation.is_cancelled() {
+                return Err(wasmtime::Error::msg("Wasm execution cancelled"));
+            }
+            if Instant::now() >= *callback_control.deadline.lock().unwrap() {
+                return Err(wasmtime::Error::msg("Wasm execution deadline exceeded"));
+            }
+            Ok(UpdateDeadline::Continue(1))
+        });
+        store.set_epoch_deadline(1);
+        cancellation.register_engine(&self.epoch_engine.engine);
+        Ok((store, control))
     }
 
     pub fn run_session(
@@ -124,10 +369,60 @@ impl FilterEngine {
         session: &Session,
         records: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>, S4Error> {
-        let mut store = self
-            .create_store()
+        let mut filter_session = self.start_session(session)?;
+        let mut output = Vec::with_capacity(records.len());
+        for payload in records {
+            match filter_session.transform(payload)? {
+                TransformOutcome::Emit(data) => output.push(data),
+                TransformOutcome::Drop => {}
+            }
+        }
+
+        let trailing = filter_session.finish()?;
+        if !trailing.is_empty() {
+            output.push(trailing);
+        }
+        Ok(output)
+    }
+
+    pub fn start_session(&self, session: &Session) -> Result<FilterSession, S4Error> {
+        self.start_session_with_cancellation(session, CancellationToken::new())
+    }
+
+    pub fn start_session_with_cancellation(
+        &self,
+        session: &Session,
+        cancellation: CancellationToken,
+    ) -> Result<FilterSession, S4Error> {
+        self.start_session_with_cancellation_and_fuel(session, cancellation, u64::MAX)
+    }
+
+    pub fn start_session_with_cancellation_and_fuel(
+        &self,
+        session: &Session,
+        cancellation: CancellationToken,
+        begin_fuel_limit: u64,
+    ) -> Result<FilterSession, S4Error> {
+        self.start_session_with_control(
+            session,
+            cancellation,
+            begin_fuel_limit,
+            Instant::now() + self.limits.object_timeout,
+        )
+    }
+
+    pub fn start_session_with_control(
+        &self,
+        session: &Session,
+        cancellation: CancellationToken,
+        begin_fuel_limit: u64,
+        object_deadline: Instant,
+    ) -> Result<FilterSession, S4Error> {
+        let object_deadline = object_deadline.min(Instant::now() + self.limits.object_timeout);
+        let (mut store, control) = self
+            .create_store(&cancellation, object_deadline)
             .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
-        let mut linker = Linker::new(&self.engine);
+        let mut linker = Linker::new(&self.epoch_engine.engine);
         add_wasi_to_linker(&mut linker)
             .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
         let instance = linker
@@ -149,39 +444,17 @@ impl FilterEngine {
             stable_fields: session.stable_fields.clone(),
         };
 
-        funcs
-            .call_begin(&mut store, &ctx)
-            .map_err(|e| S4Error::new(codes::WASM_INIT, format!("begin: {e}")))
-            .and_then(|r| r.map_err(|e| S4Error::new(codes::WASM_INIT, e)))?;
-
-        let mut output = Vec::with_capacity(records.len());
-        for payload in records {
-            let decision_result = funcs
-                .call_transform(&mut store, payload)
-                .map_err(|e| S4Error::new(codes::WASM_TRAP, format!("transform: {e}")))?;
-
-            match decision_result {
-                Ok(Decision::Emit(data)) => output.push(data),
-                Ok(Decision::Drop) => {}
-                Ok(Decision::Reject(reason)) => {
-                    return Err(S4Error::new(codes::WASM_REJECT, reason));
-                }
-                Err(e) => {
-                    return Err(S4Error::new(codes::WASM_TRAP, e));
-                }
-            }
-        }
-
-        let trailing = funcs
-            .call_finish(&mut store)
-            .map_err(|e| S4Error::new(codes::WASM_TRAP, format!("finish: {e}")))
-            .and_then(|r| r.map_err(|e| S4Error::new(codes::WASM_TRAP, e)))?;
-
-        if !trailing.is_empty() {
-            output.push(trailing);
-        }
-
-        Ok(output)
+        let mut filter_session = FilterSession {
+            store,
+            funcs,
+            cancellation,
+            control,
+            limits: self.limits.clone(),
+            object_deadline,
+            fuel_consumed: 0,
+        };
+        filter_session.call_begin(&ctx, begin_fuel_limit)?;
+        Ok(filter_session)
     }
 
     pub fn run(&self, session: &Session, records: &[Vec<u8>]) -> Result<Vec<u8>, S4Error> {
@@ -191,5 +464,248 @@ impl FilterEngine {
             out.extend_from_slice(r);
         }
         Ok(out)
+    }
+}
+
+fn register_epoch_engine(engine: &Arc<EpochEngine>) {
+    EPOCH_ENGINES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(Arc::downgrade(engine));
+    EPOCH_THREAD.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("s4-wasm-epoch".to_string())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(EPOCH_TICK);
+                    let Some(engines) = EPOCH_ENGINES.get() else {
+                        continue;
+                    };
+                    engines.lock().unwrap().retain(|engine| {
+                        if let Some(engine) = engine.upgrade() {
+                            engine.engine.increment_epoch();
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+            })
+            .expect("failed to start Wasmtime epoch ticker");
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn noop_component() -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("components")
+            .join("noop.component.wasm");
+        std::fs::read(path).expect("noop.component.wasm; run just build-filters")
+    }
+
+    fn test_component() -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-components")
+            .join("test-filter.component.wasm");
+        std::fs::read(path).expect("test-filter.component.wasm; run just build-filters")
+    }
+
+    fn session() -> Session {
+        Session {
+            format: "text".to_string(),
+            content_type: "text/plain".to_string(),
+            policy_version: 1,
+            ..Session::default()
+        }
+    }
+
+    #[test]
+    fn persistent_session_processes_records_and_finishes_once() {
+        let engine = FilterEngine::new(&noop_component()).unwrap();
+        let mut filter = engine.start_session(&session()).unwrap();
+        assert_eq!(
+            filter.transform(b"first").unwrap(),
+            TransformOutcome::Emit(b"first".to_vec())
+        );
+        assert_eq!(
+            filter.transform(b"second").unwrap(),
+            TransformOutcome::Emit(b"second".to_vec())
+        );
+        assert!(filter.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn batch_wrapper_matches_incremental_session() {
+        let engine = FilterEngine::new(&noop_component()).unwrap();
+        let records = vec![b"first".to_vec(), b"second".to_vec()];
+        let batch = engine.run_session(&session(), &records).unwrap();
+
+        let mut filter = engine.start_session(&session()).unwrap();
+        let mut incremental = Vec::new();
+        for record in &records {
+            if let TransformOutcome::Emit(bytes) = filter.transform(record).unwrap() {
+                incremental.push(bytes);
+            }
+        }
+        let tail = filter.finish().unwrap();
+        if !tail.is_empty() {
+            incremental.push(tail);
+        }
+        assert_eq!(incremental, batch);
+    }
+
+    #[test]
+    fn each_object_gets_an_independent_store() {
+        let engine = FilterEngine::new(&noop_component()).unwrap();
+        let mut first = engine.start_session(&session()).unwrap();
+        let mut second = engine.start_session(&session()).unwrap();
+        assert_eq!(
+            first.transform(b"first").unwrap(),
+            TransformOutcome::Emit(b"first".to_vec())
+        );
+        assert_eq!(
+            second.transform(b"second").unwrap(),
+            TransformOutcome::Emit(b"second".to_vec())
+        );
+    }
+
+    #[test]
+    fn filter_session_can_move_to_a_dedicated_executor() {
+        fn assert_send<T: Send>() {}
+        assert_send::<FilterSession>();
+    }
+
+    #[test]
+    fn guest_state_continues_within_object_and_resets_between_stores() {
+        let engine = FilterEngine::new(&test_component()).unwrap();
+        let mut first = engine.start_session(&session()).unwrap();
+        assert_eq!(
+            first.transform(b"state").unwrap(),
+            TransformOutcome::Emit(b"1".to_vec())
+        );
+        assert_eq!(
+            first.transform(b"state").unwrap(),
+            TransformOutcome::Emit(b"2".to_vec())
+        );
+        let mut second = engine.start_session(&session()).unwrap();
+        assert_eq!(
+            second.transform(b"state").unwrap(),
+            TransformOutcome::Emit(b"1".to_vec())
+        );
+    }
+
+    #[test]
+    fn guest_drop_reject_and_lifecycle_traps_have_stable_codes() {
+        let engine = FilterEngine::new(&test_component()).unwrap();
+        let mut filter = engine.start_session(&session()).unwrap();
+        assert_eq!(filter.transform(b"drop").unwrap(), TransformOutcome::Drop);
+        assert_eq!(
+            filter.transform(b"reject").unwrap_err().code(),
+            codes::WASM_REJECT
+        );
+
+        let mut filter = engine.start_session(&session()).unwrap();
+        assert_eq!(
+            filter.transform(b"trap").unwrap_err().code(),
+            codes::WASM_TRAP
+        );
+
+        let mut begin_trap = session();
+        begin_trap.content_type = "test/begin-trap".to_string();
+        assert_eq!(
+            engine.start_session(&begin_trap).err().unwrap().code(),
+            codes::WASM_INIT
+        );
+
+        let mut finish_trap = session();
+        finish_trap.content_type = "test/finish=trap".to_string();
+        assert_eq!(
+            engine
+                .start_session(&finish_trap)
+                .unwrap()
+                .finish()
+                .unwrap_err()
+                .code(),
+            codes::WASM_TRAP
+        );
+    }
+
+    #[test]
+    fn non_empty_finish_output_is_returned_once() {
+        let engine = FilterEngine::new(&test_component()).unwrap();
+        let mut configured = session();
+        configured.content_type = "test/finish=tail".to_string();
+        assert_eq!(
+            engine.start_session(&configured).unwrap().finish().unwrap(),
+            b"tail"
+        );
+    }
+
+    #[test]
+    fn cancellation_interrupts_an_active_guest_call() {
+        let engine = FilterEngine::with_limits(
+            &test_component(),
+            RuntimeLimits {
+                cumulative_fuel: u64::MAX,
+                per_call_fuel: u64::MAX,
+                per_call_timeout: Duration::from_secs(5),
+                object_timeout: Duration::from_secs(5),
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut filter = engine
+            .start_session_with_cancellation(&session(), cancellation.clone())
+            .unwrap();
+        let call = std::thread::spawn(move || filter.transform(b"loop"));
+        std::thread::sleep(Duration::from_millis(25));
+        cancellation.cancel();
+        assert_eq!(
+            call.join().unwrap().unwrap_err().code(),
+            codes::WASM_CANCELLED
+        );
+    }
+
+    #[test]
+    fn per_call_wall_deadline_interrupts_an_infinite_loop() {
+        let engine = FilterEngine::with_limits(
+            &test_component(),
+            RuntimeLimits {
+                cumulative_fuel: u64::MAX,
+                per_call_fuel: u64::MAX,
+                per_call_timeout: Duration::from_millis(25),
+                object_timeout: Duration::from_secs(1),
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap();
+        let mut filter = engine.start_session(&session()).unwrap();
+        assert_eq!(
+            filter.transform(b"loop").unwrap_err().code(),
+            codes::WASM_DEADLINE
+        );
+    }
+
+    #[test]
+    fn aggregate_guest_memory_growth_is_limited() {
+        let engine = FilterEngine::new(&test_component()).unwrap();
+        let mut filter = engine.start_session(&session()).unwrap();
+        assert_eq!(
+            filter.transform(b"memory").unwrap_err().code(),
+            codes::WASM_TRAP
+        );
     }
 }

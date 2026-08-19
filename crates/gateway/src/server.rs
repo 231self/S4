@@ -10,15 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use aws_credential_types::Credentials as SigV4Credentials;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sigv4::http_request::{
-    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningParams,
-    SigningSettings, UriPathNormalizationMode, sign,
-};
-use aws_sigv4::sign::v4;
 use aws_smithy_types::date_time::Format as DateTimeFormat;
 use axum::{
     Json, Router,
@@ -27,8 +21,8 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{delete, get, head, post, put},
 };
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -36,6 +30,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::backend::{BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation};
 use crate::control::{ControlPlane, RequestKind};
+use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, strip_hop_by_hop_headers,
@@ -43,6 +38,7 @@ use crate::object::{
 use crate::plugin_registry::PluginRegistry;
 use crate::s3_error;
 use crate::service_storage::{ServiceStorage, parse_service_backends};
+use crate::sigv4::{RequestAuthorization, SigV4Error, SigV4Policy, SigningKeyCache};
 use crate::store::{
     BackendConfig, BackendRegistry, FileKeyStore, KeyRepository, KeyStore, MemoryStore,
     PostgresKeyStore, sha256_hash,
@@ -66,6 +62,8 @@ pub struct AppState {
     pub streaming_read_mode: StreamingReadMode,
     pub source_body_limits: BodyLimits,
     pub presigned_http_policy: PresignedHttpPolicy,
+    pub sigv4_cache: Arc<SigningKeyCache>,
+    pub sigv4_policy: SigV4Policy,
 }
 
 pub struct Auth {
@@ -294,196 +292,6 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
-}
-
-struct SigV4Auth {
-    access_key: String,
-    region: String,
-    service: String,
-    signed_headers: Vec<String>,
-    signature: String,
-}
-
-/// Parse the components of an `Authorization: AWS4-HMAC-SHA256 ...` header.
-fn parse_sigv4(auth: &str) -> Option<SigV4Auth> {
-    let rest = auth.strip_prefix("AWS4-HMAC-SHA256 ")?;
-    let mut credential: Option<(String, String, String)> = None;
-    let mut signed_headers: Option<Vec<String>> = None;
-    let mut signature: Option<String> = None;
-    for part in rest.split(',') {
-        let part = part.trim();
-        if let Some(v) = part.strip_prefix("Credential=") {
-            let mut it = v.splitn(5, '/');
-            let access_key = it.next()?.to_string();
-            it.next()?; // scope date
-            let region = it.next()?.to_string();
-            let service = it.next()?.to_string();
-            it.next()?; // "aws4_request"
-            credential = Some((access_key, region, service));
-        } else if let Some(v) = part.strip_prefix("SignedHeaders=") {
-            signed_headers = Some(v.split(';').map(|s| s.to_string()).collect());
-        } else if let Some(v) = part.strip_prefix("Signature=") {
-            signature = Some(v.to_string());
-        }
-    }
-    Some(SigV4Auth {
-        access_key: credential.as_ref()?.0.clone(),
-        region: credential.as_ref()?.1.clone(),
-        service: credential.as_ref()?.2.clone(),
-        signed_headers: signed_headers?,
-        signature: signature?,
-    })
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Hinnant algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Parse `YYYYMMDD'T'HHMMSS'Z'` (the SigV4 `x-amz-date` format).
-fn parse_sigv4_timestamp(s: &str) -> Option<SystemTime> {
-    let b = s.as_bytes();
-    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
-        return None;
-    }
-    let two = |i: usize| -> Option<u64> {
-        let hi = b[i].checked_sub(b'0')? as u64;
-        let lo = b[i + 1].checked_sub(b'0')? as u64;
-        Some(hi * 10 + lo)
-    };
-    let year = two(0)? * 100 + two(2)?;
-    let month = two(4)?;
-    let day = two(6)?;
-    let hour = two(9)?;
-    let minute = two(11)?;
-    let second = two(13)?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let total = days_from_civil(year as i64, month as i64, day as i64) * 86_400
-        + hour as i64 * 3_600
-        + minute as i64 * 60
-        + second as i64;
-    if total < 0 {
-        return None;
-    }
-    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(total as u64))
-}
-
-/// Lowercase hex SHA-256 of `bytes` (for `x-amz-content-sha256` comparison).
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    use std::fmt::Write;
-    let mut out = String::with_capacity(64);
-    for b in Sha256::digest(bytes) {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
-/// Recompute the SigV4 signature for the incoming request using the same
-/// signing settings the AWS SDK applies for S3 (single percent-encoding, no
-/// URI path normalization, `x-amz-content-sha256` payload hash) and compare
-/// against the client-provided signature.
-fn verify_sigv4(
-    method: &str,
-    uri: &Uri,
-    headers: &HeaderMap,
-    body: &[u8],
-    secret: &str,
-    sigv4: &SigV4Auth,
-) -> bool {
-    let Some(x_amz_date) = headers.get("x-amz-date").and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    let Some(time) = parse_sigv4_timestamp(x_amz_date) else {
-        return false;
-    };
-
-    let mut settings = SigningSettings::default();
-    settings.percent_encoding_mode = PercentEncodingMode::Single;
-    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
-    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-
-    let identity: aws_smithy_runtime_api::client::identity::Identity = SigV4Credentials::new(
-        sigv4.access_key.clone(),
-        secret.to_string(),
-        None,
-        None,
-        "s4-front-door",
-    )
-    .into();
-    let params: SigningParams = match v4::SigningParams::builder()
-        .identity(&identity)
-        .region(&sigv4.region)
-        .name(&sigv4.service)
-        .time(time)
-        .settings(settings)
-        .build()
-    {
-        Ok(p) => p.into(),
-        Err(_) => return false,
-    };
-
-    // Feed exactly the headers the client signed — any extra header changes
-    // the canonical request and the signature would not match.
-    let mut signed_headers = Vec::with_capacity(sigv4.signed_headers.len());
-    for name in &sigv4.signed_headers {
-        let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) else {
-            return false;
-        };
-        signed_headers.push((name.as_str(), value));
-    }
-
-    let target = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(uri.path());
-    let payload = match headers
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some("UNSIGNED-PAYLOAD") => SignableBody::UnsignedPayload,
-        Some(hash) if !hash.is_empty() => {
-            // Never trust the claimed hash for a non-empty body: recompute
-            // against the actual bytes so body tampering is detected even when
-            // the attacker keeps the original x-amz-content-sha256 header.
-            if !body.is_empty() {
-                let actual = sha256_hex(body);
-                if !actual.eq_ignore_ascii_case(hash) {
-                    return false;
-                }
-            }
-            SignableBody::Precomputed(hash.to_string())
-        }
-        _ => SignableBody::Bytes(body),
-    };
-
-    let request = match SignableRequest::new(
-        method,
-        target.to_string(),
-        signed_headers.into_iter(),
-        payload,
-    ) {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-
-    match sign(request, &params) {
-        Ok(output) => output.signature().eq_ignore_ascii_case(&sigv4.signature),
-        Err(_) => false,
-    }
 }
 
 fn backend_resolver(state: &AppState) -> BackendResolver {
@@ -982,89 +790,147 @@ async fn open_backend_object(
     }
 }
 
-async fn authenticate(
+struct HeaderAuthentication {
+    auth: Auth,
+    body_verifier: Option<BodyVerifier>,
+}
+
+impl HeaderAuthentication {
+    fn without_body(auth: Auth) -> Self {
+        Self {
+            auth,
+            body_verifier: None,
+        }
+    }
+
+    fn verify_body(mut self, body: &[u8]) -> Result<Auth, IntegrityError> {
+        if let Some(mut verifier) = self.body_verifier.take() {
+            verifier.push(body)?;
+            verifier.finish()?;
+        }
+        Ok(self.auth)
+    }
+}
+
+#[derive(Debug)]
+enum HeaderAuthError {
+    Denied,
+    InvalidPayload(IntegrityError),
+}
+
+impl From<SigV4Error> for HeaderAuthError {
+    fn from(error: SigV4Error) -> Self {
+        match error {
+            SigV4Error::Payload(error) => Self::InvalidPayload(error),
+            _ => Self::Denied,
+        }
+    }
+}
+
+async fn authenticate_headers(
     method: &str,
     uri: &Uri,
     headers: &HeaderMap,
-    body: &[u8],
     keys: &Arc<dyn KeyRepository>,
     state: &AppState,
-) -> Option<Auth> {
-    let auth = headers.get("Authorization").and_then(|v| v.to_str().ok());
-    match auth {
-        Some(a) if a.starts_with("AWS4-") => {
-            // Local/demo mode skips signature verification entirely.
-            if state.auth_disabled {
-                return Some(Auth {
-                    user_id: "demo-user".to_string(),
-                    public_key_pem: None,
-                    stable_key: None,
-                });
-            }
-            let sigv4 = parse_sigv4(a)?;
-            let key = keys.get_key(&sigv4.access_key).await?;
-            if key_expired(key.expires_at.as_deref()) {
-                return None;
-            }
-            let secret = keys.decrypt_secret(&sigv4.access_key).await?;
-            if !verify_sigv4(method, uri, headers, body, &secret, &sigv4) {
-                return None;
-            }
-            return Some(Auth {
+) -> Result<HeaderAuthentication, HeaderAuthError> {
+    if let Some(sigv4) = RequestAuthorization::parse(uri, headers).map_err(HeaderAuthError::from)? {
+        // AUTH_DISABLED is an explicit local-only bypass retained for the
+        // development S3 front door. Production always takes the strict
+        // authorization and integrity path below.
+        if state.auth_disabled {
+            return Ok(HeaderAuthentication::without_body(Auth {
+                user_id: "demo-user".to_string(),
+                public_key_pem: None,
+                stable_key: None,
+            }));
+        }
+        let key = keys
+            .get_key(sigv4.access_key())
+            .await
+            .ok_or(HeaderAuthError::Denied)?;
+        if key_expired(key.expires_at.as_deref()) {
+            return Err(HeaderAuthError::Denied);
+        }
+        let secret = keys
+            .decrypt_secret(sigv4.access_key())
+            .await
+            .ok_or(HeaderAuthError::Denied)?;
+        let body_verifier = sigv4
+            .authorize(
+                method,
+                uri,
+                headers,
+                &secret,
+                &state.sigv4_cache,
+                &state.sigv4_policy,
+                SystemTime::now(),
+            )
+            .map_err(HeaderAuthError::from)?;
+        return Ok(HeaderAuthentication {
+            auth: Auth {
                 user_id: key.user_id.clone(),
                 public_key_pem: key.public_key_pem.clone(),
                 stable_key: Some(derive_stable_key(&secret)),
-            });
-        }
+            },
+            body_verifier: Some(body_verifier),
+        });
+    }
+
+    let auth = headers.get("Authorization").and_then(|v| v.to_str().ok());
+    match auth {
         Some(a) if a.starts_with("Bearer ") => {
             let token = &a[7..];
             // MCP bearer token (s4m_...): a self-contained credential.
             if token.starts_with("s4m_") {
                 if let Some(user_id) = keys.resolve_mcp_token(token).await {
-                    return Some(Auth {
+                    return Ok(HeaderAuthentication::without_body(Auth {
                         user_id,
                         public_key_pem: None,
                         stable_key: None,
-                    });
+                    }));
                 }
-                return None;
+                return Err(HeaderAuthError::Denied);
             }
             // Try API key format: Bearer s4_xxx:s4s_xxx
             if let Some((ak, sk)) = token.split_once(':') {
-                let (user_id, public_key_pem) = keys.resolve_credentials(ak, sk).await?;
-                return Some(Auth {
+                let (user_id, public_key_pem) = keys
+                    .resolve_credentials(ak, sk)
+                    .await
+                    .ok_or(HeaderAuthError::Denied)?;
+                return Ok(HeaderAuthentication::without_body(Auth {
                     user_id,
                     public_key_pem,
                     stable_key: Some(derive_stable_key(sk)),
-                });
+                }));
             }
             // Try JWT
             if state.jwt_decoder.is_some() {
                 let uid = get_user_id(headers, state);
                 if uid != "demo-user" {
-                    return Some(Auth {
+                    return Ok(HeaderAuthentication::without_body(Auth {
                         user_id: uid,
                         public_key_pem: None,
                         stable_key: None,
-                    });
+                    }));
                 }
             }
-            return None;
+            return Err(HeaderAuthError::Denied);
         }
-        _ => None::<Auth>,
+        _ => {}
     };
     // x-s4-mcp-token header: MCP bearer token.
     if let Some(tok) = headers.get("x-s4-mcp-token").and_then(|v| v.to_str().ok()) {
         if tok.starts_with("s4m_")
             && let Some(user_id) = keys.resolve_mcp_token(tok).await
         {
-            return Some(Auth {
+            return Ok(HeaderAuthentication::without_body(Auth {
                 user_id,
                 public_key_pem: None,
                 stable_key: None,
-            });
+            }));
         }
-        return None;
+        return Err(HeaderAuthError::Denied);
     }
     let ak = headers
         .get("x-s4-access-key")
@@ -1075,24 +941,39 @@ async fn authenticate(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if let Some((user_id, public_key_pem)) = keys.resolve_credentials(ak, sk).await {
-        return Some(Auth {
+        return Ok(HeaderAuthentication::without_body(Auth {
             user_id,
             public_key_pem,
             stable_key: Some(derive_stable_key(sk)),
-        });
+        }));
     }
     // Allow access in demo mode only when auth is explicitly disabled or
     // when using an in-memory keystore with no keys (dev/first-run mode).
     // Never allow unauthenticated access when keys are persisted — this
     // prevents an empty database from becoming an open door in production.
     if state.auth_disabled {
-        return Some(Auth {
+        return Ok(HeaderAuthentication::without_body(Auth {
             user_id: "demo-user".to_string(),
             public_key_pem: None,
             stable_key: None,
-        });
+        }));
     }
-    None
+    Err(HeaderAuthError::Denied)
+}
+
+async fn authenticate(
+    method: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    keys: &Arc<dyn KeyRepository>,
+    state: &AppState,
+) -> Option<Auth> {
+    authenticate_headers(method, uri, headers, keys, state)
+        .await
+        .ok()?
+        .verify_body(body)
+        .ok()
 }
 
 fn key_expired(expires_at: Option<&str>) -> bool {
@@ -1556,6 +1437,57 @@ async fn store_processed(
     }
 }
 
+#[derive(Debug)]
+enum VerifiedBodyError {
+    Integrity(IntegrityError),
+    TooLarge,
+    Transport,
+}
+
+async fn read_verified_body(
+    mut authentication: HeaderAuthentication,
+    mut body: axum::body::Body,
+    max_decoded_bytes: usize,
+) -> Result<(Auth, bytes::Bytes), VerifiedBodyError> {
+    let mut decoded = bytes::BytesMut::new();
+    while let Some(frame) = body
+        .frame()
+        .await
+        .transpose()
+        .map_err(|_| VerifiedBodyError::Transport)?
+    {
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            Err(frame) => {
+                if frame.into_trailers().is_ok() {
+                    return Err(VerifiedBodyError::Integrity(IntegrityError::Framing(
+                        "HTTP trailers are not valid outside aws-chunked framing",
+                    )));
+                }
+                continue;
+            }
+        };
+        if data.len() > max_decoded_bytes {
+            return Err(VerifiedBodyError::TooLarge);
+        }
+        let chunks = if let Some(verifier) = &mut authentication.body_verifier {
+            verifier.push(&data).map_err(VerifiedBodyError::Integrity)?
+        } else {
+            vec![data]
+        };
+        for chunk in chunks {
+            if decoded.len().saturating_add(chunk.len()) > max_decoded_bytes {
+                return Err(VerifiedBodyError::TooLarge);
+            }
+            decoded.extend_from_slice(&chunk);
+        }
+    }
+    if let Some(verifier) = authentication.body_verifier.take() {
+        verifier.finish().map_err(VerifiedBodyError::Integrity)?;
+    }
+    Ok((authentication.auth, decoded.freeze()))
+}
+
 async fn s3_put(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -1596,22 +1528,22 @@ async fn s3_put(
         return s3_error::multipart_not_supported(&key);
     }
     let max_bytes = effective_legacy_max_object_bytes(&state);
-    let body = match axum::body::to_bytes(request_body, max_bytes).await {
-        Ok(body) => body,
-        Err(_) => return s3_error::entity_too_large(&key),
-    };
-    let Some(auth) = authenticate(
+    let header_auth = match authenticate_headers(
         parts.method.as_str(),
         &parts.uri,
         &parts.headers,
-        &body,
         &state.keys,
         &state,
     )
     .await
-    else {
-        return s3_error::access_denied(&key);
+    {
+        Ok(authentication) => authentication,
+        Err(HeaderAuthError::InvalidPayload(error)) => {
+            return s3_error::invalid_request(&key, &error.to_string());
+        }
+        Err(HeaderAuthError::Denied) => return s3_error::signature_mismatch(&key),
     };
+    let auth = &header_auth.auth;
     if let Some(reason) = state
         .control
         .authorize(&auth.user_id, RequestKind::Write)
@@ -1624,6 +1556,19 @@ async fn s3_put(
             Ok(backend) => backend,
             Err(error) => return s3_error::internal_error(&key, &error),
         };
+    let (auth, body) = match read_verified_body(header_auth, request_body, max_bytes).await {
+        Ok(verified) => verified,
+        Err(VerifiedBodyError::TooLarge) => return s3_error::entity_too_large(&key),
+        Err(VerifiedBodyError::Integrity(
+            IntegrityError::PayloadHashMismatch | IntegrityError::SignatureMismatch,
+        )) => return s3_error::signature_mismatch(&key),
+        Err(VerifiedBodyError::Integrity(error)) => {
+            return s3_error::bad_digest(&key, &error.to_string());
+        }
+        Err(VerifiedBodyError::Transport) => {
+            return s3_error::invalid_request(&key, "request body stream failed");
+        }
+    };
 
     let output = match process_input(&state, &parts.headers, &auth, &body) {
         Ok(o) => o,
@@ -2201,7 +2146,12 @@ async fn root(
         .and_then(|v| v.to_str().ok())
         .map(|a| a.starts_with("AWS4-"))
         .unwrap_or(false)
-        || headers.contains_key("x-s4-access-key");
+        || headers.contains_key("x-s4-access-key")
+        || uri.query().is_some_and(|query| {
+            query
+                .split('&')
+                .any(|pair| pair.starts_with("X-Amz-Algorithm="))
+        });
     if !is_s3 {
         return Html(dashboard_html()).into_response();
     }
@@ -2865,6 +2815,8 @@ pub async fn build_state(
         streaming_read_mode: StreamingReadMode::from_env(),
         source_body_limits,
         presigned_http_policy: PresignedHttpPolicy::from_env(),
+        sigv4_cache: Arc::new(SigningKeyCache::standard()),
+        sigv4_policy: SigV4Policy::from_env(),
     }))
 }
 

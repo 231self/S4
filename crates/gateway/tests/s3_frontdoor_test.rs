@@ -8,14 +8,46 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use bytes::Bytes;
+use http_body::{Frame, SizeHint};
 use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
 use s4_gateway::control::NoopControlPlane;
 use s4_gateway::key_cipher::default_wrapping;
 use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
+use s4_gateway::sigv4::SigV4Policy;
 use s4_gateway::store::FileKeyStore;
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt as _;
+use tokio::process::Command;
 use tower::ServiceExt;
+
+struct PollTrackingBody {
+    polls: Arc<AtomicUsize>,
+    data: Option<Bytes>,
+}
+
+impl http_body::Body for PollTrackingBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(self.data.take().map(|data| Ok(Frame::data(data))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.data.as_ref().map_or(0, Bytes::len) as u64)
+    }
+}
 
 async fn test_state() -> Arc<AppState> {
     // SAFETY: test-only env mutation; every test in this file sets the same
@@ -868,6 +900,216 @@ async fn sigv4_tampered_body_rejected() {
         StatusCode::FORBIDDEN,
         "body tampering must be rejected by SigV4"
     );
+}
+
+#[tokio::test]
+async fn invalid_sigv4_headers_are_rejected_without_polling_put_body() {
+    let (app, state) = router().await;
+    let (ak, _sk) = make_key(&state).await;
+    let uri = "http://s4.local/bkt/unpolled.txt";
+    let signed = signed_request(&ak, "wrong-secret", "PUT", uri, b"sensitive body");
+    let (parts, _) = signed.into_parts();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let request = Request::from_parts(
+        parts,
+        Body::new(PollTrackingBody {
+            polls: polls.clone(),
+            data: Some(Bytes::from_static(b"sensitive body")),
+        }),
+    );
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn valid_sigv4_seed_polls_then_rejects_payload_hash_mismatch() {
+    let (app, state) = router().await;
+    let (ak, sk) = make_key(&state).await;
+    let uri = "http://s4.local/bkt/hash-mismatch.txt";
+    let signed = signed_request(&ak, &sk, "PUT", uri, b"claimed body");
+    let (parts, _) = signed.into_parts();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let request = Request::from_parts(
+        parts,
+        Body::new(PollTrackingBody {
+            polls: polls.clone(),
+            data: Some(Bytes::from_static(b"different body")),
+        }),
+    );
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(polls.load(Ordering::SeqCst) > 0);
+    assert!(state.store.get("bkt", "hash-mismatch.txt").is_none());
+}
+
+#[tokio::test]
+async fn unmodified_rust_sdk_default_put_is_accepted() {
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .sigv4_policy = SigV4Policy::new("us-east-1", true);
+    let (access_key, secret) = make_key(&state).await;
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let config = aws_sdk_s3::Config::builder()
+        .behavior_version_latest()
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            access_key,
+            secret,
+            None,
+            None,
+            "phase-4-rust-sdk",
+        ))
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .endpoint_url(format!("http://{address}"))
+        .force_path_style(true)
+        .build();
+    let client = aws_sdk_s3::Client::from_conf(config);
+    client
+        .put_object()
+        .bucket("sdk-bucket")
+        .key("default-put.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"SDK contact sdk@example.com",
+        ))
+        .send()
+        .await
+        .expect("unmodified Rust SDK PUT");
+
+    let stored = state
+        .store
+        .get("sdk-bucket", "default-put.txt")
+        .expect("SDK object stored only after integrity verification");
+    let text = String::from_utf8_lossy(&stored.data);
+    assert!(text.contains("[REDACTED_EMAIL]"), "stored body: {text}");
+    assert!(!text.contains("sdk@example.com"), "stored body: {text}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn available_aws_cli_and_boto3_interoperate() {
+    let aws_available = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new("aws")
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok_and(|output| output.status.success()));
+    let boto3_available = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new("python3")
+            .args(["-c", "import boto3"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok_and(|output| output.status.success()));
+    if !aws_available && !boto3_available {
+        return;
+    }
+
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .sigv4_policy = SigV4Policy::new("us-east-1", true);
+    let (access_key, secret) = make_key(&state).await;
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{address}");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    if aws_available {
+        let endpoint = endpoint.clone();
+        let access_key = access_key.clone();
+        let secret = secret.clone();
+        let mut child = Command::new("aws")
+            .args([
+                "s3",
+                "cp",
+                "-",
+                "s3://cli-bucket/default.txt",
+                "--endpoint-url",
+                &endpoint,
+                "--region",
+                "us-east-1",
+                "--no-progress",
+            ])
+            .env("AWS_ACCESS_KEY_ID", access_key)
+            .env("AWS_SECRET_ACCESS_KEY", secret)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start AWS CLI");
+        child
+            .stdin
+            .take()
+            .expect("AWS CLI stdin")
+            .write_all(b"CLI contact cli@example.com")
+            .await
+            .expect("write AWS CLI body");
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .expect("AWS CLI timed out")
+            .expect("wait for AWS CLI");
+        assert!(
+            output.status.success(),
+            "AWS CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(state.store.get("cli-bucket", "default.txt").is_some());
+    }
+
+    if boto3_available {
+        let script = r#"
+import boto3, os
+from botocore.config import Config
+boto3.client(
+    "s3",
+    endpoint_url=os.environ["S4_TEST_ENDPOINT"],
+    region_name="us-east-1",
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    config=Config(s3={"addressing_style": "path"}),
+).put_object(Bucket="boto-bucket", Key="default.txt", Body=b"boto contact boto@example.com")
+"#;
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            Command::new("python3")
+                .args(["-c", script])
+                .env("S4_TEST_ENDPOINT", &endpoint)
+                .env("AWS_ACCESS_KEY_ID", &access_key)
+                .env("AWS_SECRET_ACCESS_KEY", &secret)
+                .env("AWS_EC2_METADATA_DISABLED", "true")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("boto3 timed out")
+        .expect("run boto3");
+        assert!(
+            output.status.success(),
+            "boto3 failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(state.store.get("boto-bucket", "default.txt").is_some());
+    }
+    server.abort();
 }
 
 #[tokio::test]

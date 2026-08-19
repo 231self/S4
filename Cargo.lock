@@ -4252,6 +4252,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "crc",
  "csv-core",
  "dirs",
  "hex",

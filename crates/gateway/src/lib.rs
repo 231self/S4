@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod control;
 pub mod entity;
+pub mod integrity;
 pub mod key_cipher;
 pub mod object;
 pub mod plugin_registry;
@@ -8,6 +9,7 @@ pub mod record;
 pub mod s3_error;
 pub mod server;
 pub mod service_storage;
+pub mod sigv4;
 pub mod store;
 
 use bytes::Bytes;

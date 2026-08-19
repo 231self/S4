@@ -11,6 +11,7 @@ pub mod server;
 pub mod service_storage;
 pub mod sigv4;
 pub mod store;
+pub mod transaction;
 
 use bytes::Bytes;
 use plugin_registry::{PipelineSession, PluginRegistry};

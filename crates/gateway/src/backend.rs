@@ -224,6 +224,26 @@ impl PresignedHttpPolicy {
     }
 
     pub async fn client_for(&self, url: &Url) -> Result<reqwest::Client, String> {
+        self.client_for_operation(url, self.minimum_validity, false)
+            .await
+    }
+
+    /// Destination requests are always HTTPS, even when a self-hosted
+    /// administrator has enabled HTTP for development read sources.
+    pub async fn client_for_destination(
+        &self,
+        url: &Url,
+        minimum_validity: Duration,
+    ) -> Result<reqwest::Client, String> {
+        self.client_for_operation(url, minimum_validity, true).await
+    }
+
+    async fn client_for_operation(
+        &self,
+        url: &Url,
+        minimum_validity: Duration,
+        require_https: bool,
+    ) -> Result<reqwest::Client, String> {
         let host = url
             .host_str()
             .ok_or_else(|| "presigned URL must have a host".to_string())?
@@ -233,14 +253,14 @@ impl PresignedHttpPolicy {
         }
         match url.scheme() {
             "https" => {}
-            "http" if self.allow_http => {}
+            "http" if self.allow_http && !require_https => {}
             "http" => return Err("presigned HTTP sources require HTTPS".to_string()),
             _ => return Err("presigned source URL scheme is not supported".to_string()),
         }
         if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
             return Err("presigned URL userinfo and fragments are forbidden".to_string());
         }
-        validate_expiry(url, self.minimum_validity)?;
+        validate_expiry(url, minimum_validity)?;
 
         let port = url
             .port_or_known_default()

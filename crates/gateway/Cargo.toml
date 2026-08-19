@@ -42,12 +42,14 @@ sha1 = "0.10"
 crc = "3.4"
 hex.workspace = true
 sqlx.workspace = true
-sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-uuid"] }
+sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-uuid", "with-json"] }
 async-trait.workspace = true
 dirs = "6"
+tokio-util = { version = "0.7", features = ["io"] }
 utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-swagger-ui = { workspace = true, features = ["axum"] }
 tower-http = { version = "0.6", features = ["cors"] }
+thiserror.workspace = true
 
 [dev-dependencies]
 libc = "0.2"

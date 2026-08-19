@@ -10,8 +10,13 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use s4_gateway::entity::api_key;
+use s4_gateway::entity::object_operation;
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
 use s4_gateway::store::{KeyRepository, PostgresKeyStore, sha256_hash};
+use s4_gateway::transaction::{
+    EvidenceRecord, ExpectedObject, ObjectDestination, OperationJournal, OperationRecord,
+    OperationState, PartRecord, PostgresOperationJournal,
+};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, SqlxPostgresConnector};
 use sqlx::PgPool;
@@ -121,7 +126,9 @@ where
     F: FnOnce(PgPool) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
-    let _guard = DB_TEST_LOCK.lock().expect("database test lock");
+    let _guard = DB_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -135,7 +142,8 @@ where
             .run(&pool)
             .await
             .expect("migrations should apply");
-        body(pool).await;
+        body(pool.clone()).await;
+        pool.close().await;
     });
 }
 
@@ -162,6 +170,79 @@ fn postgres_secret_envelope_roundtrip() {
             Some(secret.as_str())
         );
         delete_api_key(&db, &key_id).await;
+    });
+}
+
+#[test]
+fn postgres_operation_journal_persists_canonical_ambiguous_completion() {
+    with_pool(|pool| async move {
+        let db = sea_db(pool.clone());
+        let journal = PostgresOperationJournal::new(pool);
+        let operation = OperationRecord::intent(
+            ObjectDestination {
+                backend_id: "db-test".to_string(),
+                bucket: "bucket".to_string(),
+                logical_key: format!("logical-{}", uuid::Uuid::new_v4()),
+                physical_key: format!("physical-{}", uuid::Uuid::new_v4()),
+            },
+            ExpectedObject {
+                digest: Some("sha256:test".to_string()),
+                size: Some(4),
+                metadata: Default::default(),
+            },
+        );
+        journal.insert_intent(operation.clone()).await.unwrap();
+        journal
+            .set_open(operation.id, Some("upload-id"))
+            .await
+            .unwrap();
+        let part = PartRecord {
+            operation_id: operation.id,
+            part_number: 1,
+            etag: "etag-1".to_string(),
+            size_bytes: 4,
+            digest: "sha256:part".to_string(),
+            created_at_ms: 1,
+        };
+        journal.record_part(part.clone()).await.unwrap();
+        journal.record_part(part).await.unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Open,
+                OperationState::Completing,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Completing,
+                OperationState::CommitUnknown,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .append_evidence(EvidenceRecord::new(
+                operation.id,
+                "lost_complete_response",
+                serde_json::json!({"retry": false}),
+            ))
+            .await
+            .unwrap();
+
+        let persisted = journal.get(operation.id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, OperationState::CommitUnknown);
+        assert_eq!(persisted.upload_id.as_deref(), Some("upload-id"));
+        assert_eq!(journal.parts(operation.id).await.unwrap().len(), 1);
+        assert_eq!(journal.evidence(operation.id).await.unwrap().len(), 1);
+
+        object_operation::Entity::delete_by_id(operation.id)
+            .exec(&db)
+            .await
+            .expect("delete operation journal test row");
     });
 }
 

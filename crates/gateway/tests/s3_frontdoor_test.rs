@@ -8,11 +8,13 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
 use s4_gateway::control::NoopControlPlane;
 use s4_gateway::key_cipher::default_wrapping;
-use s4_gateway::server::{AppState, build_router, build_state};
+use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
 use s4_gateway::store::FileKeyStore;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceExt;
 
 async fn test_state() -> Arc<AppState> {
@@ -323,6 +325,224 @@ async fn head_and_delete_remain_available() {
         app.oneshot(get).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn streaming_memory_get_preserves_range_and_head_metadata() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.store.put(
+        "range",
+        "object.txt",
+        bytes::Bytes::from_static(b"0123456789"),
+        "text/plain",
+    );
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state);
+
+    let get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/range/object.txt")
+            .header(header::RANGE, "bytes=2-5")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "4");
+    assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+    assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "2345"
+    );
+
+    let head = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri("/range/object.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.oneshot(head).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+    assert!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+async fn spawn_presigned_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    async fn object(
+        method: axum::http::Method,
+        headers: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        let range = headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok());
+        let (status, body, content_range) = if range == Some("bytes=2-5") {
+            (StatusCode::PARTIAL_CONTENT, "2345", Some("bytes 2-5/10"))
+        } else {
+            (StatusCode::OK, "0123456789", None)
+        };
+        let mut response = axum::response::Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::CONTENT_ENCODING, "identity")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=object.txt",
+            )
+            .header(header::CONTENT_LANGUAGE, "en")
+            .header(header::CACHE_CONTROL, "private, max-age=60")
+            .header(header::ETAG, "\"upstream-etag\"")
+            .header(header::LAST_MODIFIED, "Wed, 19 Aug 2026 09:00:00 GMT")
+            .header("x-amz-checksum-sha256", "checksum")
+            .header("x-amz-version-id", "version-7")
+            .header("connection", "x-upstream-private")
+            .header("x-upstream-private", "remove-me")
+            .header(header::ACCEPT_RANGES, "bytes");
+        if let Some(content_range) = content_range {
+            response = response.header(header::CONTENT_RANGE, content_range);
+        }
+        if method == axum::http::Method::HEAD {
+            response = response.header(header::CONTENT_LENGTH, "10");
+            response.body(Body::empty()).unwrap()
+        } else {
+            response = response.header(header::CONTENT_LENGTH, body.len().to_string());
+            response.body(Body::from(body)).unwrap()
+        }
+    }
+
+    async fn redirect() -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, "/object")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    let app = axum::Router::new()
+        .route("/object", axum::routing::get(object).head(object))
+        .route("/redirect", axum::routing::get(redirect));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{address}"), task)
+}
+
+#[tokio::test]
+async fn real_router_streams_presigned_http_range_headers_and_rejects_redirects() {
+    let (upstream, task) = spawn_presigned_upstream().await;
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.presigned_http_policy = PresignedHttpPolicy::new(
+        ["127.0.0.1".to_string()],
+        ["127.0.0.1".to_string()],
+        true,
+        Duration::ZERO,
+        Arc::new(TokioAddressResolver),
+    );
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state);
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/proxy/object")
+            .header(header::RANGE, "bytes=2-5")
+            .header(
+                "x-s4-backend-url",
+                format!("{upstream}/object?Expires={expires}"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    for (name, expected) in [
+        (header::CONTENT_LENGTH.as_str(), "4"),
+        (header::CONTENT_RANGE.as_str(), "bytes 2-5/10"),
+        (header::CONTENT_TYPE.as_str(), "text/plain"),
+        (header::CONTENT_ENCODING.as_str(), "identity"),
+        (header::CONTENT_LANGUAGE.as_str(), "en"),
+        (header::CACHE_CONTROL.as_str(), "private, max-age=60"),
+        (header::ETAG.as_str(), "\"upstream-etag\""),
+        ("x-amz-checksum-sha256", "checksum"),
+        ("x-amz-version-id", "version-7"),
+    ] {
+        assert_eq!(response.headers()[name], expected, "header {name}");
+    }
+    assert!(!response.headers().contains_key("connection"));
+    assert!(!response.headers().contains_key("x-upstream-private"));
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "2345"
+    );
+
+    let head = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri("/proxy/object")
+            .header(
+                "x-s4-backend-url",
+                format!("{upstream}/object?Expires={expires}"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(head).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+    assert_eq!(response.headers()[header::ETAG], "\"upstream-etag\"");
+    assert!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let redirect = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/proxy/redirect")
+            .header(
+                "x-s4-backend-url",
+                format!("{upstream}/redirect?Expires={expires}"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.oneshot(redirect).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    task.abort();
 }
 
 #[tokio::test]

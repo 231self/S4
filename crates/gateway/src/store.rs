@@ -1,5 +1,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
+use bytes::Bytes;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
@@ -17,7 +18,7 @@ use crate::key_cipher::SecretCipher;
 
 #[derive(Debug, Clone)]
 pub struct StoredObject {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub content_type: String,
     pub etag: String,
 }
@@ -62,10 +63,16 @@ impl MemoryStore {
         format!("{}/{}", bucket, key)
     }
 
-    pub fn put(&self, bucket: &str, key: &str, data: Vec<u8>, content_type: &str) -> StoredObject {
+    pub fn put(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: &str,
+    ) -> StoredObject {
         let etag = format!("\"{}\"", Uuid::new_v4());
         let obj = StoredObject {
-            data,
+            data: data.into(),
             content_type: content_type.to_string(),
             etag: etag.clone(),
         };
@@ -85,7 +92,29 @@ impl MemoryStore {
     }
 
     pub fn head(&self, bucket: &str, key: &str) -> Option<StoredObject> {
-        self.get(bucket, key)
+        self.objects
+            .read()
+            .unwrap()
+            .get(&Self::object_key(bucket, key))
+            .map(|object| StoredObject {
+                data: Bytes::new(),
+                content_type: object.content_type.clone(),
+                etag: object.etag.clone(),
+            })
+    }
+
+    pub fn metadata(&self, bucket: &str, key: &str) -> Option<(usize, String, String)> {
+        self.objects
+            .read()
+            .unwrap()
+            .get(&Self::object_key(bucket, key))
+            .map(|object| {
+                (
+                    object.data.len(),
+                    object.content_type.clone(),
+                    object.etag.clone(),
+                )
+            })
     }
 
     pub fn delete(&self, bucket: &str, key: &str) -> bool {

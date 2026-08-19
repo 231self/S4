@@ -19,10 +19,11 @@ use aws_sigv4::http_request::{
     SigningSettings, UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
+use aws_smithy_types::date_time::Format as DateTimeFormat;
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header},
     response::{Html, IntoResponse},
     routing::{delete, get, head, post, put},
 };
@@ -33,8 +34,12 @@ use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::backend::{BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation};
 use crate::control::{ControlPlane, RequestKind};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
+use crate::object::{
+    BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, strip_hop_by_hop_headers,
+};
 use crate::plugin_registry::PluginRegistry;
 use crate::s3_error;
 use crate::service_storage::{ServiceStorage, parse_service_backends};
@@ -58,6 +63,9 @@ pub struct AppState {
     pub auth_disabled: bool,
     pub control: Arc<dyn ControlPlane>,
     pub legacy_max_object_bytes: usize,
+    pub streaming_read_mode: StreamingReadMode,
+    pub source_body_limits: BodyLimits,
+    pub presigned_http_policy: PresignedHttpPolicy,
 }
 
 pub struct Auth {
@@ -67,6 +75,32 @@ pub struct Auth {
 }
 
 const LEGACY_MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StreamingReadMode {
+    #[default]
+    Off,
+    Passthrough,
+    Transformed,
+}
+
+impl StreamingReadMode {
+    fn from_env() -> Self {
+        match std::env::var("S4_STREAMING_READ_MODE").as_deref() {
+            Ok("passthrough") => Self::Passthrough,
+            Ok("transformed") => Self::Transformed,
+            Ok("off") | Err(_) => Self::Off,
+            Ok(value) => {
+                warn!("invalid S4_STREAMING_READ_MODE={value:?}; using off");
+                Self::Off
+            }
+        }
+    }
+
+    fn streams_passthrough(self) -> bool {
+        matches!(self, Self::Passthrough | Self::Transformed)
+    }
+}
 
 fn legacy_max_object_bytes() -> usize {
     let configured = match std::env::var("S4_LEGACY_MAX_OBJECT_BYTES") {
@@ -92,65 +126,6 @@ fn legacy_max_object_bytes() -> usize {
 
 fn effective_legacy_max_object_bytes(state: &AppState) -> usize {
     state.legacy_max_object_bytes.min(LEGACY_MAX_OBJECT_BYTES)
-}
-
-#[derive(Debug)]
-enum BoundedReadError {
-    EntityTooLarge,
-    Backend(String),
-}
-
-fn append_bounded(
-    data: &mut Vec<u8>,
-    chunk: &[u8],
-    max_bytes: usize,
-) -> Result<(), BoundedReadError> {
-    if chunk.len() > max_bytes.saturating_sub(data.len()) {
-        return Err(BoundedReadError::EntityTooLarge);
-    }
-    data.extend_from_slice(chunk);
-    Ok(())
-}
-
-async fn collect_http_body(
-    mut response: reqwest::Response,
-    max_bytes: usize,
-) -> Result<Vec<u8>, BoundedReadError> {
-    if response
-        .content_length()
-        .is_some_and(|size| size > max_bytes as u64)
-    {
-        return Err(BoundedReadError::EntityTooLarge);
-    }
-    let mut data =
-        Vec::with_capacity(response.content_length().unwrap_or(0).min(max_bytes as u64) as usize);
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| BoundedReadError::Backend(error.to_string()))?
-    {
-        append_bounded(&mut data, &chunk, max_bytes)?;
-    }
-    Ok(data)
-}
-
-async fn collect_s3_body(
-    mut body: ByteStream,
-    max_bytes: usize,
-) -> Result<Vec<u8>, BoundedReadError> {
-    let (_, upper) = body.size_hint();
-    if upper.is_some_and(|size| size > max_bytes as u64) {
-        return Err(BoundedReadError::EntityTooLarge);
-    }
-    let mut data = Vec::with_capacity(upper.unwrap_or(0).min(max_bytes as u64) as usize);
-    while let Some(chunk) = body
-        .try_next()
-        .await
-        .map_err(|error| BoundedReadError::Backend(error.to_string()))?
-    {
-        append_bounded(&mut data, &chunk, max_bytes)?;
-    }
-    Ok(data)
 }
 
 /// Derive the deterministic-encryption key for an API key secret:
@@ -511,27 +486,500 @@ fn verify_sigv4(
     }
 }
 
-async fn get_user_s3_client(state: &AppState, uid: &str) -> Option<Client> {
-    if let Some(ref s3) = state.s3_client {
-        return Some(s3.clone());
+fn backend_resolver(state: &AppState) -> BackendResolver {
+    BackendResolver::new(
+        state.backends.clone(),
+        state.service_storage.clone(),
+        state.s3_client.clone(),
+        state.store.clone(),
+    )
+}
+
+async fn resolve_backend(
+    state: &AppState,
+    user_id: &str,
+    headers: &HeaderMap,
+    operation: StorageOperation,
+) -> Result<ResolvedBackend, String> {
+    backend_resolver(state)
+        .resolve(user_id, headers, operation)
+        .await
+}
+
+#[derive(Debug)]
+enum OpenObjectError {
+    NotFound,
+    InvalidRange,
+    Rejected(String),
+    Backend(String),
+}
+
+fn open_error_response(key: &str, error: OpenObjectError) -> axum::response::Response {
+    match error {
+        OpenObjectError::NotFound => s3_error::no_such_key(key),
+        OpenObjectError::InvalidRange => axum::response::Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .body(axum::body::Body::empty())
+            .expect("valid range response"),
+        OpenObjectError::Rejected(detail) => {
+            warn!("presigned source rejected for {key}: {detail}");
+            s3_error::access_denied(key)
+        }
+        OpenObjectError::Backend(detail) => {
+            warn!("backend read failed for {key}: {detail}");
+            s3_error::internal_error(key, &detail)
+        }
     }
-    let cfg = state.backends.get(uid)?;
-    if !cfg.is_configured() || cfg.endpoint.is_empty() {
-        return None;
+}
+
+fn insert_header(metadata: &mut ObjectMetadata, name: &'static str, value: Option<&str>) {
+    if let Some(value) = value {
+        metadata.insert(HeaderName::from_static(name), value);
     }
-    let creds = Credentials::new(&cfg.access_key, &cfg.secret_key, None, None, "s4-backend");
-    let region = if cfg.region.is_empty() {
-        "us-east-1".to_string()
-    } else {
-        cfg.region.clone()
+}
+
+fn insert_number<T: ToString>(metadata: &mut ObjectMetadata, name: &'static str, value: Option<T>) {
+    if let Some(value) = value {
+        metadata.insert(HeaderName::from_static(name), value.to_string());
+    }
+}
+
+fn s3_get_metadata(output: &aws_sdk_s3::operation::get_object::GetObjectOutput) -> ObjectMetadata {
+    let mut metadata = ObjectMetadata {
+        version_id: output.version_id.clone(),
+        ..ObjectMetadata::default()
     };
-    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(Region::new(region))
-        .endpoint_url(&cfg.endpoint)
-        .credentials_provider(creds)
-        .load()
-        .await;
-    Some(Client::new(&config))
+    insert_number(&mut metadata, "content-length", output.content_length);
+    insert_header(&mut metadata, "accept-ranges", output.accept_ranges());
+    insert_header(&mut metadata, "content-range", output.content_range());
+    insert_header(&mut metadata, "content-type", output.content_type());
+    insert_header(&mut metadata, "content-encoding", output.content_encoding());
+    insert_header(
+        &mut metadata,
+        "content-disposition",
+        output.content_disposition(),
+    );
+    insert_header(&mut metadata, "content-language", output.content_language());
+    insert_header(&mut metadata, "cache-control", output.cache_control());
+    insert_header(&mut metadata, "etag", output.e_tag());
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-crc32",
+        output.checksum_crc32(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-crc32c",
+        output.checksum_crc32_c(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-crc64nvme",
+        output.checksum_crc64_nvme(),
+    );
+    insert_header(&mut metadata, "x-amz-checksum-sha1", output.checksum_sha1());
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-sha256",
+        output.checksum_sha256(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-sha512",
+        output.checksum_sha512(),
+    );
+    insert_header(&mut metadata, "x-amz-checksum-md5", output.checksum_md5());
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-xxhash64",
+        output.checksum_xxhash64(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-xxhash3",
+        output.checksum_xxhash3(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-xxhash128",
+        output.checksum_xxhash128(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-type",
+        output.checksum_type().map(|value| value.as_str()),
+    );
+    insert_header(&mut metadata, "x-amz-version-id", output.version_id());
+    insert_number(&mut metadata, "x-amz-mp-parts-count", output.parts_count);
+    insert_number(&mut metadata, "x-amz-missing-meta", output.missing_meta);
+    insert_header(&mut metadata, "x-amz-expiration", output.expiration());
+    insert_header(&mut metadata, "x-amz-restore", output.restore());
+    insert_header(
+        &mut metadata,
+        "x-amz-website-redirect-location",
+        output.website_redirect_location(),
+    );
+    if let Some(last_modified) = output.last_modified()
+        && let Ok(value) = last_modified.fmt(DateTimeFormat::HttpDate)
+    {
+        metadata.insert(header::LAST_MODIFIED, value);
+    }
+    if let Some(user_metadata) = output.metadata() {
+        for (name, value) in user_metadata {
+            if let Ok(name) = HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()) {
+                metadata.append(name, value);
+            }
+        }
+    }
+    metadata
+}
+
+fn s3_head_metadata(
+    output: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> ObjectMetadata {
+    let mut metadata = ObjectMetadata {
+        version_id: output.version_id.clone(),
+        ..ObjectMetadata::default()
+    };
+    insert_number(&mut metadata, "content-length", output.content_length);
+    insert_header(&mut metadata, "accept-ranges", output.accept_ranges());
+    insert_header(&mut metadata, "content-range", output.content_range());
+    insert_header(&mut metadata, "content-type", output.content_type());
+    insert_header(&mut metadata, "content-encoding", output.content_encoding());
+    insert_header(
+        &mut metadata,
+        "content-disposition",
+        output.content_disposition(),
+    );
+    insert_header(&mut metadata, "content-language", output.content_language());
+    insert_header(&mut metadata, "cache-control", output.cache_control());
+    insert_header(&mut metadata, "etag", output.e_tag());
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-crc32",
+        output.checksum_crc32(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-crc32c",
+        output.checksum_crc32_c(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-crc64nvme",
+        output.checksum_crc64_nvme(),
+    );
+    insert_header(&mut metadata, "x-amz-checksum-sha1", output.checksum_sha1());
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-sha256",
+        output.checksum_sha256(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-sha512",
+        output.checksum_sha512(),
+    );
+    insert_header(&mut metadata, "x-amz-checksum-md5", output.checksum_md5());
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-xxhash64",
+        output.checksum_xxhash64(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-xxhash3",
+        output.checksum_xxhash3(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-xxhash128",
+        output.checksum_xxhash128(),
+    );
+    insert_header(
+        &mut metadata,
+        "x-amz-checksum-type",
+        output.checksum_type().map(|value| value.as_str()),
+    );
+    insert_header(&mut metadata, "x-amz-version-id", output.version_id());
+    insert_number(&mut metadata, "x-amz-mp-parts-count", output.parts_count);
+    insert_number(&mut metadata, "x-amz-missing-meta", output.missing_meta);
+    insert_header(&mut metadata, "x-amz-expiration", output.expiration());
+    insert_header(&mut metadata, "x-amz-restore", output.restore());
+    insert_header(
+        &mut metadata,
+        "x-amz-website-redirect-location",
+        output.website_redirect_location(),
+    );
+    if let Some(last_modified) = output.last_modified()
+        && let Ok(value) = last_modified.fmt(DateTimeFormat::HttpDate)
+    {
+        metadata.insert(header::LAST_MODIFIED, value);
+    }
+    if let Some(user_metadata) = output.metadata() {
+        for (name, value) in user_metadata {
+            if let Ok(name) = HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()) {
+                metadata.append(name, value);
+            }
+        }
+    }
+    metadata
+}
+
+fn forwarded_read_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = HeaderMap::new();
+    for name in [
+        header::RANGE,
+        header::IF_MATCH,
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+        header::IF_UNMODIFIED_SINCE,
+    ] {
+        for value in headers.get_all(&name) {
+            forwarded.append(name.clone(), value.clone());
+        }
+    }
+    forwarded
+}
+
+async fn open_http_object(
+    state: &AppState,
+    url: reqwest::Url,
+    headers: &HeaderMap,
+    head_only: bool,
+) -> Result<OpenedObject, OpenObjectError> {
+    let client = state
+        .presigned_http_policy
+        .client_for(&url)
+        .await
+        .map_err(OpenObjectError::Rejected)?;
+    let method = if head_only {
+        reqwest::Method::HEAD
+    } else {
+        reqwest::Method::GET
+    };
+    let response = client
+        .request(method, url)
+        .headers(forwarded_read_headers(headers))
+        .send()
+        .await
+        .map_err(|error| OpenObjectError::Backend(error.to_string()))?;
+    if response.status().is_redirection() {
+        return Err(OpenObjectError::Rejected(
+            "presigned HTTP source redirects are forbidden".to_string(),
+        ));
+    }
+    let response: axum::http::Response<reqwest::Body> = response.into();
+    let (parts, body) = response.into_parts();
+    let mut response_headers = parts.headers;
+    strip_hop_by_hop_headers(&mut response_headers);
+    let version_id = response_headers
+        .get("x-amz-version-id")
+        .or_else(|| response_headers.get("x-goog-generation"))
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let metadata = ObjectMetadata {
+        headers: response_headers,
+        version_id,
+    };
+    let body = if head_only {
+        axum::body::Body::empty()
+    } else {
+        axum::body::Body::new(body)
+    };
+    Ok(OpenedObject::new(
+        parts.status,
+        metadata,
+        body,
+        state.source_body_limits,
+    ))
+}
+
+fn memory_range(
+    data: &bytes::Bytes,
+    range: Option<&str>,
+) -> Result<(bytes::Bytes, Option<String>), OpenObjectError> {
+    let Some(range) = range else {
+        return Ok((data.clone(), None));
+    };
+    let spec = range
+        .strip_prefix("bytes=")
+        .filter(|spec| !spec.contains(','))
+        .ok_or(OpenObjectError::InvalidRange)?;
+    let (start, end) = spec.split_once('-').ok_or(OpenObjectError::InvalidRange)?;
+    let length = data.len();
+    if length == 0 {
+        return Err(OpenObjectError::InvalidRange);
+    }
+    let (start, end) = if start.is_empty() {
+        let suffix = end
+            .parse::<usize>()
+            .map_err(|_| OpenObjectError::InvalidRange)?;
+        if suffix == 0 {
+            return Err(OpenObjectError::InvalidRange);
+        }
+        (length.saturating_sub(suffix), length - 1)
+    } else {
+        let start = start
+            .parse::<usize>()
+            .map_err(|_| OpenObjectError::InvalidRange)?;
+        let end = if end.is_empty() {
+            length - 1
+        } else {
+            end.parse::<usize>()
+                .map_err(|_| OpenObjectError::InvalidRange)?
+        };
+        if start >= length || start > end {
+            return Err(OpenObjectError::InvalidRange);
+        }
+        (start, end.min(length - 1))
+    };
+    Ok((
+        data.slice(start..=end),
+        Some(format!("bytes {start}-{end}/{length}")),
+    ))
+}
+
+async fn open_backend_object(
+    state: &AppState,
+    backend: ResolvedBackend,
+    user_id: &str,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    head_only: bool,
+) -> Result<OpenedObject, OpenObjectError> {
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    match backend {
+        ResolvedBackend::PresignedHttp(url) => {
+            open_http_object(state, url, headers, head_only).await
+        }
+        ResolvedBackend::S3 { client, .. } => {
+            if head_only {
+                let output = client
+                    .head_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        if error.to_string().contains("NotFound") {
+                            OpenObjectError::NotFound
+                        } else {
+                            OpenObjectError::Backend(error.to_string())
+                        }
+                    })?;
+                return Ok(OpenedObject::new(
+                    StatusCode::OK,
+                    s3_head_metadata(&output),
+                    axum::body::Body::empty(),
+                    state.source_body_limits,
+                ));
+            }
+            let mut request = client.get_object().bucket(bucket).key(key);
+            if let Some(range) = range {
+                request = request.range(range);
+            }
+            let output = request.send().await.map_err(|error| {
+                if error.to_string().contains("NotFound") || error.to_string().contains("NoSuchKey")
+                {
+                    OpenObjectError::NotFound
+                } else {
+                    OpenObjectError::Backend(error.to_string())
+                }
+            })?;
+            let status = if output.content_range.is_some() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            };
+            let metadata = s3_get_metadata(&output);
+            let body = axum::body::Body::new(output.body.into_inner());
+            Ok(OpenedObject::new(
+                status,
+                metadata,
+                body,
+                state.source_body_limits,
+            ))
+        }
+        ResolvedBackend::Managed(storage) => {
+            let managed_key = format!("{user_id}/{bucket}/{key}");
+            if head_only {
+                let output = storage
+                    .head_output(&managed_key)
+                    .await
+                    .ok_or(OpenObjectError::NotFound)?;
+                return Ok(OpenedObject::new(
+                    StatusCode::OK,
+                    s3_head_metadata(&output),
+                    axum::body::Body::empty(),
+                    state.source_body_limits,
+                ));
+            }
+            let output = storage
+                .open(&managed_key, range)
+                .await
+                .ok_or(OpenObjectError::NotFound)?;
+            let status = if output.content_range.is_some() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            };
+            let metadata = s3_get_metadata(&output);
+            let body = axum::body::Body::new(output.body.into_inner());
+            Ok(OpenedObject::new(
+                status,
+                metadata,
+                body,
+                state.source_body_limits,
+            ))
+        }
+        ResolvedBackend::Memory(store) => {
+            if head_only {
+                let (size, content_type, etag) = store
+                    .metadata(bucket, key)
+                    .ok_or(OpenObjectError::NotFound)?;
+                let mut metadata = ObjectMetadata::default();
+                metadata.insert(header::CONTENT_LENGTH, size.to_string());
+                metadata.insert(header::CONTENT_TYPE, content_type);
+                metadata.insert(header::ETAG, etag);
+                metadata.insert(header::ACCEPT_RANGES, "bytes");
+                return Ok(OpenedObject::new(
+                    StatusCode::OK,
+                    metadata,
+                    axum::body::Body::empty(),
+                    state.source_body_limits,
+                ));
+            }
+            let object = store.get(bucket, key).ok_or(OpenObjectError::NotFound)?;
+            let (data, content_range) = memory_range(&object.data, range)?;
+            let mut metadata = ObjectMetadata::default();
+            metadata.insert(header::CONTENT_LENGTH, data.len().to_string());
+            metadata.insert(header::CONTENT_TYPE, object.content_type);
+            metadata.insert(header::ETAG, object.etag);
+            metadata.insert(header::ACCEPT_RANGES, "bytes");
+            if let Some(content_range) = content_range {
+                metadata.insert(header::CONTENT_RANGE, content_range);
+            }
+            let status = if range.is_some() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            };
+            let body = axum::body::Body::new(ChunkedBytesBody::new(
+                data,
+                state.source_body_limits.max_frame_bytes,
+            ));
+            Ok(OpenedObject::new(
+                status,
+                metadata,
+                body,
+                state.source_body_limits,
+            ))
+        }
+    }
 }
 
 async fn authenticate(
@@ -979,16 +1427,6 @@ fn wants_transformed_read(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn bounded_read_error(key: &str, error: BoundedReadError) -> axum::response::Response {
-    match error {
-        BoundedReadError::EntityTooLarge => s3_error::entity_too_large(key),
-        BoundedReadError::Backend(detail) => {
-            warn!("backend read failed for {key}: {detail}");
-            s3_error::internal_error(key, &detail)
-        }
-    }
-}
-
 /// Run the filter pipeline over `body`.
 fn process_input(
     state: &AppState,
@@ -1016,44 +1454,46 @@ fn process_input(
 async fn store_processed(
     state: &AppState,
     auth: &Auth,
+    backend: ResolvedBackend,
     bucket: &str,
     key: &str,
-    headers: &HeaderMap,
     output: crate::TransformOutput,
     input_len: usize,
 ) -> axum::response::Response {
-    if let Some(backend_url) = headers
-        .get("x-s4-backend-url")
-        .and_then(|v| v.to_str().ok())
-    {
-        match reqwest::Client::new()
-            .put(backend_url)
-            .body(output.bytes.clone())
-            .send()
-            .await
-        {
-            Ok(_) => {
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Write, input_len as u64)
-                    .await;
-                info!(
-                    "PUT /{bucket}/{key} -> presigned URL ({} records, user={})",
-                    output.records_processed, auth.user_id
-                );
-                StatusCode::OK.into_response()
-            }
-            Err(e) => {
-                warn!("backend put failed: {e}");
-                s3_error::internal_error(key, &e.to_string())
+    let crate::TransformOutput {
+        bytes,
+        records_processed,
+    } = output;
+    let bytes = bytes::Bytes::from(bytes);
+    match backend {
+        ResolvedBackend::PresignedHttp(url) => {
+            let client = match state.presigned_http_policy.client_for(&url).await {
+                Ok(client) => client,
+                Err(error) => return open_error_response(key, OpenObjectError::Rejected(error)),
+            };
+            match client.put(url).body(bytes).send().await {
+                Ok(_) => {
+                    state
+                        .control
+                        .record(&auth.user_id, RequestKind::Write, input_len as u64)
+                        .await;
+                    info!(
+                        "PUT /{bucket}/{key} -> presigned URL ({} records, user={})",
+                        records_processed, auth.user_id
+                    );
+                    StatusCode::OK.into_response()
+                }
+                Err(e) => {
+                    warn!("backend put failed: {e}");
+                    s3_error::internal_error(key, &e.to_string())
+                }
             }
         }
-    } else if let Some(s3) = get_user_s3_client(state, &auth.user_id).await {
-        match s3
+        ResolvedBackend::S3 { client, .. } => match client
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from(output.bytes))
+            .body(ByteStream::from(bytes))
             .send()
             .await
         {
@@ -1064,7 +1504,7 @@ async fn store_processed(
                     .await;
                 info!(
                     "PUT /{bucket}/{key} -> S3 ({} records, user={})",
-                    output.records_processed, auth.user_id
+                    records_processed, auth.user_id
                 );
                 StatusCode::OK.into_response()
             }
@@ -1072,13 +1512,11 @@ async fn store_processed(
                 warn!("upstream put failed: {e}");
                 s3_error::internal_error(key, &e.to_string())
             }
-        }
-    } else if !state.service_storage.is_empty() {
-        match state
-            .service_storage
+        },
+        ResolvedBackend::Managed(storage) => match storage
             .put(
                 &format!("{}/{bucket}/{key}", auth.user_id),
-                output.bytes.to_vec(),
+                bytes,
                 "text/plain",
             )
             .await
@@ -1090,7 +1528,7 @@ async fn store_processed(
                     .await;
                 info!(
                     "PUT /{bucket}/{key} -> service storage ({} records, user={})",
-                    output.records_processed, auth.user_id
+                    records_processed, auth.user_id
                 );
                 StatusCode::OK.into_response()
             }
@@ -1098,22 +1536,23 @@ async fn store_processed(
                 warn!("service storage put failed: {e}");
                 s3_error::internal_error(key, &e.to_string())
             }
+        },
+        ResolvedBackend::Memory(store) => {
+            state
+                .control
+                .record(&auth.user_id, RequestKind::Write, input_len as u64)
+                .await;
+            let obj = store.put(bucket, key, bytes, "text/plain");
+            info!(
+                "PUT /{bucket}/{key} -> memory ({} records, {} bytes, user={})",
+                records_processed,
+                obj.data.len(),
+                auth.user_id
+            );
+            let mut resp = axum::response::Response::builder().status(StatusCode::OK);
+            resp = resp.header("ETag", &obj.etag);
+            resp.body(axum::body::Body::empty()).unwrap()
         }
-    } else {
-        state
-            .control
-            .record(&auth.user_id, RequestKind::Write, input_len as u64)
-            .await;
-        let obj = state.store.put(bucket, key, output.bytes, "text/plain");
-        info!(
-            "PUT /{bucket}/{key} -> memory ({} records, {} bytes, user={})",
-            output.records_processed,
-            obj.data.len(),
-            auth.user_id
-        );
-        let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-        resp = resp.header("ETag", &obj.etag);
-        resp.body(axum::body::Body::empty()).unwrap()
     }
 }
 
@@ -1144,6 +1583,16 @@ async fn s3_put(
         {
             return s3_error::payment_required(&key, reason.message);
         }
+        if let Err(error) = resolve_backend(
+            &state,
+            &auth.user_id,
+            &parts.headers,
+            StorageOperation::Multipart,
+        )
+        .await
+        {
+            return s3_error::internal_error(&key, &error);
+        }
         return s3_error::multipart_not_supported(&key);
     }
     let max_bytes = effective_legacy_max_object_bytes(&state);
@@ -1170,6 +1619,11 @@ async fn s3_put(
     {
         return s3_error::payment_required(&key, reason.message);
     }
+    let backend =
+        match resolve_backend(&state, &auth.user_id, &parts.headers, StorageOperation::Put).await {
+            Ok(backend) => backend,
+            Err(error) => return s3_error::internal_error(&key, &error),
+        };
 
     let output = match process_input(&state, &parts.headers, &auth, &body) {
         Ok(o) => o,
@@ -1187,16 +1641,7 @@ async fn s3_put(
         );
         return s3_error::entity_too_large(&key);
     }
-    store_processed(
-        &state,
-        &auth,
-        &bucket,
-        &key,
-        &parts.headers,
-        output,
-        body.len(),
-    )
-    .await
+    store_processed(&state, &auth, backend, &bucket, &key, output, body.len()).await
 }
 
 async fn s3_get(
@@ -1223,118 +1668,66 @@ async fn s3_get(
         return s3_error::transformed_read_not_supported(&key);
     }
     if params.upload_id.is_some() {
+        if let Err(error) =
+            resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Multipart).await
+        {
+            return s3_error::internal_error(&key, &error);
+        }
         return s3_error::multipart_not_supported(&key);
     }
-    let max_bytes = effective_legacy_max_object_bytes(&state);
-
-    if let Some(backend_url) = headers
-        .get("x-s4-backend-url")
-        .and_then(|v| v.to_str().ok())
+    let backend =
+        match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Get).await {
+            Ok(backend) => backend,
+            Err(error) => return s3_error::internal_error(&key, &error),
+        };
+    let object = match open_backend_object(
+        &state,
+        backend,
+        &auth.user_id,
+        &bucket,
+        &key,
+        &headers,
+        false,
+    )
+    .await
     {
-        match reqwest::get(backend_url).await {
-            Ok(resp) => {
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Read, 0)
-                    .await;
-                let status = resp.status();
-                let ct = resp
-                    .headers()
-                    .get("content-type")
-                    .map(|v| v.to_str().unwrap_or("application/octet-stream").to_string())
-                    .unwrap_or_else(|| "text/plain".to_string());
-                let body_bytes = match collect_http_body(resp, max_bytes).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => return bounded_read_error(&key, error),
-                };
-                let mut builder = axum::response::Response::builder()
-                    .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
-                builder = builder.header("Content-Type", &ct);
-                builder = builder.header("Content-Length", body_bytes.len().to_string());
-                builder.body(axum::body::Body::from(body_bytes)).unwrap()
-            }
-            Err(e) => {
-                warn!("backend get failed: {e}");
-                s3_error::internal_error(&key, &e.to_string())
-            }
-        }
-    } else if let Some(ref s3) = state.s3_client {
-        let mut req = s3.get_object().bucket(&bucket).key(&key);
-        if let Some(range) = headers.get("Range").and_then(|v| v.to_str().ok()) {
-            req = req.range(range);
-        }
-        match req.send().await {
-            Ok(output) => {
-                let ct = output
-                    .content_type
-                    .clone()
-                    .unwrap_or_else(|| "text/plain".to_string());
-                let etag = output.e_tag.clone();
-                match collect_s3_body(output.body, max_bytes).await {
-                    Ok(bytes) => {
-                        state
-                            .control
-                            .record(&auth.user_id, RequestKind::Read, 0)
-                            .await;
-                        let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-                        if let Some(etag) = etag.as_deref() {
-                            resp = resp.header("ETag", etag);
-                        }
-                        resp = resp.header("Content-Type", &ct);
-                        resp = resp.header("Content-Length", bytes.len().to_string());
-                        resp.body(axum::body::Body::from(bytes)).unwrap()
-                    }
-                    Err(error) => bounded_read_error(&key, error),
-                }
-            }
-            Err(e) => {
-                if e.to_string().contains("NotFound") {
-                    s3_error::no_such_key(&key)
-                } else {
-                    s3_error::internal_error(&key, &e.to_string())
-                }
-            }
-        }
-    } else if !state.service_storage.is_empty() {
-        match state
-            .service_storage
-            .get(&format!("{}/{bucket}/{key}", auth.user_id), max_bytes)
-            .await
-        {
-            Ok(Some((data, content_type))) => {
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Read, 0)
-                    .await;
-                let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-                resp = resp.header("Content-Type", content_type);
-                resp = resp.header("Content-Length", data.len().to_string());
-                resp.body(axum::body::Body::from(data)).unwrap()
-            }
-            Ok(None) => s3_error::no_such_key(&key),
-            Err(crate::service_storage::ServiceStorageReadError::EntityTooLarge) => {
-                s3_error::entity_too_large(&key)
-            }
-        }
-    } else {
-        match state.store.get(&bucket, &key) {
-            Some(obj) => {
-                if obj.data.len() > max_bytes {
-                    return s3_error::entity_too_large(&key);
-                }
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Read, 0)
-                    .await;
-                let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-                resp = resp.header("ETag", &obj.etag);
-                resp = resp.header("Content-Type", &obj.content_type);
-                resp = resp.header("Content-Length", obj.data.len().to_string());
-                resp.body(axum::body::Body::from(obj.data)).unwrap()
-            }
-            None => s3_error::no_such_key(&key),
-        }
+        Ok(object) => object,
+        Err(error) => return open_error_response(&key, error),
+    };
+    state
+        .control
+        .record(&auth.user_id, RequestKind::Read, 0)
+        .await;
+
+    if state.streaming_read_mode.streams_passthrough() {
+        return object.into_response();
     }
+
+    let max_bytes = effective_legacy_max_object_bytes(&state);
+    if object
+        .metadata
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return s3_error::entity_too_large(&key);
+    }
+    let status = object.status;
+    let metadata = object.metadata;
+    let body = match axum::body::to_bytes(object.body, max_bytes).await {
+        Ok(body) => body,
+        Err(error) => {
+            warn!("legacy backend read failed for {key}: {error}");
+            return s3_error::entity_too_large(&key);
+        }
+    };
+    let mut response = axum::response::Response::builder().status(status);
+    if let Some(headers) = response.headers_mut() {
+        headers.extend(metadata.headers);
+    }
+    response.body(axum::body::Body::from(body)).unwrap()
 }
 
 async fn s3_head(
@@ -1356,48 +1749,30 @@ async fn s3_head(
         return s3_error::payment_required(&key, reason.message);
     }
 
-    if let Some(ref s3) = state.s3_client {
-        match s3.head_object().bucket(&bucket).key(&key).send().await {
-            Ok(output) => {
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Read, 0)
-                    .await;
-                let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-                if let Some(etag) = output.e_tag.as_deref() {
-                    resp = resp.header("ETag", etag);
-                }
-                if let Some(ct) = output.content_type.as_deref() {
-                    resp = resp.header("Content-Type", ct);
-                }
-                if let Some(cl) = output.content_length {
-                    resp = resp.header("Content-Length", cl.to_string());
-                }
-                resp.body(axum::body::Body::empty()).unwrap()
-            }
-            Err(e) => {
-                if e.to_string().contains("NotFound") {
-                    s3_error::no_such_key(&key)
-                } else {
-                    s3_error::internal_error(&key, &e.to_string())
-                }
-            }
+    let backend =
+        match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Head).await {
+            Ok(backend) => backend,
+            Err(error) => return s3_error::internal_error(&key, &error),
+        };
+    match open_backend_object(
+        &state,
+        backend,
+        &auth.user_id,
+        &bucket,
+        &key,
+        &headers,
+        true,
+    )
+    .await
+    {
+        Ok(object) => {
+            state
+                .control
+                .record(&auth.user_id, RequestKind::Read, 0)
+                .await;
+            object.into_response()
         }
-    } else {
-        match state.store.head(&bucket, &key) {
-            Some(obj) => {
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Read, 0)
-                    .await;
-                let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-                resp = resp.header("ETag", &obj.etag);
-                resp = resp.header("Content-Type", &obj.content_type);
-                resp = resp.header("Content-Length", obj.data.len().to_string());
-                resp.body(axum::body::Body::empty()).unwrap()
-            }
-            None => s3_error::no_such_key(&key),
-        }
+        Err(error) => open_error_response(&key, error),
     }
 }
 
@@ -1423,11 +1798,47 @@ async fn s3_delete(
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
 
     if params.upload_id.is_some() {
+        if let Err(error) =
+            resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Multipart).await
+        {
+            return s3_error::internal_error(&key, &error);
+        }
         return s3_error::multipart_not_supported(&key);
     }
 
-    if let Some(ref s3) = state.s3_client {
-        match s3.delete_object().bucket(&bucket).key(&key).send().await {
+    let backend =
+        match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Delete).await {
+            Ok(backend) => backend,
+            Err(error) => return s3_error::internal_error(&key, &error),
+        };
+    match backend {
+        ResolvedBackend::PresignedHttp(url) => {
+            let client = match state.presigned_http_policy.client_for(&url).await {
+                Ok(client) => client,
+                Err(error) => return open_error_response(&key, OpenObjectError::Rejected(error)),
+            };
+            match client.delete(url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    state
+                        .control
+                        .record(&auth.user_id, RequestKind::Write, 0)
+                        .await;
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                Ok(response) => s3_error::internal_error(
+                    &key,
+                    &format!("presigned DELETE returned {}", response.status()),
+                ),
+                Err(error) => s3_error::internal_error(&key, &error.to_string()),
+            }
+        }
+        ResolvedBackend::S3 { client, .. } => match client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+        {
             Ok(_) => {
                 state
                     .control
@@ -1436,14 +1847,28 @@ async fn s3_delete(
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(e) => s3_error::internal_error(&key, &e.to_string()),
+        },
+        ResolvedBackend::Managed(storage) => {
+            if let Err(error) = storage
+                .delete(&format!("{}/{bucket}/{key}", auth.user_id))
+                .await
+            {
+                return s3_error::internal_error(&key, &error.to_string());
+            }
+            state
+                .control
+                .record(&auth.user_id, RequestKind::Write, 0)
+                .await;
+            StatusCode::NO_CONTENT.into_response()
         }
-    } else {
-        state.store.delete(&bucket, &key);
-        state
-            .control
-            .record(&auth.user_id, RequestKind::Write, 0)
-            .await;
-        StatusCode::NO_CONTENT.into_response()
+        ResolvedBackend::Memory(store) => {
+            store.delete(&bucket, &key);
+            state
+                .control
+                .record(&auth.user_id, RequestKind::Write, 0)
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
     }
 }
 
@@ -1476,6 +1901,16 @@ async fn s3_post(
     info!("POST /{bucket}/{key} user={}", auth.user_id);
 
     if params.uploads.is_some() || params.upload_id.is_some() {
+        if let Err(error) = resolve_backend(
+            &state,
+            &auth.user_id,
+            &parts.headers,
+            StorageOperation::Multipart,
+        )
+        .await
+        {
+            return s3_error::internal_error(&key, &error);
+        }
         return s3_error::multipart_not_supported(&key);
     }
     s3_error::not_implemented(&key)
@@ -1502,26 +1937,31 @@ async fn s3_list_objects(
         return s3_error::payment_required(&bucket, reason.message);
     }
 
-    // Prefer a configured S3 backend, then the in-memory store.
-    let mut client = state.s3_client.clone();
-    if client.is_none() {
-        client = get_user_s3_client(&state, &auth.user_id).await;
-    }
-    if let Some(s3) = client {
-        return match list_from_s3(&s3, &bucket, &params).await {
+    let backend =
+        match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::List).await {
+            Ok(backend) => backend,
+            Err(error) => return s3_error::internal_error(&bucket, &error),
+        };
+    match backend {
+        ResolvedBackend::S3 { client, .. } => match list_from_s3(&client, &bucket, &params).await {
             Ok(xml) => s3_xml_ok(xml),
             Err(e) => {
                 warn!("list from S3 backend failed for {bucket}: {e}");
                 s3_error::internal_error(&bucket, &e.to_string())
             }
-        };
+        },
+        ResolvedBackend::Memory(store) => s3_xml_ok(list_from_memory(&store, &bucket, &params)),
+        ResolvedBackend::Managed(_) => {
+            warn!("listing is not supported against managed service storage for {bucket}");
+            s3_xml_ok(empty_list(&bucket, &params))
+        }
+        ResolvedBackend::PresignedHttp(url) => {
+            match open_http_object(&state, url, &headers, false).await {
+                Ok(object) => object.into_response(),
+                Err(error) => open_error_response(&bucket, error),
+            }
+        }
     }
-    if !state.service_storage.is_empty() {
-        warn!(
-            "listing is not supported against service storage; returning an empty page for {bucket}"
-        );
-    }
-    s3_xml_ok(list_from_memory(&state, &bucket, &params))
 }
 
 /// Forward a ListObjectsV2 request to an S3 backend.
@@ -1617,7 +2057,7 @@ async fn list_from_s3(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Re
 }
 
 /// ListObjectsV2 against the in-memory store.
-fn list_from_memory(state: &AppState, bucket: &str, params: &S3Query) -> String {
+fn list_from_memory(store: &MemoryStore, bucket: &str, params: &S3Query) -> String {
     let prefix = params.prefix.as_deref().unwrap_or("");
     let delimiter = params.delimiter.as_deref();
     let max_keys = params.max_keys.unwrap_or(1000).min(1000) as usize;
@@ -1629,8 +2069,7 @@ fn list_from_memory(state: &AppState, bucket: &str, params: &S3Query) -> String 
         .or(params.marker.as_deref());
 
     let bucket_prefix = format!("{bucket}/");
-    let mut keys: Vec<String> = state
-        .store
+    let mut keys: Vec<String> = store
         .list_keys()
         .into_iter()
         .filter_map(|full| full.strip_prefix(&bucket_prefix).map(|k| k.to_string()))
@@ -1661,9 +2100,9 @@ fn list_from_memory(state: &AppState, bucket: &str, params: &S3Query) -> String 
             continue;
         }
         prev_common = None;
-        let obj = state.store.get(bucket, &k);
-        let (etag, size) = obj
-            .map(|o| (o.etag, o.data.len() as u64))
+        let (etag, size) = store
+            .metadata(bucket, &k)
+            .map(|(size, _, etag)| (etag, size as u64))
             .unwrap_or_default();
         outputs.push(Output::Content((k, etag, size)));
     }
@@ -1741,6 +2180,15 @@ fn list_from_memory(state: &AppState, bucket: &str, params: &S3Query) -> String 
     xml
 }
 
+fn empty_list(bucket: &str, params: &S3Query) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix><KeyCount>0</KeyCount><MaxKeys>{}</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#,
+        xml_escape(bucket),
+        xml_escape(params.prefix.as_deref().unwrap_or("")),
+        params.max_keys.unwrap_or(1000).min(1000),
+    )
+}
+
 /// `GET /` — serve the dashboard to browsers, ListBuckets to S3 clients.
 async fn root(
     State(state): State<Arc<AppState>>,
@@ -1761,29 +2209,40 @@ async fn root(
     else {
         return s3_error::access_denied("").into_response();
     };
-    match list_buckets(&state, &auth).await {
+    match list_buckets(&state, &auth, &headers).await {
         Ok(xml) => s3_xml_ok(xml).into_response(),
         Err(e) => s3_error::internal_error("", &e.to_string()).into_response(),
     }
 }
 
-async fn list_buckets(state: &AppState, auth: &Auth) -> anyhow::Result<String> {
+async fn list_buckets(
+    state: &AppState,
+    auth: &Auth,
+    headers: &HeaderMap,
+) -> anyhow::Result<String> {
     let mut names: Vec<String> = Vec::new();
-    if let Some(s3) = get_user_s3_client(state, &auth.user_id).await {
-        let out = s3.list_buckets().send().await?;
-        for b in out.buckets().iter() {
-            if let Some(n) = b.name() {
-                names.push(n.to_string());
+    match resolve_backend(state, &auth.user_id, headers, StorageOperation::List)
+        .await
+        .map_err(anyhow::Error::msg)?
+    {
+        ResolvedBackend::S3 { client, .. } => {
+            let out = client.list_buckets().send().await?;
+            for bucket in out.buckets() {
+                if let Some(name) = bucket.name() {
+                    names.push(name.to_string());
+                }
             }
         }
-    } else {
-        let mut set = std::collections::BTreeSet::new();
-        for full in state.store.list_keys() {
-            if let Some((b, _)) = full.split_once('/') {
-                set.insert(b.to_string());
+        ResolvedBackend::Memory(store) => {
+            let mut set = std::collections::BTreeSet::new();
+            for full in store.list_keys() {
+                if let Some((bucket, _)) = full.split_once('/') {
+                    set.insert(bucket.to_string());
+                }
             }
+            names.extend(set);
         }
-        names.extend(set);
+        ResolvedBackend::Managed(_) | ResolvedBackend::PresignedHttp(_) => {}
     }
     names.sort();
     let mut xml = String::from(
@@ -2215,8 +2674,8 @@ async fn list_objects(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             let obj_key = parts.get(1).unwrap_or(&"");
             let size = state
                 .store
-                .get(bucket, obj_key)
-                .map(|o| o.data.len())
+                .metadata(bucket, obj_key)
+                .map(|(size, _, _)| size)
                 .unwrap_or(0);
             ObjectResponse { key: k, size }
         })
@@ -2326,6 +2785,19 @@ pub async fn build_state(
         .map(|v| parse_service_backends(&v))
         .unwrap_or_default();
     let service_storage = Arc::new(ServiceStorage::new(service_backends));
+    let source_body_limits = BodyLimits {
+        max_frame_bytes: std::env::var("S4_SOURCE_MAX_FRAME_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES),
+        max_bytes: std::env::var("S4_MAX_OBJECT_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
+            .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
+    };
 
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
@@ -2390,6 +2862,9 @@ pub async fn build_state(
         auth_disabled,
         control,
         legacy_max_object_bytes: legacy_max_object_bytes(),
+        streaming_read_mode: StreamingReadMode::from_env(),
+        source_body_limits,
+        presigned_http_policy: PresignedHttpPolicy::from_env(),
     }))
 }
 

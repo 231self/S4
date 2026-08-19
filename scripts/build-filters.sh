@@ -76,4 +76,14 @@ for entry in "${FILTERS[@]}"; do
   echo "    -> ${OUT_DIR}/${name}.component.wasm (WASI)"
 done
 
+# Failure-injection component is built for runtime tests but never placed in the
+# production auto-load directory.
+TEST_OUT_DIR="$ROOT/target/test-components"
+mkdir -p "$TEST_OUT_DIR"
+cargo build --release -p test-filter --target "$TARGET"
+wasm-tools component new \
+  "${BIN_DIR}/test_filter.wasm" \
+  --adapt "wasi_snapshot_preview1=${ADAPTER}" \
+  -o "${TEST_OUT_DIR}/test-filter.component.wasm"
+
 echo "=== All filters built (WASI) ==="

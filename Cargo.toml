@@ -28,6 +28,8 @@ thiserror = "2"
 hex = "0.4"
 uuid = { version = "1", features = ["v7", "v4"] }
 rand = "0.8"
+bytes = "1"
+csv-core = "0.1"
 
 ciborium = "0.2"
 ed25519-dalek = "3"

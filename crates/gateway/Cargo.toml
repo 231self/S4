@@ -12,6 +12,8 @@ path = "src/main.rs"
 s4-error = { path = "../error" }
 s4-wasm-runtime = { path = "../wasm-runtime" }
 anyhow = "1"
+bytes.workspace = true
+csv-core.workspace = true
 axum.workspace = true
 tokio.workspace = true
 aws-sdk-s3.workspace = true

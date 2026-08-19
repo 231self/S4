@@ -9,6 +9,8 @@ pub mod codes {
     pub const DECODE_CSV: &str = "decode.csv";
     pub const DECODE_JSONL: &str = "decode.jsonl";
     pub const DECODE_ENCODING: &str = "decode.encoding";
+    pub const CONFIG_INVALID: &str = "config.invalid";
+    pub const LIMIT_INPUT_BYTES: &str = "limit.input_bytes";
     pub const RECORD_TOO_LARGE: &str = "record.too_large";
     pub const WASM_TRAP: &str = "wasm.trap";
     pub const WASM_REJECT: &str = "wasm.reject";

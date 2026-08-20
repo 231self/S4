@@ -4,6 +4,7 @@ pub mod entity;
 pub mod integrity;
 pub mod key_cipher;
 pub mod managed;
+pub mod multipart_staging;
 pub mod object;
 pub mod plugin_registry;
 pub mod read_spool;

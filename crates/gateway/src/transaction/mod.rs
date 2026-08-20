@@ -250,14 +250,41 @@ pub enum VersioningCapability {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionalReadCapability {
+    Unsupported,
+    Etag,
+    VersionAndEtag,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseChecksumCapability {
+    Unsupported,
+    Standard,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListCapability {
+    Unsupported,
+    V1AndV2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MultipartResponseCapability {
+    Unsupported,
+    Standard,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendCapabilities {
     pub incomplete_upload_discovery: IncompleteUploadDiscovery,
     pub abort_incomplete_upload: bool,
     pub cleanup_sla: Option<Duration>,
     pub lifecycle_rule: bool,
     pub versioning: VersioningCapability,
-    pub conditional_operations: bool,
-    pub checksums: bool,
+    pub conditional_reads: ConditionalReadCapability,
+    pub response_checksums: ResponseChecksumCapability,
+    pub list_operations: ListCapability,
+    pub multipart_responses: MultipartResponseCapability,
     pub completion_reconciliation: CompletionReconciliation,
 }
 
@@ -276,6 +303,14 @@ impl BackendCapabilities {
             Some(sla) if sla <= MAX_RECONCILIATION_SLA => Ok(()),
             _ => Err(CapabilityError::CleanupSlaExceeded),
         }
+    }
+
+    pub fn supports_conditional_reads(self) -> bool {
+        self.conditional_reads != ConditionalReadCapability::Unsupported
+    }
+
+    pub fn supports_response_checksums(self) -> bool {
+        self.response_checksums == ResponseChecksumCapability::Standard
     }
 }
 
@@ -665,8 +700,10 @@ mod tests {
             cleanup_sla: Some(MAX_RECONCILIATION_SLA),
             lifecycle_rule: true,
             versioning: VersioningCapability::Optional,
-            conditional_operations: true,
-            checksums: true,
+            conditional_reads: ConditionalReadCapability::VersionAndEtag,
+            response_checksums: ResponseChecksumCapability::Standard,
+            list_operations: ListCapability::V1AndV2,
+            multipart_responses: MultipartResponseCapability::Standard,
             completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
         };
         assert_eq!(eligible.streaming_eligibility(), Ok(()));

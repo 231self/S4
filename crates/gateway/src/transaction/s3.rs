@@ -881,8 +881,10 @@ mod tests {
                 cleanup_sla: Some(Duration::from_secs(60)),
                 lifecycle_rule: true,
                 versioning: VersioningCapability::Optional,
-                conditional_operations: true,
-                checksums: true,
+                conditional_reads: crate::transaction::ConditionalReadCapability::VersionAndEtag,
+                response_checksums: crate::transaction::ResponseChecksumCapability::Standard,
+                list_operations: crate::transaction::ListCapability::V1AndV2,
+                multipart_responses: crate::transaction::MultipartResponseCapability::Standard,
                 completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
             }
         }

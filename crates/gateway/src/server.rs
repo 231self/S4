@@ -32,6 +32,10 @@ use crate::backend::{BackendResolver, PresignedHttpPolicy, ResolvedBackend, Stor
 use crate::control::{ControlPlane, RequestKind, StreamingWriteMode};
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
+use crate::managed::{
+    InMemoryManagedRepository, LogicalObjectKey, ManagedRepository, ManagedStreamingMode,
+    PLACEMENT_VERSION_V1, PostgresManagedRepository, validate_mode,
+};
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, strip_hop_by_hop_headers,
 };
@@ -74,6 +78,7 @@ pub struct AppState {
     pub sigv4_policy: SigV4Policy,
     pub operation_journal: Option<Arc<dyn OperationJournal>>,
     pub s3_streaming_capabilities: Option<BackendCapabilities>,
+    pub managed_streaming_capabilities: Option<BackendCapabilities>,
     pub spool_config: CompatibilitySpoolConfig,
     pub spool_quota: Arc<SpoolQuota>,
     pub dev_memory_max_object_bytes: usize,
@@ -133,6 +138,21 @@ fn configured_s3_streaming_capabilities() -> Option<BackendCapabilities> {
         return None;
     }
     Some(BackendCapabilities {
+        incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
+        abort_incomplete_upload: true,
+        cleanup_sla: Some(Duration::from_secs(5 * 60)),
+        lifecycle_rule: true,
+        versioning: VersioningCapability::Optional,
+        conditional_operations: true,
+        checksums: true,
+        completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
+    })
+}
+
+fn configured_managed_streaming_capabilities() -> Option<BackendCapabilities> {
+    let configured = std::env::var("S4_MANAGED_STREAMING_TRANSACTIONAL")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    configured.then_some(BackendCapabilities {
         incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
         abort_incomplete_upload: true,
         cleanup_sla: Some(Duration::from_secs(5 * 60)),
@@ -757,12 +777,25 @@ async fn open_backend_object(
             ))
         }
         ResolvedBackend::Managed(storage) => {
-            let managed_key = format!("{user_id}/{bucket}/{key}");
+            let logical = LogicalObjectKey::new(user_id, bucket, key);
             if head_only {
-                let output = storage
-                    .head_output(&managed_key)
-                    .await
-                    .ok_or(OpenObjectError::NotFound)?;
+                let output = if storage.managed_mode() == ManagedStreamingMode::Off
+                    || (storage.managed_mode() == ManagedStreamingMode::Observe
+                        && !storage
+                            .has_authority(&logical)
+                            .await
+                            .map_err(|error| OpenObjectError::Backend(error.to_string()))?)
+                {
+                    storage
+                        .head_output(&format!("{user_id}/{bucket}/{key}"))
+                        .await
+                } else {
+                    storage
+                        .head_authoritative(&logical)
+                        .await
+                        .map_err(|error| OpenObjectError::Backend(error.to_string()))?
+                }
+                .ok_or(OpenObjectError::NotFound)?;
                 return Ok(OpenedObject::new(
                     StatusCode::OK,
                     s3_head_metadata(&output),
@@ -770,10 +803,23 @@ async fn open_backend_object(
                     state.source_body_limits,
                 ));
             }
-            let output = storage
-                .open(&managed_key, range)
-                .await
-                .ok_or(OpenObjectError::NotFound)?;
+            let output = if storage.managed_mode() == ManagedStreamingMode::Off
+                || (storage.managed_mode() == ManagedStreamingMode::Observe
+                    && !storage
+                        .has_authority(&logical)
+                        .await
+                        .map_err(|error| OpenObjectError::Backend(error.to_string()))?)
+            {
+                storage
+                    .open(&format!("{user_id}/{bucket}/{key}"), range)
+                    .await
+            } else {
+                storage
+                    .open_authoritative(&logical, range)
+                    .await
+                    .map_err(|error| OpenObjectError::Backend(error.to_string()))?
+            }
+            .ok_or(OpenObjectError::NotFound)?;
             let status = if output.content_range.is_some() {
                 StatusCode::PARTIAL_CONTENT
             } else {
@@ -1438,6 +1484,14 @@ async fn store_processed(
                 s3_error::internal_error(key, &e.to_string())
             }
         },
+        ResolvedBackend::Managed(storage)
+            if storage.managed_mode() != ManagedStreamingMode::Off =>
+        {
+            s3_error::service_unavailable(
+                key,
+                "managed mutations require authoritative streaming enforce mode",
+            )
+        }
         ResolvedBackend::Managed(storage) => match storage
             .put(
                 &format!("{}/{bucket}/{key}", auth.user_id),
@@ -1655,6 +1709,7 @@ fn streaming_format(headers: &HeaderMap) -> Result<(Format, String), StreamingPu
 async fn begin_streaming_sink(
     state: &AppState,
     backend: ResolvedBackend,
+    user_id: &str,
     bucket: &str,
     key: &str,
     content_type: &str,
@@ -1735,9 +1790,27 @@ async fn begin_streaming_sink(
         ResolvedBackend::Memory(_) => Err(StreamingPutError::Unsupported(
             "development memory streaming is not enabled".to_string(),
         )),
-        ResolvedBackend::Managed(_) => Err(StreamingPutError::Unsupported(
-            "managed streaming writes remain disabled until Phase 7".to_string(),
-        )),
+        ResolvedBackend::Managed(storage) => {
+            let capabilities = state.managed_streaming_capabilities.ok_or_else(|| {
+                StreamingPutError::Unsupported(
+                    "managed streaming needs S4_MANAGED_STREAMING_TRANSACTIONAL=true".to_string(),
+                )
+            })?;
+            let journal = state.operation_journal.clone().ok_or_else(|| {
+                StreamingPutError::Unsupported(
+                    "managed streaming needs a durable operation journal".to_string(),
+                )
+            })?;
+            storage
+                .begin_authoritative_sink(
+                    journal,
+                    capabilities,
+                    LogicalObjectKey::new(user_id, bucket, key),
+                    content_type,
+                )
+                .await
+                .map_err(StreamingPutError::from)
+        }
     }
 }
 
@@ -1811,7 +1884,15 @@ async fn streaming_single_put(
         ));
     }
     let (format, content_type) = streaming_format(headers)?;
-    let sink = begin_streaming_sink(state, backend, bucket, key, &content_type).await?;
+    let sink = begin_streaming_sink(
+        state,
+        backend,
+        &authentication.auth.user_id,
+        bucket,
+        key,
+        &content_type,
+    )
+    .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
     let sink = Arc::clone(&sink_guard.sink);
     let stable_fields = headers
@@ -2072,6 +2153,20 @@ async fn s3_put(
             Ok(backend) => backend,
             Err(error) => return s3_error::internal_error(&key, &error),
         };
+    if let ResolvedBackend::Managed(storage) = &backend {
+        match storage.managed_mode() {
+            ManagedStreamingMode::Observe => {
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed mutations are disabled in observe mode",
+                );
+            }
+            ManagedStreamingMode::Enforce if effective_write_mode < StreamingWriteMode::Single => {
+                return s3_error::not_implemented(&key);
+            }
+            ManagedStreamingMode::Off | ManagedStreamingMode::Enforce => {}
+        }
+    }
     if effective_write_mode >= StreamingWriteMode::Single {
         return match streaming_single_put(
             &state,
@@ -2343,10 +2438,20 @@ async fn s3_delete(
             Err(e) => s3_error::internal_error(&key, &e.to_string()),
         },
         ResolvedBackend::Managed(storage) => {
-            if let Err(error) = storage
-                .delete(&format!("{}/{bucket}/{key}", auth.user_id))
-                .await
-            {
+            let result = match storage.managed_mode() {
+                ManagedStreamingMode::Off => storage
+                    .delete(&format!("{}/{bucket}/{key}", auth.user_id))
+                    .await
+                    .map_err(|error| error.to_string()),
+                ManagedStreamingMode::Observe => {
+                    Err("managed mutations are disabled in observe mode".to_string())
+                }
+                ManagedStreamingMode::Enforce => storage
+                    .tombstone_authoritative(&LogicalObjectKey::new(&auth.user_id, &bucket, &key))
+                    .await
+                    .map_err(|error| error.to_string()),
+            };
+            if let Err(error) = result {
                 return s3_error::internal_error(&key, &error.to_string());
             }
             state
@@ -3283,7 +3388,13 @@ pub async fn build_state(
         .ok()
         .map(|v| parse_service_backends(&v))
         .unwrap_or_default();
-    let service_storage = Arc::new(ServiceStorage::new(service_backends));
+    let managed_mode_value = std::env::var("S4_MANAGED_STREAMING_MODE").ok();
+    let managed_mode = ManagedStreamingMode::from_value(managed_mode_value.as_deref())?;
+    let managed_placement_version = std::env::var("S4_MANAGED_PLACEMENT_VERSION")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(PLACEMENT_VERSION_V1);
     let source_body_limits = BodyLimits {
         max_frame_bytes: std::env::var("S4_SOURCE_MAX_FRAME_BYTES")
             .ok()
@@ -3299,6 +3410,7 @@ pub async fn build_state(
     };
     let streaming_write_mode = streaming_write_mode();
     let s3_streaming_capabilities = configured_s3_streaming_capabilities();
+    let managed_streaming_capabilities = configured_managed_streaming_capabilities();
     let spool_max_object_bytes = std::env::var("S4_SPOOL_MAX_OBJECT_BYTES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -3336,6 +3448,7 @@ pub async fn build_state(
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
     let mut operation_journal: Option<Arc<dyn OperationJournal>> = None;
+    let mut postgres_pool = None;
     let keys: Arc<dyn KeyRepository> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
@@ -3352,6 +3465,7 @@ pub async fn build_state(
         operation_journal = Some(Arc::new(crate::transaction::PostgresOperationJournal::new(
             pool.clone(),
         )));
+        postgres_pool = Some(pool.clone());
         Arc::new(PostgresKeyStore::with_cipher(pool, cipher.clone()))
     } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
         info!("Key store: file ({keys_file})");
@@ -3367,6 +3481,28 @@ pub async fn build_state(
         info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
         Arc::new(KeyStore::with_cipher(cipher))
     };
+    let managed_repository: Arc<dyn ManagedRepository> = if let Some(pool) = postgres_pool {
+        Arc::new(PostgresManagedRepository::new(pool))
+    } else {
+        Arc::new(InMemoryManagedRepository::new())
+    };
+    validate_mode(
+        managed_mode,
+        managed_repository.as_ref(),
+        auth_disabled || cfg!(debug_assertions),
+    )
+    .await?;
+    if managed_mode != ManagedStreamingMode::Off && managed_streaming_capabilities.is_none() {
+        anyhow::bail!(
+            "managed observe/enforce mode requires S4_MANAGED_STREAMING_TRANSACTIONAL=true"
+        );
+    }
+    let service_storage = Arc::new(ServiceStorage::with_management(
+        service_backends,
+        managed_repository,
+        managed_mode,
+        managed_placement_version,
+    ));
 
     // Local mode: ensure a demo key exists and print it so SDK demos and
     // `aws s3 --endpoint-url` work out of the box.
@@ -3386,7 +3522,7 @@ pub async fn build_state(
         }
     }
 
-    Ok(Arc::new(AppState {
+    let state = Arc::new(AppState {
         gateway: Arc::new(gateway),
         store: Arc::new(MemoryStore::new()),
         keys,
@@ -3407,11 +3543,33 @@ pub async fn build_state(
         sigv4_policy: SigV4Policy::from_env(),
         operation_journal,
         s3_streaming_capabilities,
+        managed_streaming_capabilities,
         spool_config,
         spool_quota,
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
-    }))
+    });
+    if managed_mode != ManagedStreamingMode::Off
+        && let (Some(journal), Some(capabilities)) = (
+            state.operation_journal.clone(),
+            state.managed_streaming_capabilities,
+        )
+    {
+        let storage = state.service_storage.clone();
+        tokio::spawn(async move {
+            let owner = format!("managed-repair-{}", uuid::Uuid::now_v7());
+            loop {
+                if let Err(error) = storage
+                    .repair_due(journal.clone(), capabilities, &owner, 16)
+                    .await
+                {
+                    warn!("managed repair worker failed: {error}");
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+    }
+    Ok(state)
 }
 
 /// Build the axum router for the engine. The SaaS crate merges its own

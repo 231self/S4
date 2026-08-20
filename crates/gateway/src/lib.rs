@@ -3,6 +3,7 @@ pub mod control;
 pub mod entity;
 pub mod integrity;
 pub mod key_cipher;
+pub mod managed;
 pub mod object;
 pub mod plugin_registry;
 pub mod record;

@@ -30,6 +30,157 @@ impl AwsS3TransactionBackend {
             capabilities,
         }
     }
+
+    async fn rewrite_completed_multipart_metadata(
+        &self,
+        operation: &OperationRecord,
+    ) -> Result<StoredObjectMeta, BackendError> {
+        let size = operation.expected.size.ok_or_else(|| {
+            BackendError::definitive("verified multipart output is missing an expected size")
+        })?;
+        if size == 0 {
+            return Err(BackendError::definitive(
+                "cannot rewrite a zero-byte multipart object",
+            ));
+        }
+
+        let upload = self
+            .client
+            .create_multipart_upload()
+            .bucket(&operation.destination.bucket)
+            .key(&operation.destination.physical_key)
+            .set_content_type(operation.expected.metadata.get("content-type").cloned())
+            .set_metadata(Some(object_metadata(operation)))
+            .send()
+            .await
+            .map_err(ambiguous)?;
+        let upload_id = upload.upload_id().ok_or_else(|| {
+            BackendError::ambiguous("metadata rewrite create-multipart response omitted upload ID")
+        })?;
+        let source = copy_source(operation);
+        let part_size = DIRECT_PART_BYTES as u64;
+        let part_count = size.div_ceil(part_size);
+        if part_count > 10_000 {
+            return Err(BackendError::definitive(
+                "multipart object has too many parts",
+            ));
+        }
+        let result = async {
+            let mut parts =
+                Vec::with_capacity(usize::try_from(part_count).map_err(|_| {
+                    BackendError::definitive("multipart object has too many parts")
+                })?);
+            for part_number in 1..=part_count {
+                let start = (part_number - 1) * part_size;
+                let end = (start + part_size - 1).min(size - 1);
+                let part_number = i32::try_from(part_number)
+                    .map_err(|_| BackendError::definitive("multipart object has too many parts"))?;
+                let output = self
+                    .client
+                    .upload_part_copy()
+                    .bucket(&operation.destination.bucket)
+                    .key(&operation.destination.physical_key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .copy_source(&source)
+                    .copy_source_range(format!("bytes={start}-{end}"))
+                    .send()
+                    .await
+                    .map_err(ambiguous)?;
+                let etag = output
+                    .copy_part_result()
+                    .and_then(|result| result.e_tag())
+                    .ok_or_else(|| {
+                        BackendError::ambiguous(
+                            "metadata rewrite upload-part-copy response omitted ETag",
+                        )
+                    })?;
+                parts.push(
+                    CompletedPart::builder()
+                        .part_number(part_number)
+                        .e_tag(etag)
+                        .build(),
+                );
+            }
+            let output = self
+                .client
+                .complete_multipart_upload()
+                .bucket(&operation.destination.bucket)
+                .key(&operation.destination.physical_key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(ambiguous)?;
+            Ok(StoredObjectMeta {
+                etag: output.e_tag().map(ToOwned::to_owned),
+                version_id: output.version_id().map(ToOwned::to_owned),
+            })
+        }
+        .await;
+        if result.is_err() {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&operation.destination.bucket)
+                .key(&operation.destination.physical_key)
+                .upload_id(upload_id)
+                .send()
+                .await;
+        }
+        result
+    }
+
+    async fn finalized_multipart(
+        &self,
+        operation: &OperationRecord,
+    ) -> Result<CompletionProbe, BackendError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&operation.destination.bucket)
+            .key(&operation.destination.physical_key)
+            .send()
+            .await
+        {
+            Ok(output) => {
+                let matches_operation = output
+                    .metadata()
+                    .and_then(|metadata| metadata.get("s4-operation-id"))
+                    .is_some_and(|id| id == &operation.id.to_string());
+                let matches_size = operation.expected.size.is_none_or(|expected| {
+                    output
+                        .content_length()
+                        .and_then(|size| u64::try_from(size).ok())
+                        == Some(expected)
+                });
+                if !matches_operation || !matches_size {
+                    return Ok(CompletionProbe::Inconclusive);
+                }
+                if metadata_matches(output.metadata(), operation) {
+                    return Ok(CompletionProbe::Committed(StoredObjectMeta {
+                        etag: output.e_tag().map(ToOwned::to_owned),
+                        version_id: output.version_id().map(ToOwned::to_owned),
+                    }));
+                }
+                self.rewrite_completed_multipart_metadata(operation)
+                    .await
+                    .map(CompletionProbe::Committed)
+            }
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|error| error.is_not_found()) =>
+            {
+                Ok(CompletionProbe::ProvenAbsent)
+            }
+            Err(error) => Err(ambiguous(error)),
+        }
+    }
 }
 
 fn object_metadata(operation: &OperationRecord) -> std::collections::HashMap<String, String> {
@@ -54,6 +205,32 @@ fn object_metadata(operation: &OperationRecord) -> std::collections::HashMap<Str
                 .map(|size| ("s4-size".to_string(), size.to_string())),
         )
         .collect()
+}
+
+fn metadata_matches(
+    actual: Option<&std::collections::HashMap<String, String>>,
+    operation: &OperationRecord,
+) -> bool {
+    let expected = object_metadata(operation);
+    actual.is_some_and(|actual| {
+        expected
+            .iter()
+            .all(|(key, value)| actual.get(key) == Some(value))
+    })
+}
+
+fn copy_source(operation: &OperationRecord) -> String {
+    let mut source = format!("{}/", operation.destination.bucket);
+    for byte in operation.destination.physical_key.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            source.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+
+            write!(source, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    source
 }
 
 fn ambiguous(error: impl std::fmt::Display) -> BackendError {
@@ -135,6 +312,9 @@ impl TransactionBackend for AwsS3TransactionBackend {
         upload_id: &str,
         parts: &[UploadedPart],
     ) -> Result<StoredObjectMeta, BackendError> {
+        if let CompletionProbe::Committed(meta) = self.finalized_multipart(operation).await? {
+            return Ok(meta);
+        }
         let completed = CompletedMultipartUpload::builder()
             .set_parts(Some(
                 parts
@@ -148,8 +328,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     .collect(),
             ))
             .build();
-        let output = self
-            .client
+        self.client
             .complete_multipart_upload()
             .bucket(&operation.destination.bucket)
             .key(&operation.destination.physical_key)
@@ -158,10 +337,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .send()
             .await
             .map_err(ambiguous)?;
-        Ok(StoredObjectMeta {
-            etag: output.e_tag().map(ToOwned::to_owned),
-            version_id: output.version_id().map(ToOwned::to_owned),
-        })
+        self.rewrite_completed_multipart_metadata(operation).await
     }
 
     async fn abort_multipart(
@@ -236,43 +412,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
         &self,
         operation: &OperationRecord,
     ) -> Result<CompletionProbe, BackendError> {
-        match self
-            .client
-            .head_object()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .send()
-            .await
-        {
-            Ok(output) => {
-                let matches_operation = output
-                    .metadata()
-                    .and_then(|metadata| metadata.get("s4-operation-id"))
-                    .is_some_and(|id| id == &operation.id.to_string());
-                let matches_size = operation.expected.size.is_none_or(|expected| {
-                    output
-                        .content_length()
-                        .and_then(|size| u64::try_from(size).ok())
-                        == Some(expected)
-                });
-                if matches_operation && matches_size {
-                    Ok(CompletionProbe::Committed(StoredObjectMeta {
-                        etag: output.e_tag().map(ToOwned::to_owned),
-                        version_id: output.version_id().map(ToOwned::to_owned),
-                    }))
-                } else {
-                    Ok(CompletionProbe::Inconclusive)
-                }
-            }
-            Err(error)
-                if error
-                    .as_service_error()
-                    .is_some_and(|error| error.is_not_found()) =>
-            {
-                Ok(CompletionProbe::ProvenAbsent)
-            }
-            Err(error) => Err(ambiguous(error)),
-        }
+        self.finalized_multipart(operation).await
     }
 }
 
@@ -904,6 +1044,40 @@ mod tests {
         sink.verify_output(sink.output_bytes, &digest)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn verified_multipart_metadata_replaces_initiation_metadata() {
+        let mut operation = OperationRecord::intent(
+            destination(),
+            ExpectedObject {
+                metadata: std::collections::BTreeMap::from([(
+                    "s4-generation".to_string(),
+                    "generation".to_string(),
+                )]),
+                ..ExpectedObject::default()
+            },
+        );
+        let initiation_metadata = object_metadata(&operation);
+
+        assert!(metadata_matches(Some(&initiation_metadata), &operation));
+        assert!(!initiation_metadata.contains_key("s4-sha256"));
+        assert!(!initiation_metadata.contains_key("s4-size"));
+
+        operation.expected.digest = Some("verified-digest".to_string());
+        operation.expected.size = Some((DIRECT_PART_BYTES + 1) as u64);
+
+        assert!(!metadata_matches(Some(&initiation_metadata), &operation));
+        let completed_metadata = object_metadata(&operation);
+        assert!(metadata_matches(Some(&completed_metadata), &operation));
+        assert_eq!(
+            completed_metadata.get("s4-sha256"),
+            Some(&"verified-digest".to_string())
+        );
+        assert_eq!(
+            completed_metadata.get("s4-size"),
+            Some(&(DIRECT_PART_BYTES + 1).to_string())
+        );
     }
 
     #[tokio::test]

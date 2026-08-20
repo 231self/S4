@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::ChecksumMode;
 use aws_smithy_types::date_time::Format as DateTimeFormat;
 use axum::{
     Json, Router,
@@ -22,7 +23,11 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{delete, get, head, post, put},
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
@@ -52,9 +57,10 @@ use crate::store::{
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, CompatibilitySpoolConfig,
     CompatibilitySpoolTransaction, CompatibilitySpoolUploader, CompletionReconciliation,
-    DirectS3Sink, ExpectedObject, IncompleteUploadDiscovery, MemorySinkTransaction,
-    ObjectDestination, ObjectSinkTransaction, OperationJournal, OperationReconciler, SpoolQuota,
-    StoredObjectMeta, TransactionError, VersioningCapability,
+    ConditionalReadCapability, DirectS3Sink, ExpectedObject, IncompleteUploadDiscovery,
+    ListCapability, MemorySinkTransaction, MultipartResponseCapability, ObjectDestination,
+    ObjectSinkTransaction, OperationJournal, OperationReconciler, ResponseChecksumCapability,
+    SpoolQuota, StoredObjectMeta, TransactionError, VersioningCapability,
 };
 use crate::{Format, Gateway};
 
@@ -87,6 +93,7 @@ pub struct AppState {
     pub transformed_read_spool_enabled: bool,
     pub dev_memory_max_object_bytes: usize,
     pub dev_memory_streaming_enabled: bool,
+    continuation_token_key: [u8; 32],
 }
 
 pub struct Auth {
@@ -178,8 +185,10 @@ fn configured_s3_streaming_capabilities() -> Option<BackendCapabilities> {
         cleanup_sla: Some(Duration::from_secs(5 * 60)),
         lifecycle_rule: true,
         versioning: VersioningCapability::Optional,
-        conditional_operations: true,
-        checksums: true,
+        conditional_reads: ConditionalReadCapability::VersionAndEtag,
+        response_checksums: ResponseChecksumCapability::Standard,
+        list_operations: ListCapability::V1AndV2,
+        multipart_responses: MultipartResponseCapability::Standard,
         completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
     })
 }
@@ -193,8 +202,10 @@ fn configured_managed_streaming_capabilities() -> Option<BackendCapabilities> {
         cleanup_sla: Some(Duration::from_secs(5 * 60)),
         lifecycle_rule: true,
         versioning: VersioningCapability::Optional,
-        conditional_operations: true,
-        checksums: true,
+        conditional_reads: ConditionalReadCapability::VersionAndEtag,
+        response_checksums: ResponseChecksumCapability::Standard,
+        list_operations: ListCapability::V1AndV2,
+        multipart_responses: MultipartResponseCapability::Standard,
         completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
     })
 }
@@ -764,20 +775,25 @@ async fn open_backend_object(
             open_http_object(state, url, headers, head_only).await
         }
         ResolvedBackend::S3 { client, .. } => {
+            let checksum_mode = headers
+                .get("x-amz-checksum-mode")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("enabled"));
             if head_only {
-                let output = client
-                    .head_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .send()
-                    .await
-                    .map_err(|error| {
-                        if error.to_string().contains("NotFound") {
-                            OpenObjectError::NotFound
-                        } else {
-                            OpenObjectError::Backend(error.to_string())
-                        }
-                    })?;
+                let mut request = client.head_object().bucket(bucket).key(key);
+                if checksum_mode {
+                    request = request.checksum_mode(ChecksumMode::Enabled);
+                }
+                let output = request.send().await.map_err(|error| {
+                    if error
+                        .as_service_error()
+                        .is_some_and(|service| service.is_not_found())
+                    {
+                        OpenObjectError::NotFound
+                    } else {
+                        OpenObjectError::Backend(error.to_string())
+                    }
+                })?;
                 return Ok(OpenedObject::new(
                     StatusCode::OK,
                     s3_head_metadata(&output),
@@ -789,8 +805,13 @@ async fn open_backend_object(
             if let Some(range) = range {
                 request = request.range(range);
             }
+            if checksum_mode {
+                request = request.checksum_mode(ChecksumMode::Enabled);
+            }
             let output = request.send().await.map_err(|error| {
-                if error.to_string().contains("NotFound") || error.to_string().contains("NoSuchKey")
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_no_such_key())
                 {
                     OpenObjectError::NotFound
                 } else {
@@ -2433,6 +2454,47 @@ fn transformed_source_matches_preflight(
             .is_some_and(|(left, right)| left == right)
 }
 
+fn conditional_read_response(
+    headers: &HeaderMap,
+    metadata: &ObjectMetadata,
+) -> Option<axum::response::Response> {
+    let etag = metadata.headers.get(header::ETAG)?.to_str().ok()?;
+    let matches = |condition: &str| {
+        condition
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == "*" || candidate == etag)
+    };
+    let status = if let Some(condition) = headers
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        (!matches(condition)).then_some(StatusCode::PRECONDITION_FAILED)
+    } else if let Some(condition) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        matches(condition).then_some(StatusCode::NOT_MODIFIED)
+    } else {
+        None
+    }?;
+    let mut response = axum::response::Response::builder().status(status);
+    let response_headers = response
+        .headers_mut()
+        .expect("response builder has headers");
+    response_headers.insert(header::ETAG, metadata.headers[header::ETAG].clone());
+    if let Some(version_id) = &metadata.version_id
+        && let Ok(value) = version_id.parse()
+    {
+        response_headers.insert("x-amz-version-id", value);
+    }
+    Some(
+        response
+            .body(axum::body::Body::empty())
+            .expect("valid conditional response"),
+    )
+}
+
 fn is_immutable_version_id(version_id: Option<&str>) -> bool {
     matches!(version_id, Some(version_id) if !version_id.is_empty() && version_id != "null")
 }
@@ -2889,6 +2951,10 @@ async fn s3_get(
                 ),
             );
         }
+        if let Some(response) = conditional_read_response(&headers, &object.metadata) {
+            object.cancellation.cancel();
+            return response;
+        }
         state
             .control
             .record(&auth.user_id, RequestKind::Read, 0)
@@ -2919,6 +2985,10 @@ async fn s3_get(
         Ok(object) => object,
         Err(error) => return open_error_response(&key, error),
     };
+    if let Some(response) = conditional_read_response(&headers, &object.metadata) {
+        object.cancellation.cancel();
+        return response;
+    }
     state
         .control
         .record(&auth.user_id, RequestKind::Read, 0)
@@ -3260,6 +3330,10 @@ async fn s3_head(
     .await
     {
         Ok(object) => {
+            if let Some(response) = conditional_read_response(&headers, &object.metadata) {
+                object.cancellation.cancel();
+                return response;
+            }
             state
                 .control
                 .record(&auth.user_id, RequestKind::Read, 0)
@@ -3454,7 +3528,12 @@ async fn s3_list_objects(
                 s3_error::internal_error(&bucket, &e.to_string())
             }
         },
-        ResolvedBackend::Memory(store) => s3_xml_ok(list_from_memory(&store, &bucket, &params)),
+        ResolvedBackend::Memory(store) => {
+            match list_from_memory(&store, &bucket, &params, &state.continuation_token_key) {
+                Ok(xml) => s3_xml_ok(xml),
+                Err(error) => s3_error::invalid_request(&bucket, &error),
+            }
+        }
         ResolvedBackend::Managed(_) => {
             warn!("listing is not supported against managed service storage for {bucket}");
             s3_xml_ok(empty_list(&bucket, &params))
@@ -3470,6 +3549,9 @@ async fn s3_list_objects(
 
 /// Forward a ListObjectsV2 request to an S3 backend.
 async fn list_from_s3(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Result<String> {
+    if params.list_type.as_deref() != Some("2") {
+        return list_from_s3_v1(s3, bucket, params).await;
+    }
     let mut req = s3.list_objects_v2().bucket(bucket);
     if let Some(p) = params.prefix.as_deref() {
         req = req.prefix(p);
@@ -3560,17 +3642,149 @@ async fn list_from_s3(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Re
     Ok(xml)
 }
 
+async fn list_from_s3_v1(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Result<String> {
+    let mut request = s3.list_objects().bucket(bucket);
+    if let Some(prefix) = params.prefix.as_deref() {
+        request = request.prefix(prefix);
+    }
+    if let Some(delimiter) = params.delimiter.as_deref() {
+        request = request.delimiter(delimiter);
+    }
+    if let Some(marker) = params.marker.as_deref() {
+        request = request.marker(marker);
+    }
+    if let Some(max_keys) = params.max_keys {
+        request = request.max_keys(max_keys.min(1000) as i32);
+    }
+    let output = request.send().await?;
+    let encoding = params.encoding_type.as_deref() == Some("url");
+    let display = |value: &str| {
+        if encoding {
+            url_encode(value)
+        } else {
+            value.to_string()
+        }
+    };
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    );
+    xml.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
+    xml.push_str(&format!(
+        "<Prefix>{}</Prefix>",
+        xml_escape(params.prefix.as_deref().unwrap_or(""))
+    ));
+    if let Some(delimiter) = params.delimiter.as_deref() {
+        xml.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(delimiter)));
+    }
+    if let Some(marker) = params.marker.as_deref() {
+        xml.push_str(&format!("<Marker>{}</Marker>", xml_escape(marker)));
+    }
+    xml.push_str(&format!(
+        "<MaxKeys>{}</MaxKeys>",
+        output.max_keys().unwrap_or(1000)
+    ));
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        output.is_truncated().unwrap_or(false)
+    ));
+    if let Some(marker) = output.next_marker() {
+        xml.push_str(&format!("<NextMarker>{}</NextMarker>", xml_escape(marker)));
+    }
+    for content in output.contents() {
+        let key = content.key().unwrap_or_default();
+        let last_modified = content
+            .last_modified()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        xml.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>{last_modified}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            xml_escape(&display(key)),
+            xml_escape(content.e_tag().unwrap_or_default()),
+            content.size().unwrap_or(0),
+        ));
+    }
+    for common_prefix in output.common_prefixes() {
+        if let Some(prefix) = common_prefix.prefix() {
+            xml.push_str(&format!(
+                "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+                xml_escape(&display(prefix))
+            ));
+        }
+    }
+    xml.push_str("</ListBucketResult>");
+    Ok(xml)
+}
+
+fn encode_memory_continuation(
+    key: &[u8; 32],
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    last: &str,
+) -> String {
+    let payload = serde_json::to_vec(&(bucket, prefix, delimiter, last))
+        .expect("continuation tuple is serializable");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts fixed key");
+    mac.update(&payload);
+    let mut encoded = mac.finalize().into_bytes().to_vec();
+    encoded.extend(payload);
+    URL_SAFE_NO_PAD.encode(encoded)
+}
+
+fn decode_memory_continuation(
+    key: &[u8; 32],
+    token: &str,
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+) -> Result<String, String> {
+    let encoded = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| "invalid continuation token".to_string())?;
+    if encoded.len() < 32 {
+        return Err("invalid continuation token".to_string());
+    }
+    let (tag, payload) = encoded.split_at(32);
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts fixed key");
+    mac.update(payload);
+    mac.verify_slice(tag)
+        .map_err(|_| "invalid continuation token".to_string())?;
+    let (token_bucket, token_prefix, token_delimiter, last): (
+        String,
+        String,
+        Option<String>,
+        String,
+    ) = serde_json::from_slice(payload).map_err(|_| "invalid continuation token".to_string())?;
+    (token_bucket == bucket && token_prefix == prefix && token_delimiter.as_deref() == delimiter)
+        .then_some(last)
+        .ok_or_else(|| "continuation token does not match this listing".to_string())
+}
+
 /// ListObjectsV2 against the in-memory store.
-fn list_from_memory(store: &MemoryStore, bucket: &str, params: &S3Query) -> String {
+fn list_from_memory(
+    store: &MemoryStore,
+    bucket: &str,
+    params: &S3Query,
+    continuation_key: &[u8; 32],
+) -> Result<String, String> {
     let prefix = params.prefix.as_deref().unwrap_or("");
     let delimiter = params.delimiter.as_deref();
     let max_keys = params.max_keys.unwrap_or(1000).min(1000) as usize;
     let encoding = params.encoding_type.as_deref() == Some("url");
-    let resume_after = params
-        .continuation_token
-        .as_deref()
-        .or(params.start_after.as_deref())
-        .or(params.marker.as_deref());
+    let resume_after = match params.continuation_token.as_deref() {
+        Some(token) => Some(decode_memory_continuation(
+            continuation_key,
+            token,
+            bucket,
+            prefix,
+            delimiter,
+        )?),
+        None => params
+            .start_after
+            .as_deref()
+            .or(params.marker.as_deref())
+            .map(ToOwned::to_owned),
+    };
 
     let bucket_prefix = format!("{bucket}/");
     let mut keys: Vec<String> = store
@@ -3580,11 +3794,6 @@ fn list_from_memory(store: &MemoryStore, bucket: &str, params: &S3Query) -> Stri
         .filter(|k| k.starts_with(prefix))
         .collect();
     keys.sort();
-    keys.retain(|k| match resume_after {
-        Some(t) => k.as_str() > t,
-        None => true,
-    });
-
     enum Output {
         Content((String, String, u64)),
         Common(String),
@@ -3611,6 +3820,16 @@ fn list_from_memory(store: &MemoryStore, bucket: &str, params: &S3Query) -> Stri
         outputs.push(Output::Content((k, etag, size)));
     }
 
+    // Continue from the previous *listed output*, not the raw object key. A
+    // delimiter page can end at `logs/` while raw keys `logs/a` still sort
+    // after it; filtering only raw keys would repeat that CommonPrefix forever.
+    if let Some(resume_after) = &resume_after {
+        outputs.retain(|output| match output {
+            Output::Content((key, _, _)) => key > resume_after,
+            Output::Common(prefix) => prefix > resume_after,
+        });
+    }
+
     let mut contents: Vec<(String, String, u64)> = Vec::new();
     let mut commons: Vec<String> = Vec::new();
     let mut seen = 0usize;
@@ -3621,8 +3840,10 @@ fn list_from_memory(store: &MemoryStore, bucket: &str, params: &S3Query) -> Stri
         }
         seen += 1;
     }
-    let truncated = outputs.len() > seen;
-    let next_token = if truncated {
+    // S3 permits max-keys=0. It returns an empty non-resumable page rather
+    // than manufacturing a cursor that cannot advance.
+    let truncated = max_keys > 0 && outputs.len() > seen;
+    let next_token = if truncated && seen > 0 {
         outputs.get(seen - 1).map(|out| match out {
             Output::Content((k, _, _)) => k.clone(),
             Output::Common(cp) => cp.clone(),
@@ -3646,9 +3867,16 @@ fn list_from_memory(store: &MemoryStore, bucket: &str, params: &S3Query) -> Stri
     ));
     xml.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
     xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
-    if let Some(t) = resume_after {
+    if let Some(t) = params.continuation_token.as_deref() {
         let elem = if is_v2 {
             format!("<ContinuationToken>{}</ContinuationToken>", xml_escape(t))
+        } else {
+            format!("<Marker>{}</Marker>", xml_escape(t))
+        };
+        xml.push_str(&elem);
+    } else if let Some(t) = &resume_after {
+        let elem = if is_v2 {
+            format!("<StartAfter>{}</StartAfter>", xml_escape(t))
         } else {
             format!("<Marker>{}</Marker>", xml_escape(t))
         };
@@ -3658,7 +3886,13 @@ fn list_from_memory(store: &MemoryStore, bucket: &str, params: &S3Query) -> Stri
         let elem = if is_v2 {
             format!(
                 "<NextContinuationToken>{}</NextContinuationToken>",
-                xml_escape(&t)
+                xml_escape(&encode_memory_continuation(
+                    continuation_key,
+                    bucket,
+                    prefix,
+                    delimiter,
+                    &t,
+                ))
             )
         } else {
             format!("<NextMarker>{}</NextMarker>", xml_escape(&t))
@@ -3681,7 +3915,7 @@ fn list_from_memory(store: &MemoryStore, bucket: &str, params: &S3Query) -> Stri
         ));
     }
     xml.push_str("</ListBucketResult>");
-    xml
+    Ok(xml)
 }
 
 fn empty_list(bucket: &str, params: &S3Query) -> String {
@@ -4438,6 +4672,8 @@ pub async fn build_state(
         }
     }
 
+    let mut continuation_token_key = [0; 32];
+    OsRng.fill_bytes(&mut continuation_token_key);
     let state = Arc::new(AppState {
         gateway: Arc::new(gateway),
         store: Arc::new(MemoryStore::new()),
@@ -4465,6 +4701,7 @@ pub async fn build_state(
         transformed_read_spool_enabled: transformed_read_spool_enabled(),
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
+        continuation_token_key,
     });
     if managed_mode != ManagedStreamingMode::Off
         && let (Some(journal), Some(capabilities)) = (

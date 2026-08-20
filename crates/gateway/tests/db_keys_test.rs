@@ -565,14 +565,17 @@ fn postgres_v1_rewrap_cas_accepts_concurrent_matching_v2() {
         })));
         let decrypt_store = PostgresKeyStore::with_cipher(pool, blocking_cipher);
         let decrypt_key_id = key_id.clone();
-        let decrypt = std::thread::spawn(move || {
-            tokio::runtime::Runtime::new()
-                .expect("decrypt runtime")
-                .block_on(decrypt_store.decrypt_secret(&decrypt_key_id))
+        // Run the racing database operation on this test's Tokio runtime. A
+        // short-lived second runtime can strand SQLx pool connections when it
+        // shuts down, starving the fixture cleanup below in CI.
+        let runtime = tokio::runtime::Handle::current();
+        let decrypt = tokio::task::spawn_blocking(move || {
+            runtime.block_on(decrypt_store.decrypt_secret(&decrypt_key_id))
         });
 
-        entered_rx
-            .recv_timeout(Duration::from_secs(5))
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .expect("join rewrap signal waiter")
             .expect("legacy rewrap reached conditional update window");
         let winner_cipher = SecretCipher::new(Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)));
         let winner = winner_cipher
@@ -582,7 +585,7 @@ fn postgres_v1_rewrap_cas_accepts_concurrent_matching_v2() {
         release_tx.send(()).expect("release legacy rewrap");
 
         assert_eq!(
-            decrypt.join().expect("join legacy decrypt").as_deref(),
+            decrypt.await.expect("join legacy decrypt").as_deref(),
             Some(secret.as_str())
         );
         let persisted = fetch_api_key(&db, &key_id).await;

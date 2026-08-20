@@ -459,6 +459,129 @@ async fn list_objects_returns_keys_and_prefixes() {
 }
 
 #[tokio::test]
+async fn memory_list_continuations_are_opaque_bound_and_tamper_resistant() {
+    let (app, state) = router().await;
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    for key in ["a.txt", "b.txt"] {
+        state
+            .store
+            .put("page", key, Bytes::from_static(b"x"), "text/plain");
+    }
+    let page = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/page?list-type=2&max-keys=1")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(page).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let xml = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let token = xml
+        .split("<NextContinuationToken>")
+        .nth(1)
+        .and_then(|value| value.split("</NextContinuationToken>").next())
+        .expect("truncated listing has next token");
+    assert!(!token.contains("a.txt"));
+
+    let next = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/page?list-type=2&max-keys=1&continuation-token={token}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(next).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Key>b.txt</Key>"));
+
+    let bad = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/page?list-type=2&continuation-token=not-a-token")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(bad).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let zero_page = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/page?list-type=2&max-keys=0")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(zero_page).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<IsTruncated>false</IsTruncated>"));
+
+    for key in ["logs/one/a.txt", "logs/two/a.txt"] {
+        state
+            .store
+            .put("page", key, Bytes::from_static(b"x"), "text/plain");
+    }
+    let delimiter_page = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/page?list-type=2&prefix=logs%2F&delimiter=%2F&max-keys=1")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(delimiter_page).await.unwrap();
+    let xml = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(xml.contains("<Prefix>logs/one/</Prefix>"));
+    let token = xml
+        .split("<NextContinuationToken>")
+        .nth(1)
+        .and_then(|value| value.split("</NextContinuationToken>").next())
+        .expect("delimiter page has a next token");
+    let next_delimiter_page = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/page?list-type=2&prefix=logs%2F&delimiter=%2F&max-keys=1&continuation-token={token}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.oneshot(next_delimiter_page).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Prefix>logs/two/</Prefix>"));
+    assert!(!xml.contains("<Prefix>logs/one/</Prefix>"));
+}
+
+#[tokio::test]
 async fn list_buckets_at_root() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
@@ -576,6 +699,56 @@ async fn head_and_delete_remain_available() {
         app.oneshot(get).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn conditional_get_and_head_preserve_object_identity_without_a_body() {
+    let (app, state) = router().await;
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    state.store.put(
+        "conditional",
+        "object.txt",
+        Bytes::from_static(b"conditional payload"),
+        "text/plain",
+    );
+    let etag = state
+        .store
+        .metadata("conditional", "object.txt")
+        .expect("stored object metadata")
+        .2;
+
+    let not_modified = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/conditional/object.txt")
+            .header(header::IF_NONE_MATCH, &etag)
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(not_modified).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers()[header::ETAG], etag);
+    assert!(
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let failed_match = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri("/conditional/object.txt")
+            .header(header::IF_MATCH, "\"different\"")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.oneshot(failed_match).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(response.headers()[header::ETAG], etag);
 }
 
 #[tokio::test]

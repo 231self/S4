@@ -97,6 +97,14 @@ just e2e
 # Data at rest stays raw (your app owns the originals).
 s4ctl put ./customers.json customers/c1.json --bucket s4-local
 
+# Transformed reads are deliberately opt-in. Unsafe component snapshots are
+# staged encrypted before any response bytes are disclosed.
+export S4_STREAMING_READ_MODE=transformed
+export S4_TRANSFORMED_READ_SPOOL=encrypted
+# Set this to the SHA-256 component digests reviewed for prefix-safe disclosure.
+# Imported components are unsafe unless listed here.
+export S4_PREFIX_SAFE_COMPONENT_HASHES=<comma-separated-component-sha256-digests>
+
 # An AI agent reads THROUGH S4: PII is redacted before the agent sees it.
 curl -H "x-s4-process: read" http://localhost:8080/customers/c1.json
 # → {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]","note":"hi"}
@@ -107,8 +115,20 @@ curl http://localhost:8080/customers/c1.json
 ```
 
 One source of truth, two projections: the app gets full fidelity, the agent
-gets only what you allow. Works on any GET path (S3 backend, presigned
-backend URL, managed storage, in-memory).
+gets only what you allow. Transformed reads require stored, version-bound
+metadata and work with S3, managed storage, and in-memory backends. Presigned
+backend URLs remain raw-only because they cannot provide a safe metadata
+preflight.
+
+Transformed reads reject `Range`, `partNumber`, non-identity source encodings,
+unknown mandatory formats, and `HEAD`. They never fall back to raw bytes.
+`S4_STREAMING_READ_MODE=off` (the default) rejects transformed reads;
+`passthrough` enables only raw streaming. `transformed` enables this path.
+Without `S4_TRANSFORMED_READ_SPOOL=encrypted`, a snapshot containing any
+component not listed in `S4_PREFIX_SAFE_COMPONENT_HASHES` is rejected before
+its source body is consumed. Set `S4_SPOOL_DIR`, `S4_SPOOL_MAX_OBJECT_BYTES`,
+and `S4_SPOOL_QUOTA_BYTES` to a private, capacity-reserved volume; the quota
+must cover encrypted framing overhead as well as plaintext output.
 
 **Encryption — per-field envelope encryption, decryptable only by you**
 

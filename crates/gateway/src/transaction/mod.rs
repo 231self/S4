@@ -15,6 +15,7 @@ pub use journal::PostgresOperationJournal;
 pub use memory::MemorySinkTransaction;
 pub use presign::{MultipartPresignContract, PresignedOperation};
 pub use s3::{AwsS3TransactionBackend, DirectS3Sink};
+pub(crate) use spool::READ_FILE_PREFIX;
 pub use spool::{
     CompatibilitySpoolConfig, CompatibilitySpoolTransaction, CompatibilitySpoolUploader, SpoolQuota,
 };

@@ -23,6 +23,9 @@ mod guest {
             if let Some(value) = context.content_type.strip_prefix("test/finish=") {
                 finish.extend_from_slice(value.as_bytes());
             }
+            if context.stable_fields.as_deref() == Some("finish-trap") {
+                finish.extend_from_slice(b"trap");
+            }
             if context.content_type == "test/begin-reject" {
                 return Err("begin rejected".to_string());
             }
@@ -35,9 +38,11 @@ mod guest {
         fn transform(payload: Vec<u8>) -> Result<Decision, String> {
             match payload.as_slice() {
                 b"drop" => Ok(Decision::Drop),
-                b"reject" => Ok(Decision::Reject("record rejected".to_string())),
-                b"trap" => panic!("transform trapped"),
-                b"loop" => loop {
+                payload if payload.starts_with(b"reject") => {
+                    Ok(Decision::Reject("record rejected".to_string()))
+                }
+                payload if payload.starts_with(b"trap") => panic!("transform trapped"),
+                payload if payload.starts_with(b"loop") => loop {
                     std::hint::black_box(());
                 },
                 b"memory" => {

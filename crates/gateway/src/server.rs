@@ -6,7 +6,7 @@
 //! [`crate::control::NoopControlPlane`]; the private SaaS crate builds it with
 //! its own control-plane implementation.
 
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -29,7 +29,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::backend::{BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation};
-use crate::control::{ControlPlane, RequestKind};
+use crate::control::{ControlPlane, RequestKind, StreamingWriteMode};
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::object::{
@@ -42,6 +42,13 @@ use crate::sigv4::{RequestAuthorization, SigV4Error, SigV4Policy, SigningKeyCach
 use crate::store::{
     BackendConfig, BackendRegistry, FileKeyStore, KeyRepository, KeyStore, MemoryStore,
     PostgresKeyStore, sha256_hash,
+};
+use crate::transaction::{
+    AbortSignal, AwsS3TransactionBackend, BackendCapabilities, CompatibilitySpoolConfig,
+    CompatibilitySpoolTransaction, CompatibilitySpoolUploader, CompletionReconciliation,
+    DirectS3Sink, ExpectedObject, IncompleteUploadDiscovery, MemorySinkTransaction,
+    ObjectDestination, ObjectSinkTransaction, OperationJournal, OperationReconciler, SpoolQuota,
+    StoredObjectMeta, TransactionError, VersioningCapability,
 };
 use crate::{Format, Gateway};
 
@@ -60,10 +67,17 @@ pub struct AppState {
     pub control: Arc<dyn ControlPlane>,
     pub legacy_max_object_bytes: usize,
     pub streaming_read_mode: StreamingReadMode,
+    pub streaming_write_mode: StreamingWriteMode,
     pub source_body_limits: BodyLimits,
     pub presigned_http_policy: PresignedHttpPolicy,
     pub sigv4_cache: Arc<SigningKeyCache>,
     pub sigv4_policy: SigV4Policy,
+    pub operation_journal: Option<Arc<dyn OperationJournal>>,
+    pub s3_streaming_capabilities: Option<BackendCapabilities>,
+    pub spool_config: CompatibilitySpoolConfig,
+    pub spool_quota: Arc<SpoolQuota>,
+    pub dev_memory_max_object_bytes: usize,
+    pub dev_memory_streaming_enabled: bool,
 }
 
 pub struct Auth {
@@ -98,6 +112,36 @@ impl StreamingReadMode {
     fn streams_passthrough(self) -> bool {
         matches!(self, Self::Passthrough | Self::Transformed)
     }
+}
+
+fn streaming_write_mode() -> StreamingWriteMode {
+    match std::env::var("S4_STREAMING_WRITE_MODE").as_deref() {
+        Ok("single") => StreamingWriteMode::Single,
+        Ok("all") => StreamingWriteMode::All,
+        Ok("off") | Err(_) => StreamingWriteMode::Off,
+        Ok(value) => {
+            warn!("invalid S4_STREAMING_WRITE_MODE={value:?}; using off");
+            StreamingWriteMode::Off
+        }
+    }
+}
+
+fn configured_s3_streaming_capabilities() -> Option<BackendCapabilities> {
+    let provider = std::env::var("S4_STREAMING_S3_PROVIDER").ok()?;
+    if !matches!(provider.as_str(), "aws" | "minio" | "r2" | "b2") {
+        warn!("unknown S4_STREAMING_S3_PROVIDER={provider:?}; direct streaming disabled");
+        return None;
+    }
+    Some(BackendCapabilities {
+        incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
+        abort_incomplete_upload: true,
+        cleanup_sla: Some(Duration::from_secs(5 * 60)),
+        lifecycle_rule: true,
+        versioning: VersioningCapability::Optional,
+        conditional_operations: true,
+        checksums: true,
+        completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
+    })
 }
 
 fn legacy_max_object_bytes() -> usize {
@@ -1437,6 +1481,472 @@ async fn store_processed(
     }
 }
 
+struct PresignedSpoolUploader {
+    client: reqwest::Client,
+    url: reqwest::Url,
+    max_attempts: usize,
+}
+
+#[async_trait::async_trait]
+impl CompatibilitySpoolUploader for PresignedSpoolUploader {
+    async fn upload_file(
+        &self,
+        path: &FsPath,
+        content_length: u64,
+    ) -> Result<StoredObjectMeta, TransactionError> {
+        let mut last_error = None;
+        for _ in 0..self.max_attempts.max(1) {
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|error| TransactionError::Spool(error.to_string()))?;
+            let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+            match self
+                .client
+                .put(self.url.clone())
+                .header(header::CONTENT_LENGTH, content_length)
+                .body(body)
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    return Ok(StoredObjectMeta {
+                        etag: response
+                            .headers()
+                            .get(header::ETAG)
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToOwned::to_owned),
+                        version_id: response
+                            .headers()
+                            .get("x-amz-version-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToOwned::to_owned),
+                    });
+                }
+                Ok(response) => {
+                    last_error = Some(format!(
+                        "presigned destination returned HTTP {}",
+                        response.status()
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        Err(TransactionError::Spool(last_error.unwrap_or_else(|| {
+            "presigned destination retry budget exhausted".to_string()
+        })))
+    }
+}
+
+#[derive(Debug)]
+enum StreamingPutError {
+    Integrity(IntegrityError),
+    Pipeline(s4_error::S4Error),
+    Transaction(TransactionError),
+    InputTooLarge,
+    SourceFrameTooLarge,
+    Transport,
+    InvalidRequest(String),
+    Unsupported(String),
+}
+
+impl From<s4_error::S4Error> for StreamingPutError {
+    fn from(error: s4_error::S4Error) -> Self {
+        Self::Pipeline(error)
+    }
+}
+
+impl From<TransactionError> for StreamingPutError {
+    fn from(error: TransactionError) -> Self {
+        Self::Transaction(error)
+    }
+}
+
+fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::response::Response {
+    match error {
+        StreamingPutError::Integrity(
+            IntegrityError::PayloadHashMismatch | IntegrityError::SignatureMismatch,
+        ) => s3_error::signature_mismatch(key),
+        StreamingPutError::Integrity(
+            error @ (IntegrityError::InvalidChecksum(_)
+            | IntegrityError::MissingChecksum
+            | IntegrityError::DecodedLengthMismatch),
+        ) => s3_error::bad_digest(key, &error.to_string()),
+        StreamingPutError::Integrity(error) => s3_error::invalid_request(key, &error.to_string()),
+        StreamingPutError::Pipeline(error)
+            if matches!(
+                error.code(),
+                s4_error::codes::LIMIT_INPUT_BYTES
+                    | s4_error::codes::LIMIT_OUTPUT_BYTES
+                    | s4_error::codes::LIMIT_EXPANSION
+                    | s4_error::codes::LIMIT_INTERMEDIATE_BYTES
+                    | s4_error::codes::LIMIT_FINISH_BYTES
+                    | s4_error::codes::RECORD_TOO_LARGE
+            ) =>
+        {
+            s3_error::entity_too_large(key)
+        }
+        StreamingPutError::Pipeline(error) if error.code() == s4_error::codes::WASM_ADMISSION => {
+            s3_error::slow_down(key)
+        }
+        StreamingPutError::Pipeline(error)
+            if matches!(
+                error.code(),
+                s4_error::codes::DECODE_JSON
+                    | s4_error::codes::DECODE_JSONL
+                    | s4_error::codes::DECODE_CSV
+                    | s4_error::codes::DECODE_ENCODING
+                    | s4_error::codes::WASM_REJECT
+                    | s4_error::codes::UNSUPPORTED_FORMAT
+            ) =>
+        {
+            s3_error::invalid_request(key, error.message())
+        }
+        StreamingPutError::Pipeline(error) => s3_error::internal_error(key, error.message()),
+        StreamingPutError::Transaction(
+            TransactionError::CapacityExceeded | TransactionError::TooManyParts,
+        ) => s3_error::entity_too_large(key),
+        StreamingPutError::Transaction(TransactionError::Spool(detail)) => {
+            s3_error::service_unavailable(key, &detail)
+        }
+        StreamingPutError::Transaction(error) => {
+            s3_error::service_unavailable(key, &error.to_string())
+        }
+        StreamingPutError::InputTooLarge | StreamingPutError::SourceFrameTooLarge => {
+            s3_error::entity_too_large(key)
+        }
+        StreamingPutError::Transport => {
+            s3_error::invalid_request(key, "request body stream failed")
+        }
+        StreamingPutError::InvalidRequest(detail) => s3_error::invalid_request(key, &detail),
+        StreamingPutError::Unsupported(detail) => {
+            warn!("streaming PUT rejected for {key}: {detail}");
+            s3_error::not_implemented(key)
+        }
+    }
+}
+
+fn streaming_format(headers: &HeaderMap) -> Result<(Format, String), StreamingPutError> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .ok_or_else(|| StreamingPutError::InvalidRequest("Content-Type is required".to_string()))?
+        .to_str()
+        .map_err(|_| StreamingPutError::InvalidRequest("invalid Content-Type".to_string()))?;
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let format = match media_type.as_str() {
+        "text/plain" => Format::Text,
+        "application/x-ndjson" | "application/jsonlines" => Format::Jsonl,
+        "application/json" => Format::Json,
+        "text/csv" => Format::Csv,
+        "text/tab-separated-values" => Format::Tsv,
+        _ => {
+            return Err(StreamingPutError::Unsupported(format!(
+                "unsupported streaming Content-Type {media_type:?}"
+            )));
+        }
+    };
+    Ok((format, media_type))
+}
+
+async fn begin_streaming_sink(
+    state: &AppState,
+    backend: ResolvedBackend,
+    bucket: &str,
+    key: &str,
+    content_type: &str,
+) -> Result<Box<dyn ObjectSinkTransaction>, StreamingPutError> {
+    match backend {
+        ResolvedBackend::S3 { kind, client } => {
+            let capabilities = state.s3_streaming_capabilities.ok_or_else(|| {
+                StreamingPutError::Unsupported(
+                    "direct S3 streaming needs S4_STREAMING_S3_PROVIDER".to_string(),
+                )
+            })?;
+            let journal = state.operation_journal.clone().ok_or_else(|| {
+                StreamingPutError::Unsupported(
+                    "direct S3 streaming needs a durable operation journal".to_string(),
+                )
+            })?;
+            let destination = ObjectDestination {
+                backend_id: format!("{kind:?}"),
+                bucket: bucket.to_string(),
+                logical_key: key.to_string(),
+                physical_key: key.to_string(),
+            };
+            let expected = ExpectedObject {
+                metadata: std::collections::BTreeMap::from([(
+                    "content-type".to_string(),
+                    content_type.to_string(),
+                )]),
+                ..ExpectedObject::default()
+            };
+            let backend = Arc::new(AwsS3TransactionBackend::new(client, capabilities));
+            let (abort_signal, mut abort_receiver) = AbortSignal::channel(1);
+            let reconciler = OperationReconciler::new(
+                journal.clone(),
+                backend.clone(),
+                format!("request-{}", uuid::Uuid::now_v7()),
+            )
+            .map_err(TransactionError::from)?;
+            tokio::spawn(async move {
+                while abort_receiver.recv().await.is_some() {
+                    if let Err(error) = reconciler.reconcile_due(Duration::ZERO, 16).await {
+                        warn!("streaming transaction cleanup failed: {error}");
+                    }
+                }
+            });
+            Ok(Box::new(
+                DirectS3Sink::new(journal, backend, destination, expected, 3, abort_signal).await?,
+            ))
+        }
+        ResolvedBackend::PresignedHttp(url) => {
+            let client = state
+                .presigned_http_policy
+                .client_for_destination(&url, Duration::from_secs(30))
+                .await
+                .map_err(StreamingPutError::InvalidRequest)?;
+            let uploader = Arc::new(PresignedSpoolUploader {
+                client,
+                url,
+                max_attempts: 3,
+            });
+            Ok(Box::new(
+                CompatibilitySpoolTransaction::begin(
+                    state.spool_config.clone(),
+                    Arc::clone(&state.spool_quota),
+                    uploader,
+                )
+                .await?,
+            ))
+        }
+        ResolvedBackend::Memory(store) if state.dev_memory_streaming_enabled => {
+            Ok(Box::new(MemorySinkTransaction::new(
+                store,
+                bucket,
+                key,
+                content_type,
+                state.dev_memory_max_object_bytes,
+            )?))
+        }
+        ResolvedBackend::Memory(_) => Err(StreamingPutError::Unsupported(
+            "development memory streaming is not enabled".to_string(),
+        )),
+        ResolvedBackend::Managed(_) => Err(StreamingPutError::Unsupported(
+            "managed streaming writes remain disabled until Phase 7".to_string(),
+        )),
+    }
+}
+
+async fn write_stream_record(
+    sink: &Arc<tokio::sync::Mutex<Box<dyn ObjectSinkTransaction>>>,
+    record: crate::record::Record,
+    output_hasher: &mut sha2::Sha256,
+    output_bytes: &mut u64,
+) -> Result<(), StreamingPutError> {
+    use sha2::Digest as _;
+    for chunk in [record.payload, record.separator] {
+        if chunk.is_empty() {
+            continue;
+        }
+        *output_bytes = output_bytes
+            .checked_add(chunk.len() as u64)
+            .ok_or(StreamingPutError::InputTooLarge)?;
+        output_hasher.update(&chunk);
+        sink.lock().await.write(chunk).await?;
+    }
+    Ok(())
+}
+
+struct SinkAbortGuard {
+    sink: Arc<tokio::sync::Mutex<Box<dyn ObjectSinkTransaction>>>,
+    armed: bool,
+}
+
+impl SinkAbortGuard {
+    fn new(sink: Box<dyn ObjectSinkTransaction>) -> Self {
+        Self {
+            sink: Arc::new(tokio::sync::Mutex::new(sink)),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SinkAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let sink = Arc::clone(&self.sink);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = sink.lock().await.abort().await;
+            });
+        }
+    }
+}
+
+async fn streaming_single_put(
+    state: &AppState,
+    mut authentication: HeaderAuthentication,
+    backend: ResolvedBackend,
+    headers: &HeaderMap,
+    mut body: axum::body::Body,
+    bucket: &str,
+    key: &str,
+) -> Result<(Auth, StoredObjectMeta, u64), StreamingPutError> {
+    use http_body_util::BodyExt as _;
+    use sha2::Digest as _;
+
+    if authentication.body_verifier.is_none() && headers.contains_key(header::CONTENT_ENCODING) {
+        return Err(StreamingPutError::InvalidRequest(
+            "Content-Encoding is unsupported for transformed streaming".to_string(),
+        ));
+    }
+    let (format, content_type) = streaming_format(headers)?;
+    let sink = begin_streaming_sink(state, backend, bucket, key, &content_type).await?;
+    let mut sink_guard = SinkAbortGuard::new(sink);
+    let sink = Arc::clone(&sink_guard.sink);
+    let stable_fields = headers
+        .get("x-s4-stable-fields")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let session = s4_wasm_runtime::Session {
+        format: format.as_str().to_string(),
+        content_type: content_type.clone(),
+        policy_version: 0,
+        public_key_pem: authentication.auth.public_key_pem.clone(),
+        stable_key: authentication.auth.stable_key.clone(),
+        stable_fields,
+    };
+    let cancellation = s4_wasm_runtime::CancellationToken::new();
+    let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
+        StreamingPutError::Unsupported("streaming requires a plugin registry".to_string())
+    })?;
+    let mut pipeline = match snapshot
+        .start_streaming_session(session, cancellation.clone())
+        .await
+    {
+        Ok(pipeline) => Some(pipeline),
+        Err(error) => {
+            let _ = sink.lock().await.abort().await;
+            sink_guard.disarm();
+            return Err(error.into());
+        }
+    };
+    let decoder_limits = crate::record::DecoderLimits {
+        max_source_frame_bytes: state.source_body_limits.max_frame_bytes,
+        ..crate::record::DecoderLimits::default()
+    };
+    let mut decoder = crate::record::RecordDecoder::new(format, decoder_limits)?;
+    let mut input_bytes = 0_u64;
+    let mut output_bytes = 0_u64;
+    let mut output_hasher = sha2::Sha256::new();
+
+    let processing = async {
+        while let Some(frame) = body
+            .frame()
+            .await
+            .transpose()
+            .map_err(|_| StreamingPutError::Transport)?
+        {
+            let data = frame.into_data().map_err(|frame| {
+                if frame.into_trailers().is_ok() {
+                    StreamingPutError::Integrity(IntegrityError::Framing(
+                        "HTTP trailers are not valid outside aws-chunked framing",
+                    ))
+                } else {
+                    StreamingPutError::Transport
+                }
+            })?;
+            if data.len() > state.source_body_limits.max_frame_bytes {
+                return Err(StreamingPutError::SourceFrameTooLarge);
+            }
+            let decoded = if let Some(verifier) = &mut authentication.body_verifier {
+                verifier.push(&data).map_err(StreamingPutError::Integrity)?
+            } else {
+                vec![data]
+            };
+            for chunk in decoded {
+                input_bytes = input_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(StreamingPutError::InputTooLarge)?;
+                if input_bytes > state.source_body_limits.max_bytes {
+                    return Err(StreamingPutError::InputTooLarge);
+                }
+                decoder.push(&chunk)?;
+                while let Some(record) = decoder.next_record()? {
+                    if let Some(record) = pipeline
+                        .as_mut()
+                        .expect("pipeline remains available until finish")
+                        .process(record)
+                        .await?
+                    {
+                        write_stream_record(&sink, record, &mut output_hasher, &mut output_bytes)
+                            .await?;
+                    }
+                }
+            }
+        }
+        if let Some(verifier) = authentication.body_verifier.take() {
+            let verified = verifier.finish().map_err(StreamingPutError::Integrity)?;
+            if verified != input_bytes {
+                return Err(StreamingPutError::Integrity(
+                    IntegrityError::DecodedLengthMismatch,
+                ));
+            }
+        }
+        decoder.finish()?;
+        while let Some(record) = decoder.next_record()? {
+            if let Some(record) = pipeline
+                .as_mut()
+                .expect("pipeline remains available until finish")
+                .process(record)
+                .await?
+            {
+                write_stream_record(&sink, record, &mut output_hasher, &mut output_bytes).await?;
+            }
+        }
+        let finishing = pipeline
+            .take()
+            .expect("pipeline remains available until finish");
+        for record in finishing.finish().await? {
+            write_stream_record(&sink, record, &mut output_hasher, &mut output_bytes).await?;
+        }
+        let output_digest = hex::encode(output_hasher.finalize());
+        let mut sink = sink.lock().await;
+        sink.verify_output(output_bytes, &output_digest).await?;
+        let stored = sink.complete().await?;
+        Ok((stored, input_bytes))
+    }
+    .await;
+
+    match processing {
+        Ok((stored, input_bytes)) => {
+            sink_guard.disarm();
+            Ok((authentication.auth, stored, input_bytes))
+        }
+        Err(error) => {
+            cancellation.cancel();
+            if let Some(pipeline) = pipeline.take() {
+                let _ = pipeline.cancel_and_wait().await;
+            }
+            if let Err(abort_error) = sink.lock().await.abort().await {
+                warn!("streaming sink abort failed for /{bucket}/{key}: {abort_error}");
+            }
+            sink_guard.disarm();
+            Err(error)
+        }
+    }
+}
+
 #[derive(Debug)]
 enum VerifiedBodyError {
     Integrity(IntegrityError),
@@ -1551,11 +2061,50 @@ async fn s3_put(
     {
         return s3_error::payment_required(&key, reason.message);
     }
+    let tenant_write_mode = state
+        .control
+        .streaming_write_mode(&auth.user_id)
+        .await
+        .unwrap_or(state.streaming_write_mode);
+    let effective_write_mode = state.streaming_write_mode.min(tenant_write_mode);
     let backend =
         match resolve_backend(&state, &auth.user_id, &parts.headers, StorageOperation::Put).await {
             Ok(backend) => backend,
             Err(error) => return s3_error::internal_error(&key, &error),
         };
+    if effective_write_mode >= StreamingWriteMode::Single {
+        return match streaming_single_put(
+            &state,
+            header_auth,
+            backend,
+            &parts.headers,
+            request_body,
+            &bucket,
+            &key,
+        )
+        .await
+        {
+            Ok((auth, stored, input_bytes)) => {
+                state
+                    .control
+                    .record(&auth.user_id, RequestKind::Write, input_bytes)
+                    .await;
+                info!(
+                    "streaming PUT /{bucket}/{key} committed ({input_bytes} input bytes, user={})",
+                    auth.user_id
+                );
+                let mut response = axum::response::Response::builder().status(StatusCode::OK);
+                if let Some(etag) = stored.etag {
+                    response = response.header(header::ETAG, etag);
+                }
+                if let Some(version_id) = stored.version_id {
+                    response = response.header("x-amz-version-id", version_id);
+                }
+                response.body(axum::body::Body::empty()).unwrap()
+            }
+            Err(error) => streaming_put_error_response(&key, error),
+        };
+    }
     let (auth, body) = match read_verified_body(header_auth, request_body, max_bytes).await {
         Ok(verified) => verified,
         Err(VerifiedBodyError::TooLarge) => return s3_error::entity_too_large(&key),
@@ -2748,10 +3297,45 @@ pub async fn build_state(
             .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
             .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
     };
+    let streaming_write_mode = streaming_write_mode();
+    let s3_streaming_capabilities = configured_s3_streaming_capabilities();
+    let spool_max_object_bytes = std::env::var("S4_SPOOL_MAX_OBJECT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(source_body_limits.max_bytes)
+        .min(source_body_limits.max_bytes);
+    let spool_quota_bytes = std::env::var("S4_SPOOL_QUOTA_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= spool_max_object_bytes)
+        .unwrap_or(spool_max_object_bytes.saturating_mul(2));
+    let spool_config = CompatibilitySpoolConfig {
+        directory: std::env::var("S4_SPOOL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("s4-spool")),
+        max_object_bytes: spool_max_object_bytes,
+        stale_after: Duration::from_secs(24 * 60 * 60),
+    };
+    let removed_spools = CompatibilitySpoolTransaction::cleanup_stale(&spool_config).await?;
+    if removed_spools > 0 {
+        info!(removed_spools, "removed stale compatibility spool files");
+    }
+    let spool_quota = Arc::new(SpoolQuota::new(spool_quota_bytes));
+    let dev_memory_max_object_bytes = std::env::var("S4_DEV_MEMORY_MAX_OBJECT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LEGACY_MAX_OBJECT_BYTES)
+        .min(64 * 1024 * 1024);
+    let dev_memory_streaming_enabled = auth_disabled
+        || std::env::var("S4_DEV_MEMORY_STREAMING")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
 
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
     // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
+    let mut operation_journal: Option<Arc<dyn OperationJournal>> = None;
     let keys: Arc<dyn KeyRepository> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
@@ -2765,6 +3349,9 @@ pub async fn build_state(
         migrator.set_ignore_missing(true);
         migrator.run(&pool).await.expect("failed to run migrations");
         info!("Key store: Postgres (migrations applied)");
+        operation_journal = Some(Arc::new(crate::transaction::PostgresOperationJournal::new(
+            pool.clone(),
+        )));
         Arc::new(PostgresKeyStore::with_cipher(pool, cipher.clone()))
     } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
         info!("Key store: file ({keys_file})");
@@ -2813,10 +3400,17 @@ pub async fn build_state(
         control,
         legacy_max_object_bytes: legacy_max_object_bytes(),
         streaming_read_mode: StreamingReadMode::from_env(),
+        streaming_write_mode,
         source_body_limits,
         presigned_http_policy: PresignedHttpPolicy::from_env(),
         sigv4_cache: Arc::new(SigningKeyCache::standard()),
         sigv4_policy: SigV4Policy::from_env(),
+        operation_journal,
+        s3_streaming_capabilities,
+        spool_config,
+        spool_quota,
+        dev_memory_max_object_bytes,
+        dev_memory_streaming_enabled,
     }))
 }
 

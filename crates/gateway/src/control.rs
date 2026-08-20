@@ -15,6 +15,14 @@ pub enum RequestKind {
     Read,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StreamingWriteMode {
+    #[default]
+    Off,
+    Single,
+    All,
+}
+
 /// Why a request was blocked. `code` is S3-style, `message` is human-readable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockReason {
@@ -39,6 +47,12 @@ pub trait ControlPlane: Send + Sync + 'static {
 
     /// Record usage after a successful operation (`bytes` processed).
     async fn record(&self, user_id: &str, kind: RequestKind, bytes: u64);
+
+    /// Optional tenant ceiling. `None` inherits the deployment ceiling; a
+    /// tenant can only lower, never raise, the configured mode.
+    async fn streaming_write_mode(&self, _user_id: &str) -> Option<StreamingWriteMode> {
+        None
+    }
 }
 
 /// No-op control plane for the OSS self-host binary: authorizes everything,

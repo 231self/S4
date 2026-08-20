@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -45,9 +46,7 @@ impl SpoolQuota {
                 .checked_add(bytes)
                 .ok_or_else(|| TransactionError::Spool("spool quota overflow".to_string()))?;
             if next > self.max_bytes {
-                return Err(TransactionError::Spool(
-                    "global compatibility spool quota exceeded".to_string(),
-                ));
+                return Err(TransactionError::CapacityExceeded);
             }
             match self.reserved_bytes.compare_exchange_weak(
                 current,
@@ -82,6 +81,9 @@ pub struct CompatibilitySpoolTransaction {
     path: PathBuf,
     file: Option<File>,
     bytes: u64,
+    reserved_bytes: u64,
+    output_hasher: Sha256,
+    output_verified: bool,
     finished: bool,
 }
 
@@ -96,9 +98,13 @@ impl CompatibilitySpoolTransaction {
                 "invalid compatibility spool object limit".to_string(),
             ));
         }
+        quota.reserve(config.max_object_bytes)?;
         tokio::fs::create_dir_all(&config.directory)
             .await
-            .map_err(spool_error)?;
+            .map_err(|error| {
+                quota.release(config.max_object_bytes);
+                spool_error(error)
+            })?;
         let path = config
             .directory
             .join(format!("{FILE_PREFIX}{}.tmp", Uuid::now_v7()));
@@ -108,7 +114,11 @@ impl CompatibilitySpoolTransaction {
         {
             options.mode(0o600);
         }
-        let file = options.open(&path).await.map_err(spool_error)?;
+        let file = options.open(&path).await.map_err(|error| {
+            quota.release(config.max_object_bytes);
+            spool_error(error)
+        })?;
+        let reserved_bytes = config.max_object_bytes;
         Ok(Self {
             config,
             quota,
@@ -116,6 +126,9 @@ impl CompatibilitySpoolTransaction {
             path,
             file: Some(file),
             bytes: 0,
+            reserved_bytes,
+            output_hasher: Sha256::new(),
+            output_verified: false,
             finished: false,
         })
     }
@@ -176,11 +189,8 @@ impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
             .checked_add(chunk_bytes)
             .ok_or_else(|| TransactionError::Spool("spool size overflow".to_string()))?;
         if next > self.config.max_object_bytes {
-            return Err(TransactionError::Spool(
-                "compatibility spool object limit exceeded".to_string(),
-            ));
+            return Err(TransactionError::CapacityExceeded);
         }
-        self.quota.reserve(chunk_bytes)?;
         let result = self
             .file
             .as_mut()
@@ -188,10 +198,24 @@ impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
             .write_all(&chunk)
             .await;
         if let Err(error) = result {
-            self.quota.release(chunk_bytes);
             return Err(spool_error(error));
         }
         self.bytes = next;
+        self.output_hasher.update(&chunk);
+        self.output_verified = false;
+        Ok(())
+    }
+
+    async fn verify_output(
+        &mut self,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<(), TransactionError> {
+        let actual_digest = hex::encode(self.output_hasher.clone().finalize());
+        if self.bytes != expected_size || actual_digest != expected_sha256 {
+            return Err(TransactionError::OutputMismatch);
+        }
+        self.output_verified = true;
         Ok(())
     }
 
@@ -199,12 +223,16 @@ impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
         if self.finished {
             return Err(TransactionError::Finished);
         }
+        if !self.output_verified {
+            return Err(TransactionError::OutputMismatch);
+        }
         let file = self.file.as_mut().ok_or(TransactionError::Finished)?;
         file.flush().await.map_err(spool_error)?;
         file.sync_all().await.map_err(spool_error)?;
         let result = self.uploader.upload_file(&self.path, self.bytes).await?;
         self.remove_file().await?;
-        self.quota.release(self.bytes);
+        self.quota.release(self.reserved_bytes);
+        self.reserved_bytes = 0;
         self.bytes = 0;
         self.finished = true;
         Ok(result)
@@ -215,7 +243,8 @@ impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
             return Ok(());
         }
         self.remove_file().await?;
-        self.quota.release(self.bytes);
+        self.quota.release(self.reserved_bytes);
+        self.reserved_bytes = 0;
         self.bytes = 0;
         self.finished = true;
         Ok(())
@@ -229,7 +258,8 @@ impl Drop for CompatibilitySpoolTransaction {
         }
         self.file.take();
         let _ = std::fs::remove_file(&self.path);
-        self.quota.release(self.bytes);
+        self.quota.release(self.reserved_bytes);
+        self.reserved_bytes = 0;
         self.bytes = 0;
     }
 }
@@ -330,6 +360,11 @@ mod tests {
         .unwrap();
         transaction
             .write(Bytes::from_static(b"immutable"))
+            .await
+            .unwrap();
+        let digest = hex::encode(transaction.output_hasher.clone().finalize());
+        transaction
+            .verify_output(transaction.bytes, &digest)
             .await
             .unwrap();
         assert!(transaction.complete().await.is_err());

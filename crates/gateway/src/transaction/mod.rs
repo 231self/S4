@@ -4,6 +4,7 @@
 //! persistence, backend, and recovery contracts without changing write routing.
 
 mod journal;
+mod memory;
 mod presign;
 mod s3;
 mod spool;
@@ -11,6 +12,7 @@ mod spool;
 #[cfg(any(test, debug_assertions))]
 pub use journal::InMemoryOperationJournal;
 pub use journal::PostgresOperationJournal;
+pub use memory::MemorySinkTransaction;
 pub use presign::{MultipartPresignContract, PresignedOperation};
 pub use s3::{AwsS3TransactionBackend, DirectS3Sink};
 pub use spool::{
@@ -201,6 +203,11 @@ pub trait OperationJournal: Send + Sync {
         operation_id: Uuid,
         upload_id: Option<&str>,
     ) -> Result<(), JournalError>;
+    async fn set_expected(
+        &self,
+        operation_id: Uuid,
+        expected: &ExpectedObject,
+    ) -> Result<(), JournalError>;
     async fn transition(
         &self,
         operation_id: Uuid,
@@ -385,11 +392,20 @@ pub enum TransactionError {
     TooManyParts,
     #[error("transaction spool failed: {0}")]
     Spool(String),
+    #[error("transaction output does not match the validated digest or size")]
+    OutputMismatch,
+    #[error("transaction destination capacity or object limit exceeded")]
+    CapacityExceeded,
 }
 
 #[async_trait]
 pub trait ObjectSinkTransaction: Send {
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError>;
+    async fn verify_output(
+        &mut self,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<(), TransactionError>;
     async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError>;
     async fn abort(&mut self) -> Result<(), TransactionError>;
 }

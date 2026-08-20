@@ -11,6 +11,8 @@ use s4_wasm_runtime::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use tokio::sync::{mpsc, oneshot};
+
 use crate::record::Record;
 
 /// Default per-session fuel budget for the plugin pipeline. Set high enough
@@ -153,6 +155,20 @@ pub struct PipelineSession {
     stage_output_bytes: Vec<u64>,
     fuel_consumed: u64,
     object_deadline: Instant,
+}
+
+enum PipelineCommand {
+    Process(Record, oneshot::Sender<Result<Option<Record>, S4Error>>),
+    Finish(oneshot::Sender<Result<Vec<Record>, S4Error>>),
+}
+
+/// Async, backpressured handle to one object-scoped pipeline running on the
+/// dedicated Wasm executor. At most one command can be queued in addition to
+/// the command currently executing.
+pub struct StreamingPipelineSession {
+    sender: Option<mpsc::Sender<PipelineCommand>>,
+    cancellation: CancellationToken,
+    task: Option<tokio::task::JoinHandle<Result<(), S4Error>>>,
 }
 
 impl Default for PluginRegistry {
@@ -532,6 +548,123 @@ impl PipelineSnapshot {
             Ok::<_, S4Error>(output)
         })?
     }
+
+    pub async fn start_streaming_session(
+        self,
+        session: s4_wasm_runtime::Session,
+        cancellation: CancellationToken,
+    ) -> Result<StreamingPipelineSession, S4Error> {
+        let reservation = self.guest_memory_reservation()?;
+        let executor = Arc::clone(&self.executor);
+        let task_cancellation = cancellation.clone();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (started_sender, started_receiver) = oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            executor.execute(reservation, &task_cancellation.clone(), move || {
+                let mut pipeline = match self.start_session(&session, task_cancellation) {
+                    Ok(pipeline) => {
+                        let _ = started_sender.send(Ok(()));
+                        pipeline
+                    }
+                    Err(error) => {
+                        let _ = started_sender.send(Err(error));
+                        return Ok(());
+                    }
+                };
+                while let Some(command) = receiver.blocking_recv() {
+                    match command {
+                        PipelineCommand::Process(record, response) => {
+                            match pipeline.process(record) {
+                                Ok(record) => {
+                                    let _ = response.send(Ok(record));
+                                }
+                                Err(error) => {
+                                    let _ = response.send(Err(error));
+                                    break;
+                                }
+                            }
+                        }
+                        PipelineCommand::Finish(response) => {
+                            let _ = response.send(pipeline.finish());
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            })?
+        });
+        match started_receiver.await {
+            Ok(Ok(())) => Ok(StreamingPipelineSession {
+                sender: Some(sender),
+                cancellation,
+                task: Some(task),
+            }),
+            Ok(Err(error)) => {
+                let _ = task.await;
+                Err(error)
+            }
+            Err(_) => match task.await {
+                Ok(Err(error)) => Err(error),
+                Ok(Ok(())) => Err(S4Error::new(
+                    codes::INTERNAL,
+                    "Wasm pipeline stopped before session startup",
+                )),
+                Err(error) => Err(S4Error::new(codes::INTERNAL, error.to_string())),
+            },
+        }
+    }
+}
+
+impl StreamingPipelineSession {
+    pub async fn process(&mut self, record: Record) -> Result<Option<Record>, S4Error> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(pipeline_stopped)?
+            .send(PipelineCommand::Process(record, response_sender))
+            .await
+            .map_err(|_| pipeline_stopped())?;
+        response_receiver.await.map_err(|_| pipeline_stopped())?
+    }
+
+    pub async fn finish(mut self) -> Result<Vec<Record>, S4Error> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        let sender = self.sender.take().ok_or_else(pipeline_stopped)?;
+        sender
+            .send(PipelineCommand::Finish(response_sender))
+            .await
+            .map_err(|_| pipeline_stopped())?;
+        drop(sender);
+        let result = response_receiver.await.map_err(|_| pipeline_stopped())?;
+        self.wait().await?;
+        result
+    }
+
+    pub async fn cancel_and_wait(mut self) -> Result<(), S4Error> {
+        self.cancellation.cancel();
+        self.sender.take();
+        self.wait().await
+    }
+
+    async fn wait(&mut self) -> Result<(), S4Error> {
+        match self.task.take() {
+            Some(task) => task
+                .await
+                .map_err(|error| S4Error::new(codes::INTERNAL, error.to_string()))?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for StreamingPipelineSession {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.sender.take();
+    }
+}
+
+fn pipeline_stopped() -> S4Error {
+    S4Error::new(codes::WASM_CANCELLED, "Wasm pipeline session stopped")
 }
 
 impl PipelineSession {

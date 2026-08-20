@@ -263,8 +263,11 @@ where
     F: FnOnce() -> R + Send + 'static,
 {
     Box::new(move || {
-        let _permit = permit;
         let result = catch_unwind(AssertUnwindSafe(task)).map_err(panic_error);
+        // Release aggregate guest-memory admission before publishing task
+        // completion so callers never observe a completed job still consuming
+        // capacity.
+        drop(permit);
         let _ = result_sender.send(result);
     })
 }

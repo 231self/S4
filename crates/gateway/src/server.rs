@@ -6,6 +6,7 @@
 //! [`crate::control::NoopControlPlane`]; the private SaaS crate builds it with
 //! its own control-plane implementation.
 
+use std::collections::HashSet;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -39,7 +40,8 @@ use crate::managed::{
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, strip_hop_by_hop_headers,
 };
-use crate::plugin_registry::PluginRegistry;
+use crate::plugin_registry::{PluginCapabilities, PluginRegistry, StreamingPipelineSession};
+use crate::read_spool::EncryptedReadSpool;
 use crate::s3_error;
 use crate::service_storage::{ServiceStorage, parse_service_backends};
 use crate::sigv4::{RequestAuthorization, SigV4Error, SigV4Policy, SigningKeyCache};
@@ -81,6 +83,8 @@ pub struct AppState {
     pub managed_streaming_capabilities: Option<BackendCapabilities>,
     pub spool_config: CompatibilitySpoolConfig,
     pub spool_quota: Arc<SpoolQuota>,
+    /// Unsafe transformed reads are allowed only with encrypted durable staging.
+    pub transformed_read_spool_enabled: bool,
     pub dev_memory_max_object_bytes: usize,
     pub dev_memory_streaming_enabled: bool,
 }
@@ -117,6 +121,37 @@ impl StreamingReadMode {
     fn streams_passthrough(self) -> bool {
         matches!(self, Self::Passthrough | Self::Transformed)
     }
+}
+
+fn transformed_read_spool_enabled() -> bool {
+    std::env::var("S4_TRANSFORMED_READ_SPOOL")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("encrypted"))
+}
+
+/// Imported plugins are unsafe by default. Operators may opt known component
+/// digests into direct reads at process start; dashboard callers cannot raise
+/// this capability and a digest cannot be re-registered with different flags.
+fn prefix_safe_component_hashes() -> HashSet<String> {
+    std::env::var("S4_PREFIX_SAFE_COMPONENT_HASHES")
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|hash| {
+            let valid = hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+            if !valid {
+                warn!("ignoring invalid S4_PREFIX_SAFE_COMPONENT_HASHES entry");
+                None
+            } else {
+                Some(hash.to_ascii_lowercase())
+            }
+        })
+        .collect()
 }
 
 fn streaming_write_mode() -> StreamingWriteMode {
@@ -2233,6 +2268,529 @@ async fn s3_put(
     store_processed(&state, &auth, backend, &bucket, &key, output, body.len()).await
 }
 
+#[derive(Debug)]
+enum TransformedReadError {
+    InvalidRequest(String),
+    Capacity(String),
+    Source(String),
+    Pipeline(s4_error::S4Error),
+    Spool(TransactionError),
+}
+
+impl From<s4_error::S4Error> for TransformedReadError {
+    fn from(error: s4_error::S4Error) -> Self {
+        Self::Pipeline(error)
+    }
+}
+
+impl From<TransactionError> for TransformedReadError {
+    fn from(error: TransactionError) -> Self {
+        Self::Spool(error)
+    }
+}
+
+fn transformed_read_error_response(
+    key: &str,
+    error: TransformedReadError,
+) -> axum::response::Response {
+    match error {
+        TransformedReadError::InvalidRequest(detail) => s3_error::invalid_request(key, &detail),
+        TransformedReadError::Capacity(detail) => s3_error::service_unavailable(key, &detail),
+        TransformedReadError::Source(detail) => s3_error::internal_error(key, &detail),
+        TransformedReadError::Spool(TransactionError::CapacityExceeded) => {
+            s3_error::service_unavailable(
+                key,
+                "encrypted transformed-read staging capacity is unavailable",
+            )
+        }
+        TransformedReadError::Spool(error) => {
+            s3_error::service_unavailable(key, &error.to_string())
+        }
+        TransformedReadError::Pipeline(error)
+            if matches!(
+                error.code(),
+                s4_error::codes::LIMIT_INPUT_BYTES
+                    | s4_error::codes::LIMIT_OUTPUT_BYTES
+                    | s4_error::codes::LIMIT_EXPANSION
+                    | s4_error::codes::LIMIT_INTERMEDIATE_BYTES
+                    | s4_error::codes::LIMIT_FINISH_BYTES
+                    | s4_error::codes::RECORD_TOO_LARGE
+            ) =>
+        {
+            s3_error::entity_too_large(key)
+        }
+        TransformedReadError::Pipeline(error)
+            if matches!(
+                error.code(),
+                s4_error::codes::DECODE_JSON
+                    | s4_error::codes::DECODE_JSONL
+                    | s4_error::codes::DECODE_CSV
+                    | s4_error::codes::DECODE_ENCODING
+                    | s4_error::codes::WASM_REJECT
+                    | s4_error::codes::UNSUPPORTED_FORMAT
+            ) =>
+        {
+            s3_error::invalid_request(key, error.message())
+        }
+        TransformedReadError::Pipeline(error) => s3_error::internal_error(key, error.message()),
+    }
+}
+
+/// A transformed representation has different validators and range semantics
+/// from its source. Keep only descriptive representation metadata.
+fn transformed_response_headers(
+    metadata: &ObjectMetadata,
+    content_length: Option<u64>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_DISPOSITION,
+        header::CONTENT_LANGUAGE,
+    ] {
+        for value in metadata.headers.get_all(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
+    if let Some(content_length) = content_length
+        && let Ok(value) = content_length.to_string().parse()
+    {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+    headers
+}
+
+fn transformed_read_preflight(
+    headers: &HeaderMap,
+    params: &S3Query,
+    metadata: &ObjectMetadata,
+) -> Result<(Format, String), TransformedReadError> {
+    if headers.contains_key(header::RANGE) {
+        return Err(TransformedReadError::InvalidRequest(
+            "Range is not supported for transformed reads".to_string(),
+        ));
+    }
+    if params.part_number.is_some() {
+        return Err(TransformedReadError::InvalidRequest(
+            "part-number reads are not supported for transformed reads".to_string(),
+        ));
+    }
+    if let Some(encoding) = metadata.headers.get(header::CONTENT_ENCODING) {
+        let encoding = encoding.to_str().map_err(|_| {
+            TransformedReadError::InvalidRequest("invalid source Content-Encoding".to_string())
+        })?;
+        if !encoding.eq_ignore_ascii_case("identity") {
+            return Err(TransformedReadError::InvalidRequest(
+                "Content-Encoding is unsupported for transformed reads".to_string(),
+            ));
+        }
+    }
+    let content_type = metadata
+        .headers
+        .get(header::CONTENT_TYPE)
+        .ok_or_else(|| {
+            TransformedReadError::InvalidRequest(
+                "Content-Type is required for transformed reads".to_string(),
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            TransformedReadError::InvalidRequest("invalid source Content-Type".to_string())
+        })?;
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let format = match media_type.as_str() {
+        "text/plain" => Format::Text,
+        "application/x-ndjson" | "application/jsonlines" => Format::Jsonl,
+        "application/json" => Format::Json,
+        "text/csv" => Format::Csv,
+        "text/tab-separated-values" => Format::Tsv,
+        _ => {
+            return Err(TransformedReadError::InvalidRequest(format!(
+                "unsupported transformed-read Content-Type {media_type:?}"
+            )));
+        }
+    };
+    Ok((format, media_type))
+}
+
+/// An unversioned source is safe to transform only if both metadata responses
+/// carry the same strong validator. Weak ETags are cache validators, not an
+/// assertion that the bytes consumed by GET match the bytes inspected by HEAD.
+fn transformed_source_matches_preflight(
+    preflight: &ObjectMetadata,
+    source: &ObjectMetadata,
+) -> bool {
+    (is_immutable_version_id(preflight.version_id.as_deref())
+        && preflight.version_id == source.version_id)
+        || strong_etag(preflight)
+            .zip(strong_etag(source))
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn is_immutable_version_id(version_id: Option<&str>) -> bool {
+    matches!(version_id, Some(version_id) if !version_id.is_empty() && version_id != "null")
+}
+
+fn strong_etag(metadata: &ObjectMetadata) -> Option<&str> {
+    let etag = metadata.headers.get(header::ETAG)?.to_str().ok()?;
+    let etag = etag.trim();
+    (etag.len() > 2 && etag.starts_with('"') && etag.ends_with('"') && !etag.starts_with("W/"))
+        .then_some(etag)
+}
+
+fn schedule_spool_cleanup(config: CompatibilitySpoolConfig) {
+    // A zero duration is useful for direct cleanup tests but must not create a
+    // busy loop if a future caller reuses it for the service configuration.
+    let interval = config.stale_after.max(Duration::from_secs(60));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match CompatibilitySpoolTransaction::cleanup_stale(&config).await {
+                Ok(removed) if removed > 0 => {
+                    info!(removed, "removed stale spool files");
+                }
+                Ok(_) => {}
+                Err(error) => warn!("failed to remove stale spool files: {error}"),
+            }
+        }
+    });
+}
+
+fn transformed_session(
+    auth: &Auth,
+    headers: &HeaderMap,
+    format: Format,
+    content_type: String,
+) -> s4_wasm_runtime::Session {
+    s4_wasm_runtime::Session {
+        format: format.as_str().to_string(),
+        content_type,
+        policy_version: 0,
+        public_key_pem: auth.public_key_pem.clone(),
+        stable_key: auth.stable_key.clone(),
+        stable_fields: headers
+            .get("x-s4-stable-fields")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
+    }
+}
+
+async fn process_transformed_source<F, Fut>(
+    mut object: OpenedObject,
+    mut pipeline: StreamingPipelineSession,
+    format: Format,
+    max_source_frame_bytes: usize,
+    mut emit: F,
+) -> Result<(), TransformedReadError>
+where
+    F: FnMut(bytes::Bytes) -> Fut,
+    Fut: std::future::Future<Output = Result<(), TransformedReadError>>,
+{
+    let cancellation = object.cancellation.clone();
+    let decoder_limits = crate::record::DecoderLimits {
+        max_source_frame_bytes,
+        ..crate::record::DecoderLimits::default()
+    };
+    // CountedBody enforces the configured source-frame bound before this point;
+    // the decoder sees the same frame without copying it as a whole object.
+    let mut decoder = crate::record::RecordDecoder::new(format, decoder_limits)?;
+    let result = async {
+        while let Some(frame) = object.body.frame().await {
+            let frame = frame.map_err(|error| TransformedReadError::Source(error.to_string()))?;
+            let data = frame.into_data().map_err(|frame| {
+                if frame.into_trailers().is_ok() {
+                    TransformedReadError::Source(
+                        "source trailers are not valid for transformed reads".to_string(),
+                    )
+                } else {
+                    TransformedReadError::Source("source returned a non-data frame".to_string())
+                }
+            })?;
+            decoder.push(&data)?;
+            while let Some(record) = decoder.next_record()? {
+                if let Some(record) = pipeline.process(record).await? {
+                    if !record.payload.is_empty() {
+                        emit(record.payload).await?;
+                    }
+                    if !record.separator.is_empty() {
+                        emit(record.separator).await?;
+                    }
+                }
+            }
+        }
+        decoder.finish()?;
+        while let Some(record) = decoder.next_record()? {
+            if let Some(record) = pipeline.process(record).await? {
+                if !record.payload.is_empty() {
+                    emit(record.payload).await?;
+                }
+                if !record.separator.is_empty() {
+                    emit(record.separator).await?;
+                }
+            }
+        }
+        for record in pipeline.finish().await? {
+            if !record.payload.is_empty() {
+                emit(record.payload).await?;
+            }
+            if !record.separator.is_empty() {
+                emit(record.separator).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        cancellation.cancel();
+        // Dropping an un-finished session interrupts a current guest call. The
+        // worker owns it here, so no retry or raw fallback is possible.
+    }
+    result
+}
+
+enum DirectReadEvent {
+    Data(bytes::Bytes),
+    Failed(TransformedReadError),
+    Done,
+}
+
+struct DirectReadBody {
+    first: Option<bytes::Bytes>,
+    receiver: tokio::sync::mpsc::Receiver<DirectReadEvent>,
+    source_cancellation: s4_wasm_runtime::CancellationToken,
+    pipeline_cancellation: s4_wasm_runtime::CancellationToken,
+    done: bool,
+}
+
+impl http_body::Body for DirectReadBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(bytes) = self.first.take() {
+            return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes))));
+        }
+        match self.receiver.poll_recv(cx) {
+            std::task::Poll::Ready(Some(DirectReadEvent::Data(bytes))) => {
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
+            }
+            std::task::Poll::Ready(Some(DirectReadEvent::Failed(error))) => {
+                self.done = true;
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(error_to_log(&error)))))
+            }
+            std::task::Poll::Ready(Some(DirectReadEvent::Done)) | std::task::Poll::Ready(None) => {
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for DirectReadBody {
+    fn drop(&mut self) {
+        if !self.done {
+            self.source_cancellation.cancel();
+            self.pipeline_cancellation.cancel();
+        }
+    }
+}
+
+fn error_to_log(error: &TransformedReadError) -> String {
+    match error {
+        TransformedReadError::InvalidRequest(detail)
+        | TransformedReadError::Capacity(detail)
+        | TransformedReadError::Source(detail) => detail.clone(),
+        TransformedReadError::Pipeline(error) => error.to_string(),
+        TransformedReadError::Spool(error) => error.to_string(),
+    }
+}
+
+async fn transformed_read_response(
+    state: &AppState,
+    auth: &Auth,
+    headers: &HeaderMap,
+    preflight: (Format, String),
+    response_metadata: ObjectMetadata,
+    object: OpenedObject,
+    key: &str,
+) -> axum::response::Response {
+    let (format, content_type) = preflight;
+    let snapshot = match state.gateway.pipeline_snapshot() {
+        Some(snapshot) => snapshot,
+        None => {
+            return transformed_read_error_response(
+                key,
+                TransformedReadError::Capacity(
+                    "transformed reads require a plugin registry".to_string(),
+                ),
+            );
+        }
+    };
+    let source_cancellation = object.cancellation.clone();
+    let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
+    let pipeline = match snapshot
+        .clone()
+        .start_streaming_session(
+            transformed_session(auth, headers, format, content_type),
+            pipeline_cancellation.clone(),
+        )
+        .await
+    {
+        Ok(pipeline) => pipeline,
+        Err(error) => return transformed_read_error_response(key, error.into()),
+    };
+    let direct = snapshot
+        .capabilities()
+        .iter()
+        .all(|capabilities| capabilities.prefix_safe_for_read);
+    if direct {
+        let max_source_frame_bytes = state.source_body_limits.max_frame_bytes;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            let result = process_transformed_source(
+                object,
+                pipeline,
+                format,
+                max_source_frame_bytes,
+                |bytes| {
+                    let sender = sender.clone();
+                    async move {
+                        sender
+                            .send(DirectReadEvent::Data(bytes))
+                            .await
+                            .map_err(|_| {
+                                TransformedReadError::Source(
+                                    "client cancelled transformed read".to_string(),
+                                )
+                            })
+                    }
+                },
+            )
+            .await;
+            let event = match result {
+                Ok(()) => DirectReadEvent::Done,
+                Err(error) => DirectReadEvent::Failed(error),
+            };
+            let _ = sender.send(event).await;
+        });
+        return match receiver.recv().await {
+            Some(DirectReadEvent::Data(first)) => {
+                let mut response = axum::response::Response::builder().status(StatusCode::OK);
+                response
+                    .headers_mut()
+                    .unwrap()
+                    .extend(transformed_response_headers(&response_metadata, None));
+                response
+                    .body(axum::body::Body::new(DirectReadBody {
+                        first: Some(first),
+                        receiver,
+                        source_cancellation,
+                        pipeline_cancellation,
+                        done: false,
+                    }))
+                    .unwrap()
+            }
+            Some(DirectReadEvent::Done) | None => {
+                let mut response = axum::response::Response::builder().status(StatusCode::OK);
+                response
+                    .headers_mut()
+                    .unwrap()
+                    .extend(transformed_response_headers(&response_metadata, Some(0)));
+                response.body(axum::body::Body::empty()).unwrap()
+            }
+            Some(DirectReadEvent::Failed(error)) => transformed_read_error_response(key, error),
+        };
+    }
+    if !state.transformed_read_spool_enabled {
+        source_cancellation.cancel();
+        return transformed_read_error_response(
+            key,
+            TransformedReadError::Capacity(
+                "unsafe transformed reads require S4_TRANSFORMED_READ_SPOOL=encrypted".to_string(),
+            ),
+        );
+    }
+    let spool = match EncryptedReadSpool::begin(
+        state.spool_config.directory.clone(),
+        state.spool_config.max_object_bytes,
+        Arc::clone(&state.spool_quota),
+    )
+    .await
+    {
+        Ok(spool) => spool,
+        Err(error) => return transformed_read_error_response(key, error.into()),
+    };
+    let (spool_sender, mut spool_receiver) = tokio::sync::mpsc::channel(2);
+    let spool_writer = tokio::spawn(async move {
+        let mut spool = spool;
+        while let Some(bytes) = spool_receiver.recv().await {
+            if let Err(error) = spool.write(bytes).await {
+                spool.abort().await;
+                return Err(TransformedReadError::from(error));
+            }
+        }
+        Ok(spool)
+    });
+    let output_sender = spool_sender.clone();
+    let result = process_transformed_source(
+        object,
+        pipeline,
+        format,
+        state.source_body_limits.max_frame_bytes,
+        move |bytes| {
+            let sender = output_sender.clone();
+            async move {
+                sender.send(bytes).await.map_err(|_| {
+                    TransformedReadError::Capacity(
+                        "encrypted transformed-read staging failed".to_string(),
+                    )
+                })
+            }
+        },
+    )
+    .await;
+    drop(spool_sender);
+    if let Err(error) = result {
+        let _ = spool_writer.await;
+        return transformed_read_error_response(key, error);
+    }
+    let spool = match spool_writer.await {
+        Ok(Ok(spool)) => spool,
+        Ok(Err(error)) => return transformed_read_error_response(key, error),
+        Err(error) => {
+            return transformed_read_error_response(
+                key,
+                TransformedReadError::Capacity(format!(
+                    "encrypted transformed-read staging task failed: {error}"
+                )),
+            );
+        }
+    };
+    let (body, content_length) = match spool.into_body(source_cancellation).await {
+        Ok(result) => result,
+        Err(error) => return transformed_read_error_response(key, error.into()),
+    };
+    let mut response = axum::response::Response::builder().status(StatusCode::OK);
+    response
+        .headers_mut()
+        .unwrap()
+        .extend(transformed_response_headers(
+            &response_metadata,
+            Some(content_length),
+        ));
+    response.body(body).unwrap()
+}
+
 async fn s3_get(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -2253,7 +2811,8 @@ async fn s3_get(
         return s3_error::payment_required(&key, reason.message);
     }
 
-    if wants_transformed_read(&headers) {
+    let transformed_read = wants_transformed_read(&headers);
+    if transformed_read && state.streaming_read_mode != StreamingReadMode::Transformed {
         return s3_error::transformed_read_not_supported(&key);
     }
     if params.upload_id.is_some() {
@@ -2269,6 +2828,83 @@ async fn s3_get(
             Ok(backend) => backend,
             Err(error) => return s3_error::internal_error(&key, &error),
         };
+    // A transformed representation must be admitted from authoritative object
+    // metadata before a source GET can start delivering bytes. Passthrough keeps
+    // its existing one-request behavior below.
+    if transformed_read {
+        if matches!(&backend, ResolvedBackend::PresignedHttp(_)) {
+            return transformed_read_error_response(
+                &key,
+                TransformedReadError::InvalidRequest(
+                    "transformed reads require stored object metadata".to_string(),
+                ),
+            );
+        }
+        let metadata = match open_backend_object(
+            &state,
+            backend.clone(),
+            &auth.user_id,
+            &bucket,
+            &key,
+            &headers,
+            true,
+        )
+        .await
+        {
+            Ok(object) => object.metadata,
+            Err(error) => return open_error_response(&key, error),
+        };
+        let preflight = match transformed_read_preflight(&headers, &params, &metadata) {
+            Ok(preflight) => preflight,
+            Err(error) => return transformed_read_error_response(&key, error),
+        };
+        let object = match open_backend_object(
+            &state,
+            backend,
+            &auth.user_id,
+            &bucket,
+            &key,
+            &headers,
+            false,
+        )
+        .await
+        {
+            Ok(object) => object,
+            Err(error) => return open_error_response(&key, error),
+        };
+        let source_preflight = match transformed_read_preflight(&headers, &params, &object.metadata)
+        {
+            Ok(preflight) => preflight,
+            Err(error) => return transformed_read_error_response(&key, error),
+        };
+        if source_preflight.0 != preflight.0
+            || source_preflight.1 != preflight.1
+            || !transformed_source_matches_preflight(&metadata, &object.metadata)
+        {
+            object.cancellation.cancel();
+            return transformed_read_error_response(
+                &key,
+                TransformedReadError::Source(
+                    "source metadata changed after transformed-read preflight".to_string(),
+                ),
+            );
+        }
+        state
+            .control
+            .record(&auth.user_id, RequestKind::Read, 0)
+            .await;
+        let response_metadata = object.metadata.clone();
+        return transformed_read_response(
+            &state,
+            &auth,
+            &headers,
+            preflight,
+            response_metadata,
+            object,
+            &key,
+        )
+        .await;
+    }
     let object = match open_backend_object(
         &state,
         backend,
@@ -2319,6 +2955,269 @@ async fn s3_get(
     response.body(axum::body::Body::from(body)).unwrap()
 }
 
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    use axum::body::Body;
+    use bytes::Bytes;
+    use http_body::{Frame, SizeHint};
+
+    use super::*;
+
+    struct PollTrackingBody {
+        polls: Arc<AtomicUsize>,
+        data: Option<Bytes>,
+    }
+
+    struct GeneratedLineBody {
+        remaining: u64,
+        frame_bytes: usize,
+    }
+
+    impl http_body::Body for PollTrackingBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(self.data.take().map(|data| Ok(Frame::data(data))))
+        }
+    }
+
+    impl http_body::Body for GeneratedLineBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.remaining == 0 {
+                return Poll::Ready(None);
+            }
+            let len = self.remaining.min(self.frame_bytes as u64) as usize;
+            self.remaining -= len as u64;
+            let mut data = vec![b'x'; len];
+            data[len - 1] = b'\n';
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from(data)))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(self.remaining)
+        }
+    }
+
+    fn metadata(
+        version_id: Option<&str>,
+        etag: Option<&str>,
+        content_type: &str,
+    ) -> ObjectMetadata {
+        let mut metadata = ObjectMetadata {
+            version_id: version_id.map(str::to_owned),
+            ..ObjectMetadata::default()
+        };
+        metadata.insert(header::CONTENT_TYPE, content_type);
+        if let Some(etag) = etag {
+            metadata.insert(header::ETAG, etag);
+        }
+        metadata
+    }
+
+    #[test]
+    fn transformed_source_binding_requires_a_version_or_matching_strong_etag() {
+        let versioned = metadata(Some("v1"), None, "text/plain");
+        assert!(transformed_source_matches_preflight(
+            &versioned,
+            &metadata(Some("v1"), None, "text/plain")
+        ));
+        assert!(!transformed_source_matches_preflight(
+            &versioned,
+            &metadata(Some("v2"), None, "text/plain")
+        ));
+        let suspended = metadata(Some("null"), None, "text/plain");
+        assert!(
+            !transformed_source_matches_preflight(
+                &suspended,
+                &metadata(Some("null"), None, "text/plain")
+            ),
+            "S3 versioning-suspended null versions are mutable and need a matching ETag"
+        );
+
+        let unversioned = metadata(None, Some("\"source-a\""), "text/plain");
+        assert!(transformed_source_matches_preflight(
+            &unversioned,
+            &metadata(None, Some("\"source-a\""), "text/plain")
+        ));
+        assert!(!transformed_source_matches_preflight(
+            &unversioned,
+            &metadata(None, Some("\"source-b\""), "text/plain")
+        ));
+        assert!(!transformed_source_matches_preflight(
+            &unversioned,
+            &metadata(None, Some("W/\"source-a\""), "text/plain")
+        ));
+        assert!(!transformed_source_matches_preflight(
+            &metadata(None, None, "text/plain"),
+            &metadata(None, None, "text/plain")
+        ));
+    }
+
+    #[test]
+    fn transformed_preflight_rejects_source_header_changes_without_polling_source() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let object = OpenedObject::new(
+            StatusCode::OK,
+            metadata(None, Some("\"source-a\""), "application/octet-stream"),
+            Body::new(PollTrackingBody {
+                polls: Arc::clone(&polls),
+                data: Some(Bytes::from_static(b"must not be read")),
+            }),
+            BodyLimits::default(),
+        );
+        let params = S3Query::default();
+        assert!(transformed_read_preflight(&HeaderMap::new(), &params, &object.metadata).is_err());
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+
+        let before = metadata(None, Some("\"source-a\""), "text/plain");
+        let after = metadata(None, Some("\"source-a\""), "application/json");
+        assert!(transformed_read_preflight(&HeaderMap::new(), &params, &before).is_ok());
+        assert!(transformed_read_preflight(&HeaderMap::new(), &params, &after).is_ok());
+        assert_ne!(
+            transformed_read_preflight(&HeaderMap::new(), &params, &before).unwrap(),
+            transformed_read_preflight(&HeaderMap::new(), &params, &after).unwrap(),
+            "the GET representation cannot change source format after HEAD"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_body_truncates_after_a_late_pipeline_failure_and_cancels_on_drop() {
+        let source_cancellation = s4_wasm_runtime::CancellationToken::new();
+        let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender
+            .send(DirectReadEvent::Data(Bytes::from_static(b"safe-prefix")))
+            .await
+            .unwrap();
+        sender
+            .send(DirectReadEvent::Failed(TransformedReadError::Source(
+                "injected late failure".to_string(),
+            )))
+            .await
+            .unwrap();
+        let mut body = DirectReadBody {
+            first: None,
+            receiver,
+            source_cancellation: source_cancellation.clone(),
+            pipeline_cancellation: pipeline_cancellation.clone(),
+            done: false,
+        };
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first, Bytes::from_static(b"safe-prefix"));
+        assert!(body.frame().await.unwrap().is_err());
+        drop(body);
+        assert!(!source_cancellation.is_cancelled());
+        assert!(!pipeline_cancellation.is_cancelled());
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(sender);
+        let body = DirectReadBody {
+            first: None,
+            receiver,
+            source_cancellation: source_cancellation.clone(),
+            pipeline_cancellation: pipeline_cancellation.clone(),
+            done: false,
+        };
+        drop(body);
+        assert!(source_cancellation.is_cancelled());
+        assert!(pipeline_cancellation.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transformed_record_pipeline_has_fixed_rss_for_a_gibibyte_source() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const FRAME_BYTES: usize = 64 * 1024;
+        // Unit tests run in parallel with Wasmtime initialization elsewhere in
+        // this process. This still catches whole-object buffering while leaving
+        // room for unrelated allocator arena growth.
+        const MAX_RSS_GROWTH: u64 = 256 * 1024 * 1024;
+
+        let before = peak_rss_bytes();
+        let registry = PluginRegistry::new();
+        let pipeline = registry
+            .snapshot()
+            .start_streaming_session(
+                s4_wasm_runtime::Session {
+                    format: "text".to_string(),
+                    content_type: "text/plain".to_string(),
+                    ..Default::default()
+                },
+                s4_wasm_runtime::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let object = OpenedObject::new(
+            StatusCode::OK,
+            metadata(None, Some("\"source-a\""), "text/plain"),
+            Body::new(GeneratedLineBody {
+                remaining: GIB,
+                frame_bytes: FRAME_BYTES,
+            }),
+            BodyLimits {
+                max_frame_bytes: FRAME_BYTES,
+                max_bytes: GIB,
+            },
+        );
+        let output_bytes = Arc::new(AtomicU64::new(0));
+        process_transformed_source(object, pipeline, Format::Text, FRAME_BYTES, {
+            let output_bytes = Arc::clone(&output_bytes);
+            move |bytes| {
+                let output_bytes = Arc::clone(&output_bytes);
+                async move {
+                    output_bytes.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let after = peak_rss_bytes();
+
+        assert_eq!(output_bytes.load(Ordering::SeqCst), GIB);
+        assert!(
+            after.saturating_sub(before) <= MAX_RSS_GROWTH,
+            "transformed 1 GiB stream grew peak RSS by {} MiB (limit {} MiB)",
+            after.saturating_sub(before) / (1024 * 1024),
+            MAX_RSS_GROWTH / (1024 * 1024),
+        );
+    }
+
+    fn peak_rss_bytes() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage initializes the provided rusage on success, and
+        // the pointer remains valid for the duration of the call.
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(result, 0, "getrusage failed");
+        // SAFETY: a successful getrusage initialized the value.
+        let usage = unsafe { usage.assume_init() };
+        #[cfg(target_os = "macos")]
+        {
+            usage.ru_maxrss as u64
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            usage.ru_maxrss as u64 * 1024
+        }
+    }
+}
+
 async fn s3_head(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -2336,6 +3235,12 @@ async fn s3_head(
         .await
     {
         return s3_error::payment_required(&key, reason.message);
+    }
+    if wants_transformed_read(&headers) {
+        return s3_error::invalid_request(
+            &key,
+            "HEAD is not supported for transformed reads until transformed metadata is available",
+        );
     }
 
     let backend =
@@ -3317,17 +4222,27 @@ pub async fn build_state(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(crate::plugin_registry::DEFAULT_PIPELINE_FUEL);
+    use sha2::Digest as _;
+
     let engine = s4_wasm_runtime::FilterEngine::with_fuel(&component_bytes, pipeline_fuel)?;
     let plugins = Arc::new(PluginRegistry::with_fuel(pipeline_fuel));
+    let prefix_safe_hashes = prefix_safe_component_hashes();
 
-    // Load default filter plugin
-    plugins.import("pii-default", &component_bytes)?;
+    // Only a startup-controlled component digest can grant direct-read safety.
+    let default_hash = hex::encode(sha2::Sha256::digest(&component_bytes));
+    plugins.import_with_capabilities(
+        "pii-default",
+        &component_bytes,
+        PluginCapabilities {
+            prefix_safe_for_read: prefix_safe_hashes.contains(&default_hash),
+        },
+    )?;
 
     // Auto-load plugins from S4_PLUGINS_DIR if set
     if let Ok(plugin_dir) = std::env::var("S4_PLUGINS_DIR") {
         let dir = std::path::Path::new(&plugin_dir);
         if dir.exists() {
-            plugins.load_from_dir(dir)?;
+            plugins.load_from_dir_with_capabilities(dir, &prefix_safe_hashes)?;
         }
     }
 
@@ -3431,8 +4346,9 @@ pub async fn build_state(
     };
     let removed_spools = CompatibilitySpoolTransaction::cleanup_stale(&spool_config).await?;
     if removed_spools > 0 {
-        info!(removed_spools, "removed stale compatibility spool files");
+        info!(removed_spools, "removed stale spool files");
     }
+    schedule_spool_cleanup(spool_config.clone());
     let spool_quota = Arc::new(SpoolQuota::new(spool_quota_bytes));
     let dev_memory_max_object_bytes = std::env::var("S4_DEV_MEMORY_MAX_OBJECT_BYTES")
         .ok()
@@ -3546,6 +4462,7 @@ pub async fn build_state(
         managed_streaming_capabilities,
         spool_config,
         spool_quota,
+        transformed_read_spool_enabled: transformed_read_spool_enabled(),
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
     });

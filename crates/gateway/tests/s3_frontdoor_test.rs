@@ -13,9 +13,11 @@ use http_body::{Frame, SizeHint};
 use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
 use s4_gateway::control::{ControlPlane, NoopControlPlane, RequestKind, StreamingWriteMode};
 use s4_gateway::key_cipher::default_wrapping;
+use s4_gateway::object::BodyLimits;
 use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
 use s4_gateway::sigv4::SigV4Policy;
 use s4_gateway::store::FileKeyStore;
+use s4_gateway::transaction::SpoolQuota;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -110,6 +112,11 @@ async fn test_state() -> Arc<AppState> {
         std::env::remove_var("S4_LEGACY_MAX_OBJECT_BYTES");
         std::env::remove_var("S4_STREAMING_READ_MODE");
         std::env::remove_var("S4_STREAMING_WRITE_MODE");
+        std::env::remove_var("S4_TRANSFORMED_READ_SPOOL");
+        std::env::remove_var("S4_PREFIX_SAFE_COMPONENT_HASHES");
+        std::env::remove_var("S4_SPOOL_DIR");
+        std::env::remove_var("S4_SPOOL_MAX_OBJECT_BYTES");
+        std::env::remove_var("S4_SPOOL_QUOTA_BYTES");
         std::env::remove_var("S4_STREAMING_S3_PROVIDER");
         std::env::remove_var("S4_MANAGED_STREAMING_MODE");
         std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
@@ -169,6 +176,58 @@ async fn make_key(state: &Arc<AppState>) -> (String, String) {
         .create_key("test-user", "sigv4-test", 0, None)
         .await
         .expect("create test API key")
+}
+
+fn test_filter_component() -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-components/test-filter.component.wasm");
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "{}: run `just build-filters` first: {error}",
+            path.display()
+        )
+    })
+}
+
+async fn unsafe_transformed_test_state(later_filter: bool) -> Arc<AppState> {
+    let mut state = test_state().await;
+    let spool_dir =
+        std::env::temp_dir().join(format!("s4-read-spool-failure-{}", uuid::Uuid::now_v7()));
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = true;
+    state_mut.spool_config.directory = spool_dir;
+    state_mut.spool_config.max_object_bytes = 1024;
+    state_mut.spool_quota = Arc::new(SpoolQuota::new(2048));
+    for plugin in state.plugins.list() {
+        state.plugins.set_enabled(&plugin.id, false);
+    }
+    if later_filter {
+        state
+            .plugins
+            .import(
+                "test-noop-before-reject",
+                &read_component("noop.component.wasm"),
+            )
+            .unwrap();
+    }
+    state
+        .plugins
+        .import("test-failure", &test_filter_component())
+        .unwrap();
+    state
+}
+
+fn read_component(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/components")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "{}: run `just build-filters` first: {error}",
+            path.display()
+        )
+    })
 }
 
 fn auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
@@ -1689,6 +1748,285 @@ async fn stable_transformed_reads_are_rejected_without_disclosure() {
     assert!(!tb.contains("alice@example.com"), "b leaks PII: {tb}");
     assert!(ta.contains("<Code>NotImplemented</Code>"), "{ta}");
     assert!(tb.contains("<Code>NotImplemented</Code>"), "{tb}");
+}
+
+#[tokio::test]
+async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
+    let mut state = test_state().await;
+    let spool_dir =
+        std::env::temp_dir().join(format!("s4-read-spool-router-{}", uuid::Uuid::now_v7()));
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = true;
+    state_mut.spool_config.directory = spool_dir.clone();
+    state_mut.spool_config.max_object_bytes = 1024;
+    state_mut.spool_quota = Arc::new(SpoolQuota::new(2048));
+    state.store.put(
+        "read",
+        "raw.txt",
+        Bytes::from_static(b"contact alice@example.com\n"),
+        "text/plain; charset=utf-8",
+    );
+    let (ak, sk) = make_key(&state).await;
+    let app = build_router(state);
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/read/raw.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/plain; charset=utf-8"
+    );
+    assert!(!response.headers().contains_key(header::ETAG));
+    assert!(!response.headers().contains_key(header::ACCEPT_RANGES));
+    assert!(!response.headers().contains_key(header::CONTENT_RANGE));
+    assert!(!response.headers().contains_key("x-amz-version-id"));
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "contact [REDACTED_EMAIL]\n"
+    );
+    assert!(
+        std::fs::read_dir(&spool_dir).unwrap().next().is_none(),
+        "staged ciphertext must be removed after replay"
+    );
+}
+
+#[tokio::test]
+async fn transformed_read_rejects_range_part_head_encoding_and_unknown_format() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = true;
+    state.store.put(
+        "read",
+        "good.txt",
+        Bytes::from_static(b"secret"),
+        "text/plain",
+    );
+    state.store.put(
+        "read",
+        "unknown.bin",
+        Bytes::from_static(b"alice@example.com"),
+        "application/octet-stream",
+    );
+    let (ak, sk) = make_key(&state).await;
+    let app = build_router(state);
+    for (method, uri, extra_header) in [
+        ("GET", "/read/good.txt", Some((header::RANGE, "bytes=0-1"))),
+        ("GET", "/read/good.txt?partNumber=1", None),
+        ("HEAD", "/read/good.txt", None),
+        ("GET", "/read/unknown.bin", None),
+    ] {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-s4-process", "read");
+        if let Some((name, value)) = extra_header {
+            request = request.header(name, value);
+        }
+        let response = app
+            .clone()
+            .oneshot(add_headers(
+                request.body(Body::empty()).unwrap(),
+                &auth_headers(&ak, &sk),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if method != "HEAD" {
+            assert!(String::from_utf8_lossy(&body).contains("<Code>InvalidRequest</Code>"));
+        }
+        assert!(!String::from_utf8_lossy(&body).contains("alice@example.com"));
+    }
+}
+
+#[tokio::test]
+async fn unsafe_transformed_read_refuses_unavailable_staging_without_disclosure() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = true;
+    state_mut.spool_config.max_object_bytes = 4;
+    state_mut.spool_quota = Arc::new(SpoolQuota::new(4));
+    state.store.put(
+        "read",
+        "large.txt",
+        Bytes::from_static(b"alice@example.com"),
+        "text/plain",
+    );
+    let (ak, sk) = make_key(&state).await;
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/read/large.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>ServiceUnavailable</Code>"));
+    assert!(!String::from_utf8_lossy(&body).contains("alice@example.com"));
+}
+
+#[tokio::test]
+async fn unsafe_transformed_failures_never_disclose_early_late_or_finish_output() {
+    for (name, payload, stable_fields, later_filter, status) in [
+        (
+            "early reject",
+            "reject sensitive-source",
+            None,
+            false,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "later reject",
+            "reject sensitive-source",
+            None,
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "transform trap",
+            "trap sensitive-source",
+            None,
+            false,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            "finish trap",
+            "safe-before-finish",
+            Some("finish-trap"),
+            false,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let state = unsafe_transformed_test_state(later_filter).await;
+        state
+            .store
+            .put("read", "failure.txt", payload, "text/plain");
+        let (ak, sk) = make_key(&state).await;
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/read/failure.txt")
+            .header("x-s4-process", "read");
+        if let Some(stable_fields) = stable_fields {
+            request = request.header("x-s4-stable-fields", stable_fields);
+        }
+        let response = build_router(state)
+            .oneshot(add_headers(
+                request.body(Body::empty()).unwrap(),
+                &auth_headers(&ak, &sk),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{name}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains(payload),
+            "{name} disclosed source bytes: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn unsafe_transformed_source_limit_has_no_disclosure() {
+    let mut state = unsafe_transformed_test_state(false).await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .source_body_limits = BodyLimits {
+        max_frame_bytes: 4,
+        max_bytes: 4,
+    };
+    state.store.put("read", "limit.txt", "12345", "text/plain");
+    let (ak, sk) = make_key(&state).await;
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/read/limit.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("12345"));
+}
+
+#[tokio::test]
+async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = false;
+    for plugin in state.plugins.list() {
+        state.plugins.set_enabled(&plugin.id, false);
+    }
+    state.store.put(
+        "read",
+        "direct.txt",
+        Bytes::from_static(b"one\ntwo\n"),
+        "text/plain",
+    );
+    let (ak, sk) = make_key(&state).await;
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/read/direct.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "one\ntwo\n"
+    );
 }
 
 #[tokio::test]

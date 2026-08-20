@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -214,7 +214,7 @@ impl PluginRegistry {
         self.import_with_capabilities(name, component_bytes, PluginCapabilities::default())
     }
 
-    pub fn import_with_capabilities(
+    pub(crate) fn import_with_capabilities(
         &self,
         name: &str,
         component_bytes: &[u8],
@@ -414,6 +414,17 @@ impl PluginRegistry {
     }
 
     pub fn load_from_dir(&self, dir: &Path) -> anyhow::Result<Vec<PluginInfo>> {
+        self.load_from_dir_with_capabilities(dir, &HashSet::new())
+    }
+
+    /// Capability declarations are supplied by startup administration, never
+    /// by component bytes or the dashboard import request. A hash's first
+    /// registration remains immutable for the process lifetime.
+    pub(crate) fn load_from_dir_with_capabilities(
+        &self,
+        dir: &Path,
+        prefix_safe_hashes: &HashSet<String>,
+    ) -> anyhow::Result<Vec<PluginInfo>> {
         let mut added = Vec::new();
         if !dir.exists() || !dir.is_dir() {
             return Ok(added);
@@ -430,7 +441,11 @@ impl PluginRegistry {
                 .file_stem()
                 .and_then(|name| name.to_str())
                 .unwrap_or("unknown");
-            match self.import(name, &bytes) {
+            let hash = hex::encode(Sha256::digest(&bytes));
+            let capabilities = PluginCapabilities {
+                prefix_safe_for_read: prefix_safe_hashes.contains(&hash),
+            };
+            match self.import_with_capabilities(name, &bytes, capabilities) {
                 Ok(info) => {
                     tracing::info!("loaded plugin: {} ({})", name, path.display());
                     added.push(info);

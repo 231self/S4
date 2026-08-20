@@ -6,6 +6,7 @@ pub mod key_cipher;
 pub mod managed;
 pub mod object;
 pub mod plugin_registry;
+pub mod read_spool;
 pub mod record;
 pub mod s3_error;
 pub mod server;

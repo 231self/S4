@@ -13,6 +13,9 @@ use uuid::Uuid;
 use super::{ObjectSinkTransaction, StoredObjectMeta, TransactionError};
 
 const FILE_PREFIX: &str = "s4-spool-";
+/// Encrypted transformed-read staging shares the compatibility spool directory.
+/// Keep its cleanup policy and private-file handling in this module as well.
+pub(crate) const READ_FILE_PREFIX: &str = "s4-read-spool-";
 
 #[derive(Clone, Debug)]
 pub struct CompatibilitySpoolConfig {
@@ -39,7 +42,7 @@ impl SpoolQuota {
         self.reserved_bytes.load(Ordering::Acquire)
     }
 
-    fn reserve(&self, bytes: u64) -> Result<(), TransactionError> {
+    pub(crate) fn reserve_bytes(&self, bytes: u64) -> Result<(), TransactionError> {
         let mut current = self.reserved_bytes.load(Ordering::Acquire);
         loop {
             let next = current
@@ -60,7 +63,7 @@ impl SpoolQuota {
         }
     }
 
-    fn release(&self, bytes: u64) {
+    pub(crate) fn release_bytes(&self, bytes: u64) {
         self.reserved_bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
@@ -98,11 +101,11 @@ impl CompatibilitySpoolTransaction {
                 "invalid compatibility spool object limit".to_string(),
             ));
         }
-        quota.reserve(config.max_object_bytes)?;
+        quota.reserve_bytes(config.max_object_bytes)?;
         tokio::fs::create_dir_all(&config.directory)
             .await
             .map_err(|error| {
-                quota.release(config.max_object_bytes);
+                quota.release_bytes(config.max_object_bytes);
                 spool_error(error)
             })?;
         let path = config
@@ -115,7 +118,7 @@ impl CompatibilitySpoolTransaction {
             options.mode(0o600);
         }
         let file = options.open(&path).await.map_err(|error| {
-            quota.release(config.max_object_bytes);
+            quota.release_bytes(config.max_object_bytes);
             spool_error(error)
         })?;
         let reserved_bytes = config.max_object_bytes;
@@ -152,7 +155,7 @@ impl CompatibilitySpoolTransaction {
         while let Some(entry) = entries.next_entry().await.map_err(spool_error)? {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !name.starts_with(FILE_PREFIX) || !name.ends_with(".tmp") {
+            if !is_recognized_spool_file(name) {
                 continue;
             }
             let metadata = entry.metadata().await.map_err(spool_error)?;
@@ -175,6 +178,10 @@ impl CompatibilitySpoolTransaction {
             Err(error) => Err(spool_error(error)),
         }
     }
+}
+
+fn is_recognized_spool_file(name: &str) -> bool {
+    name.ends_with(".tmp") && (name.starts_with(FILE_PREFIX) || name.starts_with(READ_FILE_PREFIX))
 }
 
 #[async_trait]
@@ -231,7 +238,7 @@ impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
         file.sync_all().await.map_err(spool_error)?;
         let result = self.uploader.upload_file(&self.path, self.bytes).await?;
         self.remove_file().await?;
-        self.quota.release(self.reserved_bytes);
+        self.quota.release_bytes(self.reserved_bytes);
         self.reserved_bytes = 0;
         self.bytes = 0;
         self.finished = true;
@@ -243,7 +250,7 @@ impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
             return Ok(());
         }
         self.remove_file().await?;
-        self.quota.release(self.reserved_bytes);
+        self.quota.release_bytes(self.reserved_bytes);
         self.reserved_bytes = 0;
         self.bytes = 0;
         self.finished = true;
@@ -258,7 +265,7 @@ impl Drop for CompatibilitySpoolTransaction {
         }
         self.file.take();
         let _ = std::fs::remove_file(&self.path);
-        self.quota.release(self.reserved_bytes);
+        self.quota.release_bytes(self.reserved_bytes);
         self.reserved_bytes = 0;
         self.bytes = 0;
     }
@@ -382,14 +389,19 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("s4-spool-test-{}", Uuid::now_v7()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let stale = directory.join(format!("{FILE_PREFIX}old.tmp"));
+        let stale_read = directory.join(format!("{READ_FILE_PREFIX}old.tmp"));
         let unrelated = directory.join("keep.tmp");
         tokio::fs::write(&stale, b"stale").await.unwrap();
+        tokio::fs::write(&stale_read, b"stale encrypted read")
+            .await
+            .unwrap();
         tokio::fs::write(&unrelated, b"keep").await.unwrap();
         let removed = CompatibilitySpoolTransaction::cleanup_stale(&config(directory.clone(), 1))
             .await
             .unwrap();
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2);
         assert!(!stale.exists());
+        assert!(!stale_read.exists());
         assert!(unrelated.exists());
         let _ = std::fs::remove_file(unrelated);
         let _ = std::fs::remove_dir(directory);

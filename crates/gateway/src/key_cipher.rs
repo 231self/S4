@@ -40,6 +40,13 @@ const NONCE_LEN: usize = 12;
 pub trait KeyWrapping: Send + Sync + Debug {
     fn wrap(&self, dek: &[u8]) -> Result<Vec<u8>>;
     fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>>;
+
+    /// Whether ciphertext wrapped by this implementation remains decryptable
+    /// after a gateway restart. Durable artifact staging must fail closed when
+    /// this is false: losing a DEK would permanently strand tenant data.
+    fn is_durable(&self) -> bool {
+        false
+    }
 }
 
 /// Wraps the DEK with a static 256-bit KEK using AES-256-GCM. The per-wrap
@@ -47,6 +54,7 @@ pub trait KeyWrapping: Send + Sync + Debug {
 #[derive(Debug)]
 pub struct LocalKeyWrapping {
     kek: [u8; KEY_LEN],
+    durable: bool,
 }
 
 impl LocalKeyWrapping {
@@ -60,7 +68,7 @@ impl LocalKeyWrapping {
                 let kek: [u8; KEY_LEN] = kek
                     .try_into()
                     .map_err(|_| anyhow!("S4_SECRET_KEK must decode to 32 bytes"))?;
-                Ok(Some(Self { kek }))
+                Ok(Some(Self { kek, durable: true }))
             }
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(e) => Err(e).context("failed to read S4_SECRET_KEK"),
@@ -69,7 +77,7 @@ impl LocalKeyWrapping {
 
     /// A KEK supplied directly (tests, key material from elsewhere).
     pub fn with_kek(kek: [u8; KEY_LEN]) -> Self {
-        Self { kek }
+        Self { kek, durable: true }
     }
 
     /// A random in-memory KEK. Used when no KEK is configured: secrets cannot
@@ -78,7 +86,10 @@ impl LocalKeyWrapping {
     pub fn ephemeral() -> Self {
         let mut kek = [0u8; KEY_LEN];
         OsRng.fill_bytes(&mut kek);
-        Self { kek }
+        Self {
+            kek,
+            durable: false,
+        }
     }
 }
 
@@ -104,6 +115,10 @@ impl KeyWrapping for LocalKeyWrapping {
         cipher
             .decrypt(Nonce::from_slice(nonce), ct)
             .map_err(|_| anyhow!("DEK unwrap failed"))
+    }
+
+    fn is_durable(&self) -> bool {
+        self.durable
     }
 }
 

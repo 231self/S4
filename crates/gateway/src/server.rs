@@ -24,7 +24,7 @@ use axum::{
     routing::{delete, get, head, post, put},
 };
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use rand::{RngCore, rngs::OsRng};
@@ -33,6 +33,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
+use uuid::Uuid;
 
 use crate::backend::{BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation};
 use crate::control::{ControlPlane, RequestKind, StreamingWriteMode};
@@ -41,6 +42,12 @@ use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::managed::{
     InMemoryManagedRepository, LogicalObjectKey, ManagedRepository, ManagedStreamingMode,
     PLACEMENT_VERSION_V1, PostgresManagedRepository, validate_mode,
+};
+use crate::multipart_staging::{
+    ARTIFACT_PREFIX, CleanupAudit, EncryptedPartWriter, MAX_ACTIVE_UPLOADS, MultipartIdentity,
+    MultipartLifecycle, MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
+    PostgresMultipartRepository, S3StagingArtifactStore, StagedArtifact, StagingArtifactStore,
+    StagingError, StagingQuotaLimits, now_ms,
 };
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, strip_hop_by_hop_headers,
@@ -93,13 +100,23 @@ pub struct AppState {
     pub transformed_read_spool_enabled: bool,
     pub dev_memory_max_object_bytes: usize,
     pub dev_memory_streaming_enabled: bool,
+    multipart_staging: Option<Arc<MultipartStaging>>,
+    multipart_mode: MultipartMode,
     continuation_token_key: [u8; 32],
 }
 
 pub struct Auth {
     user_id: String,
+    credential_policy_id: String,
     public_key_pem: Option<String>,
     stable_key: Option<Vec<u8>>,
+}
+
+struct MultipartStaging {
+    repository: Arc<dyn MultipartRepository>,
+    artifacts: Arc<dyn StagingArtifactStore>,
+    directory: PathBuf,
+    wrapping: Arc<dyn KeyWrapping>,
 }
 
 const LEGACY_MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
@@ -169,6 +186,24 @@ fn streaming_write_mode() -> StreamingWriteMode {
         Ok(value) => {
             warn!("invalid S4_STREAMING_WRITE_MODE={value:?}; using off");
             StreamingWriteMode::Off
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MultipartMode {
+    #[default]
+    Reject,
+    Staged,
+}
+
+fn multipart_mode() -> MultipartMode {
+    match std::env::var("S4_MULTIPART_MODE").as_deref() {
+        Ok("staged") => MultipartMode::Staged,
+        Ok("reject") | Err(_) => MultipartMode::Reject,
+        Ok(value) => {
+            warn!("invalid S4_MULTIPART_MODE={value:?}; using reject");
+            MultipartMode::Reject
         }
     }
 }
@@ -335,6 +370,10 @@ struct S3Query {
     upload_id: Option<String>,
     #[serde(rename = "partNumber")]
     part_number: Option<u32>,
+    #[serde(rename = "part-number-marker")]
+    part_number_marker: Option<u32>,
+    #[serde(rename = "max-parts")]
+    max_parts: Option<u32>,
     #[serde(rename = "list-type")]
     list_type: Option<String>,
     prefix: Option<String>,
@@ -987,6 +1026,7 @@ async fn authenticate_headers(
         if state.auth_disabled {
             return Ok(HeaderAuthentication::without_body(Auth {
                 user_id: "demo-user".to_string(),
+                credential_policy_id: "local-demo".to_string(),
                 public_key_pem: None,
                 stable_key: None,
             }));
@@ -1016,6 +1056,7 @@ async fn authenticate_headers(
         return Ok(HeaderAuthentication {
             auth: Auth {
                 user_id: key.user_id.clone(),
+                credential_policy_id: key.key_id.clone(),
                 public_key_pem: key.public_key_pem.clone(),
                 stable_key: Some(derive_stable_key(&secret)),
             },
@@ -1032,6 +1073,7 @@ async fn authenticate_headers(
                 if let Some(user_id) = keys.resolve_mcp_token(token).await {
                     return Ok(HeaderAuthentication::without_body(Auth {
                         user_id,
+                        credential_policy_id: format!("mcp:{}", sha256_hash(token)),
                         public_key_pem: None,
                         stable_key: None,
                     }));
@@ -1046,6 +1088,7 @@ async fn authenticate_headers(
                     .ok_or(HeaderAuthError::Denied)?;
                 return Ok(HeaderAuthentication::without_body(Auth {
                     user_id,
+                    credential_policy_id: ak.to_string(),
                     public_key_pem,
                     stable_key: Some(derive_stable_key(sk)),
                 }));
@@ -1056,6 +1099,7 @@ async fn authenticate_headers(
                 if uid != "demo-user" {
                     return Ok(HeaderAuthentication::without_body(Auth {
                         user_id: uid,
+                        credential_policy_id: "jwt".to_string(),
                         public_key_pem: None,
                         stable_key: None,
                     }));
@@ -1072,6 +1116,7 @@ async fn authenticate_headers(
         {
             return Ok(HeaderAuthentication::without_body(Auth {
                 user_id,
+                credential_policy_id: format!("mcp:{}", sha256_hash(tok)),
                 public_key_pem: None,
                 stable_key: None,
             }));
@@ -1089,6 +1134,7 @@ async fn authenticate_headers(
     if let Some((user_id, public_key_pem)) = keys.resolve_credentials(ak, sk).await {
         return Ok(HeaderAuthentication::without_body(Auth {
             user_id,
+            credential_policy_id: ak.to_string(),
             public_key_pem,
             stable_key: Some(derive_stable_key(sk)),
         }));
@@ -1100,6 +1146,7 @@ async fn authenticate_headers(
     if state.auth_disabled {
         return Ok(HeaderAuthentication::without_body(Auth {
             user_id: "demo-user".to_string(),
+            credential_policy_id: "local-demo".to_string(),
             public_key_pem: None,
             stable_key: None,
         }));
@@ -2135,45 +2182,446 @@ async fn read_verified_body(
     Ok((authentication.auth, decoded.freeze()))
 }
 
+fn multipart_identity(auth: &Auth, bucket: &str, key: &str, upload_id: &str) -> MultipartIdentity {
+    MultipartIdentity {
+        tenant_id: auth.user_id.clone(),
+        credential_policy_id: auth.credential_policy_id.clone(),
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id: upload_id.to_string(),
+    }
+}
+
+fn staged_multipart(state: &AppState) -> Option<&Arc<MultipartStaging>> {
+    (state.streaming_write_mode == StreamingWriteMode::All
+        && state.multipart_mode == MultipartMode::Staged)
+        .then_some(state.multipart_staging.as_ref())
+        .flatten()
+}
+
+fn multipart_snapshot(
+    headers: &HeaderMap,
+    backend: &ResolvedBackend,
+    plugins: &PluginRegistry,
+    max_bytes: u64,
+) -> MultipartSnapshot {
+    let mut metadata: std::collections::BTreeMap<String, String> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            name.as_str()
+                .strip_prefix("x-amz-meta-")
+                .zip(value.to_str().ok())
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+        })
+        .collect();
+    for name in [header::CONTENT_TYPE, header::CONTENT_ENCODING] {
+        if let Some(value) = headers.get(&name).and_then(|value| value.to_str().ok()) {
+            metadata.insert(name.to_string(), value.to_string());
+        }
+    }
+    let tags = headers
+        .get("x-amz-tagging")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split('&')
+                .filter_map(|pair| {
+                    pair.split_once('=')
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let destination = match backend {
+        ResolvedBackend::S3 { .. } => serde_json::json!({"kind":"s3"}),
+        ResolvedBackend::Managed(_) => serde_json::json!({"kind":"managed"}),
+        ResolvedBackend::Memory(_) => serde_json::json!({"kind":"memory"}),
+        ResolvedBackend::PresignedHttp(_) => serde_json::json!({"kind":"presigned-http"}),
+    };
+    MultipartSnapshot {
+        metadata,
+        tags,
+        checksum_mode: headers
+            .get("x-amz-checksum-algorithm")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
+        destination,
+        plugin_snapshot: serde_json::to_value(plugins.list())
+            .unwrap_or_else(|_| serde_json::json!([])),
+        max_staged_bytes: max_bytes,
+    }
+}
+
+fn staged_part_reservation(headers: &HeaderMap) -> Result<u64, StagingError> {
+    // SigV4 streaming carries the decoded length separately; reserving the
+    // HTTP framing length would under/over-account the persisted plaintext.
+    headers
+        .get("x-amz-decoded-content-length")
+        .or_else(|| headers.get(header::CONTENT_LENGTH))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .ok_or(StagingError::InvalidPart)
+}
+
+fn create_multipart_xml(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(upload_id)
+    )
+}
+
+fn list_parts_xml(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[MultipartPart],
+    truncated: bool,
+) -> String {
+    let part_xml: String = parts.iter().map(|part| format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag><Size>{}</Size><ChecksumSHA256>{}</ChecksumSHA256></Part>", part.part_number, xml_escape(&part.etag), part.size_bytes, part.checksum_sha256)).collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><IsTruncated>{}</IsTruncated>{part_xml}</ListPartsResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(upload_id),
+        truncated
+    )
+}
+
+async fn cleanup_staged_parts(
+    staging: &MultipartStaging,
+    upload_id: &str,
+    parts: Vec<MultipartPart>,
+    kind: &str,
+) {
+    for part in parts {
+        let result = staging.artifacts.delete(&part.artifact_key).await;
+        let detail = match result {
+            Ok(()) => match staging
+                .repository
+                .confirm_artifact_deleted(&part.artifact_key)
+                .await
+            {
+                Ok(()) => {
+                    serde_json::json!({"part_number":part.part_number,"attempt":part.attempt})
+                }
+                Err(error) => {
+                    serde_json::json!({"part_number":part.part_number,"attempt":part.attempt,"error":error.to_string()})
+                }
+            },
+            Err(error) => {
+                serde_json::json!({"part_number":part.part_number,"attempt":part.attempt,"error":error.to_string()})
+            }
+        };
+        if let Err(error) = staging
+            .repository
+            .audit(CleanupAudit {
+                id: Uuid::now_v7(),
+                upload_id: upload_id.to_string(),
+                kind: kind.to_string(),
+                detail,
+                created_at_ms: now_ms(),
+            })
+            .await
+        {
+            warn!("multipart cleanup audit failed: {error}");
+        }
+    }
+}
+
+async fn reconcile_staged_artifacts(staging: &MultipartStaging) -> Result<(), StagingError> {
+    for candidate in staging.repository.cleanup_candidates(now_ms(), 256).await? {
+        if staging
+            .artifacts
+            .delete(&candidate.artifact_key)
+            .await
+            .is_ok()
+        {
+            staging
+                .repository
+                .confirm_artifact_deleted(&candidate.artifact_key)
+                .await?;
+            staging
+                .repository
+                .audit(CleanupAudit {
+                    id: Uuid::now_v7(),
+                    upload_id: candidate.upload_id,
+                    kind: "reconcile_attempt".to_string(),
+                    detail: serde_json::json!({"artifact_key": candidate.artifact_key}),
+                    created_at_ms: now_ms(),
+                })
+                .await?;
+        }
+    }
+    let known = staging.repository.known_artifact_keys().await?;
+    let cutoff = now_ms() - crate::multipart_staging::RECONCILIATION_GRACE.as_millis() as i64;
+    for StagedArtifact {
+        key,
+        modified_at_ms,
+    } in staging.artifacts.list(ARTIFACT_PREFIX).await?
+    {
+        // An object is never written before its PENDING record commits. The
+        // grace period avoids deleting an in-flight S3 PUT during a scan.
+        if !known.contains_key(&key) && modified_at_ms <= cutoff {
+            let _ = staging.artifacts.delete(&key).await;
+        }
+    }
+    Ok(())
+}
+
+async fn s3_upload_part(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    params: S3Query,
+    request: Request,
+) -> axum::response::Response {
+    let (parts, mut body) = request.into_parts();
+    let (Some(part_number), Some(upload_id)) = (params.part_number, params.upload_id) else {
+        return s3_error::invalid_request(&key, "partNumber and uploadId are required");
+    };
+    let mut authentication = match authenticate_headers(
+        parts.method.as_str(),
+        &parts.uri,
+        &parts.headers,
+        &state.keys,
+        &state,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(HeaderAuthError::InvalidPayload(error)) => {
+            return s3_error::invalid_request(&key, &error.to_string());
+        }
+        Err(HeaderAuthError::Denied) => return s3_error::signature_mismatch(&key),
+    };
+    if let Some(reason) = state
+        .control
+        .authorize(&authentication.auth.user_id, RequestKind::Write)
+        .await
+    {
+        return s3_error::payment_required(&key, reason.message);
+    }
+    if state
+        .control
+        .streaming_write_mode(&authentication.auth.user_id)
+        .await
+        .unwrap_or(state.streaming_write_mode)
+        < StreamingWriteMode::All
+    {
+        return s3_error::multipart_not_supported(&key);
+    }
+    let Some(staging) = staged_multipart(&state).cloned() else {
+        return s3_error::multipart_not_supported(&key);
+    };
+    if resolve_backend(
+        &state,
+        &authentication.auth.user_id,
+        &parts.headers,
+        StorageOperation::Multipart,
+    )
+    .await
+    .is_err()
+    {
+        return s3_error::internal_error(&key, "multipart backend resolution failed");
+    }
+    let identity = multipart_identity(&authentication.auth, &bucket, &key, &upload_id);
+    let upload = match staging.repository.get_authorized(&identity).await {
+        Ok(upload) => upload,
+        Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+        Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+    };
+    if upload.lifecycle != MultipartLifecycle::Open || upload.expires_at_ms <= now_ms() {
+        return s3_error::no_such_upload(&key);
+    }
+    let reserved_bytes = match staged_part_reservation(&parts.headers) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return s3_error::invalid_request(
+                &key,
+                "multipart parts require a positive decoded Content-Length",
+            );
+        }
+    };
+    // This is the durable quota/CAS point. It must occur before consuming a
+    // body frame, opening a temp file, or creating an object-store artifact.
+    let pending = match staging
+        .repository
+        .begin_part(&identity, part_number, reserved_bytes, now_ms())
+        .await
+    {
+        Ok(pending) => pending,
+        Err(StagingError::QuotaExceeded) => return s3_error::slow_down(&key),
+        Err(StagingError::NotFound | StagingError::NotOpen) => {
+            return s3_error::no_such_upload(&key);
+        }
+        Err(StagingError::InvalidPart) => {
+            return s3_error::invalid_request(&key, "invalid multipart part");
+        }
+        Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+    };
+    let mut writer = match EncryptedPartWriter::begin(
+        &staging.directory,
+        &identity,
+        part_number,
+        pending.attempt,
+        &upload.snapshot,
+        pending.reserved_bytes,
+        staging.wrapping.clone(),
+    )
+    .await
+    {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = staging
+                .repository
+                .discard_pending(&identity, &pending)
+                .await;
+            return s3_error::internal_error(&key, &error.to_string());
+        }
+    };
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(_) => {
+                let _ = staging
+                    .repository
+                    .discard_pending(&identity, &pending)
+                    .await;
+                return s3_error::invalid_request(&key, "request body transport failed");
+            }
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.len() > state.source_body_limits.max_frame_bytes {
+            let _ = staging
+                .repository
+                .discard_pending(&identity, &pending)
+                .await;
+            return s3_error::invalid_request(
+                &key,
+                "multipart body frame exceeds configured limit",
+            );
+        }
+        let decoded = match &mut authentication.body_verifier {
+            Some(verifier) => match verifier.push(&data) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    let _ = staging
+                        .repository
+                        .discard_pending(&identity, &pending)
+                        .await;
+                    return s3_error::bad_digest(&key, &error.to_string());
+                }
+            },
+            None => vec![data],
+        };
+        for chunk in decoded {
+            if let Err(error) = writer.write(chunk).await {
+                let _ = staging
+                    .repository
+                    .discard_pending(&identity, &pending)
+                    .await;
+                return s3_error::internal_error(&key, &error.to_string());
+            }
+        }
+    }
+    if let Some(verifier) = authentication.body_verifier.take()
+        && let Err(error) = verifier.finish()
+    {
+        let _ = staging
+            .repository
+            .discard_pending(&identity, &pending)
+            .await;
+        return s3_error::bad_digest(&key, &error.to_string());
+    }
+    let finished = match writer.finish().await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = staging
+                .repository
+                .discard_pending(&identity, &pending)
+                .await;
+            return s3_error::internal_error(&key, &error.to_string());
+        }
+    };
+    if let Some(expected) = parts
+        .headers
+        .get("content-md5")
+        .and_then(|value| value.to_str().ok())
+    {
+        let actual = hex::decode(finished.etag.trim_matches('"')).unwrap_or_default();
+        if B64.decode(expected).ok().as_deref() != Some(actual.as_slice()) {
+            finished.remove().await;
+            let _ = staging
+                .repository
+                .discard_pending(&identity, &pending)
+                .await;
+            return s3_error::bad_digest(&key, "Content-MD5 does not match the uploaded part");
+        }
+    }
+    if let Err(error) = staging
+        .artifacts
+        .put_file(&pending.artifact_key, &finished.path)
+        .await
+    {
+        finished.remove().await;
+        return s3_error::internal_error(&key, &error.to_string());
+    }
+    finished.remove().await;
+    let part = MultipartPart {
+        upload_id: upload_id.clone(),
+        part_number,
+        attempt: pending.attempt,
+        artifact_key: pending.artifact_key.clone(),
+        etag: finished.etag,
+        checksum_sha256: finished.checksum_sha256,
+        size_bytes: finished.size_bytes,
+        created_at_ms: now_ms(),
+    };
+    match staging
+        .repository
+        .commit_part(&identity, &pending, part)
+        .await
+    {
+        Ok(previous) => {
+            if !previous.is_empty() {
+                cleanup_staged_parts(&staging, &upload_id, previous, "part_replaced").await;
+            }
+            let mut response = axum::response::Response::builder().status(StatusCode::OK);
+            response = response.header(
+                header::ETAG,
+                staging
+                    .repository
+                    .list_parts(&identity, part_number.saturating_sub(1), 1)
+                    .await
+                    .ok()
+                    .and_then(|parts| parts.0.first().map(|part| part.etag.clone()))
+                    .unwrap_or_default(),
+            );
+            response.body(axum::body::Body::empty()).unwrap()
+        }
+        Err(error) => {
+            // The DB outcome can be unknown after a connection failure. Leave
+            // the PENDING outbox record and ciphertext for reconciliation.
+            s3_error::internal_error(&key, &error.to_string())
+        }
+    }
+}
+
 async fn s3_put(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<S3Query>,
     request: Request,
 ) -> impl IntoResponse {
-    let (parts, request_body) = request.into_parts();
     if params.part_number.is_some() || params.upload_id.is_some() {
-        let Some(auth) = authenticate(
-            parts.method.as_str(),
-            &parts.uri,
-            &parts.headers,
-            &[],
-            &state.keys,
-            &state,
-        )
-        .await
-        else {
-            return s3_error::access_denied(&key);
-        };
-        if let Some(reason) = state
-            .control
-            .authorize(&auth.user_id, RequestKind::Write)
-            .await
-        {
-            return s3_error::payment_required(&key, reason.message);
-        }
-        if let Err(error) = resolve_backend(
-            &state,
-            &auth.user_id,
-            &parts.headers,
-            StorageOperation::Multipart,
-        )
-        .await
-        {
-            return s3_error::internal_error(&key, &error);
-        }
-        return s3_error::multipart_not_supported(&key);
+        return s3_upload_part(state, bucket, key, params, request).await;
     }
+    let (parts, request_body) = request.into_parts();
     let max_bytes = effective_legacy_max_object_bytes(&state);
     let header_auth = match authenticate_headers(
         parts.method.as_str(),
@@ -2878,12 +3326,37 @@ async fn s3_get(
         return s3_error::transformed_read_not_supported(&key);
     }
     if params.upload_id.is_some() {
-        if let Err(error) =
-            resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Multipart).await
+        if resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Multipart)
+            .await
+            .is_err()
         {
-            return s3_error::internal_error(&key, &error);
+            return s3_error::internal_error(&key, "multipart backend resolution failed");
         }
-        return s3_error::multipart_not_supported(&key);
+        let Some(staging) = staged_multipart(&state).cloned() else {
+            return s3_error::multipart_not_supported(&key);
+        };
+        let identity = multipart_identity(
+            &auth,
+            &bucket,
+            &key,
+            params.upload_id.as_deref().unwrap_or_default(),
+        );
+        let limit = params.max_parts.unwrap_or(1000).clamp(1, 1000) as usize;
+        return match staging
+            .repository
+            .list_parts(&identity, params.part_number_marker.unwrap_or(0), limit)
+            .await
+        {
+            Ok((parts, truncated)) => s3_xml_ok(list_parts_xml(
+                &bucket,
+                &key,
+                &identity.upload_id,
+                &parts,
+                truncated,
+            )),
+            Err(StagingError::NotFound) => s3_error::no_such_upload(&key),
+            Err(error) => s3_error::internal_error(&key, &error.to_string()),
+        };
     }
     let backend =
         match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Get).await {
@@ -3366,12 +3839,26 @@ async fn s3_delete(
     info!("DELETE /{bucket}/{key} user={}", auth.user_id);
 
     if params.upload_id.is_some() {
-        if let Err(error) =
-            resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Multipart).await
+        if resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Multipart)
+            .await
+            .is_err()
         {
-            return s3_error::internal_error(&key, &error);
+            return s3_error::internal_error(&key, "multipart backend resolution failed");
         }
-        return s3_error::multipart_not_supported(&key);
+        let Some(staging) = staged_multipart(&state).cloned() else {
+            return s3_error::multipart_not_supported(&key);
+        };
+        let upload_id = params.upload_id.as_deref().unwrap_or_default();
+        let identity = multipart_identity(&auth, &bucket, &key, upload_id);
+        return match staging.repository.abort(&identity, now_ms()).await {
+            Ok(parts) => {
+                cleanup_staged_parts(&staging, upload_id, parts, "abort").await;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(StagingError::NotFound) => s3_error::no_such_upload(&key),
+            Err(StagingError::NotOpen) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => s3_error::internal_error(&key, &error.to_string()),
+        };
     }
 
     let backend =
@@ -3478,8 +3965,8 @@ async fn s3_post(
     }
     info!("POST /{bucket}/{key} user={}", auth.user_id);
 
-    if params.uploads.is_some() || params.upload_id.is_some() {
-        if let Err(error) = resolve_backend(
+    if params.uploads.is_some() {
+        let backend = match resolve_backend(
             &state,
             &auth.user_id,
             &parts.headers,
@@ -3487,8 +3974,48 @@ async fn s3_post(
         )
         .await
         {
-            return s3_error::internal_error(&key, &error);
+            Ok(backend) => backend,
+            Err(error) => return s3_error::internal_error(&key, &error),
+        };
+        let Some(staging) = staged_multipart(&state).cloned() else {
+            return s3_error::multipart_not_supported(&key);
+        };
+        if state
+            .control
+            .streaming_write_mode(&auth.user_id)
+            .await
+            .unwrap_or(state.streaming_write_mode)
+            < StreamingWriteMode::All
+        {
+            return s3_error::multipart_not_supported(&key);
         }
+        let upload_id = Uuid::now_v7().to_string();
+        let now = now_ms();
+        let upload = MultipartUpload {
+            identity: multipart_identity(&auth, &bucket, &key, &upload_id),
+            snapshot: multipart_snapshot(
+                &parts.headers,
+                &backend,
+                &state.plugins,
+                state.source_body_limits.max_bytes,
+            ),
+            lifecycle: MultipartLifecycle::Open,
+            staged_bytes: 0,
+            reserved_bytes: 0,
+            created_at_ms: now,
+            expires_at_ms: now + 24 * 60 * 60 * 1000,
+            updated_at_ms: now,
+            tombstone_until_ms: None,
+        };
+        return match staging.repository.create(upload).await {
+            Ok(()) => s3_xml_ok(create_multipart_xml(&bucket, &key, &upload_id)),
+            Err(StagingError::QuotaExceeded) => s3_error::slow_down(&key),
+            Err(error) => s3_error::internal_error(&key, &error.to_string()),
+        };
+    }
+    if params.upload_id.is_some() {
+        // Completion is deliberately not implemented until Phase 11 has a
+        // fenced lease and an ordered one-pass transform.
         return s3_error::multipart_not_supported(&key);
     }
     s3_error::not_implemented(&key)
@@ -4485,7 +5012,7 @@ pub async fn build_state(
     // Envelope encryption for API key secrets (needed to verify SigV4).
     // The wrapping backend is injected by the caller so the engine stays
     // policy-free: OSS uses `default_wrapping()`, SaaS injects KMS/Vault.
-    let cipher = Arc::new(SecretCipher::new(wrapping));
+    let cipher = Arc::new(SecretCipher::new(wrapping.clone()));
 
     let s3_client = match &s3_endpoint {
         Some(endpoint) => {
@@ -4557,6 +5084,29 @@ pub async fn build_state(
             .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
             .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
     };
+    let multipart_mode = multipart_mode();
+    let multipart_tenant_quota_bytes = std::env::var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            source_body_limits
+                .max_bytes
+                .saturating_mul(MAX_ACTIVE_UPLOADS as u64)
+        });
+    let multipart_global_quota_bytes = std::env::var("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| multipart_tenant_quota_bytes.saturating_mul(4));
+    let multipart_quotas = (multipart_mode == MultipartMode::Staged)
+        .then(|| {
+            StagingQuotaLimits::new(multipart_tenant_quota_bytes, multipart_global_quota_bytes)
+                .map_err(|_| {
+                    anyhow::anyhow!("invalid multipart staging tenant/global quota configuration")
+                })
+        })
+        .transpose()?;
     let streaming_write_mode = streaming_write_mode();
     let s3_streaming_capabilities = configured_s3_streaming_capabilities();
     let managed_streaming_capabilities = configured_managed_streaming_capabilities();
@@ -4631,11 +5181,80 @@ pub async fn build_state(
         info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
         Arc::new(KeyStore::with_cipher(cipher))
     };
-    let managed_repository: Arc<dyn ManagedRepository> = if let Some(pool) = postgres_pool {
+    let managed_repository: Arc<dyn ManagedRepository> = if let Some(pool) = postgres_pool.clone() {
         Arc::new(PostgresManagedRepository::new(pool))
     } else {
         Arc::new(InMemoryManagedRepository::new())
     };
+    let multipart_staging = if multipart_mode == MultipartMode::Staged && wrapping.is_durable() {
+        if let Some(pool) = postgres_pool.clone() {
+            let endpoint = std::env::var("S4_MULTIPART_STAGING_ENDPOINT").ok();
+            let bucket = std::env::var("S4_MULTIPART_STAGING_BUCKET").ok();
+            let access_key = std::env::var("S4_MULTIPART_STAGING_ACCESS_KEY_ID").ok();
+            let secret_key = std::env::var("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY").ok();
+            match (endpoint, bucket, access_key, secret_key) {
+                (Some(endpoint), Some(bucket), Some(access_key), Some(secret_key)) => {
+                    let region = std::env::var("S4_MULTIPART_STAGING_REGION")
+                        .unwrap_or_else(|_| "us-east-1".to_string());
+                    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                        .region(Region::new(region))
+                        .endpoint_url(endpoint)
+                        .credentials_provider(Credentials::new(
+                            access_key,
+                            secret_key,
+                            None,
+                            None,
+                            "multipart-staging",
+                        ))
+                        .load()
+                        .await;
+                    Some(Arc::new(MultipartStaging {
+                        repository: Arc::new(PostgresMultipartRepository::with_quotas(
+                            pool,
+                            multipart_quotas.expect("staged multipart has validated quotas"),
+                        )),
+                        artifacts: Arc::new(S3StagingArtifactStore::new(
+                            Client::new(&config),
+                            bucket,
+                        )),
+                        directory: std::env::var("S4_MULTIPART_STAGING_DIR")
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|_| spool_config.directory.join("multipart")),
+                        wrapping: wrapping.clone(),
+                    }))
+                }
+                _ => {
+                    warn!(
+                        "staged multipart requested without a complete S4-controlled staging backend; transformed multipart remains rejected"
+                    );
+                    None
+                }
+            }
+        } else {
+            warn!(
+                "staged multipart requested without DATABASE_URL; transformed multipart remains rejected"
+            );
+            None
+        }
+    } else if multipart_mode == MultipartMode::Staged {
+        warn!(
+            "staged multipart requested with ephemeral key wrapping; transformed multipart remains rejected"
+        );
+        None
+    } else {
+        None
+    };
+    if let Some(staging) = &multipart_staging {
+        let removed = EncryptedPartWriter::cleanup_stale(
+            &staging.directory,
+            Duration::from_secs(24 * 60 * 60),
+        )
+        .await?;
+        if removed > 0 {
+            info!(removed, "removed orphaned encrypted multipart spool files");
+        }
+        reconcile_staged_artifacts(staging).await?;
+    }
     validate_mode(
         managed_mode,
         managed_repository.as_ref(),
@@ -4701,6 +5320,8 @@ pub async fn build_state(
         transformed_read_spool_enabled: transformed_read_spool_enabled(),
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
+        multipart_staging,
+        multipart_mode,
         continuation_token_key,
     });
     if managed_mode != ManagedStreamingMode::Off
@@ -4720,6 +5341,33 @@ pub async fn build_state(
                     warn!("managed repair worker failed: {error}");
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+    }
+    if let Some(staging) = state.multipart_staging.clone() {
+        tokio::spawn(async move {
+            loop {
+                match staging.repository.reap_expired(now_ms(), 64).await {
+                    Ok(parts) if !parts.is_empty() => {
+                        let upload_ids: HashSet<_> =
+                            parts.iter().map(|part| part.upload_id.clone()).collect();
+                        for upload_id in upload_ids {
+                            let selected: Vec<_> = parts
+                                .iter()
+                                .filter(|part| part.upload_id == upload_id)
+                                .cloned()
+                                .collect();
+                            cleanup_staged_parts(&staging, &upload_id, selected, "expiry_reap")
+                                .await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!("multipart expiry reconciliation failed: {error}"),
+                }
+                if let Err(error) = reconcile_staged_artifacts(&staging).await {
+                    warn!("multipart artifact reconciliation failed: {error}");
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
     }

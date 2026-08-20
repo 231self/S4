@@ -184,6 +184,54 @@ impl OperationJournal for PostgresOperationJournal {
         Ok(())
     }
 
+    async fn set_expected(
+        &self,
+        operation_id: Uuid,
+        expected: &ExpectedObject,
+    ) -> Result<(), JournalError> {
+        let expected_size = expected
+            .size
+            .map(|size| {
+                i64::try_from(size).map_err(|_| {
+                    JournalError::Conflict("expected object size exceeds BIGINT".to_string())
+                })
+            })
+            .transpose()?;
+        let metadata = serde_json::to_value(&expected.metadata)
+            .map_err(|error| JournalError::Corrupt(error.to_string()))?;
+        let result = object_operation::Entity::update_many()
+            .col_expr(
+                object_operation::Column::ExpectedDigest,
+                Expr::value(expected.digest.clone()),
+            )
+            .col_expr(
+                object_operation::Column::ExpectedSize,
+                Expr::value(expected_size),
+            )
+            .col_expr(
+                object_operation::Column::ExpectedMetadata,
+                Expr::value(metadata),
+            )
+            .col_expr(
+                object_operation::Column::UpdatedAtMs,
+                Expr::value(unix_time_ms()),
+            )
+            .filter(object_operation::Column::Id.eq(operation_id))
+            .filter(object_operation::Column::State.is_in([
+                OperationState::Intent.as_str(),
+                OperationState::Open.as_str(),
+            ]))
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected != 1 {
+            return Err(JournalError::Conflict(format!(
+                "operation {operation_id} cannot update expected output"
+            )));
+        }
+        Ok(())
+    }
+
     async fn transition(
         &self,
         operation_id: Uuid,
@@ -434,6 +482,30 @@ impl OperationJournal for InMemoryOperationJournal {
         }
         operation.state = OperationState::Open;
         operation.upload_id = upload_id.map(ToOwned::to_owned);
+        operation.updated_at_ms = unix_time_ms();
+        Ok(())
+    }
+
+    async fn set_expected(
+        &self,
+        operation_id: Uuid,
+        expected: &ExpectedObject,
+    ) -> Result<(), JournalError> {
+        let mut state = self.state.lock().await;
+        let operation = state
+            .operations
+            .get_mut(&operation_id)
+            .ok_or(JournalError::NotFound(operation_id))?;
+        if !matches!(
+            operation.state,
+            OperationState::Intent | OperationState::Open
+        ) {
+            return Err(JournalError::Conflict(format!(
+                "operation {operation_id} cannot update expected output in {}",
+                operation.state
+            )));
+        }
+        operation.expected = expected.clone();
         operation.updated_at_ms = unix_time_ms();
         Ok(())
     }

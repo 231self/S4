@@ -6,6 +6,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::{Buf, Bytes, BytesMut};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::{
     AbortSignal, BackendCapabilities, BackendError, CompletionProbe, DIRECT_PART_BYTES,
@@ -31,6 +32,30 @@ impl AwsS3TransactionBackend {
     }
 }
 
+fn object_metadata(operation: &OperationRecord) -> std::collections::HashMap<String, String> {
+    operation
+        .expected
+        .metadata
+        .iter()
+        .filter(|(key, _)| key.as_str() != "content-type")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .chain([("s4-operation-id".to_string(), operation.id.to_string())])
+        .chain(
+            operation
+                .expected
+                .digest
+                .as_ref()
+                .map(|digest| ("s4-sha256".to_string(), digest.clone())),
+        )
+        .chain(
+            operation
+                .expected
+                .size
+                .map(|size| ("s4-size".to_string(), size.to_string())),
+        )
+        .collect()
+}
+
 fn ambiguous(error: impl std::fmt::Display) -> BackendError {
     BackendError::ambiguous(error.to_string())
 }
@@ -51,15 +76,8 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .put_object()
             .bucket(&operation.destination.bucket)
             .key(&operation.destination.physical_key)
-            .set_metadata(Some(
-                operation
-                    .expected
-                    .metadata
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .chain([("s4-operation-id".to_string(), operation.id.to_string())])
-                    .collect(),
-            ))
+            .set_content_type(operation.expected.metadata.get("content-type").cloned())
+            .set_metadata(Some(object_metadata(operation)))
             .body(ByteStream::from(body))
             .send()
             .await
@@ -76,15 +94,8 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .create_multipart_upload()
             .bucket(&operation.destination.bucket)
             .key(&operation.destination.physical_key)
-            .set_metadata(Some(
-                operation
-                    .expected
-                    .metadata
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .chain([("s4-operation-id".to_string(), operation.id.to_string())])
-                    .collect(),
-            ))
+            .set_content_type(operation.expected.metadata.get("content-type").cloned())
+            .set_metadata(Some(object_metadata(operation)))
             .send()
             .await
             .map_err(ambiguous)?;
@@ -238,7 +249,13 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     .metadata()
                     .and_then(|metadata| metadata.get("s4-operation-id"))
                     .is_some_and(|id| id == &operation.id.to_string());
-                if matches_operation {
+                let matches_size = operation.expected.size.is_none_or(|expected| {
+                    output
+                        .content_length()
+                        .and_then(|size| u64::try_from(size).ok())
+                        == Some(expected)
+                });
+                if matches_operation && matches_size {
                     Ok(CompletionProbe::Committed(StoredObjectMeta {
                         etag: output.e_tag().map(ToOwned::to_owned),
                         version_id: output.version_id().map(ToOwned::to_owned),
@@ -268,6 +285,9 @@ pub struct DirectS3Sink {
     parts: Vec<UploadedPart>,
     max_attempts: usize,
     abort_signal: AbortSignal,
+    output_hasher: Sha256,
+    output_bytes: u64,
+    output_verified: bool,
     finished: bool,
 }
 
@@ -292,6 +312,9 @@ impl DirectS3Sink {
             parts: Vec::new(),
             max_attempts: max_attempts.max(1),
             abort_signal,
+            output_hasher: Sha256::new(),
+            output_bytes: 0,
+            output_verified: false,
             finished: false,
         })
     }
@@ -525,6 +548,12 @@ impl ObjectSinkTransaction for DirectS3Sink {
         if self.finished {
             return Err(TransactionError::Finished);
         }
+        self.output_bytes = self
+            .output_bytes
+            .checked_add(chunk.len() as u64)
+            .ok_or(TransactionError::OutputMismatch)?;
+        self.output_hasher.update(&chunk);
+        self.output_verified = false;
         while !chunk.is_empty() {
             let available = DIRECT_PART_BYTES - self.buffer.len();
             let copied = available.min(chunk.len());
@@ -542,9 +571,30 @@ impl ObjectSinkTransaction for DirectS3Sink {
         Ok(())
     }
 
+    async fn verify_output(
+        &mut self,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<(), TransactionError> {
+        let actual_digest = hex::encode(self.output_hasher.clone().finalize());
+        if self.output_bytes != expected_size || actual_digest != expected_sha256 {
+            return Err(TransactionError::OutputMismatch);
+        }
+        self.operation.expected.digest = Some(actual_digest);
+        self.operation.expected.size = Some(expected_size);
+        self.journal
+            .set_expected(self.operation.id, &self.operation.expected)
+            .await?;
+        self.output_verified = true;
+        Ok(())
+    }
+
     async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);
+        }
+        if !self.output_verified {
+            return Err(TransactionError::OutputMismatch);
         }
         let result = if self.upload_id.is_some() {
             self.complete_multipart().await
@@ -849,6 +899,13 @@ mod tests {
         (sink, receiver)
     }
 
+    async fn verify_buffered_output(sink: &mut DirectS3Sink) {
+        let digest = hex::encode(sink.output_hasher.clone().finalize());
+        sink.verify_output(sink.output_bytes, &digest)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn below_or_at_threshold_is_one_retryable_put() {
         for size in [0, DIRECT_PART_BYTES - 1, DIRECT_PART_BYTES] {
@@ -857,6 +914,7 @@ mod tests {
             backend.fail_next("put");
             let (mut sink, _) = sink(journal.clone(), backend.clone(), 2).await;
             sink.write(Bytes::from(vec![7; size])).await.unwrap();
+            verify_buffered_output(&mut sink).await;
             sink.complete().await.unwrap();
             let bodies = backend.bodies("put");
             assert_eq!(bodies.len(), 2);
@@ -883,6 +941,7 @@ mod tests {
         sink.write(Bytes::from(vec![9; DIRECT_PART_BYTES + 17]))
             .await
             .unwrap();
+        verify_buffered_output(&mut sink).await;
         sink.complete().await.unwrap();
         let first = backend.bodies("part-1");
         assert_eq!(first.len(), 2);
@@ -904,6 +963,7 @@ mod tests {
         sink.write(Bytes::from(vec![1; DIRECT_PART_BYTES + 1]))
             .await
             .unwrap();
+        verify_buffered_output(&mut sink).await;
         assert!(sink.complete().await.is_err());
         let operation_id = sink.operation_id();
         assert_eq!(

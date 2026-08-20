@@ -155,6 +155,10 @@ impl Gateway {
             records_processed: record_count,
         })
     }
+
+    pub fn pipeline_snapshot(&self) -> Option<plugin_registry::PipelineSnapshot> {
+        self.plugins.as_ref().map(|plugins| plugins.snapshot())
+    }
 }
 
 pub fn split_records(input: &[u8], format: Format) -> Result<Vec<Vec<u8>>, S4Error> {

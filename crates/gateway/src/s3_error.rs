@@ -127,6 +127,24 @@ pub fn invalid_request(key: &str, detail: &str) -> axum::response::Response {
     s3_error_xml("InvalidRequest", detail, key, StatusCode::BAD_REQUEST)
 }
 
+pub fn slow_down(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "SlowDown",
+        "Please reduce your request rate.",
+        key,
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+}
+
+pub fn service_unavailable(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml(
+        "ServiceUnavailable",
+        detail,
+        key,
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+}
+
 pub fn bucket_not_allowed(bucket: &str) -> axum::response::Response {
     s3_error_xml(
         "AccessDenied",

@@ -11,11 +11,12 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
-use s4_gateway::control::NoopControlPlane;
+use s4_gateway::control::{ControlPlane, NoopControlPlane, RequestKind, StreamingWriteMode};
 use s4_gateway::key_cipher::default_wrapping;
 use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
 use s4_gateway::sigv4::SigV4Policy;
 use s4_gateway::store::FileKeyStore;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -30,6 +31,53 @@ use tower::ServiceExt;
 struct PollTrackingBody {
     polls: Arc<AtomicUsize>,
     data: Option<Bytes>,
+}
+
+struct FrameSequenceBody {
+    frames: VecDeque<Result<Frame<Bytes>, std::io::Error>>,
+}
+
+impl FrameSequenceBody {
+    fn data(frames: impl IntoIterator<Item = Bytes>) -> Self {
+        Self {
+            frames: frames
+                .into_iter()
+                .map(|frame| Ok(Frame::data(frame)))
+                .collect(),
+        }
+    }
+}
+
+impl http_body::Body for FrameSequenceBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(self.frames.pop_front())
+    }
+}
+
+#[derive(Debug)]
+struct StreamingOffControl;
+
+#[async_trait::async_trait]
+impl ControlPlane for StreamingOffControl {
+    async fn authorize(
+        &self,
+        _user_id: &str,
+        _kind: RequestKind,
+    ) -> Option<s4_gateway::control::BlockReason> {
+        None
+    }
+
+    async fn record(&self, _user_id: &str, _kind: RequestKind, _bytes: u64) {}
+
+    async fn streaming_write_mode(&self, _user_id: &str) -> Option<StreamingWriteMode> {
+        Some(StreamingWriteMode::Off)
+    }
 }
 
 impl http_body::Body for PollTrackingBody {
@@ -61,6 +109,9 @@ async fn test_state() -> Arc<AppState> {
         std::env::remove_var("S4_SERVICE_BUCKETS");
         std::env::remove_var("S4_LEGACY_MAX_OBJECT_BYTES");
         std::env::remove_var("S4_STREAMING_READ_MODE");
+        std::env::remove_var("S4_STREAMING_WRITE_MODE");
+        std::env::remove_var("S4_STREAMING_S3_PROVIDER");
+        std::env::remove_var("S4_DEV_MEMORY_STREAMING");
         std::env::remove_var("S4_MULTIPART_MODE");
         // Load the built filter components so the full pipeline (including
         // stable-encrypt) is available for joinable-read tests.
@@ -169,6 +220,112 @@ async fn put_get_roundtrip_filters_pii() {
         !text.contains("a@b.com"),
         "raw email must not be stored: {text}"
     );
+}
+
+#[tokio::test]
+async fn streaming_put_is_frame_invariant_and_preserves_separators() {
+    let input = b"contact a@b.com now\r\nsecond line\n";
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.auth_disabled = true;
+    state_mut.dev_memory_streaming_enabled = true;
+    state_mut.streaming_write_mode = StreamingWriteMode::Single;
+    state_mut.source_body_limits.max_frame_bytes = input.len().max(1);
+    let app = build_router(state.clone());
+    for split in 0..=input.len() {
+        let key = format!("split-{split}.txt");
+        let body = Body::new(FrameSequenceBody::data([
+            Bytes::copy_from_slice(&input[..split]),
+            Bytes::copy_from_slice(&input[split..]),
+        ]));
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/stream/{key}"))
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(body)
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "split {split}");
+        let stored = state.store.get("stream", &key).expect("committed object");
+        assert_eq!(
+            stored.data,
+            Bytes::from_static(b"contact [REDACTED_EMAIL] now\r\nsecond line\n"),
+            "split {split}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn streaming_put_limit_failure_has_no_partial_visibility() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.auth_disabled = true;
+    state_mut.dev_memory_streaming_enabled = true;
+    state_mut.streaming_write_mode = StreamingWriteMode::Single;
+    state_mut.source_body_limits.max_frame_bytes = 4;
+    state_mut.source_body_limits.max_bytes = 7;
+    let app = build_router(state.clone());
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/stream/too-large.txt")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::new(FrameSequenceBody::data([
+            Bytes::from_static(b"1234"),
+            Bytes::from_static(b"5678"),
+        ])))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&response_body).contains("<Code>EntityTooLarge</Code>"));
+    assert!(state.store.get("stream", "too-large.txt").is_none());
+}
+
+#[tokio::test]
+async fn tenant_mode_can_only_lower_the_deployment_ceiling() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.auth_disabled = true;
+    state_mut.streaming_write_mode = StreamingWriteMode::All;
+    state_mut.legacy_max_object_bytes = 4;
+    state_mut.control = Arc::new(StreamingOffControl);
+    let app = build_router(state.clone());
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/stream/tenant-off.txt")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from("12345"))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(state.store.get("stream", "tenant-off.txt").is_none());
+}
+
+#[tokio::test]
+async fn unsupported_streaming_backend_is_rejected_without_polling_body() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_write_mode = StreamingWriteMode::Single;
+    let app = build_router(state);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/stream/unsupported.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not be read")),
+            }))
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -713,6 +870,54 @@ async fn sigv4_signed_request_accepted_and_rejected() {
         StatusCode::FORBIDDEN,
         "unknown key must fail"
     );
+}
+
+#[tokio::test]
+async fn streaming_sigv4_hash_is_checked_before_atomic_commit() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_write_mode = StreamingWriteMode::Single;
+    state_mut.dev_memory_streaming_enabled = true;
+    let (access_key, secret_key) = make_key(&state).await;
+    let app = build_router(state.clone());
+    let uri = "http://s4.local/stream/signed-stream.txt";
+    let input = b"contact a@b.com now\n";
+
+    let request = signed_request(&access_key, &secret_key, "PUT", uri, input);
+    let (mut parts, _) = request.into_parts();
+    parts
+        .headers
+        .insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+    let request = Request::from_parts(
+        parts,
+        Body::new(FrameSequenceBody::data([
+            Bytes::copy_from_slice(&input[..7]),
+            Bytes::copy_from_slice(&input[7..]),
+        ])),
+    );
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        state
+            .store
+            .get("stream", "signed-stream.txt")
+            .expect("committed object")
+            .data,
+        Bytes::from_static(b"contact [REDACTED_EMAIL] now\n")
+    );
+
+    let bad_uri = "http://s4.local/stream/tampered-stream.txt";
+    let request = signed_request(&access_key, &secret_key, "PUT", bad_uri, input);
+    let (mut parts, _) = request.into_parts();
+    parts
+        .headers
+        .insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+    let request = Request::from_parts(parts, Body::from("tampered body\n"));
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(state.store.get("stream", "tampered-stream.txt").is_none());
 }
 
 #[tokio::test]

@@ -111,6 +111,9 @@ async fn test_state() -> Arc<AppState> {
         std::env::remove_var("S4_STREAMING_READ_MODE");
         std::env::remove_var("S4_STREAMING_WRITE_MODE");
         std::env::remove_var("S4_STREAMING_S3_PROVIDER");
+        std::env::remove_var("S4_MANAGED_STREAMING_MODE");
+        std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
+        std::env::remove_var("S4_MANAGED_PLACEMENT_VERSION");
         std::env::remove_var("S4_DEV_MEMORY_STREAMING");
         std::env::remove_var("S4_MULTIPART_MODE");
         // Load the built filter components so the full pipeline (including

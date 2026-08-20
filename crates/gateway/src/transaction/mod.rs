@@ -396,6 +396,8 @@ pub enum TransactionError {
     OutputMismatch,
     #[error("transaction destination capacity or object limit exceeded")]
     CapacityExceeded,
+    #[error("managed authority publication failed: {0}")]
+    Publication(String),
 }
 
 #[async_trait]

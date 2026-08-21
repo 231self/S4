@@ -27,6 +27,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
+use md5::Md5;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
@@ -44,10 +45,12 @@ use crate::managed::{
     PLACEMENT_VERSION_V1, PostgresManagedRepository, validate_mode,
 };
 use crate::multipart_staging::{
-    ARTIFACT_PREFIX, CleanupAudit, EncryptedPartWriter, MAX_ACTIVE_UPLOADS, MultipartIdentity,
-    MultipartLifecycle, MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
-    PostgresMultipartRepository, S3StagingArtifactStore, StagedArtifact, StagingArtifactStore,
-    StagingError, StagingQuotaLimits, now_ms,
+    ARTIFACT_PREFIX, COMPLETION_LEASE, CleanupAudit, CompletePart, CompletionAcquire,
+    CompletionLease, EncryptedPartReader, EncryptedPartWriter, MAX_ACTIVE_UPLOADS,
+    MultipartCompletionResult, MultipartIdentity, MultipartLifecycle, MultipartPart,
+    MultipartRepository, MultipartSnapshot, MultipartUpload, PostgresMultipartRepository,
+    S3StagingArtifactStore, StagedArtifact, StagingArtifactStore, StagingError, StagingQuotaLimits,
+    completion_fingerprint, now_ms,
 };
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, strip_hop_by_hop_headers,
@@ -1788,6 +1791,12 @@ fn streaming_format(headers: &HeaderMap) -> Result<(Format, String), StreamingPu
         .ok_or_else(|| StreamingPutError::InvalidRequest("Content-Type is required".to_string()))?
         .to_str()
         .map_err(|_| StreamingPutError::InvalidRequest("invalid Content-Type".to_string()))?;
+    streaming_format_content_type(content_type)
+}
+
+fn streaming_format_content_type(
+    content_type: &str,
+) -> Result<(Format, String), StreamingPutError> {
     let media_type = content_type
         .split(';')
         .next()
@@ -2290,6 +2299,159 @@ fn list_parts_xml(
     )
 }
 
+const MAX_COMPLETE_XML_BYTES: usize = 1024 * 1024;
+const MAX_MULTIPART_COMPLETION_SECS: u64 = 240;
+
+fn complete_multipart_xml(bucket: &str, key: &str, result: &MultipartCompletionResult) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(result.etag.as_deref().unwrap_or_default()),
+    )
+}
+
+/// Strictly parses the small CompleteMultipartUpload grammar instead of using a
+/// general XML resolver. DTDs and entities are rejected before tokenization;
+/// S3's part ETags and SHA-256 checksums need no entity expansion.
+fn parse_complete_multipart_xml(body: &[u8]) -> Result<Vec<CompletePart>, String> {
+    if body.len() > MAX_COMPLETE_XML_BYTES {
+        return Err("CompleteMultipartUpload XML exceeds 1 MiB".to_string());
+    }
+    let input = std::str::from_utf8(body)
+        .map_err(|_| "CompleteMultipartUpload XML must be UTF-8".to_string())?;
+    if input.contains("<!") || input.contains('&') {
+        return Err("CompleteMultipartUpload XML entities and DTDs are prohibited".to_string());
+    }
+    let mut stack = Vec::<String>::new();
+    let mut parts = Vec::new();
+    let mut current_number = None;
+    let mut current_etag = None;
+    let mut current_checksum = None;
+    let mut cursor = 0;
+    let mut root_started = false;
+    let mut root_closed = false;
+    while cursor < input.len() {
+        let open = input[cursor..]
+            .find('<')
+            .map(|index| cursor + index)
+            .ok_or_else(|| "malformed CompleteMultipartUpload XML".to_string())?;
+        let text = input[cursor..open].trim();
+        if !text.is_empty() {
+            match stack.last().map(String::as_str) {
+                Some("PartNumber") => {
+                    if current_number.is_some() {
+                        return Err("duplicate PartNumber value".to_string());
+                    }
+                    current_number = Some(
+                        text.parse::<u32>()
+                            .ok()
+                            .filter(|number| *number > 0)
+                            .ok_or_else(|| "invalid PartNumber".to_string())?,
+                    );
+                }
+                Some("ETag") => {
+                    if current_etag.replace(text.to_string()).is_some() {
+                        return Err("duplicate ETag value".to_string());
+                    }
+                }
+                Some("ChecksumSHA256") => {
+                    if current_checksum.replace(text.to_string()).is_some() {
+                        return Err("duplicate ChecksumSHA256 value".to_string());
+                    }
+                }
+                _ => return Err("unexpected XML character data".to_string()),
+            }
+        }
+        let close = input[open..]
+            .find('>')
+            .map(|index| open + index)
+            .ok_or_else(|| "malformed CompleteMultipartUpload XML".to_string())?;
+        let raw = input[open + 1..close].trim();
+        cursor = close + 1;
+        if root_closed {
+            return Err("multiple CompleteMultipartUpload XML roots".to_string());
+        }
+        if raw.starts_with('?') && raw.ends_with('?') {
+            if !stack.is_empty() || !parts.is_empty() {
+                return Err("XML declaration is not at the beginning".to_string());
+            }
+            continue;
+        }
+        if let Some(raw) = raw.strip_prefix('/') {
+            let name = raw.trim().rsplit(':').next().unwrap_or_default();
+            if stack.last().map(String::as_str) != Some(name) {
+                return Err("mismatched CompleteMultipartUpload XML element".to_string());
+            }
+            stack.pop();
+            if name == "CompleteMultipartUpload" {
+                root_closed = true;
+            }
+            if name == "Part" {
+                let part_number = current_number
+                    .take()
+                    .ok_or_else(|| "Part is missing PartNumber".to_string())?;
+                let etag = current_etag
+                    .take()
+                    .filter(|etag| !etag.is_empty())
+                    .ok_or_else(|| "Part is missing ETag".to_string())?;
+                parts.push(CompletePart {
+                    part_number,
+                    etag,
+                    checksum_sha256: current_checksum.take(),
+                });
+            }
+            continue;
+        }
+        if raw.ends_with('/') {
+            return Err(
+                "self-closing CompleteMultipartUpload XML elements are not allowed".to_string(),
+            );
+        }
+        let name = raw
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or_default()
+            .rsplit(':')
+            .next()
+            .unwrap_or_default();
+        let allowed = match (stack.len(), name) {
+            (0, "CompleteMultipartUpload") if !root_started => true,
+            (1, "Part") if stack.last().map(String::as_str) == Some("CompleteMultipartUpload") => {
+                current_number = None;
+                current_etag = None;
+                current_checksum = None;
+                true
+            }
+            (2, "PartNumber" | "ETag" | "ChecksumSHA256")
+                if stack.last().map(String::as_str) == Some("Part") =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err("unexpected CompleteMultipartUpload XML element".to_string());
+        }
+        if name == "CompleteMultipartUpload" {
+            root_started = true;
+        }
+        stack.push(name.to_string());
+    }
+    if !root_started || !root_closed || !stack.is_empty() || parts.is_empty() {
+        return Err("malformed CompleteMultipartUpload XML".to_string());
+    }
+    if parts
+        .windows(2)
+        .any(|pair| pair[0].part_number >= pair[1].part_number)
+    {
+        return Err("parts must be sorted and nonduplicate".to_string());
+    }
+    Ok(parts)
+}
+
 async fn cleanup_staged_parts(
     staging: &MultipartStaging,
     upload_id: &str,
@@ -2329,6 +2491,298 @@ async fn cleanup_staged_parts(
             warn!("multipart cleanup audit failed: {error}");
         }
     }
+}
+
+#[derive(Debug)]
+enum MultipartCompletionError {
+    Staging(StagingError),
+    Streaming(StreamingPutError),
+    Invalid(String),
+}
+
+impl From<StagingError> for MultipartCompletionError {
+    fn from(error: StagingError) -> Self {
+        Self::Staging(error)
+    }
+}
+
+impl From<StreamingPutError> for MultipartCompletionError {
+    fn from(error: StreamingPutError) -> Self {
+        Self::Streaming(error)
+    }
+}
+
+impl From<s4_error::S4Error> for MultipartCompletionError {
+    fn from(error: s4_error::S4Error) -> Self {
+        Self::Streaming(error.into())
+    }
+}
+
+impl From<TransactionError> for MultipartCompletionError {
+    fn from(error: TransactionError) -> Self {
+        Self::Streaming(error.into())
+    }
+}
+
+async fn renew_and_fence_completion(
+    staging: &MultipartStaging,
+    identity: &MultipartIdentity,
+    lease: &CompletionLease,
+) -> Result<(), StagingError> {
+    let now = now_ms();
+    staging
+        .repository
+        .renew_completion(
+            identity,
+            lease.fencing_token,
+            now + COMPLETION_LEASE.as_millis() as i64,
+        )
+        .await?;
+    staging
+        .repository
+        .check_completion_lease(identity, lease.fencing_token, now_ms())
+        .await
+}
+
+async fn write_completed_record(
+    staging: &MultipartStaging,
+    identity: &MultipartIdentity,
+    lease: &CompletionLease,
+    sink: &mut Box<dyn ObjectSinkTransaction>,
+    record: crate::record::Record,
+    output_hasher: &mut sha2::Sha256,
+    output_bytes: &mut u64,
+) -> Result<(), MultipartCompletionError> {
+    use sha2::Digest as _;
+
+    for chunk in [record.payload, record.separator] {
+        if chunk.is_empty() {
+            continue;
+        }
+        renew_and_fence_completion(staging, identity, lease).await?;
+        *output_bytes = output_bytes
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| MultipartCompletionError::Invalid("output is too large".to_string()))?;
+        output_hasher.update(&chunk);
+        sink.write(chunk).await?;
+    }
+    Ok(())
+}
+
+async fn complete_staged_multipart(
+    state: &AppState,
+    staging: &MultipartStaging,
+    identity: &MultipartIdentity,
+    upload: &MultipartUpload,
+    lease: &CompletionLease,
+    auth: &Auth,
+    backend: ResolvedBackend,
+) -> Result<MultipartCompletionResult, MultipartCompletionError> {
+    use sha2::Digest as _;
+
+    let destination_kind = match &backend {
+        ResolvedBackend::S3 { .. } => "s3",
+        ResolvedBackend::Managed(_) => "managed",
+        ResolvedBackend::Memory(_) => "memory",
+        ResolvedBackend::PresignedHttp(_) => "presigned-http",
+    };
+    if upload
+        .snapshot
+        .destination
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        != Some(destination_kind)
+    {
+        return Err(MultipartCompletionError::Invalid(
+            "multipart destination changed since initiation".to_string(),
+        ));
+    }
+    // The Phase 10 snapshot records the ordered plugin identities. Until
+    // component snapshots are independently persisted, reject a changed
+    // registry rather than silently transforming with a different policy.
+    if serde_json::to_value(state.plugins.list()).ok()
+        != Some(upload.snapshot.plugin_snapshot.clone())
+    {
+        return Err(MultipartCompletionError::Invalid(
+            "multipart plugin snapshot is no longer available".to_string(),
+        ));
+    }
+    let content_type = upload
+        .snapshot
+        .metadata
+        .get("content-type")
+        .ok_or_else(|| {
+            MultipartCompletionError::Invalid("multipart Content-Type is missing".to_string())
+        })?;
+    let (format, content_type) = streaming_format_content_type(content_type)?;
+    renew_and_fence_completion(staging, identity, lease).await?;
+    let mut sink = begin_streaming_sink(
+        state,
+        backend,
+        &auth.user_id,
+        &identity.bucket,
+        &identity.key,
+        &content_type,
+    )
+    .await?;
+    let cancellation = s4_wasm_runtime::CancellationToken::new();
+    let session = s4_wasm_runtime::Session {
+        format: format.as_str().to_string(),
+        content_type,
+        policy_version: 0,
+        public_key_pem: auth.public_key_pem.clone(),
+        stable_key: auth.stable_key.clone(),
+        stable_fields: None,
+    };
+    let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
+        MultipartCompletionError::Invalid("streaming pipeline is unavailable".to_string())
+    })?;
+    let mut pipeline = Some(
+        snapshot
+            .start_streaming_session(session, cancellation.clone())
+            .await?,
+    );
+    let limits = crate::record::DecoderLimits {
+        max_source_frame_bytes: state.source_body_limits.max_frame_bytes,
+        ..crate::record::DecoderLimits::default()
+    };
+    let mut decoder = crate::record::RecordDecoder::new(format, limits)?;
+    let mut input_bytes = 0_u64;
+    let mut output_bytes = 0_u64;
+    let mut output_hasher = sha2::Sha256::new();
+
+    let processing = async {
+        for part in &lease.selected_parts {
+            renew_and_fence_completion(staging, identity, lease).await?;
+            let body = staging.artifacts.get(&part.artifact_key).await?;
+            renew_and_fence_completion(staging, identity, lease).await?;
+            let mut reader = EncryptedPartReader::open(
+                body.into_async_read(),
+                identity,
+                part,
+                &upload.snapshot,
+                staging.wrapping.clone(),
+            )
+            .await?;
+            let mut part_bytes = 0_u64;
+            let mut part_sha256 = sha2::Sha256::new();
+            let mut part_md5 = Md5::new();
+            loop {
+                renew_and_fence_completion(staging, identity, lease).await?;
+                let Some(chunk) = reader.next_chunk().await? else {
+                    break;
+                };
+                part_bytes = part_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    MultipartCompletionError::Invalid("multipart part is too large".to_string())
+                })?;
+                input_bytes = input_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    MultipartCompletionError::Invalid("multipart input is too large".to_string())
+                })?;
+                if part_bytes > part.size_bytes || input_bytes > state.source_body_limits.max_bytes
+                {
+                    return Err(MultipartCompletionError::Invalid(
+                        "multipart input exceeds its limit".to_string(),
+                    ));
+                }
+                part_sha256.update(&chunk);
+                part_md5.update(&chunk);
+                decoder.push(&chunk)?;
+                while let Some(record) = decoder.next_record()? {
+                    if let Some(record) = pipeline
+                        .as_mut()
+                        .expect("pipeline is present until finish")
+                        .process(record)
+                        .await?
+                    {
+                        write_completed_record(
+                            staging,
+                            identity,
+                            lease,
+                            &mut sink,
+                            record,
+                            &mut output_hasher,
+                            &mut output_bytes,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            if part_bytes != part.size_bytes
+                || hex::encode(part_sha256.finalize()) != part.checksum_sha256
+                || format!("\"{}\"", hex::encode(part_md5.finalize())) != part.etag
+            {
+                return Err(MultipartCompletionError::Invalid(
+                    "staged multipart artifact does not match its committed part".to_string(),
+                ));
+            }
+        }
+        decoder.finish()?;
+        while let Some(record) = decoder.next_record()? {
+            if let Some(record) = pipeline
+                .as_mut()
+                .expect("pipeline is present until finish")
+                .process(record)
+                .await?
+            {
+                write_completed_record(
+                    staging,
+                    identity,
+                    lease,
+                    &mut sink,
+                    record,
+                    &mut output_hasher,
+                    &mut output_bytes,
+                )
+                .await?;
+            }
+        }
+        let finishing = pipeline.take().expect("pipeline is present until finish");
+        for record in finishing.finish().await? {
+            write_completed_record(
+                staging,
+                identity,
+                lease,
+                &mut sink,
+                record,
+                &mut output_hasher,
+                &mut output_bytes,
+            )
+            .await?;
+        }
+        let checksum_sha256 = hex::encode(output_hasher.finalize());
+        renew_and_fence_completion(staging, identity, lease).await?;
+        sink.verify_output(output_bytes, &checksum_sha256).await?;
+        renew_and_fence_completion(staging, identity, lease).await?;
+        let stored = sink.complete().await?;
+        let result = MultipartCompletionResult {
+            etag: stored.etag,
+            checksum_sha256,
+            version_id: stored.version_id,
+        };
+        renew_and_fence_completion(staging, identity, lease).await?;
+        staging
+            .repository
+            .complete_completion(identity, lease.fencing_token, result.clone(), now_ms())
+            .await?;
+        Ok(result)
+    }
+    .await;
+    if let Err(error) = &processing {
+        cancellation.cancel();
+        if let Some(pipeline) = pipeline.take() {
+            let _ = pipeline.cancel_and_wait().await;
+        }
+        // Never allow a stale worker to issue an abort. The durable Phase 5
+        // journal reconciles ambiguous destination outcomes after a crash.
+        if renew_and_fence_completion(staging, identity, lease)
+            .await
+            .is_ok()
+        {
+            let _ = sink.abort().await;
+        }
+        let _ = error;
+    }
+    processing
 }
 
 async fn reconcile_staged_artifacts(staging: &MultipartStaging) -> Result<(), StagingError> {
@@ -3943,7 +4397,173 @@ async fn s3_post(
     Query(params): Query<S3Query>,
     request: Request,
 ) -> impl IntoResponse {
-    let (parts, _body) = request.into_parts();
+    let (parts, body) = request.into_parts();
+    if let Some(upload_id) = params.upload_id.as_deref() {
+        let authentication = match authenticate_headers(
+            parts.method.as_str(),
+            &parts.uri,
+            &parts.headers,
+            &state.keys,
+            &state,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(HeaderAuthError::InvalidPayload(error)) => {
+                return s3_error::invalid_request(&key, &error.to_string());
+            }
+            Err(HeaderAuthError::Denied) => return s3_error::signature_mismatch(&key),
+        };
+        let (auth, body) =
+            match read_verified_body(authentication, body, MAX_COMPLETE_XML_BYTES).await {
+                Ok(value) => value,
+                Err(VerifiedBodyError::TooLarge) => {
+                    return s3_error::invalid_request(
+                        &key,
+                        "CompleteMultipartUpload XML exceeds 1 MiB",
+                    );
+                }
+                Err(VerifiedBodyError::Integrity(error)) => {
+                    return s3_error::bad_digest(&key, &error.to_string());
+                }
+                Err(VerifiedBodyError::Transport) => {
+                    return s3_error::invalid_request(
+                        &key,
+                        "CompleteMultipartUpload request body failed",
+                    );
+                }
+            };
+        if let Some(reason) = state
+            .control
+            .authorize(&auth.user_id, RequestKind::Write)
+            .await
+        {
+            return s3_error::payment_required(&key, reason.message);
+        }
+        if state
+            .control
+            .streaming_write_mode(&auth.user_id)
+            .await
+            .unwrap_or(state.streaming_write_mode)
+            < StreamingWriteMode::All
+        {
+            return s3_error::multipart_not_supported(&key);
+        }
+        let selected = match parse_complete_multipart_xml(&body) {
+            Ok(parts) => parts,
+            Err(error) if error.contains("sorted") => return s3_error::invalid_part_order(&key),
+            Err(error) => return s3_error::invalid_request(&key, &error),
+        };
+        let Some(staging) = staged_multipart(&state).cloned() else {
+            return s3_error::multipart_not_supported(&key);
+        };
+        let identity = multipart_identity(&auth, &bucket, &key, upload_id);
+        let upload = match staging.repository.get_authorized(&identity).await {
+            Ok(upload) => upload,
+            Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+        };
+        let fingerprint = match completion_fingerprint(&upload, &selected) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+        };
+        let lease = match staging
+            .repository
+            .acquire_completion(
+                &identity,
+                &fingerprint,
+                &selected,
+                &format!("complete-{}", Uuid::now_v7()),
+                now_ms() + COMPLETION_LEASE.as_millis() as i64,
+                now_ms(),
+            )
+            .await
+        {
+            Ok(CompletionAcquire::Replayed(result)) => {
+                let mut response = s3_xml_ok(complete_multipart_xml(&bucket, &key, &result));
+                if let Some(version) = result.version_id
+                    && let Ok(version) = version.parse()
+                {
+                    response.headers_mut().insert("x-amz-version-id", version);
+                }
+                return response;
+            }
+            Ok(CompletionAcquire::Busy) => return s3_error::slow_down(&key),
+            Ok(CompletionAcquire::Acquired(lease)) => lease,
+            Err(StagingError::InvalidPart) => {
+                return s3_error::invalid_part(
+                    &key,
+                    "submitted part is missing or does not match its staged ETag/checksum",
+                );
+            }
+            Err(StagingError::CompletionConflict) => {
+                return s3_error::invalid_request(
+                    &key,
+                    "conflicting CompleteMultipartUpload request",
+                );
+            }
+            Err(StagingError::NotFound | StagingError::NotOpen) => {
+                return s3_error::no_such_upload(&key);
+            }
+            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+        };
+        let backend = match resolve_backend(
+            &state,
+            &auth.user_id,
+            &parts.headers,
+            StorageOperation::Multipart,
+        )
+        .await
+        {
+            Ok(backend) => backend,
+            Err(error) => return s3_error::internal_error(&key, &error),
+        };
+        let complete = tokio::time::timeout(
+            Duration::from_secs(MAX_MULTIPART_COMPLETION_SECS),
+            complete_staged_multipart(&state, &staging, &identity, &upload, &lease, &auth, backend),
+        )
+        .await;
+        let result = match complete {
+            Ok(Ok(result)) => result,
+            Ok(Err(MultipartCompletionError::Staging(StagingError::Fenced))) => {
+                return s3_error::service_unavailable(&key, "multipart completion lease was lost");
+            }
+            Ok(Err(MultipartCompletionError::Staging(StagingError::InvalidPart))) => {
+                return s3_error::invalid_part(&key, "staged part validation failed");
+            }
+            Ok(Err(MultipartCompletionError::Staging(error))) => {
+                return s3_error::internal_error(&key, &error.to_string());
+            }
+            Ok(Err(MultipartCompletionError::Streaming(error))) => {
+                return streaming_put_error_response(&key, error);
+            }
+            Ok(Err(MultipartCompletionError::Invalid(error))) => {
+                return s3_error::invalid_request(&key, &error);
+            }
+            Err(_) => {
+                return s3_error::service_unavailable(
+                    &key,
+                    "multipart completion exceeded the configured hosted time limit",
+                );
+            }
+        };
+        cleanup_staged_parts(&staging, upload_id, lease.cleanup_parts, "complete").await;
+        let selected_bytes = lease
+            .selected_parts
+            .iter()
+            .fold(0_u64, |total, part| total.saturating_add(part.size_bytes));
+        state
+            .control
+            .record(&auth.user_id, RequestKind::Write, selected_bytes)
+            .await;
+        let mut response = s3_xml_ok(complete_multipart_xml(&bucket, &key, &result));
+        if let Some(version) = result.version_id
+            && let Ok(version) = version.parse()
+        {
+            response.headers_mut().insert("x-amz-version-id", version);
+        }
+        return response;
+    }
     let Some(auth) = authenticate(
         parts.method.as_str(),
         &parts.uri,
@@ -4006,17 +4626,17 @@ async fn s3_post(
             expires_at_ms: now + 24 * 60 * 60 * 1000,
             updated_at_ms: now,
             tombstone_until_ms: None,
+            complete_request_fingerprint: None,
+            completion_lease_owner: None,
+            completion_lease_expires_at_ms: None,
+            completion_fencing_token: 0,
+            completion_result: None,
         };
         return match staging.repository.create(upload).await {
             Ok(()) => s3_xml_ok(create_multipart_xml(&bucket, &key, &upload_id)),
             Err(StagingError::QuotaExceeded) => s3_error::slow_down(&key),
             Err(error) => s3_error::internal_error(&key, &error.to_string()),
         };
-    }
-    if params.upload_id.is_some() {
-        // Completion is deliberately not implemented until Phase 11 has a
-        // fenced lease and an ordered one-pass transform.
-        return s3_error::multipart_not_supported(&key);
     }
     s3_error::not_implemented(&key)
 }
@@ -5440,5 +6060,28 @@ mod auth_tests {
                 .expect("valid Supabase token");
 
         assert_eq!(decoded.claims["sub"], "user-123");
+    }
+}
+
+#[cfg(test)]
+mod multipart_completion_tests {
+    use super::parse_complete_multipart_xml;
+
+    #[test]
+    fn complete_xml_is_strict_ordered_and_entity_free() {
+        let parts = parse_complete_multipart_xml(
+            br#"<?xml version="1.0"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"one"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"two"</ETag><ChecksumSHA256>abc</ChecksumSHA256></Part></CompleteMultipartUpload>"#,
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].checksum_sha256.as_deref(), Some("abc"));
+        assert!(parse_complete_multipart_xml(
+            br#"<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>"two"</ETag></Part><Part><PartNumber>1</PartNumber><ETag>"one"</ETag></Part></CompleteMultipartUpload>"#,
+        )
+        .is_err());
+        assert!(parse_complete_multipart_xml(
+            br#"<!DOCTYPE x [<!ENTITY boom "boom">]><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&boom;</ETag></Part></CompleteMultipartUpload>"#,
+        )
+        .is_err());
     }
 }

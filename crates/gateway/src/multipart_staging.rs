@@ -25,7 +25,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -42,6 +42,9 @@ const NONCE_LEN: usize = 12;
 const FILE_PREFIX: &str = "s4-multipart-";
 pub const ARTIFACT_PREFIX: &str = "multipart/";
 pub const RECONCILIATION_GRACE: Duration = Duration::from_secs(5 * 60);
+pub const COMPLETION_LEASE: Duration = Duration::from_secs(30);
+const MAX_ARTIFACT_HEADER_BYTES: usize = 64 * 1024;
+const MAX_ENCRYPTED_FRAME_BYTES: usize = 8 * 1024 * 1024 + 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct StagingQuotaLimits {
@@ -105,6 +108,8 @@ pub struct MultipartSnapshot {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MultipartLifecycle {
     Open,
+    Completing,
+    Completed,
     Aborted,
     Expired,
 }
@@ -120,6 +125,11 @@ pub struct MultipartUpload {
     pub expires_at_ms: i64,
     pub updated_at_ms: i64,
     pub tombstone_until_ms: Option<i64>,
+    pub complete_request_fingerprint: Option<String>,
+    pub completion_lease_owner: Option<String>,
+    pub completion_lease_expires_at_ms: Option<i64>,
+    pub completion_fencing_token: u64,
+    pub completion_result: Option<MultipartCompletionResult>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,6 +142,39 @@ pub struct MultipartPart {
     pub checksum_sha256: String,
     pub size_bytes: u64,
     pub created_at_ms: i64,
+}
+
+/// A client-selected part from a CompleteMultipartUpload document. Checksum is
+/// optional because S3 clients commonly submit only the ETag; when supplied it
+/// is matched exactly against the staged part.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompletePart {
+    pub part_number: u32,
+    pub etag: String,
+    pub checksum_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MultipartCompletionResult {
+    pub etag: Option<String>,
+    pub checksum_sha256: String,
+    pub version_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompletionLease {
+    pub fencing_token: u64,
+    pub selected_parts: Vec<MultipartPart>,
+    /// Includes selected and unselected current parts. Cleanup is retried by
+    /// reconciliation after a process crash, so success never depends on it.
+    pub cleanup_parts: Vec<MultipartPart>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CompletionAcquire {
+    Acquired(CompletionLease),
+    Replayed(MultipartCompletionResult),
+    Busy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,6 +198,10 @@ pub enum StagingError {
     QuotaExceeded,
     #[error("invalid multipart part")]
     InvalidPart,
+    #[error("multipart completion request conflicts with the existing request")]
+    CompletionConflict,
+    #[error("multipart completion lease is fenced")]
+    Fenced,
     #[error("multipart staging persistence failure: {0}")]
     Persistence(String),
     #[error("multipart staging encryption failure: {0}")]
@@ -212,6 +259,37 @@ pub trait MultipartRepository: Send + Sync {
         marker: u32,
         limit: usize,
     ) -> Result<(Vec<MultipartPart>, bool), StagingError>;
+    /// Validates client-selected parts and acquires (or takes over) the only
+    /// completion lease. The request fingerprint is durable before any staged
+    /// bytes are read.
+    async fn acquire_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fingerprint: &str,
+        parts: &[CompletePart],
+        owner: &str,
+        lease_expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<CompletionAcquire, StagingError>;
+    async fn renew_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        lease_expires_at_ms: i64,
+    ) -> Result<(), StagingError>;
+    async fn check_completion_lease(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        now_ms: i64,
+    ) -> Result<(), StagingError>;
+    async fn complete_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        result: MultipartCompletionResult,
+        now_ms: i64,
+    ) -> Result<(), StagingError>;
     async fn abort(
         &self,
         identity: &MultipartIdentity,
@@ -410,6 +488,18 @@ fn upload_model(upload: &MultipartUpload) -> Result<multipart_upload::ActiveMode
         ),
         expires_at_ms: Set(upload.expires_at_ms),
         tombstone_until_ms: Set(upload.tombstone_until_ms),
+        complete_request_fingerprint: Set(upload.complete_request_fingerprint.clone()),
+        completion_lease_owner: Set(upload.completion_lease_owner.clone()),
+        completion_lease_expires_at_ms: Set(upload.completion_lease_expires_at_ms),
+        completion_fencing_token: Set(i64::try_from(upload.completion_fencing_token).map_err(
+            |_| StagingError::Persistence("invalid completion fencing token".to_string()),
+        )?),
+        completion_result: Set(upload
+            .completion_result
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(json_error)?),
         created_at_ms: Set(upload.created_at_ms),
         updated_at_ms: Set(upload.updated_at_ms),
     })
@@ -418,6 +508,8 @@ fn upload_model(upload: &MultipartUpload) -> Result<multipart_upload::ActiveMode
 fn lifecycle_name(lifecycle: MultipartLifecycle) -> &'static str {
     match lifecycle {
         MultipartLifecycle::Open => "OPEN",
+        MultipartLifecycle::Completing => "COMPLETING",
+        MultipartLifecycle::Completed => "COMPLETED",
         MultipartLifecycle::Aborted => "ABORTED",
         MultipartLifecycle::Expired => "EXPIRED",
     }
@@ -425,6 +517,8 @@ fn lifecycle_name(lifecycle: MultipartLifecycle) -> &'static str {
 fn lifecycle(value: &str) -> Result<MultipartLifecycle, StagingError> {
     match value {
         "OPEN" => Ok(MultipartLifecycle::Open),
+        "COMPLETING" => Ok(MultipartLifecycle::Completing),
+        "COMPLETED" => Ok(MultipartLifecycle::Completed),
         "ABORTED" => Ok(MultipartLifecycle::Aborted),
         "EXPIRED" => Ok(MultipartLifecycle::Expired),
         _ => Err(StagingError::Persistence(
@@ -468,6 +562,17 @@ fn upload_from_model(model: multipart_upload::Model) -> Result<MultipartUpload, 
         expires_at_ms: model.expires_at_ms,
         updated_at_ms: model.updated_at_ms,
         tombstone_until_ms: model.tombstone_until_ms,
+        complete_request_fingerprint: model.complete_request_fingerprint,
+        completion_lease_owner: model.completion_lease_owner,
+        completion_lease_expires_at_ms: model.completion_lease_expires_at_ms,
+        completion_fencing_token: u64::try_from(model.completion_fencing_token).map_err(|_| {
+            StagingError::Persistence("negative completion fencing token".to_string())
+        })?,
+        completion_result: model
+            .completion_result
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(json_error)?,
     })
 }
 fn part_from_model(model: multipart_part_attempt::Model) -> Result<MultipartPart, StagingError> {
@@ -482,6 +587,57 @@ fn part_from_model(model: multipart_part_attempt::Model) -> Result<MultipartPart
             .map_err(|_| StagingError::Persistence("negative part size".to_string()))?,
         created_at_ms: model.created_at_ms,
     })
+}
+
+pub fn completion_fingerprint(
+    upload: &MultipartUpload,
+    parts: &[CompletePart],
+) -> Result<String, StagingError> {
+    // Serialize only immutable upload inputs and canonical client selection.
+    // BTreeMap-backed metadata/tags keep the fingerprint stable across retries.
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "identity": upload.identity,
+        "parts": parts,
+        "metadata": upload.snapshot.metadata,
+        "tags": upload.snapshot.tags,
+        "checksum_mode": upload.snapshot.checksum_mode,
+        "destination": upload.snapshot.destination,
+        "plugin_snapshot": upload.snapshot.plugin_snapshot,
+        "limits": upload.snapshot.max_staged_bytes,
+    }))
+    .map_err(json_error)?;
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+fn validate_selected_parts(
+    current: &[MultipartPart],
+    requested: &[CompletePart],
+) -> Result<Vec<MultipartPart>, StagingError> {
+    if requested.is_empty() {
+        return Err(StagingError::InvalidPart);
+    }
+    let mut previous = 0;
+    let mut selected = Vec::with_capacity(requested.len());
+    for request in requested {
+        if request.part_number == 0 || request.part_number <= previous {
+            return Err(StagingError::InvalidPart);
+        }
+        previous = request.part_number;
+        let part = current
+            .iter()
+            .find(|part| part.part_number == request.part_number)
+            .ok_or(StagingError::InvalidPart)?;
+        if part.etag != request.etag
+            || request
+                .checksum_sha256
+                .as_deref()
+                .is_some_and(|checksum| checksum != part.checksum_sha256)
+        {
+            return Err(StagingError::InvalidPart);
+        }
+        selected.push(part.clone());
+    }
+    Ok(selected)
 }
 
 fn global_quota_scope() -> String {
@@ -1078,6 +1234,196 @@ impl MultipartRepository for PostgresMultipartRepository {
         parts.truncate(limit);
         Ok((parts, truncated))
     }
+    async fn acquire_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fingerprint: &str,
+        parts: &[CompletePart],
+        owner: &str,
+        lease_expires_at_ms: i64,
+        now: i64,
+    ) -> Result<CompletionAcquire, StagingError> {
+        let tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        let model = multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::UploadId.eq(identity.upload_id.clone()))
+            .filter(multipart_upload::Column::TenantId.eq(identity.tenant_id.clone()))
+            .filter(
+                multipart_upload::Column::CredentialPolicyId
+                    .eq(identity.credential_policy_id.clone()),
+            )
+            .filter(multipart_upload::Column::Bucket.eq(identity.bucket.clone()))
+            .filter(multipart_upload::Column::ObjectKey.eq(identity.key.clone()))
+            .lock_exclusive()
+            .one(&tx)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .ok_or(StagingError::NotFound)?;
+        let upload = upload_from_model(model.clone())?;
+        if upload.lifecycle == MultipartLifecycle::Completed {
+            let result = upload.completion_result.ok_or_else(|| {
+                StagingError::Persistence("completed upload is missing its result".to_string())
+            })?;
+            tx.commit()
+                .await
+                .map_err(|error| StagingError::Persistence(error.to_string()))?;
+            return if upload.complete_request_fingerprint.as_deref() == Some(fingerprint) {
+                Ok(CompletionAcquire::Replayed(result))
+            } else {
+                Err(StagingError::CompletionConflict)
+            };
+        }
+        if upload.lifecycle == MultipartLifecycle::Aborted
+            || upload.lifecycle == MultipartLifecycle::Expired
+        {
+            return Err(StagingError::NotOpen);
+        }
+        if upload.lifecycle == MultipartLifecycle::Completing
+            && upload.complete_request_fingerprint.as_deref() != Some(fingerprint)
+        {
+            return Err(StagingError::CompletionConflict);
+        }
+        if upload.lifecycle == MultipartLifecycle::Completing
+            && upload
+                .completion_lease_expires_at_ms
+                .is_some_and(|expires| expires > now)
+        {
+            tx.commit()
+                .await
+                .map_err(|error| StagingError::Persistence(error.to_string()))?;
+            return Ok(CompletionAcquire::Busy);
+        }
+        if upload.lifecycle == MultipartLifecycle::Open && upload.expires_at_ms <= now {
+            return Err(StagingError::NotOpen);
+        }
+        let cleanup_parts: Vec<_> = multipart_part_attempt::Entity::find()
+            .filter(multipart_part_attempt::Column::UploadId.eq(identity.upload_id.clone()))
+            .filter(multipart_part_attempt::Column::IsCurrent.eq(true))
+            .order_by_asc(multipart_part_attempt::Column::PartNumber)
+            .all(&tx)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .into_iter()
+            .map(part_from_model)
+            .collect::<Result<_, _>>()?;
+        let selected_parts = validate_selected_parts(&cleanup_parts, parts)?;
+        let fencing_token = upload
+            .completion_fencing_token
+            .checked_add(1)
+            .ok_or_else(|| {
+                StagingError::Persistence("completion fencing token exhausted".to_string())
+            })?;
+        let mut active: multipart_upload::ActiveModel = model.into();
+        active.lifecycle = Set("COMPLETING".to_string());
+        active.complete_request_fingerprint = Set(Some(fingerprint.to_string()));
+        active.completion_lease_owner = Set(Some(owner.to_string()));
+        active.completion_lease_expires_at_ms = Set(Some(lease_expires_at_ms));
+        active.completion_fencing_token = Set(i64::try_from(fencing_token).map_err(|_| {
+            StagingError::Persistence("invalid completion fencing token".to_string())
+        })?);
+        active.updated_at_ms = Set(now);
+        active
+            .update(&tx)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        Ok(CompletionAcquire::Acquired(CompletionLease {
+            fencing_token,
+            selected_parts,
+            cleanup_parts,
+        }))
+    }
+    async fn renew_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        lease_expires_at_ms: i64,
+    ) -> Result<(), StagingError> {
+        let result = multipart_upload::Entity::update_many()
+            .col_expr(
+                multipart_upload::Column::CompletionLeaseExpiresAtMs,
+                Expr::value(Some(lease_expires_at_ms)),
+            )
+            .col_expr(multipart_upload::Column::UpdatedAtMs, Expr::value(now_ms()))
+            .filter(multipart_upload::Column::UploadId.eq(identity.upload_id.clone()))
+            .filter(multipart_upload::Column::TenantId.eq(identity.tenant_id.clone()))
+            .filter(multipart_upload::Column::Lifecycle.eq("COMPLETING"))
+            .filter(
+                multipart_upload::Column::CompletionFencingToken
+                    .eq(i64::try_from(fencing_token).map_err(|_| StagingError::Fenced)?),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        (result.rows_affected == 1)
+            .then_some(())
+            .ok_or(StagingError::Fenced)
+    }
+    async fn check_completion_lease(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        now: i64,
+    ) -> Result<(), StagingError> {
+        let upload = self.get_authorized(identity).await?;
+        (upload.lifecycle == MultipartLifecycle::Completing
+            && upload.completion_fencing_token == fencing_token
+            && upload
+                .completion_lease_expires_at_ms
+                .is_some_and(|expires| expires > now))
+        .then_some(())
+        .ok_or(StagingError::Fenced)
+    }
+    async fn complete_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        result: MultipartCompletionResult,
+        now: i64,
+    ) -> Result<(), StagingError> {
+        self.check_completion_lease(identity, fencing_token, now)
+            .await?;
+        let result_json = serde_json::to_value(&result).map_err(json_error)?;
+        let updated = multipart_upload::Entity::update_many()
+            .col_expr(
+                multipart_upload::Column::Lifecycle,
+                Expr::value("COMPLETED"),
+            )
+            .col_expr(
+                multipart_upload::Column::CompletionResult,
+                Expr::value(result_json),
+            )
+            .col_expr(
+                multipart_upload::Column::CompletionLeaseOwner,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                multipart_upload::Column::CompletionLeaseExpiresAtMs,
+                Expr::value(Option::<i64>::None),
+            )
+            .col_expr(
+                multipart_upload::Column::TombstoneUntilMs,
+                Expr::value(Some(now + DEFAULT_EXPIRY.as_millis() as i64)),
+            )
+            .col_expr(multipart_upload::Column::UpdatedAtMs, Expr::value(now))
+            .filter(multipart_upload::Column::UploadId.eq(identity.upload_id.clone()))
+            .filter(multipart_upload::Column::Lifecycle.eq("COMPLETING"))
+            .filter(
+                multipart_upload::Column::CompletionFencingToken
+                    .eq(i64::try_from(fencing_token).map_err(|_| StagingError::Fenced)?),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        (updated.rows_affected == 1)
+            .then_some(())
+            .ok_or(StagingError::Fenced)
+    }
     async fn abort(
         &self,
         identity: &MultipartIdentity,
@@ -1555,6 +1901,151 @@ impl MultipartRepository for InMemoryMultipartRepository {
         Ok((parts, truncated))
     }
 
+    async fn acquire_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fingerprint: &str,
+        parts: &[CompletePart],
+        owner: &str,
+        lease_expires_at_ms: i64,
+        now: i64,
+    ) -> Result<CompletionAcquire, StagingError> {
+        let mut state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get(&identity.upload_id)
+            .filter(|upload| same_identity(upload, identity))
+            .cloned()
+            .ok_or(StagingError::NotFound)?;
+        if upload.lifecycle == MultipartLifecycle::Completed {
+            let result = upload.completion_result.ok_or_else(|| {
+                StagingError::Persistence("completed upload is missing its result".to_string())
+            })?;
+            return if upload.complete_request_fingerprint.as_deref() == Some(fingerprint) {
+                Ok(CompletionAcquire::Replayed(result))
+            } else {
+                Err(StagingError::CompletionConflict)
+            };
+        }
+        if upload.lifecycle == MultipartLifecycle::Aborted
+            || upload.lifecycle == MultipartLifecycle::Expired
+        {
+            return Err(StagingError::NotOpen);
+        }
+        if upload.lifecycle == MultipartLifecycle::Completing
+            && upload.complete_request_fingerprint.as_deref() != Some(fingerprint)
+        {
+            return Err(StagingError::CompletionConflict);
+        }
+        if upload.lifecycle == MultipartLifecycle::Completing
+            && upload
+                .completion_lease_expires_at_ms
+                .is_some_and(|expires| expires > now)
+        {
+            return Ok(CompletionAcquire::Busy);
+        }
+        if upload.lifecycle == MultipartLifecycle::Open && upload.expires_at_ms <= now {
+            return Err(StagingError::NotOpen);
+        }
+        let mut cleanup_parts: Vec<_> = state
+            .parts
+            .values()
+            .filter(|part| part.upload_id == identity.upload_id)
+            .cloned()
+            .collect();
+        cleanup_parts.sort_by_key(|part| part.part_number);
+        let selected_parts = validate_selected_parts(&cleanup_parts, parts)?;
+        let fencing_token = upload
+            .completion_fencing_token
+            .checked_add(1)
+            .ok_or_else(|| {
+                StagingError::Persistence("completion fencing token exhausted".to_string())
+            })?;
+        let upload = state
+            .uploads
+            .get_mut(&identity.upload_id)
+            .expect("upload cloned above");
+        upload.lifecycle = MultipartLifecycle::Completing;
+        upload.complete_request_fingerprint = Some(fingerprint.to_string());
+        upload.completion_lease_owner = Some(owner.to_string());
+        upload.completion_lease_expires_at_ms = Some(lease_expires_at_ms);
+        upload.completion_fencing_token = fencing_token;
+        upload.updated_at_ms = now;
+        Ok(CompletionAcquire::Acquired(CompletionLease {
+            fencing_token,
+            selected_parts,
+            cleanup_parts,
+        }))
+    }
+
+    async fn renew_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        lease_expires_at_ms: i64,
+    ) -> Result<(), StagingError> {
+        let mut state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get_mut(&identity.upload_id)
+            .filter(|upload| same_identity(upload, identity))
+            .ok_or(StagingError::NotFound)?;
+        if upload.lifecycle != MultipartLifecycle::Completing
+            || upload.completion_fencing_token != fencing_token
+        {
+            return Err(StagingError::Fenced);
+        }
+        upload.completion_lease_expires_at_ms = Some(lease_expires_at_ms);
+        upload.updated_at_ms = now_ms();
+        Ok(())
+    }
+
+    async fn check_completion_lease(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        now: i64,
+    ) -> Result<(), StagingError> {
+        let upload = self.get_authorized(identity).await?;
+        (upload.lifecycle == MultipartLifecycle::Completing
+            && upload.completion_fencing_token == fencing_token
+            && upload
+                .completion_lease_expires_at_ms
+                .is_some_and(|expires| expires > now))
+        .then_some(())
+        .ok_or(StagingError::Fenced)
+    }
+
+    async fn complete_completion(
+        &self,
+        identity: &MultipartIdentity,
+        fencing_token: u64,
+        result: MultipartCompletionResult,
+        now: i64,
+    ) -> Result<(), StagingError> {
+        let mut state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get_mut(&identity.upload_id)
+            .filter(|upload| same_identity(upload, identity))
+            .ok_or(StagingError::NotFound)?;
+        if upload.lifecycle != MultipartLifecycle::Completing
+            || upload.completion_fencing_token != fencing_token
+            || upload
+                .completion_lease_expires_at_ms
+                .is_none_or(|expires| expires <= now)
+        {
+            return Err(StagingError::Fenced);
+        }
+        upload.lifecycle = MultipartLifecycle::Completed;
+        upload.completion_result = Some(result);
+        upload.completion_lease_owner = None;
+        upload.completion_lease_expires_at_ms = None;
+        upload.tombstone_until_ms = Some(now + DEFAULT_EXPIRY.as_millis() as i64);
+        upload.updated_at_ms = now;
+        Ok(())
+    }
+
     async fn abort(
         &self,
         identity: &MultipartIdentity,
@@ -1615,6 +2106,9 @@ impl MultipartRepository for InMemoryMultipartRepository {
 #[async_trait]
 pub trait StagingArtifactStore: Send + Sync {
     async fn put_file(&self, key: &str, path: &Path) -> Result<(), StagingError>;
+    /// Returns an incremental encrypted artifact body. Callers decrypt frame by
+    /// frame and must hold a valid completion fence for every read.
+    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError>;
     async fn delete(&self, key: &str) -> Result<(), StagingError>;
     /// Discovery is required for startup reconciliation. Implementations must
     /// return every object below the supplied prefix, not an arbitrary page.
@@ -1647,6 +2141,16 @@ impl StagingArtifactStore for S3StagingArtifactStore {
             .await
             .map_err(|error| StagingError::Persistence(error.to_string()))?;
         Ok(())
+    }
+    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError> {
+        self.client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map(|output| output.body)
+            .map_err(|error| StagingError::Persistence(error.to_string()))
     }
     async fn delete(&self, key: &str) -> Result<(), StagingError> {
         self.client
@@ -1711,6 +2215,14 @@ impl StagingArtifactStore for MemoryStagingArtifactStore {
             ),
         );
         Ok(())
+    }
+    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError> {
+        self.objects
+            .lock()
+            .await
+            .get(key)
+            .map(|(bytes, _)| aws_sdk_s3::primitives::ByteStream::from(bytes.clone()))
+            .ok_or(StagingError::NotFound)
     }
     async fn delete(&self, key: &str) -> Result<(), StagingError> {
         self.objects.lock().await.remove(key);
@@ -1922,6 +2434,122 @@ impl FinishedPart {
     }
 }
 
+/// Incrementally authenticates and decrypts one staged artifact. It never
+/// exposes a frame until the envelope identity, snapshot digest, and AEAD tag
+/// have all been checked.
+pub struct EncryptedPartReader<R> {
+    reader: R,
+    cipher: Aes256Gcm,
+    header: ArtifactHeader,
+    chunk: u64,
+    finished: bool,
+}
+
+impl<R: AsyncRead + Unpin> EncryptedPartReader<R> {
+    pub async fn open(
+        mut reader: R,
+        identity: &MultipartIdentity,
+        part: &MultipartPart,
+        snapshot: &MultipartSnapshot,
+        wrapping: Arc<dyn KeyWrapping>,
+    ) -> Result<Self, StagingError> {
+        let mut magic = [0_u8; MAGIC.len()];
+        reader.read_exact(&mut magic).await.map_err(io_error)?;
+        if magic != MAGIC {
+            return Err(StagingError::Crypto(
+                "invalid staging artifact magic".to_string(),
+            ));
+        }
+        let mut header_len = [0_u8; 4];
+        reader.read_exact(&mut header_len).await.map_err(io_error)?;
+        let header_len = u32::from_be_bytes(header_len) as usize;
+        if header_len == 0 || header_len > MAX_ARTIFACT_HEADER_BYTES {
+            return Err(StagingError::Crypto(
+                "invalid staging artifact header".to_string(),
+            ));
+        }
+        let mut encoded = vec![0_u8; header_len];
+        reader.read_exact(&mut encoded).await.map_err(io_error)?;
+        let header: ArtifactHeader = serde_json::from_slice(&encoded)
+            .map_err(|_| StagingError::Crypto("invalid staging artifact header".to_string()))?;
+        let expected_digest = hex::encode(Sha256::digest(
+            serde_json::to_vec(snapshot)
+                .map_err(|error| StagingError::Persistence(error.to_string()))?,
+        ));
+        if header.tenant_id != identity.tenant_id
+            || header.upload_id != identity.upload_id
+            || header.part_number != part.part_number
+            || header.attempt != part.attempt
+            || header.metadata_digest != expected_digest
+        {
+            return Err(StagingError::Crypto(
+                "staging artifact identity mismatch".to_string(),
+            ));
+        }
+        let dek = wrapping
+            .unwrap(
+                &B64.decode(&header.wrapped_dek)
+                    .map_err(|_| StagingError::Crypto("invalid wrapped staging key".to_string()))?,
+            )
+            .map_err(|error| StagingError::Crypto(error.to_string()))?;
+        let cipher = Aes256Gcm::new_from_slice(&dek)
+            .map_err(|error| StagingError::Crypto(error.to_string()))?;
+        Ok(Self {
+            reader,
+            cipher,
+            header,
+            chunk: 0,
+            finished: false,
+        })
+    }
+
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, StagingError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let mut length = [0_u8; 4];
+        match self.reader.read_exact(&mut length).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                self.finished = true;
+                return Ok(None);
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+        let length = u32::from_be_bytes(length) as usize;
+        if !(16..=MAX_ENCRYPTED_FRAME_BYTES).contains(&length) {
+            return Err(StagingError::Crypto(
+                "invalid staging artifact frame length".to_string(),
+            ));
+        }
+        let mut nonce = [0_u8; NONCE_LEN];
+        self.reader.read_exact(&mut nonce).await.map_err(io_error)?;
+        let mut ciphertext = vec![0_u8; length];
+        self.reader
+            .read_exact(&mut ciphertext)
+            .await
+            .map_err(io_error)?;
+        let aad = artifact_aad(&self.header, self.chunk);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                StagingError::Crypto("staging artifact authentication failed".to_string())
+            })?;
+        self.chunk = self
+            .chunk
+            .checked_add(1)
+            .ok_or_else(|| StagingError::Crypto("staging artifact chunk overflow".to_string()))?;
+        Ok(Some(Bytes::from(plaintext)))
+    }
+}
+
 fn artifact_aad(header: &ArtifactHeader, chunk: u64) -> Vec<u8> {
     format!(
         "s4.multipart.stage.v1\0{}\0{}\0{}\0{}\0{}\0{}",
@@ -1980,6 +2608,11 @@ mod tests {
             expires_at_ms: now + 1000,
             updated_at_ms: now,
             tombstone_until_ms: None,
+            complete_request_fingerprint: None,
+            completion_lease_owner: None,
+            completion_lease_expires_at_ms: None,
+            completion_fencing_token: 0,
+            completion_result: None,
         }
     }
 
@@ -2146,6 +2779,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_parts_feed_one_decoder_across_record_and_utf8_boundaries() {
+        let directory = std::env::temp_dir().join(format!("s4-stage-test-{}", Uuid::now_v7()));
+        let wrapping = Arc::new(LocalKeyWrapping::with_kek([8; 32]));
+        let snapshot = snapshot();
+        let mut first_writer = EncryptedPartWriter::begin(
+            &directory,
+            &identity(),
+            1,
+            1,
+            &snapshot,
+            1024,
+            wrapping.clone(),
+        )
+        .await
+        .unwrap();
+        first_writer
+            .write(Bytes::from_static(b"first \xc3"))
+            .await
+            .unwrap();
+        let first = first_writer.finish().await.unwrap();
+        let mut second_writer = EncryptedPartWriter::begin(
+            &directory,
+            &identity(),
+            2,
+            1,
+            &snapshot,
+            1024,
+            wrapping.clone(),
+        )
+        .await
+        .unwrap();
+        second_writer
+            .write(Bytes::from_static(b"\xa9\nsecond"))
+            .await
+            .unwrap();
+        let second = second_writer.finish().await.unwrap();
+        let parts = [(1, first), (2, second)];
+        let mut decoder = crate::record::RecordDecoder::new(
+            crate::Format::Text,
+            crate::record::DecoderLimits::default(),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        for (number, finished) in &parts {
+            let part = MultipartPart {
+                upload_id: "upload".to_string(),
+                part_number: *number,
+                attempt: 1,
+                artifact_key: format!("artifact-{number}"),
+                etag: finished.etag.clone(),
+                checksum_sha256: finished.checksum_sha256.clone(),
+                size_bytes: finished.size_bytes,
+                created_at_ms: now_ms(),
+            };
+            let ciphertext = tokio::fs::read(&finished.path).await.unwrap();
+            let mut reader = EncryptedPartReader::open(
+                aws_sdk_s3::primitives::ByteStream::from(ciphertext).into_async_read(),
+                &identity(),
+                &part,
+                &snapshot,
+                wrapping.clone(),
+            )
+            .await
+            .unwrap();
+            while let Some(chunk) = reader.next_chunk().await.unwrap() {
+                decoder.push(&chunk).unwrap();
+                while let Some(record) = decoder.next_record().unwrap() {
+                    records.push(record);
+                }
+            }
+        }
+        decoder.finish().unwrap();
+        while let Some(record) = decoder.next_record().unwrap() {
+            records.push(record);
+        }
+        assert_eq!(records[0], crate::record::Record::new("first é", "\n"));
+        assert_eq!(records[1], crate::record::Record::new("second", ""));
+        for (_, finished) in parts {
+            finished.remove().await;
+        }
+        let _ = tokio::fs::remove_dir(directory).await;
+    }
+
+    #[tokio::test]
     async fn ephemeral_wrapping_cannot_start_durable_staging() {
         let directory = std::env::temp_dir().join(format!("s4-stage-test-{}", Uuid::now_v7()));
         let result = EncryptedPartWriter::begin(
@@ -2227,5 +2944,187 @@ mod tests {
                 .reserved_bytes,
             0
         );
+    }
+
+    fn complete_part(number: u32, etag: &str, checksum: Option<&str>) -> CompletePart {
+        CompletePart {
+            part_number: number,
+            etag: etag.to_string(),
+            checksum_sha256: checksum.map(ToOwned::to_owned),
+        }
+    }
+
+    async fn current_part(
+        repo: &InMemoryMultipartRepository,
+        number: u32,
+        etag: &str,
+        checksum: &str,
+    ) {
+        repo.replace_part(
+            &identity(),
+            MultipartPart {
+                upload_id: "upload".to_string(),
+                part_number: number,
+                attempt: 1,
+                artifact_key: format!("artifact-{number}"),
+                etag: etag.to_string(),
+                checksum_sha256: checksum.to_string(),
+                size_bytes: 3,
+                created_at_ms: now_ms(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_replays_only_the_identical_durable_request() {
+        let repo = InMemoryMultipartRepository::new();
+        repo.create(upload()).await.unwrap();
+        current_part(&repo, 1, "\"one\"", "sha-one").await;
+        let request = vec![complete_part(1, "\"one\"", Some("sha-one"))];
+        let lease = match repo
+            .acquire_completion(&identity(), "fingerprint", &request, "worker-a", 100, 0)
+            .await
+            .unwrap()
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected completion lease"),
+        };
+        repo.complete_completion(
+            &identity(),
+            lease.fencing_token,
+            MultipartCompletionResult {
+                etag: Some("\"output\"".to_string()),
+                checksum_sha256: "output-sha".to_string(),
+                version_id: Some("version-a".to_string()),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.acquire_completion(&identity(), "fingerprint", &request, "worker-b", 200, 2)
+                .await,
+            Ok(CompletionAcquire::Replayed(MultipartCompletionResult { ref etag, ref checksum_sha256, ref version_id }))
+                if etag.as_deref() == Some("\"output\"")
+                    && checksum_sha256 == "output-sha"
+                    && version_id.as_deref() == Some("version-a")
+        ));
+        assert!(matches!(
+            repo.acquire_completion(&identity(), "different", &request, "worker-b", 200, 2)
+                .await,
+            Err(StagingError::CompletionConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn completion_lease_takeover_fences_the_stale_worker() {
+        let repo = InMemoryMultipartRepository::new();
+        repo.create(upload()).await.unwrap();
+        current_part(&repo, 1, "\"one\"", "sha-one").await;
+        let request = vec![complete_part(1, "\"one\"", None)];
+        let first = match repo
+            .acquire_completion(&identity(), "same", &request, "worker-a", 10, 0)
+            .await
+            .unwrap()
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected first lease"),
+        };
+        assert!(matches!(
+            repo.acquire_completion(&identity(), "same", &request, "worker-b", 20, 1)
+                .await,
+            Ok(CompletionAcquire::Busy)
+        ));
+        let second = match repo
+            .acquire_completion(&identity(), "same", &request, "worker-b", 30, 11)
+            .await
+            .unwrap()
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected takeover lease"),
+        };
+        assert!(second.fencing_token > first.fencing_token);
+        assert!(matches!(
+            repo.check_completion_lease(&identity(), first.fencing_token, 12)
+                .await,
+            Err(StagingError::Fenced)
+        ));
+        assert!(
+            repo.check_completion_lease(&identity(), second.fencing_token, 12)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_missing_extra_duplicate_and_conflicting_parts() {
+        let repo = InMemoryMultipartRepository::new();
+        repo.create(upload()).await.unwrap();
+        current_part(&repo, 1, "\"one\"", "sha-one").await;
+        assert!(matches!(
+            repo.acquire_completion(
+                &identity(),
+                "missing",
+                &[complete_part(2, "\"two\"", None)],
+                "worker",
+                10,
+                0,
+            )
+            .await,
+            Err(StagingError::InvalidPart)
+        ));
+        assert!(matches!(
+            repo.acquire_completion(
+                &identity(),
+                "conflicting",
+                &[complete_part(1, "\"wrong\"", Some("sha-one"))],
+                "worker",
+                10,
+                0,
+            )
+            .await,
+            Err(StagingError::InvalidPart)
+        ));
+        assert!(matches!(
+            repo.acquire_completion(
+                &identity(),
+                "duplicate",
+                &[
+                    complete_part(1, "\"one\"", None),
+                    complete_part(1, "\"one\"", None),
+                ],
+                "worker",
+                10,
+                0,
+            )
+            .await,
+            Err(StagingError::InvalidPart)
+        ));
+    }
+
+    #[tokio::test]
+    async fn abort_is_idempotent_and_wins_before_completion_acquisition() {
+        let repo = InMemoryMultipartRepository::new();
+        repo.create(upload()).await.unwrap();
+        current_part(&repo, 1, "\"one\"", "sha-one").await;
+        assert_eq!(repo.abort(&identity(), 1).await.unwrap().len(), 1);
+        assert!(matches!(
+            repo.abort(&identity(), 2).await,
+            Err(StagingError::NotOpen)
+        ));
+        assert!(matches!(
+            repo.acquire_completion(
+                &identity(),
+                "after-abort",
+                &[complete_part(1, "\"one\"", None)],
+                "worker",
+                10,
+                2,
+            )
+            .await,
+            Err(StagingError::NotOpen)
+        ));
     }
 }

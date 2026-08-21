@@ -33,8 +33,16 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, SqlxPostgresConnector};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Method, Request, StatusCode, header};
+use s4_gateway::control::NoopControlPlane;
+use s4_gateway::server::{build_router, build_state};
+use tower::ServiceExt;
 
 const TEST_KEK: [u8; 32] = [7; 32];
 static DB_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -813,5 +821,476 @@ fn postgres_expired_key_rejected() {
             "expired key must be rejected"
         );
         delete_api_key(&db, &key_id).await;
+    });
+}
+
+fn auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("x-s4-access-key", ak.to_string()),
+        ("x-s4-secret-key", sk.to_string()),
+    ]
+}
+
+fn add_headers(req: Request<Body>, hdrs: &[(&'static str, String)]) -> Request<Body> {
+    let (mut parts, body) = req.into_parts();
+    for (name, value) in hdrs {
+        parts.headers.insert(*name, value.parse().unwrap());
+    }
+    Request::from_parts(parts, body)
+}
+
+fn extract_xml(xml: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    xml.split(&open)
+        .nth(1)
+        .and_then(|rest| rest.split(&close).next())
+        .unwrap_or_default()
+        .to_string()
+}
+
+type MockObjects = Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>;
+
+const MOCK_STAGING_BUCKET: &str = "staging-bucket";
+
+/// Decodes the SigV4 streaming (`aws-chunked`) framing the SDK applies to a
+/// non-replayable PutObject body. Frames are `<hex-size>;chunk-signature=...`
+/// headers followed by the raw chunk bytes; a zero-size chunk ends the body.
+fn decode_aws_chunked(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let line_end = data[pos..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|index| pos + index)
+            .unwrap_or(data.len());
+        let line = &data[pos..line_end];
+        let size_str = line.split(|byte| *byte == b';').next().unwrap_or(b"");
+        let size =
+            usize::from_str_radix(std::str::from_utf8(size_str).unwrap_or_default().trim(), 16)
+                .unwrap_or(0);
+        pos = line_end.saturating_add(2);
+        if size == 0 || pos.saturating_add(size) > data.len() {
+            break;
+        }
+        out.extend_from_slice(&data[pos..pos + size]);
+        pos += size;
+        if data.get(pos..pos + 2) == Some(b"\r\n") {
+            pos += 2;
+        }
+    }
+    out
+}
+
+/// Minimal S3-compatible object store backing `S3StagingArtifactStore`. The
+/// staging store only needs PutObject/GetObject/DeleteObject/ListObjectsV2,
+/// and the AWS SDK addresses a custom endpoint path-style (`/{bucket}/{key}`).
+async fn mock_s3_handler(
+    State(objects): State<MockObjects>,
+    request: Request<Body>,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().trim_start_matches('/').to_string();
+    let query = parts.uri.query().unwrap_or_default().to_string();
+
+    if parts.method == Method::GET && query.contains("list-type=2") {
+        let prefix = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("prefix="))
+            .unwrap_or_default()
+            .replace("%2F", "/");
+        let objects = objects.lock().await;
+        let mut keys: Vec<String> = objects
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        keys.sort();
+        let mut xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{MOCK_STAGING_BUCKET}</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>"#,
+            keys.len()
+        );
+        for object_key in keys {
+            xml.push_str(&format!(
+                "<Contents><Key>{object_key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><Size>{}</Size></Contents>",
+                objects.get(&object_key).map_or(0, Vec::len)
+            ));
+        }
+        xml.push_str("</ListBucketResult>");
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+    }
+
+    let key = path
+        .strip_prefix(&format!("{MOCK_STAGING_BUCKET}/"))
+        .map(str::to_owned)
+        .unwrap_or(path);
+
+    match parts.method {
+        Method::PUT => {
+            let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024)
+                .await
+                .unwrap_or_default();
+            let decoded = if bytes.starts_with(b"S4MP10\0") {
+                bytes.to_vec()
+            } else {
+                decode_aws_chunked(&bytes)
+            };
+            objects.lock().await.insert(key, decoded);
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap()
+        }
+        Method::GET => {
+            let objects = objects.lock().await;
+            match objects.get(&key) {
+                Some(bytes) => axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                    .body(Body::from(bytes.clone()))
+                    .unwrap(),
+                None => axum::response::Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .unwrap(),
+            }
+        }
+        Method::DELETE => {
+            objects.lock().await.remove(&key);
+            axum::response::Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap()
+        }
+        _ => axum::response::Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Body::empty())
+            .unwrap(),
+    }
+}
+
+async fn upload_part(
+    app: &axum::Router,
+    hdrs: &[(&'static str, String)],
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    body: &[u8],
+) -> String {
+    let req = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{bucket}/{key}?partNumber={part_number}&uploadId={upload_id}"
+            ))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .body(Body::from(body.to_vec()))
+            .unwrap(),
+        hdrs,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "UploadPart {part_number}");
+    resp.headers()
+        .get(header::ETAG)
+        .expect("UploadPart ETag")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Drives the full S3 multipart HTTP surface through `build_router` against a
+/// durable Postgres repository, an in-memory staging object store, and the
+/// dev-memory destination. Runs only when `DATABASE_URL` is set.
+#[test]
+fn router_staged_multipart_flow_is_durable_and_idempotent() {
+    with_pool(|pool| async move {
+        let _ = &pool;
+
+        let staging_dir =
+            std::env::temp_dir().join(format!("s4-multipart-staging-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+
+        let objects: MockObjects = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let mock_app = axum::Router::new()
+            .fallback(mock_s3_handler)
+            .with_state(objects.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        // SAFETY: test-only process-global env mutation. Every test in this
+        // binary is serialized on `DB_TEST_LOCK`, so no other test observes
+        // these values concurrently.
+        unsafe {
+            std::env::set_var("AUTH_DISABLED", "0");
+            std::env::remove_var("S4_KEYS_FILE");
+            std::env::remove_var("S3_ENDPOINT");
+            std::env::remove_var("S4_SERVICE_BUCKETS");
+            std::env::remove_var("S4_SECRET_KEK");
+            std::env::remove_var("S4_STREAMING_S3_PROVIDER");
+            std::env::remove_var("S4_PLUGINS_DIR");
+            std::env::remove_var("S4_FILTER_COMPONENT");
+            std::env::remove_var("S4_MANAGED_STREAMING_MODE");
+            std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
+            std::env::set_var("S4_STREAMING_WRITE_MODE", "all");
+            std::env::set_var("S4_STREAMING_READ_MODE", "passthrough");
+            std::env::set_var("S4_DEV_MEMORY_STREAMING", "1");
+            std::env::set_var("S4_MULTIPART_MODE", "staged");
+            std::env::set_var("S4_MULTIPART_STAGING_DIR", staging_dir.to_str().unwrap());
+            std::env::set_var("S4_MULTIPART_STAGING_ENDPOINT", &endpoint);
+            std::env::set_var("S4_MULTIPART_STAGING_BUCKET", MOCK_STAGING_BUCKET);
+            std::env::set_var("S4_MULTIPART_STAGING_ACCESS_KEY_ID", "test-access");
+            std::env::set_var("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY", "test-secret");
+            std::env::set_var("S4_MULTIPART_STAGING_REGION", "us-east-1");
+        }
+
+        let state = build_state(
+            Arc::new(NoopControlPlane),
+            Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
+        )
+        .await
+        .expect("build_state with durable staged multipart");
+        let (ak, sk) = state
+            .keys
+            .create_key("test-user", "multipart-test", 0, None)
+            .await
+            .expect("create test API key");
+        let app = build_router(state.clone());
+        let hdrs = auth_headers(&ak, &sk);
+
+        let bucket = format!("mp-bkt-{}", uuid::Uuid::new_v4());
+        let key = format!("object-{}.txt", uuid::Uuid::new_v4());
+
+        // CreateMultipartUpload.
+        let create = add_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploads"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .unwrap(),
+            &hdrs,
+        );
+        let resp = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "CreateMultipartUpload");
+        let create_xml = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let upload_id = extract_xml(&create_xml, "UploadId");
+        assert!(!upload_id.is_empty());
+
+        // UploadPart part 2 first, then part 1: assembly must still follow
+        // part-number order, not upload order.
+        let part1_body: &[u8] = b"first line: alice@example.com\n";
+        let part2_body: &[u8] = b"second line: card 4111111111111111\n";
+        let etag2 = upload_part(&app, &hdrs, &bucket, &key, &upload_id, 2, part2_body).await;
+        let etag1 = upload_part(&app, &hdrs, &bucket, &key, &upload_id, 1, part1_body).await;
+
+        // ListParts.
+        let list = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{bucket}/{key}?uploadId={upload_id}"))
+                .body(Body::empty())
+                .unwrap(),
+            &hdrs,
+        );
+        let resp = app.clone().oneshot(list).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "ListParts");
+        let list_xml = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            list_xml.contains("<PartNumber>1</PartNumber>"),
+            "{list_xml}"
+        );
+        assert!(
+            list_xml.contains("<PartNumber>2</PartNumber>"),
+            "{list_xml}"
+        );
+
+        // CompleteMultipartUpload with the strict sorted XML document.
+        let complete_xml = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let complete = add_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploadId={upload_id}"))
+                .body(Body::from(complete_xml.clone()))
+                .unwrap(),
+            &hdrs,
+        );
+        let resp = app.clone().oneshot(complete).await.unwrap();
+        let status = resp.status();
+        let complete_body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "CompleteMultipartUpload: {complete_body}"
+        );
+        let final_etag = extract_xml(&complete_body, "ETag");
+        assert!(!final_etag.is_empty());
+
+        // GET the assembled object: PII redacted and parts in part-number order.
+        let get = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{bucket}/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+            &hdrs,
+        );
+        let resp = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET assembled object");
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("[REDACTED_EMAIL]"), "email redacted: {text}");
+        assert!(text.contains("[REDACTED_CARD]"), "card redacted: {text}");
+        assert!(
+            !text.contains("alice@example.com"),
+            "raw email leaked: {text}"
+        );
+        assert!(
+            !text.contains("4111111111111111"),
+            "raw card leaked: {text}"
+        );
+        let first = text.find("first line:").expect("first line present");
+        let second = text.find("second line:").expect("second line present");
+        assert!(
+            first < second,
+            "parts assembled in part-number order: {text}"
+        );
+
+        // Re-POSTing the same complete XML replays the stored result.
+        let replay = add_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploadId={upload_id}"))
+                .body(Body::from(complete_xml))
+                .unwrap(),
+            &hdrs,
+        );
+        let resp = app.clone().oneshot(replay).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "idempotent completion replay"
+        );
+        let replay_body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(extract_xml(&replay_body, "ETag"), final_etag);
+
+        // A conflicting part set is rejected.
+        let conflicting = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let conflict_req = add_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploadId={upload_id}"))
+                .body(Body::from(conflicting))
+                .unwrap(),
+            &hdrs,
+        );
+        let resp = app.clone().oneshot(conflict_req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "conflicting completion"
+        );
+
+        // Abort is idempotent and removes the staged artifacts.
+        let abort_key = format!("abort-{}.txt", uuid::Uuid::new_v4());
+        let create = add_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{abort_key}?uploads"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .unwrap(),
+            &hdrs,
+        );
+        let resp = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "abort CreateMultipartUpload");
+        let create_xml = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let abort_upload_id = extract_xml(&create_xml, "UploadId");
+        upload_part(
+            &app,
+            &hdrs,
+            &bucket,
+            &abort_key,
+            &abort_upload_id,
+            1,
+            b"abort me: bob@example.com\n",
+        )
+        .await;
+        assert!(
+            !objects.lock().await.is_empty(),
+            "staged artifact exists before abort"
+        );
+
+        for _ in 0..2 {
+            let abort = add_headers(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/{bucket}/{abort_key}?uploadId={abort_upload_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                &hdrs,
+            );
+            let resp = app.clone().oneshot(abort).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NO_CONTENT,
+                "AbortMultipartUpload"
+            );
+        }
+        assert!(
+            objects.lock().await.is_empty(),
+            "abort removed all staging artifacts"
+        );
+
+        mock_task.abort();
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
     });
 }

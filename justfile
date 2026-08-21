@@ -43,6 +43,38 @@ lint-full: lint audit test
 e2e:
   bash scripts/e2e-local.sh
 
+# Streaming data-plane focused suite (the gateway crate is the streaming plane)
+test-streaming:
+  cargo test -p s4-gateway
+
+# Streaming end-to-end against MinIO (direct S3 sink; requires Docker)
+e2e-streaming:
+  bash scripts/e2e-local.sh
+
+# Unmodified AWS CLI + boto3 interop (requires awscli/boto3 on PATH)
+interop:
+  cargo test -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
+
+# Fault-injection suite: multipart staging fault matrix + streaming failure paths
+fault-streaming:
+  cargo test -p s4-gateway multipart_staging::tests
+  cargo test -p s4-gateway --test s3_frontdoor_test streaming_put_limit_failure_has_no_partial_visibility
+  cargo test -p s4-gateway --test s3_frontdoor_test unsafe_transformed_failures_never_disclose_early_late_or_finish_output
+  cargo test -p s4-gateway --test s3_frontdoor_test valid_sigv4_seed_polls_then_rejects_payload_hash_mismatch
+
+# Fixed-RSS memory bound (1 GiB source; asserts allocation is object-size-independent)
+bench-rss:
+  cargo test -p s4-gateway --test streaming_rss -- --nocapture
+
+# Soak: high-case-count property tests + repeated streaming round-trips
+soak-streaming:
+  PROPTEST_CASES=10000 cargo test -p s4-gateway --test property --test record_decoder
+  S4_SOAK_ITERATIONS=500 cargo test -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored
+
+# Release image smoke (boot smoke against the built OCI image)
+release-smoke:
+  bash scripts/release-image-smoke.sh
+
 # Run the CI workflow locally with act (no GitHub minutes)
 ci-local:
   act -W .github/workflows/ci.yml

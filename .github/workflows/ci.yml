@@ -110,10 +110,24 @@ jobs:
       - name: Test Postgres migrations and secret envelopes
         run: cargo test -p s4-gateway --test db_keys_test
 
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install AWS CLI and boto3
+        run: |
+          python3 -m pip install --user awscli boto3
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Unmodified-client interop (AWS CLI + boto3)
+        run: cargo test -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
+
   # Aggregate status so branch protection's required `check` keeps working
   # and never ends up "skipped" when a constituent job fails.
   check:
-    needs: [fmt, lint, test, sdk, e2e, postgres]
+    needs: [fmt, lint, test, sdk, e2e, postgres, interop]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

@@ -5948,3 +5948,27 @@ mod multipart_completion_tests {
         .is_err());
     }
 }
+
+#[cfg(test)]
+mod s3_provider_capability_tests {
+    use super::configured_s3_streaming_capabilities;
+
+    #[test]
+    fn provider_selection_is_exact_and_fail_closed() {
+        for provider in ["aws", "minio", "r2", "b2"] {
+            unsafe { std::env::set_var("S4_STREAMING_S3_PROVIDER", provider) }
+            let capabilities = configured_s3_streaming_capabilities();
+            assert!(
+                capabilities.is_some(),
+                "provider {provider} must enable direct S3 streaming"
+            );
+            let capabilities = capabilities.expect("capabilities present");
+            assert!(capabilities.supports_conditional_reads());
+            assert!(capabilities.supports_response_checksums());
+        }
+        unsafe { std::env::set_var("S4_STREAMING_S3_PROVIDER", "wasabi") }
+        assert!(configured_s3_streaming_capabilities().is_none());
+        unsafe { std::env::remove_var("S4_STREAMING_S3_PROVIDER") }
+        assert!(configured_s3_streaming_capabilities().is_none());
+    }
+}

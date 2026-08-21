@@ -13,7 +13,6 @@ use std::time::{Duration, SystemTime};
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ChecksumMode;
 use aws_smithy_types::date_time::Format as DateTimeFormat;
 use axum::{
@@ -270,10 +269,6 @@ fn legacy_max_object_bytes() -> usize {
     bounded
 }
 
-fn effective_legacy_max_object_bytes(state: &AppState) -> usize {
-    state.legacy_max_object_bytes.min(LEGACY_MAX_OBJECT_BYTES)
-}
-
 /// Derive the deterministic-encryption key for an API key secret:
 /// two 32-byte HMAC-SHA256 outputs (`"s4-stable-encrypt"` + counter) giving
 /// the 64-byte key AES-256-SIV requires. The plugin receives only this
@@ -408,20 +403,6 @@ struct S3Query {
     )
 )]
 struct ApiDoc;
-
-fn detect_format(headers: &HeaderMap) -> Format {
-    let ct = headers
-        .get("Content-Type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("text/plain");
-    match ct {
-        "application/x-ndjson" | "application/jsonlines" => Format::Jsonl,
-        "application/json" => Format::Json,
-        "text/csv" => Format::Csv,
-        "text/tab-separated-values" => Format::Tsv,
-        _ => Format::Text,
-    }
-}
 
 /// Escape a value for inclusion in an S3 XML document.
 fn xml_escape(s: &str) -> String {
@@ -1399,6 +1380,65 @@ struct DemoRedactRequest {
     text: String,
 }
 
+/// Run a bounded in-memory input through the streaming record decoder and
+/// persistent pipeline session. Kept small on purpose: demo endpoints cap the
+/// input so this never becomes a whole-object buffer.
+async fn run_demo_streaming(
+    state: &AppState,
+    input: &[u8],
+    format: Format,
+    content_type: &str,
+    public_key_pem: Option<&str>,
+    stable_key: Option<&[u8]>,
+    stable_fields: Option<&str>,
+) -> Result<(Vec<u8>, usize), s4_error::S4Error> {
+    let session = s4_wasm_runtime::Session {
+        format: format.as_str().to_string(),
+        content_type: content_type.to_string(),
+        policy_version: 0,
+        public_key_pem: public_key_pem.map(str::to_string),
+        stable_key: stable_key.map(<[u8]>::to_vec),
+        stable_fields: stable_fields.map(str::to_string),
+    };
+    let cancellation = s4_wasm_runtime::CancellationToken::new();
+    let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
+        s4_error::S4Error::new(
+            s4_error::codes::INTERNAL,
+            "demo pipeline requires a plugin registry",
+        )
+    })?;
+    let mut pipeline = snapshot
+        .start_streaming_session(session, cancellation)
+        .await?;
+    let limits = crate::record::DecoderLimits::default();
+    let mut decoder = crate::record::RecordDecoder::new(format, limits)?;
+    let mut output = Vec::new();
+    let mut records = 0usize;
+    for chunk in input.chunks(limits.max_source_frame_bytes) {
+        decoder.push(chunk)?;
+        while let Some(record) = decoder.next_record()? {
+            records += 1;
+            if let Some(record) = pipeline.process(record).await? {
+                output.extend_from_slice(&record.payload);
+                output.extend_from_slice(&record.separator);
+            }
+        }
+    }
+    decoder.finish()?;
+    while let Some(record) = decoder.next_record()? {
+        records += 1;
+        if let Some(record) = pipeline.process(record).await? {
+            output.extend_from_slice(&record.payload);
+            output.extend_from_slice(&record.separator);
+        }
+    }
+    for record in pipeline.finish().await? {
+        output.extend_from_slice(&record.payload);
+        output.extend_from_slice(&record.separator);
+    }
+    Ok((output, records))
+}
+
 async fn demo_redact(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DemoRedactRequest>,
@@ -1408,17 +1448,20 @@ async fn demo_redact(
     }
     // Run the engine's default pipeline (PII redaction). No public key, no
     // stable key: this is the pure "detect + redact" path.
-    match state.gateway.process(
+    match run_demo_streaming(
+        &state,
         body.text.as_bytes(),
         Format::Text,
         "text/plain",
         None,
         None,
         None,
-    ) {
-        Ok(out) => Json(serde_json::json!({
-            "redacted": String::from_utf8_lossy(&out.bytes),
-            "records_processed": out.records_processed,
+    )
+    .await
+    {
+        Ok((bytes, records_processed)) => Json(serde_json::json!({
+            "redacted": String::from_utf8_lossy(&bytes),
+            "records_processed": records_processed,
         }))
         .into_response(),
         Err(e) => (
@@ -1502,143 +1545,6 @@ fn wants_transformed_read(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("read") || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-}
-
-/// Run the filter pipeline over `body`.
-fn process_input(
-    state: &AppState,
-    headers: &HeaderMap,
-    auth: &Auth,
-    body: &[u8],
-) -> Result<crate::TransformOutput, s4_error::S4Error> {
-    let format = detect_format(headers);
-    let stable_fields = headers
-        .get("x-s4-stable-fields")
-        .and_then(|v| v.to_str().ok());
-    state.gateway.process(
-        body,
-        format,
-        "text/plain",
-        auth.public_key_pem.as_deref(),
-        auth.stable_key.as_deref(),
-        stable_fields,
-    )
-}
-
-/// Store already-filtered bytes via the configured backend, following the same
-/// priority as a plain PUT (presigned URL header → S3 backend → service
-/// storage → in-memory).
-async fn store_processed(
-    state: &AppState,
-    auth: &Auth,
-    backend: ResolvedBackend,
-    bucket: &str,
-    key: &str,
-    output: crate::TransformOutput,
-    input_len: usize,
-) -> axum::response::Response {
-    let crate::TransformOutput {
-        bytes,
-        records_processed,
-    } = output;
-    let bytes = bytes::Bytes::from(bytes);
-    match backend {
-        ResolvedBackend::PresignedHttp(url) => {
-            let client = match state.presigned_http_policy.client_for(&url).await {
-                Ok(client) => client,
-                Err(error) => return open_error_response(key, OpenObjectError::Rejected(error)),
-            };
-            match client.put(url).body(bytes).send().await {
-                Ok(_) => {
-                    state
-                        .control
-                        .record(&auth.user_id, RequestKind::Write, input_len as u64)
-                        .await;
-                    info!(
-                        "PUT /{bucket}/{key} -> presigned URL ({} records, user={})",
-                        records_processed, auth.user_id
-                    );
-                    StatusCode::OK.into_response()
-                }
-                Err(e) => {
-                    warn!("backend put failed: {e}");
-                    s3_error::internal_error(key, &e.to_string())
-                }
-            }
-        }
-        ResolvedBackend::S3 { client, .. } => match client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from(bytes))
-            .send()
-            .await
-        {
-            Ok(_) => {
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Write, input_len as u64)
-                    .await;
-                info!(
-                    "PUT /{bucket}/{key} -> S3 ({} records, user={})",
-                    records_processed, auth.user_id
-                );
-                StatusCode::OK.into_response()
-            }
-            Err(e) => {
-                warn!("upstream put failed: {e}");
-                s3_error::internal_error(key, &e.to_string())
-            }
-        },
-        ResolvedBackend::Managed(storage)
-            if storage.managed_mode() != ManagedStreamingMode::Off =>
-        {
-            s3_error::service_unavailable(
-                key,
-                "managed mutations require authoritative streaming enforce mode",
-            )
-        }
-        ResolvedBackend::Managed(storage) => match storage
-            .put(
-                &format!("{}/{bucket}/{key}", auth.user_id),
-                bytes,
-                "text/plain",
-            )
-            .await
-        {
-            Ok(()) => {
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Write, input_len as u64)
-                    .await;
-                info!(
-                    "PUT /{bucket}/{key} -> service storage ({} records, user={})",
-                    records_processed, auth.user_id
-                );
-                StatusCode::OK.into_response()
-            }
-            Err(e) => {
-                warn!("service storage put failed: {e}");
-                s3_error::internal_error(key, &e.to_string())
-            }
-        },
-        ResolvedBackend::Memory(store) => {
-            state
-                .control
-                .record(&auth.user_id, RequestKind::Write, input_len as u64)
-                .await;
-            let obj = store.put(bucket, key, bytes, "text/plain");
-            info!(
-                "PUT /{bucket}/{key} -> memory ({} records, {} bytes, user={})",
-                records_processed,
-                obj.data.len(),
-                auth.user_id
-            );
-            let mut resp = axum::response::Response::builder().status(StatusCode::OK);
-            resp = resp.header("ETag", &obj.etag);
-            resp.body(axum::body::Body::empty()).unwrap()
-        }
-    }
 }
 
 struct PresignedSpoolUploader {
@@ -3076,7 +2982,6 @@ async fn s3_put(
         return s3_upload_part(state, bucket, key, params, request).await;
     }
     let (parts, request_body) = request.into_parts();
-    let max_bytes = effective_legacy_max_object_bytes(&state);
     let header_auth = match authenticate_headers(
         parts.method.as_str(),
         &parts.uri,
@@ -3125,70 +3030,43 @@ async fn s3_put(
             ManagedStreamingMode::Off | ManagedStreamingMode::Enforce => {}
         }
     }
-    if effective_write_mode >= StreamingWriteMode::Single {
-        return match streaming_single_put(
-            &state,
-            header_auth,
-            backend,
-            &parts.headers,
-            request_body,
-            &bucket,
-            &key,
-        )
-        .await
-        {
-            Ok((auth, stored, input_bytes)) => {
-                state
-                    .control
-                    .record(&auth.user_id, RequestKind::Write, input_bytes)
-                    .await;
-                info!(
-                    "streaming PUT /{bucket}/{key} committed ({input_bytes} input bytes, user={})",
-                    auth.user_id
-                );
-                let mut response = axum::response::Response::builder().status(StatusCode::OK);
-                if let Some(etag) = stored.etag {
-                    response = response.header(header::ETAG, etag);
-                }
-                if let Some(version_id) = stored.version_id {
-                    response = response.header("x-amz-version-id", version_id);
-                }
-                response.body(axum::body::Body::empty()).unwrap()
+    // Legacy buffered PUT was removed in Phase 12. A write-mode below `single`
+    // rejects without polling the request body; there is no fallback to a
+    // whole-object buffer.
+    if effective_write_mode < StreamingWriteMode::Single {
+        return s3_error::not_implemented(&key);
+    }
+    match streaming_single_put(
+        &state,
+        header_auth,
+        backend,
+        &parts.headers,
+        request_body,
+        &bucket,
+        &key,
+    )
+    .await
+    {
+        Ok((auth, stored, input_bytes)) => {
+            state
+                .control
+                .record(&auth.user_id, RequestKind::Write, input_bytes)
+                .await;
+            info!(
+                "streaming PUT /{bucket}/{key} committed ({input_bytes} input bytes, user={})",
+                auth.user_id
+            );
+            let mut response = axum::response::Response::builder().status(StatusCode::OK);
+            if let Some(etag) = stored.etag {
+                response = response.header(header::ETAG, etag);
             }
-            Err(error) => streaming_put_error_response(&key, error),
-        };
+            if let Some(version_id) = stored.version_id {
+                response = response.header("x-amz-version-id", version_id);
+            }
+            response.body(axum::body::Body::empty()).unwrap()
+        }
+        Err(error) => streaming_put_error_response(&key, error),
     }
-    let (auth, body) = match read_verified_body(header_auth, request_body, max_bytes).await {
-        Ok(verified) => verified,
-        Err(VerifiedBodyError::TooLarge) => return s3_error::entity_too_large(&key),
-        Err(VerifiedBodyError::Integrity(
-            IntegrityError::PayloadHashMismatch | IntegrityError::SignatureMismatch,
-        )) => return s3_error::signature_mismatch(&key),
-        Err(VerifiedBodyError::Integrity(error)) => {
-            return s3_error::bad_digest(&key, &error.to_string());
-        }
-        Err(VerifiedBodyError::Transport) => {
-            return s3_error::invalid_request(&key, "request body stream failed");
-        }
-    };
-
-    let output = match process_input(&state, &parts.headers, &auth, &body) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("filter failed for /{bucket}/{key}: {e}");
-            return s3_error::internal_error(&key, &e.to_string());
-        }
-    };
-    if output.bytes.len() > max_bytes {
-        warn!(
-            input_bytes = body.len(),
-            output_bytes = output.bytes.len(),
-            max_bytes,
-            "filtered output exceeds the legacy object limit"
-        );
-        return s3_error::entity_too_large(&key);
-    }
-    store_processed(&state, &auth, backend, &bucket, &key, output, body.len()).await
 }
 
 #[derive(Debug)]
@@ -3925,31 +3803,10 @@ async fn s3_get(
         return object.into_response();
     }
 
-    let max_bytes = effective_legacy_max_object_bytes(&state);
-    if object
-        .metadata
-        .headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|length| length > max_bytes as u64)
-    {
-        return s3_error::entity_too_large(&key);
-    }
-    let status = object.status;
-    let metadata = object.metadata;
-    let body = match axum::body::to_bytes(object.body, max_bytes).await {
-        Ok(body) => body,
-        Err(error) => {
-            warn!("legacy backend read failed for {key}: {error}");
-            return s3_error::entity_too_large(&key);
-        }
-    };
-    let mut response = axum::response::Response::builder().status(status);
-    if let Some(headers) = response.headers_mut() {
-        headers.extend(metadata.headers);
-    }
-    response.body(axum::body::Body::from(body)).unwrap()
+    // Legacy whole-object GET buffering was removed in Phase 12. With reads
+    // administratively disabled, reject without collecting the object body;
+    // dropping `object` cancels the source before any byte is buffered.
+    s3_error::not_implemented(&key)
 }
 
 #[cfg(test)]
@@ -5801,6 +5658,12 @@ pub async fn build_state(
         info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
         Arc::new(KeyStore::with_cipher(cipher))
     };
+    if operation_journal.is_none() && auth_disabled && cfg!(debug_assertions) {
+        info!(
+            "Operation journal: in-memory (dev local mode; streaming S3 PUT uses a non-durable journal)"
+        );
+        operation_journal = Some(Arc::new(crate::transaction::InMemoryOperationJournal::new()));
+    }
     let managed_repository: Arc<dyn ManagedRepository> = if let Some(pool) = postgres_pool.clone() {
         Arc::new(PostgresManagedRepository::new(pool))
     } else {

@@ -332,17 +332,12 @@ impl PluginRegistry {
     }
 
     pub fn snapshot(&self) -> PipelineSnapshot {
-        self.snapshot_with_skip(&[])
-    }
-
-    fn snapshot_with_skip(&self, skip: &[&str]) -> PipelineSnapshot {
         let state = self.state.read().unwrap();
         let plugins = state
             .order
             .iter()
             .filter_map(|id| state.plugins.get(id))
             .filter(|plugin| plugin.info.enabled)
-            .filter(|plugin| !plugin_is_skipped(&plugin.info.name, skip))
             .map(|plugin| SnapshotPlugin {
                 info: plugin.info.clone(),
                 component_hash: plugin.component_hash.clone(),
@@ -355,62 +350,6 @@ impl PluginRegistry {
             limits: self.pipeline_limits,
             executor: Arc::clone(&self.executor),
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn process_all(
-        &self,
-        format: super::Format,
-        content_type: &str,
-        public_key_pem: Option<&str>,
-        stable_key: Option<&[u8]>,
-        stable_fields: Option<&str>,
-        records: &[Vec<u8>],
-    ) -> Result<Vec<Vec<u8>>, S4Error> {
-        self.process_all_with(
-            format,
-            content_type,
-            public_key_pem,
-            stable_key,
-            stable_fields,
-            records,
-            &[],
-        )
-    }
-
-    /// Like `process_all`, but excludes matching plugin names from the snapshot.
-    #[allow(clippy::too_many_arguments)]
-    pub fn process_all_with(
-        &self,
-        format: super::Format,
-        content_type: &str,
-        public_key_pem: Option<&str>,
-        stable_key: Option<&[u8]>,
-        stable_fields: Option<&str>,
-        records: &[Vec<u8>],
-        skip: &[&str],
-    ) -> Result<Vec<Vec<u8>>, S4Error> {
-        let snapshot = self.snapshot_with_skip(skip);
-        let session = s4_wasm_runtime::Session {
-            format: format.as_str().to_string(),
-            content_type: content_type.to_string(),
-            policy_version: 0,
-            public_key_pem: public_key_pem.map(str::to_string),
-            stable_key: stable_key.map(<[u8]>::to_vec),
-            stable_fields: stable_fields.map(str::to_string),
-        };
-        let records: Vec<Record> = records
-            .iter()
-            .map(|payload| Record::new(Bytes::copy_from_slice(payload), Bytes::new()))
-            .collect();
-        snapshot
-            .process_records(session, records, CancellationToken::new())
-            .map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.payload.to_vec())
-                    .collect()
-            })
     }
 
     pub fn load_from_dir(&self, dir: &Path) -> anyhow::Result<Vec<PluginInfo>> {
@@ -542,28 +481,6 @@ impl PipelineSnapshot {
         })
     }
 
-    pub fn process_records(
-        self,
-        session: s4_wasm_runtime::Session,
-        records: Vec<Record>,
-        cancellation: CancellationToken,
-    ) -> Result<Vec<Record>, S4Error> {
-        let reservation = self.guest_memory_reservation()?;
-        let executor = Arc::clone(&self.executor);
-        let task_cancellation = cancellation.clone();
-        executor.execute(reservation, &cancellation, move || {
-            let mut pipeline = self.start_session(&session, task_cancellation)?;
-            let mut output = Vec::new();
-            for record in records {
-                if let Some(record) = pipeline.process(record)? {
-                    output.push(record);
-                }
-            }
-            output.extend(pipeline.finish()?);
-            Ok::<_, S4Error>(output)
-        })?
-    }
-
     pub async fn start_streaming_session(
         self,
         session: s4_wasm_runtime::Session,
@@ -683,24 +600,6 @@ fn pipeline_stopped() -> S4Error {
 }
 
 impl PipelineSession {
-    pub(crate) fn from_filter(name: impl Into<String>, filter: FilterSession) -> Self {
-        let fuel_consumed = filter.fuel_consumed();
-        let limits = PipelineLimits::default();
-        Self {
-            plugins: vec![Some(PluginSession {
-                name: name.into(),
-                filter: Box::new(filter),
-                accounted_fuel: fuel_consumed,
-            })],
-            limits,
-            input_bytes: 0,
-            output_bytes: 0,
-            stage_output_bytes: vec![0],
-            fuel_consumed,
-            object_deadline: Instant::now() + limits.max_wall_time,
-        }
-    }
-
     pub fn process(&mut self, record: Record) -> Result<Option<Record>, S4Error> {
         self.check_deadline()?;
         self.input_bytes = checked_total(
@@ -869,10 +768,6 @@ impl PipelineSession {
     }
 }
 
-fn plugin_is_skipped(name: &str, skip: &[&str]) -> bool {
-    skip.contains(&name) || skip.contains(&name.split('.').next().unwrap_or(""))
-}
-
 fn plugin_error(name: &str, error: S4Error) -> S4Error {
     S4Error::new(error.code(), format!("plugin {name}: {}", error.message()))
 }
@@ -910,7 +805,6 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::Format;
 
     fn component_named(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1072,14 +966,20 @@ mod tests {
         let input = Record::new("alice@example.com", "\n");
 
         let first_output = first_object
-            .process_records(session(), vec![input.clone()], CancellationToken::new())
+            .start_session(&session(), CancellationToken::new())
+            .unwrap()
+            .process(input.clone())
+            .unwrap()
             .unwrap();
         let later_output = later_object
-            .process_records(session(), vec![input], CancellationToken::new())
+            .start_session(&session(), CancellationToken::new())
+            .unwrap()
+            .process(input)
+            .unwrap()
             .unwrap();
 
-        assert_eq!(first_output[0], Record::new("[REDACTED_EMAIL]", "\n"));
-        assert_eq!(later_output[0], Record::new("alice@example.com", "\n"));
+        assert_eq!(first_output, Record::new("[REDACTED_EMAIL]", "\n"));
+        assert_eq!(later_output, Record::new("alice@example.com", "\n"));
     }
 
     #[test]
@@ -1203,8 +1103,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plugin_count_fuel_and_admission_have_stable_codes() {
+    #[tokio::test]
+    async fn plugin_count_fuel_and_admission_have_stable_codes() {
         let plugin_limits = PipelineLimits {
             max_plugins: 1,
             ..PipelineLimits::default()
@@ -1259,20 +1159,14 @@ mod tests {
         )
         .unwrap();
         registry.import("a", &component()).unwrap();
-        assert_eq!(
-            registry
-                .process_all(
-                    Format::Text,
-                    "text/plain",
-                    None,
-                    None,
-                    None,
-                    &[b"x".to_vec()],
-                )
-                .unwrap_err()
-                .code(),
-            codes::WASM_ADMISSION
-        );
+        match registry
+            .snapshot()
+            .start_streaming_session(session(), CancellationToken::new())
+            .await
+        {
+            Ok(_) => panic!("admission must reject an over-budget pipeline"),
+            Err(error) => assert_eq!(error.code(), codes::WASM_ADMISSION),
+        }
     }
 
     #[test]
@@ -1293,21 +1187,23 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_wrapper_uses_snapshot_pipeline() {
+    fn snapshot_pipeline_processes_records_and_finishes() {
         let registry = PluginRegistry::new();
         registry.import("noop", &component()).unwrap();
-        let records = vec![b"one".to_vec(), b"two".to_vec()];
-        assert_eq!(
-            registry
-                .process_all(Format::Text, "text/plain", None, None, None, &records)
-                .unwrap(),
-            records
-        );
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.component_hashes().len(), 1);
         assert_eq!(snapshot.capabilities(), [PluginCapabilities::default()]);
-        snapshot
+        let mut pipeline = snapshot
             .start_session(&session(), CancellationToken::new())
             .unwrap();
+        assert_eq!(
+            pipeline.process(Record::new("one", "\n")).unwrap().unwrap(),
+            Record::new("one", "\n")
+        );
+        assert_eq!(
+            pipeline.process(Record::new("two", "\n")).unwrap().unwrap(),
+            Record::new("two", "\n")
+        );
+        assert!(pipeline.finish().unwrap().is_empty());
     }
 }

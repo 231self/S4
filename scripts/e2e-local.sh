@@ -54,6 +54,9 @@ S3_SECRET_ACCESS_KEY=minioadmin \
 S3_REGION=us-east-1 \
 LISTEN_ADDR="127.0.0.1:$GW_PORT" \
 S4_FILTER_COMPONENT="$ROOT/target/components/pii-default.component.wasm" \
+S4_STREAMING_WRITE_MODE=single \
+S4_STREAMING_READ_MODE=passthrough \
+S4_STREAMING_S3_PROVIDER=minio \
 AUTH_DISABLED=true \
 "$ROOT/target/debug/s4-gateway" > "$GW_LOG" 2>&1 &
 GW_PID=$!

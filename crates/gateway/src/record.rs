@@ -425,27 +425,6 @@ impl RecordDecoder {
     }
 }
 
-pub fn decode_all(
-    input: &[u8],
-    format: Format,
-    limits: DecoderLimits,
-) -> Result<Vec<Record>, S4Error> {
-    let frame_size = limits.max_source_frame_bytes;
-    let mut decoder = RecordDecoder::new(format, limits)?;
-    let mut records = Vec::new();
-    for chunk in input.chunks(frame_size) {
-        decoder.push(chunk)?;
-        while let Some(record) = decoder.next_record()? {
-            records.push(record);
-        }
-    }
-    decoder.finish()?;
-    while let Some(record) = decoder.next_record()? {
-        records.push(record);
-    }
-    Ok(records)
-}
-
 fn validate_utf8(input: &[u8], code: &'static str) -> Result<(), S4Error> {
     std::str::from_utf8(input)
         .map(|_| ())

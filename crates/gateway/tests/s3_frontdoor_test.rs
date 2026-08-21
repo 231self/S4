@@ -123,6 +123,11 @@ async fn test_state() -> Arc<AppState> {
         std::env::remove_var("S4_MANAGED_PLACEMENT_VERSION");
         std::env::remove_var("S4_DEV_MEMORY_STREAMING");
         std::env::remove_var("S4_MULTIPART_MODE");
+        // Phase 12 removed the legacy buffered PUT/GET path entirely; the
+        // streaming in-memory dev backend is the only write/read path left.
+        std::env::set_var("S4_STREAMING_WRITE_MODE", "single");
+        std::env::set_var("S4_STREAMING_READ_MODE", "passthrough");
+        std::env::set_var("S4_DEV_MEMORY_STREAMING", "1");
         // Load the built filter components so the full pipeline (including
         // stable-encrypt) is available for joinable-read tests.
         let components =
@@ -351,7 +356,6 @@ async fn tenant_mode_can_only_lower_the_deployment_ceiling() {
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.auth_disabled = true;
     state_mut.streaming_write_mode = StreamingWriteMode::All;
-    state_mut.legacy_max_object_bytes = 4;
     state_mut.control = Arc::new(StreamingOffControl);
     let app = build_router(state.clone());
     let request = Request::builder()
@@ -361,8 +365,73 @@ async fn tenant_mode_can_only_lower_the_deployment_ceiling() {
         .body(Body::from("12345"))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Phase 12: a write-mode below `single` rejects outright; there is no
+    // legacy buffered fallback to run a size cap against.
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>NotImplemented</Code>"));
     assert!(state.store.get("stream", "tenant-off.txt").is_none());
+}
+
+#[tokio::test]
+async fn streaming_off_rejects_put_without_polling_and_get_without_buffering() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_write_mode = StreamingWriteMode::Off;
+    state_mut.streaming_read_mode = StreamingReadMode::Off;
+    state_mut.dev_memory_streaming_enabled = true;
+    let app = build_router(state.clone());
+
+    // Write mode off: PUT rejects without polling the request body.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let put = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/off/object.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not be read")),
+            }))
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
+    let response = app.clone().oneshot(put).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "write-mode-off PUT must not poll the body"
+    );
+    assert!(state.store.get("off", "object.txt").is_none());
+
+    // Read mode off: GET rejects without buffering or disclosing the object.
+    state.store.put(
+        "off",
+        "object.txt",
+        Bytes::from_static(b"payload"),
+        "text/plain",
+    );
+    let get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/off/object.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
+    let response = app.oneshot(get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&body).contains("payload"),
+        "read-mode-off GET must not buffer the object body"
+    );
 }
 
 #[tokio::test]
@@ -371,6 +440,7 @@ async fn unsupported_streaming_backend_is_rejected_without_polling_body() {
     let (access_key, secret_key) = make_key(&state).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.streaming_write_mode = StreamingWriteMode::Single;
+    state_mut.dev_memory_streaming_enabled = false;
     let app = build_router(state);
     let polls = Arc::new(AtomicUsize::new(0));
     let request = add_headers(
@@ -401,6 +471,7 @@ async fn list_objects_returns_keys_and_prefixes() {
             Request::builder()
                 .method("PUT")
                 .uri(format!("/bkt/{key}"))
+                .header(header::CONTENT_TYPE, "text/plain")
                 .body(Body::from("data"))
                 .unwrap(),
             &hdrs,
@@ -591,6 +662,7 @@ async fn list_buckets_at_root() {
         Request::builder()
             .method("PUT")
             .uri("/mybkt/obj")
+            .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from("x"))
             .unwrap(),
         &hdrs,
@@ -653,6 +725,7 @@ async fn head_and_delete_remain_available() {
         Request::builder()
             .method("PUT")
             .uri("/bkt/lifecycle.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from("payload"))
             .unwrap(),
         &hdrs,
@@ -1070,6 +1143,16 @@ fn signed_request(
     req
 }
 
+/// Streaming PUT requires an explicit Content-Type (it is not part of the
+/// SigV4 SignedHeaders, so injecting it after signing is safe).
+fn with_content_type(request: Request<Body>, content_type: &str) -> Request<Body> {
+    let (mut parts, body) = request.into_parts();
+    parts
+        .headers
+        .insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    Request::from_parts(parts, body)
+}
+
 #[tokio::test]
 async fn sigv4_signed_request_accepted_and_rejected() {
     let (app, state) = router().await;
@@ -1077,7 +1160,10 @@ async fn sigv4_signed_request_accepted_and_rejected() {
     let uri = "http://s4.local/demo/signed.txt";
 
     // Correct signature → 200.
-    let req = signed_request(&ak, &sk, "PUT", uri, b"hello world");
+    let req = with_content_type(
+        signed_request(&ak, &sk, "PUT", uri, b"hello world"),
+        "text/plain",
+    );
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     if status != StatusCode::OK {
@@ -1162,7 +1248,10 @@ async fn sigv4_get_object_roundtrip() {
 
     // PUT via SigV4.
     let uri = "http://s4.local/bkt/signed.txt";
-    let req = signed_request(&ak, &sk, "PUT", uri, b"content a@b.com");
+    let req = with_content_type(
+        signed_request(&ak, &sk, "PUT", uri, b"content a@b.com"),
+        "text/plain",
+    );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -1328,7 +1417,7 @@ async fn sigv4_tampered_body_rejected() {
     let uri = "http://s4.local/bkt/tamper.txt";
 
     // Sign body A, then send body B with the A-signature -> 403.
-    let req = signed_request(&ak, &sk, "PUT", uri, b"AAAA");
+    let req = with_content_type(signed_request(&ak, &sk, "PUT", uri, b"AAAA"), "text/plain");
     let (mut parts, _old_body) = req.into_parts();
     parts
         .headers
@@ -1368,7 +1457,10 @@ async fn valid_sigv4_seed_polls_then_rejects_payload_hash_mismatch() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
     let uri = "http://s4.local/bkt/hash-mismatch.txt";
-    let signed = signed_request(&ak, &sk, "PUT", uri, b"claimed body");
+    let signed = with_content_type(
+        signed_request(&ak, &sk, "PUT", uri, b"claimed body"),
+        "text/plain",
+    );
     let (parts, _) = signed.into_parts();
     let polls = Arc::new(AtomicUsize::new(0));
     let request = Request::from_parts(
@@ -1417,6 +1509,7 @@ async fn unmodified_rust_sdk_default_put_is_accepted() {
         .put_object()
         .bucket("sdk-bucket")
         .key("default-put.txt")
+        .content_type("text/plain")
         .body(aws_sdk_s3::primitives::ByteStream::from_static(
             b"SDK contact sdk@example.com",
         ))
@@ -1486,6 +1579,8 @@ async fn available_aws_cli_and_boto3_interoperate() {
                 "--region",
                 "us-east-1",
                 "--no-progress",
+                "--content-type",
+                "text/plain",
             ])
             .env("AWS_ACCESS_KEY_ID", access_key)
             .env("AWS_SECRET_ACCESS_KEY", secret)
@@ -1526,7 +1621,7 @@ boto3.client(
     aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
     aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     config=Config(s3={"addressing_style": "path"}),
-).put_object(Bucket="boto-bucket", Key="default.txt", Body=b"boto contact boto@example.com")
+).put_object(Bucket="boto-bucket", Key="default.txt", Body=b"boto contact boto@example.com", ContentType="text/plain")
 "#;
         let output = tokio::time::timeout(
             Duration::from_secs(30),
@@ -1566,6 +1661,7 @@ async fn non_expiring_key_works() {
         Request::builder()
             .method("PUT")
             .uri("/demo/x.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from("x"))
             .unwrap(),
         &hdrs,
@@ -1787,6 +1883,7 @@ async fn legacy_body_limit_never_exceeds_hard_ceiling() {
         Request::builder()
             .method("PUT")
             .uri("/limits/default.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from(vec![b'x'; 16 * 1024 * 1024 + 1]))
             .unwrap(),
         &auth_headers(&ak, &sk),
@@ -1802,7 +1899,7 @@ async fn legacy_body_limit_never_exceeds_hard_ceiling() {
 }
 
 #[tokio::test]
-async fn custom_legacy_body_limit_caps_put_and_passthrough_get() {
+async fn legacy_body_limit_no_longer_bounds_streaming_put_or_passthrough_get() {
     let mut state = test_state().await;
     Arc::get_mut(&mut state)
         .expect("test state is uniquely owned")
@@ -1811,59 +1908,45 @@ async fn custom_legacy_body_limit_caps_put_and_passthrough_get() {
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
 
+    // The legacy buffered PUT path is gone: the configured legacy cap no
+    // longer bounds a streaming PUT, which is instead capped by the dev
+    // memory sink (16 MiB default).
     let put = add_headers(
         Request::builder()
             .method("PUT")
             .uri("/limits/custom.txt")
-            .body(Body::from("123456789"))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("abcdefghij"))
             .unwrap(),
         &hdrs,
     );
     let resp = app.clone().oneshot(put).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("<Code>EntityTooLarge</Code>"));
-
-    // The line-oriented pipeline appends a separator, so an input exactly at
-    // the cap must still be rejected when transformed output exceeds it.
-    let expanded = add_headers(
-        Request::builder()
-            .method("PUT")
-            .uri("/limits/expanded.txt")
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("12345678"))
-            .unwrap(),
-        &hdrs,
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "legacy cap must not bound PUT"
     );
-    let resp = app.clone().oneshot(expanded).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("<Code>EntityTooLarge</Code>"));
+    assert!(state.store.get("limits", "custom.txt").is_some());
 
-    state.store.put(
-        "limits",
-        "upstream.txt",
-        b"123456789".to_vec(),
-        "text/plain",
-    );
+    // Passthrough GET streams the stored object regardless of the legacy cap.
     let get = add_headers(
         Request::builder()
             .method("GET")
-            .uri("/limits/upstream.txt")
+            .uri("/limits/custom.txt")
             .body(Body::empty())
             .unwrap(),
         &hdrs,
     );
     let resp = app.oneshot(get).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("<Code>EntityTooLarge</Code>"));
+    assert_eq!(
+        body.as_ref(),
+        b"abcdefghij",
+        "passthrough GET must not buffer or reject against the legacy cap"
+    );
 }
 
 #[tokio::test]

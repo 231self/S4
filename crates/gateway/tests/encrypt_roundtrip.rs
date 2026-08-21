@@ -10,12 +10,13 @@ use rsa::Oaep;
 use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
+use s4_gateway::Format;
 use s4_gateway::plugin_registry::PluginRegistry;
-use s4_gateway::{Format, Gateway};
 use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+
+mod common;
 
 fn fixture(name: &str) -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -42,10 +43,7 @@ fn read_component(name: &str) -> Vec<u8> {
     .unwrap_or_else(|_| panic!("component not found: {name}; run `just build-filters` first"))
 }
 
-fn gateway_with_encrypt() -> Gateway {
-    let engine =
-        s4_wasm_runtime::FilterEngine::new(&read_component("envelope-encrypt.component.wasm"))
-            .expect("failed to load envelope-encrypt engine");
+fn encrypt_registry() -> PluginRegistry {
     let registry = PluginRegistry::new();
     registry
         .import(
@@ -53,14 +51,13 @@ fn gateway_with_encrypt() -> Gateway {
             &read_component("envelope-encrypt.component.wasm"),
         )
         .unwrap();
-    Gateway::with_registry(engine, Arc::new(registry))
+    registry
 }
 
-fn process(gateway: &Gateway, input: &[u8], key: Option<&str>) -> Vec<u8> {
-    let mut bytes = gateway
-        .process(input, Format::Text, "text/plain", key, None, None)
-        .unwrap()
-        .bytes;
+fn process(registry: &PluginRegistry, input: &[u8], key: Option<&str>) -> Vec<u8> {
+    let mut bytes =
+        common::stream_process(registry, input, Format::Text, "text/plain", key, None, None)
+            .unwrap();
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
     }
@@ -126,10 +123,10 @@ fn encrypts_pii_with_cert_and_roundtrips() {
     let priv_key = fs::read_to_string(fixture("key.pem")).unwrap();
     let key = RsaPrivateKey::from_pkcs8_pem(&priv_key).expect("parse private key");
 
-    let gateway = gateway_with_encrypt();
+    let registry = encrypt_registry();
     let input = b"alice@example.com SSN 123-45-6789 card 4111111111111111";
 
-    let output = process(&gateway, input, Some(&cert));
+    let output = process(&registry, input, Some(&cert));
     let out_str = String::from_utf8_lossy(&output);
 
     assert!(
@@ -163,8 +160,8 @@ fn encrypts_with_spki_public_key_pem() {
     // sanity: the SPKI PEM parses
     RsaPublicKey::from_public_key_pem(&pub_pem).expect("SPKI should parse");
 
-    let gateway = gateway_with_encrypt();
-    let output = process(&gateway, b"bob@x.io 078-05-1120", Some(&pub_pem));
+    let registry = encrypt_registry();
+    let output = process(&registry, b"bob@x.io 078-05-1120", Some(&pub_pem));
     let out_str = String::from_utf8_lossy(&output);
     assert!(!out_str.contains("bob@x.io"), "plaintext leaked");
     let envelopes = extract_envelopes(&out_str);
@@ -180,9 +177,9 @@ fn encrypts_with_spki_public_key_pem() {
 
 #[test]
 fn redacts_when_no_public_key() {
-    let gateway = gateway_with_encrypt();
+    let registry = encrypt_registry();
     let input = b"alice@example.com 123-45-6789";
-    let output = process(&gateway, input, None);
+    let output = process(&registry, input, None);
     let out_str = String::from_utf8_lossy(&output);
     assert_eq!(out_str, "[REDACTED_EMAIL] [REDACTED_SSN]");
     assert!(!out_str.contains("RSA-OAEP"), "no encryption without a key");
@@ -190,9 +187,9 @@ fn redacts_when_no_public_key() {
 
 #[test]
 fn deterministic_redaction_without_key() {
-    let gateway = gateway_with_encrypt();
+    let registry = encrypt_registry();
     let input = b"a@b.co 123-45-6789";
-    let a = process(&gateway, input, None);
-    let b = process(&gateway, input, None);
+    let a = process(&registry, input, None);
+    let b = process(&registry, input, None);
     assert_eq!(a, b);
 }

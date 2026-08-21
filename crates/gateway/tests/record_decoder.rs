@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use s4_error::codes;
 use s4_gateway::Format;
-use s4_gateway::record::{DecoderLimits, Record, RecordDecoder, decode_all};
+use s4_gateway::record::{DecoderLimits, Record, RecordDecoder};
 
 fn small_limits() -> DecoderLimits {
     DecoderLimits {
@@ -10,6 +10,29 @@ fn small_limits() -> DecoderLimits {
         max_json_document_bytes: 64,
         max_csv_fields: 8,
     }
+}
+
+/// Whole-input convenience wrapper over the streaming `RecordDecoder`, used as
+/// the single-frame baseline. The production batch collector (`decode_all`)
+/// was removed in Phase 12.
+fn decode_all(
+    input: &[u8],
+    format: Format,
+    limits: DecoderLimits,
+) -> Result<Vec<Record>, s4_error::S4Error> {
+    let mut decoder = RecordDecoder::new(format, limits)?;
+    let mut records = Vec::new();
+    for chunk in input.chunks(limits.max_source_frame_bytes) {
+        decoder.push(chunk)?;
+        while let Some(record) = decoder.next_record()? {
+            records.push(record);
+        }
+    }
+    decoder.finish()?;
+    while let Some(record) = decoder.next_record()? {
+        records.push(record);
+    }
+    Ok(records)
 }
 
 fn decode_chunks(

@@ -106,7 +106,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-tools
+        run: cargo install --locked wasm-tools --version 1.255.0
+      - name: Build Wasm filters
+        run: bash scripts/build-filters.sh
       - name: Test Postgres migrations and secret envelopes
         run: cargo test -p s4-gateway --test db_keys_test
 
@@ -116,7 +122,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-tools
+        run: cargo install --locked wasm-tools --version 1.255.0
+      - name: Build Wasm filters
+        run: bash scripts/build-filters.sh
       - name: Install AWS CLI and boto3
         run: |
           python3 -m pip install --user awscli boto3

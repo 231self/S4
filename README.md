@@ -15,7 +15,9 @@ compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-i
   `wasm-tools component`, `s4ctl plugin upload`. See [docs/plugins.md](docs/plugins.md).
 - **Any S3-compatible storage** — MinIO, AWS S3, Google Cloud Storage, Backblaze B2,
   Cloudflare R2, Vultr Object Storage — single or multi-cloud (consistent-hash ring,
-  dual-write, read fail-over).
+  dual-write, read fail-over). MinIO is covered by the CI end-to-end suite;
+  Backblaze B2 is validated by the credentialed provider harness against a real
+  bucket (redaction and envelope-encryption round-trips).
 - **Agent-safe reads** — read data through S4 with `x-s4-process: read`: the pipeline
   runs on the way *out*, so AI agents get redacted/encrypted output while the object
   at rest stays raw. No second cleaned copy to keep in sync.
@@ -201,10 +203,23 @@ Two local pipeline runners, both with persistent caches:
 
 See `CONTRIBUTING.md`.
 
+## Security
+
+S4 transforms sensitive data before it reaches storage and applies strict,
+fail-closed guarantees on the streaming data plane (see
+[docs/security.md](docs/security.md) for the full model, including deployment
+responsibilities and non-guarantees).
+
+Found a vulnerability? Report it **privately** — via GitHub private
+vulnerability reporting or security@231self.com — and never through a public
+issue. See [SECURITY.md](SECURITY.md) for the supported-version policy,
+response timeline, and what to include in a report.
+
 ## Documentation
 
 - `examples/` — runnable end-to-end demos (B2 encryption round-trip).
 - `docs/plugins.md` — create and consume your own plugins.
+- `docs/security.md` — the security model of the gateway.
 - `docs/adr/` — architecture decision records.
 - `AGENTS.md` — development conventions.
 

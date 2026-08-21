@@ -461,6 +461,94 @@ async fn unsupported_streaming_backend_is_rejected_without_polling_body() {
 }
 
 #[tokio::test]
+async fn put_with_unsupported_content_encoding_is_rejected_without_polling_body() {
+    let state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let app = build_router(state.clone());
+
+    for encoding in ["gzip", "aws-chunked,gzip", "br"] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let request = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/enc/object.txt")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header(header::CONTENT_ENCODING, encoding)
+                .body(Body::new(PollTrackingBody {
+                    polls: polls.clone(),
+                    data: Some(Bytes::from_static(b"compressed bytes must not be read")),
+                }))
+                .unwrap(),
+            &auth_headers(&access_key, &secret_key),
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "Content-Encoding {encoding} must be rejected"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "Content-Encoding {encoding} PUT must not buffer the body"
+        );
+    }
+    assert!(state.store.get("enc", "object.txt").is_none());
+}
+
+#[tokio::test]
+#[ignore = "soak: run via `just soak-streaming` or the weekly workflow"]
+async fn soak_streaming_roundtrip_holds_under_repetition() {
+    let iterations = std::env::var("S4_SOAK_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(200);
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let headers = auth_headers(&access_key, &secret_key);
+
+    for i in 0..iterations {
+        let key = format!("roundtrip-{i}.txt");
+        let body = format!("contact person-{i}@example.com card 4111111111111111");
+
+        let put = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/soak/{key}"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "soak PUT {i}");
+
+        let get = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/soak/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "soak GET {i}");
+        let stored = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&stored);
+        assert!(
+            text.contains("REDACTED_EMAIL"),
+            "soak GET {i} redacted: {text}"
+        );
+        assert!(
+            !text.contains("@example.com"),
+            "soak GET {i} leaked PII: {text}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn list_objects_returns_keys_and_prefixes() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;

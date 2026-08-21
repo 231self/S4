@@ -12,11 +12,17 @@ use base64::engine::general_purpose::STANDARD as B64;
 use s4_gateway::entity::api_key;
 use s4_gateway::entity::managed_object_authority;
 use s4_gateway::entity::managed_object_repair;
+use s4_gateway::entity::multipart_upload;
 use s4_gateway::entity::object_operation;
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
 use s4_gateway::managed::{
     CopyStatus, LogicalObjectKey, ManagedRepository, ObjectAuthority, Placement,
     PostgresManagedRepository,
+};
+use s4_gateway::multipart_staging::{
+    CompletePart, CompletionAcquire, MultipartCompletionResult, MultipartIdentity,
+    MultipartLifecycle, MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
+    PostgresMultipartRepository,
 };
 use s4_gateway::store::{KeyRepository, PostgresKeyStore, sha256_hash};
 use s4_gateway::transaction::{
@@ -262,6 +268,137 @@ fn postgres_operation_journal_persists_canonical_ambiguous_completion() {
             .exec(&db)
             .await
             .expect("delete operation journal test row");
+    });
+}
+
+#[test]
+fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
+    with_pool(|pool| async move {
+        let db = sea_db(pool.clone());
+        let repository = PostgresMultipartRepository::new(pool);
+        let upload_id = format!("completion-{}", uuid::Uuid::new_v4());
+        let now = unix_time_ms();
+        let identity = MultipartIdentity {
+            tenant_id: "multipart-integration".to_string(),
+            credential_policy_id: "key".to_string(),
+            bucket: "bucket".to_string(),
+            key: format!("object-{}", uuid::Uuid::new_v4()),
+            upload_id: upload_id.clone(),
+        };
+        repository
+            .create(MultipartUpload {
+                identity: identity.clone(),
+                snapshot: MultipartSnapshot {
+                    metadata: Default::default(),
+                    tags: Default::default(),
+                    checksum_mode: None,
+                    destination: serde_json::json!({"kind":"test"}),
+                    plugin_snapshot: serde_json::json!([]),
+                    max_staged_bytes: 1024,
+                },
+                lifecycle: MultipartLifecycle::Open,
+                staged_bytes: 0,
+                reserved_bytes: 0,
+                created_at_ms: now,
+                expires_at_ms: now + 60_000,
+                updated_at_ms: now,
+                tombstone_until_ms: None,
+                complete_request_fingerprint: None,
+                completion_lease_owner: None,
+                completion_lease_expires_at_ms: None,
+                completion_fencing_token: 0,
+                completion_result: None,
+            })
+            .await
+            .expect("create multipart upload");
+        repository
+            .replace_part(
+                &identity,
+                MultipartPart {
+                    upload_id: upload_id.clone(),
+                    part_number: 1,
+                    attempt: 1,
+                    artifact_key: format!("artifact-{}", uuid::Uuid::new_v4()),
+                    etag: "\"part\"".to_string(),
+                    checksum_sha256: "part-sha".to_string(),
+                    size_bytes: 3,
+                    created_at_ms: now,
+                },
+            )
+            .await
+            .expect("persist part");
+        let selected = [CompletePart {
+            part_number: 1,
+            etag: "\"part\"".to_string(),
+            checksum_sha256: Some("part-sha".to_string()),
+        }];
+        let first = match repository
+            .acquire_completion(&identity, "request", &selected, "worker-a", now + 10, now)
+            .await
+            .expect("acquire first lease")
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected acquired completion lease"),
+        };
+        let second = match repository
+            .acquire_completion(
+                &identity,
+                "request",
+                &selected,
+                "worker-b",
+                now + 30,
+                now + 11,
+            )
+            .await
+            .expect("take over expired lease")
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected takeover completion lease"),
+        };
+        assert!(second.fencing_token > first.fencing_token);
+        assert!(
+            repository
+                .check_completion_lease(&identity, first.fencing_token, now + 12)
+                .await
+                .is_err()
+        );
+        repository
+            .complete_completion(
+                &identity,
+                second.fencing_token,
+                MultipartCompletionResult {
+                    etag: Some("\"result\"".to_string()),
+                    checksum_sha256: "result-sha".to_string(),
+                    version_id: Some("version".to_string()),
+                },
+                now + 12,
+            )
+            .await
+            .expect("persist immutable result");
+        assert!(matches!(
+            repository
+                .acquire_completion(&identity, "request", &selected, "retry", now + 40, now + 13)
+                .await,
+            Ok(CompletionAcquire::Replayed(_))
+        ));
+        assert!(
+            repository
+                .acquire_completion(
+                    &identity,
+                    "conflict",
+                    &selected,
+                    "retry",
+                    now + 40,
+                    now + 13
+                )
+                .await
+                .is_err()
+        );
+        multipart_upload::Entity::delete_many()
+            .filter(multipart_upload::Column::UploadId.eq(upload_id))
+            .exec(&db)
+            .await
+            .expect("delete multipart completion test rows");
     });
 }
 

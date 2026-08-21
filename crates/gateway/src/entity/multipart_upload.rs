@@ -21,6 +21,11 @@ pub struct Model {
     pub reserved_bytes: i64,
     pub expires_at_ms: i64,
     pub tombstone_until_ms: Option<i64>,
+    pub complete_request_fingerprint: Option<String>,
+    pub completion_lease_owner: Option<String>,
+    pub completion_lease_expires_at_ms: Option<i64>,
+    pub completion_fencing_token: i64,
+    pub completion_result: Option<Json>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }

@@ -8,6 +8,7 @@ pub struct Model {
     pub user_id: String,
     pub key_id: String,
     pub secret_hash: String,
+    pub secret_encrypted: Option<String>,
     pub label: String,
     pub created_at: DateTimeWithTimeZone,
     pub expires_at: Option<i64>,

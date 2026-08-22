@@ -26,13 +26,15 @@ class S4:
         tree = dag.git(REPO).branch(ref).tree()
         return (
             dag.container()
-            .from_("rust:1-bookworm")
+            .from_(
+                "rust:1.97.0-trixie@sha256:b92b8c8574f8f3b207fcb0912fb3e2de4041580b5934d90312d53938c9a038a9"
+            )
             .with_directory("/src", tree)
             .with_workdir("/src")
             .with_env_variable("CARGO_HOME", "/cargo")
             .with_mounted_cache("/cargo", dag.cache_volume("s4-cargo-registry"))
             .with_mounted_cache("/src/target", dag.cache_volume("s4-cargo-target"))
-            .with_exec(["rustup", "target", "add", "wasm32-unknown-unknown"])
+            .with_exec(["rustup", "target", "add", "wasm32-wasip1"])
             .with_exec(
                 ["cargo", "install", "--locked", "wasm-tools", "--version", "1.255.0"]
             )
@@ -57,7 +59,9 @@ class S4:
 
         return (
             dag.container()
-            .from_("debian:bookworm-slim")
+            .from_(
+                "debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
+            )
             .with_exec(["apt-get", "update"])
             .with_exec(
                 ["apt-get", "install", "-y", "--no-install-recommends", "ca-certificates"]

@@ -2,15 +2,22 @@
 set -euo pipefail
 
 ROOT="$(dirname "$0")/.."
-READBACK="/tmp/s4-e2e-readback.txt"
-MC_CONF="s4-mc-config"
+RUN_ID="${GITHUB_RUN_ID:-$$}"
+COMPOSE_PROJECT="s4-e2e-${RUN_ID}"
+COMPOSE=(docker compose --project-name "$COMPOSE_PROJECT" -f "$ROOT/local/docker-compose.yml")
+READBACK="/tmp/s4-e2e-readback-${RUN_ID}.txt"
+GW_LOG="/tmp/s4-e2e-gateway-${RUN_ID}.log"
+MC_CONF="${COMPOSE_PROJECT}-mc"
+MC_IMAGE="minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
 GW_PORT="${S4_E2E_GW_PORT:-9010}"
 GW_URL="http://127.0.0.1:$GW_PORT"
 GW_PID=""
 
 cleanup() {
     [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
-    rm -f "$READBACK"
+    [ -n "$GW_PID" ] && wait "$GW_PID" 2>/dev/null || true
+    "${COMPOSE[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+    rm -f "$READBACK" "$GW_LOG"
     docker volume rm "$MC_CONF" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -19,11 +26,13 @@ echo "=== S4 E2E: MinIO read/write validation ==="
 
 # 1. Start MinIO
 echo "--- Starting MinIO ---"
-docker compose -f "$ROOT/local/docker-compose.yml" up -d --wait minio 2>&1
+"${COMPOSE[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+docker volume rm "$MC_CONF" >/dev/null 2>&1 || true
+"${COMPOSE[@]}" up -d --wait minio 2>&1
 
 # mc config lives in a shared volume so alias set and subsequent ops
 # (run as separate --rm containers) see the same configuration.
-MC_OPTS=(--rm -i --network host -v "$MC_CONF:/root/.mc" minio/mc --no-color)
+MC_OPTS=(--rm -i --network host -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color)
 
 # 2. Configure MinIO client alias + create the bucket the gateway will use
 echo "--- Configuring MinIO alias ---"
@@ -40,10 +49,16 @@ echo "--- Building filters and binaries ---"
 # 4. Start the gateway against MinIO (auth disabled)
 echo "--- Starting S4 gateway on $GW_URL ---"
 S3_ENDPOINT=http://127.0.0.1:9000 \
+S3_ACCESS_KEY_ID=minioadmin \
+S3_SECRET_ACCESS_KEY=minioadmin \
+S3_REGION=us-east-1 \
 LISTEN_ADDR="127.0.0.1:$GW_PORT" \
 S4_FILTER_COMPONENT="$ROOT/target/components/pii-default.component.wasm" \
+S4_STREAMING_WRITE_MODE=single \
+S4_STREAMING_READ_MODE=passthrough \
+S4_STREAMING_S3_PROVIDER=minio \
 AUTH_DISABLED=true \
-"$ROOT/target/debug/s4-gateway" > /tmp/s4-e2e-gateway.log 2>&1 &
+"$ROOT/target/debug/s4-gateway" > "$GW_LOG" 2>&1 &
 GW_PID=$!
 
 echo "--- Waiting for gateway health ---"
@@ -56,7 +71,7 @@ for _ in $(seq 1 30); do
 done
 curl -sf "$GW_URL/health" >/dev/null 2>&1 || {
     echo "FAIL: gateway did not become healthy"
-    tail -5 /tmp/s4-e2e-gateway.log
+    tail -5 "$GW_LOG"
     exit 1
 }
 

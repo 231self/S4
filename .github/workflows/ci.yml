@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt
       - name: Format
@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -41,12 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-tools
-        run: cargo install --locked wasm-tools
+        run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
         run: bash scripts/build-filters.sh
       - name: Test
@@ -57,12 +57,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-tools
-        run: cargo install --locked wasm-tools
+        run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build SDKs (drift check)
         if: ${{ !env.ACT }}
         run: |
@@ -74,20 +74,72 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-tools
-        run: cargo install --locked wasm-tools
+        run: cargo install --locked wasm-tools --version 1.255.0
       - name: End-to-end (MinIO)
         if: ${{ !env.ACT }}
         run: bash scripts/e2e-local.sh
 
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-trixie@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: s4
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d s4"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/s4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-tools
+        run: cargo install --locked wasm-tools --version 1.255.0
+      - name: Build Wasm filters
+        run: bash scripts/build-filters.sh
+      - name: Test Postgres migrations and secret envelopes
+        run: cargo test -p s4-gateway --test db_keys_test
+
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-tools
+        run: cargo install --locked wasm-tools --version 1.255.0
+      - name: Build Wasm filters
+        run: bash scripts/build-filters.sh
+      - name: Install AWS CLI and boto3
+        run: |
+          python3 -m pip install --user awscli boto3
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Unmodified-client interop (AWS CLI + boto3)
+        run: cargo test -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
+
   # Aggregate status so branch protection's required `check` keeps working
   # and never ends up "skipped" when a constituent job fails.
   check:
-    needs: [fmt, lint, test, sdk, e2e]
+    needs: [fmt, lint, test, sdk, e2e, postgres, interop]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

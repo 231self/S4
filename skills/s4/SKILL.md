@@ -82,6 +82,6 @@ bash examples/b2-encrypt-demo.sh   # B2 encryption round-trip (needs B2_* env va
   with `if: ${{ !env.ACT }}`; `CARGO_BUILD_JOBS=2` keeps shared-VM memory bounded.
 - **Local mode keys**: with `AUTH_DISABLED=true` and no `DATABASE_URL`, keys persist
   to `~/.config/s4/keys.json` (`FileKeyStore`).
-- **wasm-tools**: pinned to a version (1.255.0 in the Dockerfile; `cargo install
-  --locked wasm-tools` elsewhere). Rust 2024 edition via `rust-toolchain.toml`.
+- **Toolchain**: Rust 1.97.0 with `wasm32-wasip1`; wasm-tools 1.255.0. Pins live
+  in `rust-toolchain.toml`, Dockerfiles, Dagger, and GitHub Actions.
 - **jj repo**: never use git for mutations (`jj commit -m`, `jj git push -b <bk>`).

@@ -6,12 +6,13 @@ use aes_siv::aead::{Aead, KeyInit};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use hmac::{Hmac, Mac};
+use s4_gateway::Format;
 use s4_gateway::plugin_registry::PluginRegistry;
-use s4_gateway::{Format, Gateway};
 use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+
+mod common;
 
 fn component(name: &str) -> Vec<u8> {
     fs::read(
@@ -38,9 +39,7 @@ fn stable_key(secret: &str) -> Vec<u8> {
     out
 }
 
-fn gateway() -> Gateway {
-    let engine =
-        s4_wasm_runtime::FilterEngine::new(&component("stable-encrypt.component.wasm")).unwrap();
+fn registry() -> PluginRegistry {
     let registry = PluginRegistry::new();
     registry
         .import(
@@ -48,11 +47,17 @@ fn gateway() -> Gateway {
             &component("stable-encrypt.component.wasm"),
         )
         .unwrap();
-    Gateway::with_registry(engine, Arc::new(registry))
+    registry
 }
 
-fn run(gw: &Gateway, input: &[u8], key: Option<&[u8]>, fields: Option<&str>) -> Vec<u8> {
-    gw.process(
+fn run(
+    registry: &PluginRegistry,
+    input: &[u8],
+    key: Option<&[u8]>,
+    fields: Option<&str>,
+) -> Vec<u8> {
+    common::stream_process(
+        registry,
         input,
         Format::Jsonl,
         "application/x-ndjson",
@@ -61,7 +66,6 @@ fn run(gw: &Gateway, input: &[u8], key: Option<&[u8]>, fields: Option<&str>) -> 
         fields,
     )
     .unwrap()
-    .bytes
 }
 
 fn decrypt(value: &str, key: &[u8]) -> String {
@@ -76,18 +80,18 @@ const INPUT: &[u8] =
 
 #[test]
 fn stable_encryption_is_deterministic() {
-    let gw = gateway();
+    let registry = registry();
     let key = stable_key("s4s_testsecret");
-    let a = run(&gw, INPUT, Some(&key), Some("email"));
-    let b = run(&gw, INPUT, Some(&key), Some("email"));
+    let a = run(&registry, INPUT, Some(&key), Some("email"));
+    let b = run(&registry, INPUT, Some(&key), Some("email"));
     assert_eq!(a, b, "same key + input must produce identical output");
 }
 
 #[test]
 fn stable_encryption_roundtrips_and_preserves_other_fields() {
-    let gw = gateway();
+    let registry = registry();
     let key = stable_key("s4s_testsecret");
-    let out = run(&gw, INPUT, Some(&key), Some("email"));
+    let out = run(&registry, INPUT, Some(&key), Some("email"));
     let out_str = String::from_utf8_lossy(&out);
 
     assert!(!out_str.contains("alice@x.com"), "plaintext email leaked");
@@ -118,19 +122,19 @@ fn stable_encryption_roundtrips_and_preserves_other_fields() {
 
 #[test]
 fn different_keys_produce_different_ciphertext() {
-    let gw = gateway();
+    let registry = registry();
     let k1 = stable_key("s4s_secret_one");
     let k2 = stable_key("s4s_secret_two");
-    let a = run(&gw, INPUT, Some(&k1), Some("email"));
-    let b = run(&gw, INPUT, Some(&k2), Some("email"));
+    let a = run(&registry, INPUT, Some(&k1), Some("email"));
+    let b = run(&registry, INPUT, Some(&k2), Some("email"));
     assert_ne!(a, b, "different tenants must not share ciphertext");
 }
 
 #[test]
 fn no_fields_no_encryption() {
-    let gw = gateway();
+    let registry = registry();
     let key = stable_key("s4s_testsecret");
-    let out = run(&gw, INPUT, Some(&key), None);
+    let out = run(&registry, INPUT, Some(&key), None);
     assert_eq!(
         out, INPUT,
         "without tagged fields the record must pass through"
@@ -139,8 +143,8 @@ fn no_fields_no_encryption() {
 
 #[test]
 fn no_key_no_encryption() {
-    let gw = gateway();
-    let out = run(&gw, INPUT, None, Some("email"));
+    let registry = registry();
+    let out = run(&registry, INPUT, None, Some("email"));
     assert_eq!(
         out, INPUT,
         "without a stable key the record must pass through"
@@ -149,17 +153,17 @@ fn no_key_no_encryption() {
 
 #[test]
 fn non_json_records_pass_through() {
-    let gw = gateway();
+    let registry = registry();
     let key = stable_key("s4s_testsecret");
     let input = b"plain text line\nanother line\n";
-    let out = run(&gw, input, Some(&key), Some("email"));
+    let out = run(&registry, input, Some(&key), Some("email"));
     assert_eq!(out, input);
 }
 
 #[test]
 fn unknown_tagged_field_is_skipped() {
-    let gw = gateway();
+    let registry = registry();
     let key = stable_key("s4s_testsecret");
-    let out = run(&gw, INPUT, Some(&key), Some("does_not_exist"));
+    let out = run(&registry, INPUT, Some(&key), Some("does_not_exist"));
     assert_eq!(out, INPUT);
 }

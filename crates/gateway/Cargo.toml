@@ -12,10 +12,22 @@ path = "src/main.rs"
 s4-error = { path = "../error" }
 s4-wasm-runtime = { path = "../wasm-runtime" }
 anyhow = "1"
+bytes.workspace = true
+csv-core.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+pin-project-lite.workspace = true
 axum.workspace = true
 tokio.workspace = true
 aws-sdk-s3.workspace = true
 aws-config.workspace = true
+aws-sigv4.workspace = true
+aws-credential-types.workspace = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace = true
+md-5.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true
@@ -26,15 +38,21 @@ jsonwebtoken.workspace = true
 reqwest.workspace = true
 hmac = "0.12"
 sha2 = "0.10"
+sha1 = "0.10"
+crc = "3.4"
+hex.workspace = true
 sqlx.workspace = true
-sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-uuid"] }
+sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-uuid", "with-json"] }
 async-trait.workspace = true
 dirs = "6"
+tokio-util = { version = "0.7", features = ["io"] }
 utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-swagger-ui = { workspace = true, features = ["axum"] }
 tower-http = { version = "0.6", features = ["cors"] }
+thiserror.workspace = true
 
 [dev-dependencies]
+libc = "0.2"
 proptest.workspace = true
 pollster = "0.4"
 tower = "0.5"

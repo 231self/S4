@@ -15,7 +15,12 @@ compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-i
   `wasm-tools component`, `s4ctl plugin upload`. See [docs/plugins.md](docs/plugins.md).
 - **Any S3-compatible storage** — MinIO, AWS S3, Google Cloud Storage, Backblaze B2,
   Cloudflare R2, Vultr Object Storage — single or multi-cloud (consistent-hash ring,
-  dual-write, read fail-over).
+  dual-write, read fail-over). MinIO is covered by the CI end-to-end suite;
+  Backblaze B2 is validated by the credentialed provider harness against a real
+  bucket (redaction and envelope-encryption round-trips).
+- **Agent-safe reads** — read data through S4 with `x-s4-process: read`: the pipeline
+  runs on the way *out*, so AI agents get redacted/encrypted output while the object
+  at rest stays raw. No second cleaned copy to keep in sync.
 - **Optional auth** — run with auth disabled locally, or enable API keys (in-memory,
   a JSON file, or Postgres).
 - **Typed SDKs** — generated Python and TypeScript clients, published with every release.
@@ -88,6 +93,45 @@ s4ctl put ./data.csv ingest/data.csv --bucket s4-local
 just e2e
 ```
 
+**Agent-safe reads — raw at rest, scrubbed on the way out**
+
+```bash
+# Data at rest stays raw (your app owns the originals).
+s4ctl put ./customers.json customers/c1.json --bucket s4-local
+
+# Transformed reads are deliberately opt-in. Unsafe component snapshots are
+# staged encrypted before any response bytes are disclosed.
+export S4_STREAMING_READ_MODE=transformed
+export S4_TRANSFORMED_READ_SPOOL=encrypted
+# Set this to the SHA-256 component digests reviewed for prefix-safe disclosure.
+# Imported components are unsafe unless listed here.
+export S4_PREFIX_SAFE_COMPONENT_HASHES=<comma-separated-component-sha256-digests>
+
+# An AI agent reads THROUGH S4: PII is redacted before the agent sees it.
+curl -H "x-s4-process: read" http://localhost:8080/customers/c1.json
+# → {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]","note":"hi"}
+
+# Same object, no header: the raw bytes your app owns.
+curl http://localhost:8080/customers/c1.json
+# → {"email":"alice@example.com","card":"4111111111111111","note":"hi"}
+```
+
+One source of truth, two projections: the app gets full fidelity, the agent
+gets only what you allow. Transformed reads require stored, version-bound
+metadata and work with S3, managed storage, and in-memory backends. Presigned
+backend URLs remain raw-only because they cannot provide a safe metadata
+preflight.
+
+Transformed reads reject `Range`, `partNumber`, non-identity source encodings,
+unknown mandatory formats, and `HEAD`. They never fall back to raw bytes.
+`S4_STREAMING_READ_MODE=off` (the default) rejects transformed reads;
+`passthrough` enables only raw streaming. `transformed` enables this path.
+Without `S4_TRANSFORMED_READ_SPOOL=encrypted`, a snapshot containing any
+component not listed in `S4_PREFIX_SAFE_COMPONENT_HASHES` is rejected before
+its source body is consumed. Set `S4_SPOOL_DIR`, `S4_SPOOL_MAX_OBJECT_BYTES`,
+and `S4_SPOOL_QUOTA_BYTES` to a private, capacity-reserved volume; the quota
+must cover encrypted framing overhead as well as plaintext output.
+
 **Encryption — per-field envelope encryption, decryptable only by you**
 
 ```bash
@@ -159,10 +203,23 @@ Two local pipeline runners, both with persistent caches:
 
 See `CONTRIBUTING.md`.
 
+## Security
+
+S4 transforms sensitive data before it reaches storage and applies strict,
+fail-closed guarantees on the streaming data plane (see
+[docs/security.md](docs/security.md) for the full model, including deployment
+responsibilities and non-guarantees).
+
+Found a vulnerability? Report it **privately** — via GitHub private
+vulnerability reporting or security@231self.com — and never through a public
+issue. See [SECURITY.md](SECURITY.md) for the supported-version policy,
+response timeline, and what to include in a report.
+
 ## Documentation
 
 - `examples/` — runnable end-to-end demos (B2 encryption round-trip).
 - `docs/plugins.md` — create and consume your own plugins.
+- `docs/security.md` — the security model of the gateway.
 - `docs/adr/` — architecture decision records.
 - `AGENTS.md` — development conventions.
 

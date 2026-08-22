@@ -1,30 +1,100 @@
 # Security Policy
 
-S4 processes potentially sensitive data (it exists to keep PII out of storage), so we
-take security reports seriously.
+S4 is a processing gateway for object storage: it exists so that sensitive data
+(PII, credentials, regulated fields) is transformed before it reaches a storage
+backend. We take security reports seriously and publish this policy so
+reporters know exactly what is supported, how to report privately, and what we
+commit to in return.
+
+## Supported versions
+
+We support the **latest stable minor release** of S4. Security fixes are
+backported to that release line and shipped as a new patch release.
+
+- Current stable line: **0.3.x** (this repository is at 0.3.5).
+- Older minor releases receive security fixes on a best-effort basis only.
+- Pre-release and `-dev` builds are not supported; move to the latest stable
+  release before reporting.
+
+If you are running a self-hosted gateway, upgrade to the latest release before
+engaging with a report — we cannot validate or fix against a version we no
+longer ship.
 
 ## Reporting a vulnerability
 
-- **Do not** open a public issue.
-- Email **security@231self.com** or use GitHub's private vulnerability reporting on
-  this repository (Security → Report a vulnerability).
-- Include: affected version/commit, a minimal reproduction, impact, and any suggested
-  fix if you have one.
+Please report security issues **privately**. Do **not** open a public issue,
+pull request, or discussion.
 
-We will acknowledge within 48 hours and aim for a fix and disclosure timeline
-proportional to severity.
+Two equivalent private channels:
+
+1. **GitHub private vulnerability reporting** — Security → Report a
+   vulnerability on this repository.
+2. **security@231self.com** — for reports that cannot go through GitHub, or
+   for incidents already in progress.
+
+### What to include in a report
+
+A good report lets us reproduce and triage quickly:
+
+- **Affected version or commit** — the release tag or commit hash you are
+  running.
+- **A minimal reproduction** — the smallest request, configuration, or plugin
+  input that triggers the issue. Include the `S3` endpoint, headers, and
+  body shape, but **never** live credentials.
+- **Impact** — what an attacker can actually do (read, write, bypass, crash,
+  data exposure) and under which feature gates the issue is reachable.
+- **Suggested fix** — optional, but always welcome.
+
+### What never belongs in a report
+
+- **Live credentials** — do not include API key secrets, backend credentials,
+  KEKs, wrapped or unwrapped data-encryption keys, or anything that could be
+  used to authenticate to a live system. Redact them and describe the shape
+  instead.
+- **Live ciphertext or staging artifacts** — do not paste real encrypted
+  objects, staging blobs, or ciphertext from a production tenant.
+- **Signed URLs** — presigned URLs are bearer credentials; never include them.
+
+If you are unsure whether a detail is sensitive, leave it out and tell us in
+the report that you can share more under a confidentiality agreement.
+
+## What happens next
+
+1. **Acknowledgement within 48 hours.** We will confirm receipt, ask for any
+   missing details, and assign an internal tracker.
+2. **Assessment.** We determine severity, affected feature gates, and whether
+   a fix requires a coordinated release.
+3. **Fix and disclosure, proportional to severity.** We will publish a fix and
+   a coordinated disclosure on a timeline proportional to the severity of the
+   issue — faster for remotely exploitable, unauthenticated issues; more
+   measured for configuration-dependent or low-severity findings.
+4. **Credit.** With your consent, we will credit you in the advisory and
+   release notes.
+
+We ask that reporters coordinate disclosure with us and do not publicly
+disclose the issue before we ship a fix (or before we confirm, in writing, that
+we will not be fixing it).
 
 ## Scope
 
-- The gateway (`crates/gateway`) — auth, key handling, storage forwarding.
+In scope:
+
+- The gateway (`crates/gateway`) — authentication (SigV4, API keys), the
+  transformation pipeline, transactional storage paths, and staging.
 - The Wasm filter runtime and plugins (`crates/wasm-runtime`, `filters/`).
-- The envelope-encryption design (see `docs/adr/`).
-- SDKs (`sdks/`) and the CLI (`crates/s4ctl`).
+- The SDKs (`sdks/`) and the CLI (`crates/s4ctl`).
+- The cryptographic designs described in `docs/adr/` and `docs/security.md`.
 
-Out of scope: third-party services you point S4 at (S3 providers, Supabase).
+Out of scope:
 
-## Key rotation
+- The security posture of the third-party storage backends S4 is pointed at
+  (S3, R2, B2, MinIO, and similar). S4 transforms and forwards; it does not
+  secure the destination.
+- Supabase or other identity providers used for dashboard sessions.
+- Vulnerabilities in upstream dependencies that have no S4-specific impact.
 
-- S4 stores only SHA-256 hashes of API key secrets, never plaintext.
-- If you suspect a key compromise, revoke it immediately (`s4ctl key revoke`) and
-  rotate your backend credentials.
+## Key handling note
+
+S4 stores only envelopes and hashes of API key secrets, never plaintext. If you
+suspect a key compromise, revoke the key immediately (`s4ctl key revoke`) and
+rotate any backend credentials it could reach before reporting.

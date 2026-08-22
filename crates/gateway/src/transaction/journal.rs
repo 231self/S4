@@ -1,4 +1,6 @@
+#[cfg(any(test, debug_assertions))]
 use std::collections::HashMap;
+#[cfg(any(test, debug_assertions))]
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,6 +9,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, SqlxPostgresConnector,
 };
+#[cfg(any(test, debug_assertions))]
 use tokio::sync::Mutex;
 use uuid::Uuid;
 

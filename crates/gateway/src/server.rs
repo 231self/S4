@@ -5658,7 +5658,8 @@ pub async fn build_state(
         info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
         Arc::new(KeyStore::with_cipher(cipher))
     };
-    if operation_journal.is_none() && auth_disabled && cfg!(debug_assertions) {
+    #[cfg(debug_assertions)]
+    if operation_journal.is_none() && auth_disabled {
         info!(
             "Operation journal: in-memory (dev local mode; streaming S3 PUT uses a non-durable journal)"
         );

@@ -44,6 +44,33 @@ pub fn internal_error(key: &str, detail: &str) -> axum::response::Response {
     )
 }
 
+pub fn transformed_read_not_supported(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "NotImplemented",
+        "Transformed reads are disabled until the streaming disclosure model is available.",
+        key,
+        StatusCode::NOT_IMPLEMENTED,
+    )
+}
+
+pub fn entity_too_large(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "EntityTooLarge",
+        "The object exceeds the maximum allowed size.",
+        key,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+pub fn multipart_not_supported(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "NotImplemented",
+        "Multipart operations are disabled until staged multipart storage is available.",
+        key,
+        StatusCode::NOT_IMPLEMENTED,
+    )
+}
+
 pub fn not_implemented(key: &str) -> axum::response::Response {
     s3_error_xml(
         "NotImplemented",
@@ -59,4 +86,70 @@ pub fn access_denied(key: &str) -> axum::response::Response {
 
 pub fn payment_required(key: &str, detail: &str) -> axum::response::Response {
     s3_error_xml("PaymentRequired", detail, key, StatusCode::PAYMENT_REQUIRED)
+}
+
+pub fn no_such_upload(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "NoSuchUpload",
+        "The specified multipart upload does not exist.",
+        key,
+        StatusCode::NOT_FOUND,
+    )
+}
+
+pub fn invalid_part(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("InvalidPart", detail, key, StatusCode::BAD_REQUEST)
+}
+
+pub fn invalid_part_order(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "InvalidPartOrder",
+        "The list of parts was not in ascending order.",
+        key,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+pub fn signature_mismatch(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "SignatureDoesNotMatch",
+        "The request signature we calculated does not match the signature you provided.",
+        key,
+        StatusCode::FORBIDDEN,
+    )
+}
+
+pub fn bad_digest(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("BadDigest", detail, key, StatusCode::BAD_REQUEST)
+}
+
+pub fn invalid_request(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("InvalidRequest", detail, key, StatusCode::BAD_REQUEST)
+}
+
+pub fn slow_down(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "SlowDown",
+        "Please reduce your request rate.",
+        key,
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+}
+
+pub fn service_unavailable(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml(
+        "ServiceUnavailable",
+        detail,
+        key,
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+}
+
+pub fn bucket_not_allowed(bucket: &str) -> axum::response::Response {
+    s3_error_xml(
+        "AccessDenied",
+        "Bucket creation and deletion are not allowed on the S4 gateway; use an existing bucket on a configured backend.",
+        bucket,
+        StatusCode::FORBIDDEN,
+    )
 }

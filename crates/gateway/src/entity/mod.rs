@@ -1,1 +1,11 @@
 pub mod api_key;
+pub mod managed_object_authority;
+pub mod managed_object_repair;
+pub mod mcp_token;
+pub mod multipart_cleanup_audit;
+pub mod multipart_part_attempt;
+pub mod multipart_staging_quota;
+pub mod multipart_upload;
+pub mod object_operation;
+pub mod object_operation_evidence;
+pub mod object_operation_part;

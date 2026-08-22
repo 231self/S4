@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 s4-error = { path = "../error" }
 wasmtime.workspace = true
+wasmtime-wasi.workspace = true
 wit-bindgen.workspace = true
 anyhow = "1"
 rand.workspace = true

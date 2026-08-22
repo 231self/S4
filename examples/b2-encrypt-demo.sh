@@ -31,6 +31,7 @@ OBJ_KEY="demo/encrypted-sample.txt"
 CERT="$ROOT/tests/fixtures/pii/crypto/cert.pem"
 KEY="$ROOT/tests/fixtures/pii/crypto/key.pem"
 MC_CONF="s4-mc-demo"
+MC_IMAGE="minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
 GW_LOG="/tmp/s4-b2-enc-demo.log"
 RAW="/tmp/s4-b2-enc-raw.txt"
 THROUGH="/tmp/s4-b2-enc-through.txt"
@@ -91,8 +92,8 @@ curl -fsS -X PUT "$GATEWAY_URL/$OBJ_KEY" \
 
 echo
 echo "===== STAGE 2: ENCRYPTED AT REST — fetched DIRECTLY from B2 (bypassing S4) ====="
-docker run --rm -v "$MC_CONF:/root/.mc" minio/mc --no-color alias set b2 "$B2_S3_ENDPOINT" "$B2_ACCESS_KEY_ID" "$B2_SECRET_ACCESS_KEY" >/dev/null
-docker run --rm -v "$MC_CONF:/root/.mc" minio/mc --no-color cat "b2/$B2_BUCKET/$OBJ_KEY" | tee "$RAW"
+docker run --rm -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color alias set b2 "$B2_S3_ENDPOINT" "$B2_ACCESS_KEY_ID" "$B2_SECRET_ACCESS_KEY" >/dev/null
+docker run --rm -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color cat "b2/$B2_BUCKET/$OBJ_KEY" | tee "$RAW"
 echo "(raw object: $(wc -c < "$RAW") bytes in bucket '$B2_BUCKET', key '$OBJ_KEY')"
 
 echo

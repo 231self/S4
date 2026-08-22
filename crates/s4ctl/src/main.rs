@@ -915,6 +915,7 @@ async fn main() -> anyhow::Result<()> {
                     let resp = client
                         .http
                         .put(format!("{}/{}/{}", client.gateway, bucket, key))
+                        .header("Content-Type", "text/plain")
                         .body(data.clone())
                         .send()
                         .await?;

@@ -23,6 +23,7 @@ GATEWAY_URL="http://127.0.0.1:${PORT}"
 INPUT="$ROOT/tests/fixtures/pii/sample1.txt"
 OBJ_KEY="demo/redacted-sample.txt"
 MC_CONF="s4-mc-redact-demo"
+MC_IMAGE="minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
 GW_LOG="/tmp/s4-b2-redact-demo.log"
 RAW="/tmp/s4-b2-redact-raw.txt"
 
@@ -61,8 +62,8 @@ curl -fsS -X PUT "$GATEWAY_URL/$OBJ_KEY" \
   -o /dev/null -w "PUT status: %{http_code}\n"
 
 echo "--- stored in B2 (fetched DIRECTLY, bypassing S4) ---"
-docker run --rm -v "$MC_CONF:/root/.mc" minio/mc --no-color alias set b2 "$B2_S3_ENDPOINT" "$B2_ACCESS_KEY_ID" "$B2_SECRET_ACCESS_KEY" >/dev/null
-docker run --rm -v "$MC_CONF:/root/.mc" minio/mc --no-color cat "b2/$B2_BUCKET/$OBJ_KEY" | tee "$RAW"
+docker run --rm -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color alias set b2 "$B2_S3_ENDPOINT" "$B2_ACCESS_KEY_ID" "$B2_SECRET_ACCESS_KEY" >/dev/null
+docker run --rm -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color cat "b2/$B2_BUCKET/$OBJ_KEY" | tee "$RAW"
 
 echo "--- verification ---"
 FAIL=0

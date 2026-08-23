@@ -2650,6 +2650,29 @@ async fn complete_staged_multipart(
                     "staged multipart artifact does not match its committed part".to_string(),
                 ));
             }
+            // JSON is a whole-document format: parts carry independent
+            // documents, so flush a completed document at each part boundary
+            // instead of concatenating every part into one JSON value.
+            decoder.end_of_segment()?;
+            while let Some(record) = decoder.next_record()? {
+                if let Some(record) = pipeline
+                    .as_mut()
+                    .expect("pipeline is present until finish")
+                    .process(record)
+                    .await?
+                {
+                    write_completed_record(
+                        staging,
+                        identity,
+                        lease,
+                        &mut sink,
+                        record,
+                        &mut output_hasher,
+                        &mut output_bytes,
+                    )
+                    .await?;
+                }
+            }
         }
         decoder.finish()?;
         while let Some(record) = decoder.next_record()? {
@@ -5976,6 +5999,16 @@ mod multipart_completion_tests {
             br#"<!DOCTYPE x [<!ENTITY boom "boom">]><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&boom;</ETag></Part></CompleteMultipartUpload>"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn complete_xml_accepts_quoted_hex_etags() {
+        let parts = parse_complete_multipart_xml(
+            br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"c56e589acfa9d79113ff4c36f72d0228"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"cde8de78ea9269548adfcd9f7505ae9b"</ETag></Part></CompleteMultipartUpload>"#,
+        )
+        .expect("two-part complete XML with quoted hex ETags must parse");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].etag, "\"c56e589acfa9d79113ff4c36f72d0228\"");
     }
 }
 

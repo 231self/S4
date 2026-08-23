@@ -158,6 +158,31 @@ impl RecordDecoder {
                 .unwrap_or(0)
     }
 
+    /// Signals the end of a discrete source segment (e.g. one multipart part).
+    ///
+    /// Whole-document formats (JSON) emit a complete document immediately and
+    /// reset so the next segment decodes independently; a document that spans
+    /// segment boundaries stays buffered until it completes. Line/TSV/CSV
+    /// formats emit incrementally and need no per-segment handling.
+    pub fn end_of_segment(&mut self) -> Result<(), S4Error> {
+        if self.format != Format::Json || self.pending.is_empty() || self.ready.is_some() {
+            return Ok(());
+        }
+        match serde_json::from_slice::<serde_json::Value>(&self.pending) {
+            Ok(_) => {
+                self.ready = Some(Record::new(
+                    Bytes::from(std::mem::take(&mut self.pending)),
+                    Bytes::new(),
+                ));
+                self.input_seen = true;
+                self.scan_offset = 0;
+            }
+            Err(error) if error.is_eof() => {}
+            Err(error) => return Err(S4Error::new(codes::DECODE_JSON, error.to_string())),
+        }
+        Ok(())
+    }
+
     fn prepare_next(&mut self, at_eof: bool) -> Result<(), S4Error> {
         if self.ready.is_some() || self.complete {
             return Ok(());
@@ -202,6 +227,10 @@ impl RecordDecoder {
     fn prepare_json(&mut self, at_eof: bool) -> Result<(), S4Error> {
         self.ensure_pending_limit(self.limits.max_json_document_bytes, "JSON document")?;
         if !at_eof {
+            return Ok(());
+        }
+        if self.pending.is_empty() {
+            self.complete = true;
             return Ok(());
         }
         validate_utf8(&self.pending, codes::DECODE_ENCODING)?;
@@ -433,4 +462,49 @@ fn validate_utf8(input: &[u8], code: &'static str) -> Result<(), S4Error> {
 
 fn limit_error(code: &'static str, kind: &str, actual: usize, limit: usize) -> S4Error {
     S4Error::new(code, format!("{kind} size {actual} exceeds limit {limit}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_segments_emit_one_document_each() {
+        let mut decoder = RecordDecoder::new(Format::Json, DecoderLimits::default()).unwrap();
+        decoder.push(br#"{"a":1}"#).unwrap();
+        assert!(decoder.next_record().unwrap().is_none());
+        decoder.end_of_segment().unwrap();
+        let record = decoder.next_record().unwrap().expect("first document");
+        assert_eq!(record.payload.as_ref(), br#"{"a":1}"#);
+        assert_eq!(record.separator.as_ref(), b"");
+
+        decoder.push(br#"{"b":2}"#).unwrap();
+        assert!(decoder.next_record().unwrap().is_none());
+        decoder.end_of_segment().unwrap();
+        let record = decoder.next_record().unwrap().expect("second document");
+        assert_eq!(record.payload.as_ref(), br#"{"b":2}"#);
+
+        decoder.finish().unwrap();
+        assert!(decoder.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn json_document_spanning_segments_stays_buffered_until_complete() {
+        let mut decoder = RecordDecoder::new(Format::Json, DecoderLimits::default()).unwrap();
+        decoder.push(br#"{"a":"#).unwrap();
+        decoder.end_of_segment().unwrap();
+        assert!(decoder.next_record().unwrap().is_none());
+        decoder.push(br#"1}"#).unwrap();
+        decoder.finish().unwrap();
+        let record = decoder.next_record().unwrap().expect("completed document");
+        assert_eq!(record.payload.as_ref(), br#"{"a":1}"#);
+        assert!(decoder.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn json_empty_stream_finishes_cleanly() {
+        let mut decoder = RecordDecoder::new(Format::Json, DecoderLimits::default()).unwrap();
+        decoder.finish().unwrap();
+        assert!(decoder.next_record().unwrap().is_none());
+    }
 }

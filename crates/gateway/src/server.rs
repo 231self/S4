@@ -5564,7 +5564,10 @@ pub async fn build_state(
                         .credentials_provider(creds)
                         .load()
                         .await;
-                    Some(Client::new(&config))
+                    let s3_config = aws_sdk_s3::config::Builder::from(&config)
+                        .force_path_style(true)
+                        .build();
+                    Some(Client::from_conf(s3_config))
                 }
                 _ => {
                     warn!(

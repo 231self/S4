@@ -79,6 +79,21 @@ impl BackendResolver {
         headers: &HeaderMap,
         _operation: StorageOperation,
     ) -> Result<ResolvedBackend, String> {
+        // S7a managed-storage override ("I don't care where"): a request with
+        // `x-s4-storage-mode: managed` always uses S4-managed storage, even when
+        // the workspace has a BYO backend configured. Any other value (or no
+        // header) keeps the normal priority below.
+        if headers
+            .get("x-s4-storage-mode")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("managed"))
+        {
+            if self.managed.is_empty() {
+                return Err("managed storage is not configured (no S4_SERVICE_BUCKETS)".to_string());
+            }
+            return Ok(ResolvedBackend::Managed(self.managed.clone()));
+        }
+
         if let Some(raw_url) = headers
             .get("x-s4-backend-url")
             .and_then(|value| value.to_str().ok())
@@ -547,8 +562,31 @@ mod tests {
                 region: "us-east-1".to_string(),
             },
         );
-        let resolver = BackendResolver::new(registry, managed, Some(global), memory);
+        let resolver = BackendResolver::new(registry, managed, Some(global), memory.clone());
         assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::PerUserS3).await;
+
+        // S7a: x-s4-storage-mode: managed forces managed storage even for a
+        // workspace with a BYO backend configured; unknown values are ignored.
+        let mut managed_override = HeaderMap::new();
+        managed_override.insert("x-s4-storage-mode", "managed".parse().unwrap());
+        assert_operations_resolve_to(&resolver, &managed_override, BackendKind::Managed).await;
+        let mut unknown_mode = HeaderMap::new();
+        unknown_mode.insert("x-s4-storage-mode", "archive".parse().unwrap());
+        assert_operations_resolve_to(&resolver, &unknown_mode, BackendKind::PerUserS3).await;
+
+        // x-s4-storage-mode: managed errors when no managed backend is configured.
+        let no_managed = BackendResolver::new(
+            Arc::new(BackendRegistry::new()),
+            Arc::new(ServiceStorage::new(Vec::new())),
+            None,
+            memory.clone(),
+        );
+        assert!(
+            no_managed
+                .resolve("user", &managed_override, StorageOperation::Put)
+                .await
+                .is_err()
+        );
 
         let mut presigned = HeaderMap::new();
         presigned.insert(

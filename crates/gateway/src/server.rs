@@ -1501,12 +1501,8 @@ async fn demo_store(
 }
 
 /// Demo read: fetch a stored demo record and run the requested disclosure mode.
-/// `mode`:
-/// - `raw`  -> the bytes at rest (as your app sees them)
-/// - `safe` -> the record run through the PII pipeline (detect + redact)
-/// - `join` -> the record run through the pipeline with stable-encrypt on
-///             `email` (same ciphertext for the same email, so the records
-///             remain joinable without exposing plaintext)
+/// `mode` is `raw` (bytes at rest), `safe` (PII redacted), or `join` (`email`
+/// stable-encrypted so records stay joinable without exposing plaintext).
 #[derive(Deserialize, ToSchema)]
 struct DemoReadQuery {
     id: Option<u32>,      // 1-based record number; default 1
@@ -1552,7 +1548,9 @@ async fn demo_read(
                 }
             }
         }
-        other => return (StatusCode::BAD_REQUEST, format!("unknown mode: {other}")).into_response(),
+        other => {
+            return (StatusCode::BAD_REQUEST, format!("unknown mode: {other}")).into_response();
+        }
     };
     Json(serde_json::json!({
         "mode": mode,

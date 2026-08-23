@@ -1500,11 +1500,9 @@ async fn demo_store(
     Json(serde_json::json!({ "stored": body.records.len(), "namespace": "__demo" })).into_response()
 }
 
-/// Demo read: fetch a stored demo record in raw mode. Transformed modes remain
-/// unavailable until the streaming disclosure model is implemented.
-/// `mode`:
-/// - `raw`  -> the bytes at rest (as your app sees them)
-/// - `safe` / `join` -> rejected
+/// Demo read: fetch a stored demo record and run the requested disclosure mode.
+/// `mode` is `raw` (bytes at rest), `safe` (PII redacted), or `join` (`email`
+/// stable-encrypted so records stay joinable without exposing plaintext).
 #[derive(Deserialize, ToSchema)]
 struct DemoReadQuery {
     id: Option<u32>,      // 1-based record number; default 1
@@ -1517,16 +1515,47 @@ async fn demo_read(
 ) -> impl IntoResponse {
     let id = q.id.unwrap_or(1);
     let mode = q.mode.as_deref().unwrap_or("raw");
-    if mode != "raw" {
-        return s3_error::transformed_read_not_supported(&format!("record-{id}.json"));
-    }
     let Some(obj) = state.store.get("__demo", &format!("record-{id}.json")) else {
         return (StatusCode::NOT_FOUND, "no demo record stored yet").into_response();
+    };
+    let body = match mode {
+        "raw" => String::from_utf8_lossy(&obj.data).into_owned(),
+        "safe" | "join" => {
+            let stable_key: Option<Vec<u8>> = if mode == "join" {
+                Some(derive_stable_key("s4-demo"))
+            } else {
+                None
+            };
+            let stable_fields: Option<&str> = if mode == "join" { Some("email") } else { None };
+            match run_demo_streaming(
+                &state,
+                &obj.data,
+                Format::Json,
+                "application/json",
+                None,
+                stable_key.as_deref(),
+                stable_fields,
+            )
+            .await
+            {
+                Ok((bytes, _)) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("pipeline error: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        other => {
+            return (StatusCode::BAD_REQUEST, format!("unknown mode: {other}")).into_response();
+        }
     };
     Json(serde_json::json!({
         "mode": mode,
         "record": id,
-        "body": String::from_utf8_lossy(&obj.data),
+        "body": body,
     }))
     .into_response()
 }

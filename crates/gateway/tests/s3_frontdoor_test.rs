@@ -2374,7 +2374,7 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
 }
 
 #[tokio::test]
-async fn demo_transformed_read_modes_are_rejected() {
+async fn demo_read_safe_and_join_modes() {
     let (app, _state) = router().await;
 
     // 1. Store two records sharing an email.
@@ -2418,7 +2418,7 @@ async fn demo_transformed_read_modes_are_rejected() {
         "raw keeps PII: {raw_text}"
     );
 
-    // 3. Safe and join modes are rejected before reading stored data.
+    // 3. Safe read runs the PII pipeline (detect + redact).
     let safe = app
         .clone()
         .oneshot(
@@ -2430,58 +2430,49 @@ async fn demo_transformed_read_modes_are_rejected() {
         )
         .await
         .unwrap();
-    assert_eq!(safe.status(), StatusCode::NOT_IMPLEMENTED);
-    let safe_body = axum::body::to_bytes(safe.into_body(), usize::MAX)
+    assert_eq!(safe.status(), StatusCode::OK);
+    let safe_bytes = axum::body::to_bytes(safe.into_body(), usize::MAX)
         .await
         .unwrap();
-    let safe_text = String::from_utf8_lossy(&safe_body);
+    let safe_text = String::from_utf8_lossy(&safe_bytes);
     assert!(
-        safe_text.contains("<Code>NotImplemented</Code>")
-            && !safe_text.contains("alice@example.com"),
-        "safe mode must fail without disclosure: {safe_text}"
+        safe_text.contains("REDACTED_EMAIL") && !safe_text.contains("alice@example.com"),
+        "safe must redact PII: {safe_text}"
     );
 
-    // 4. Joinable reads are also unavailable until Phase 8.
-    let j1 = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/dashboard/api/demo/read?id=1&mode=join")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(j1.status(), StatusCode::NOT_IMPLEMENTED);
-    let j2 = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/dashboard/api/demo/read?id=2&mode=join")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(j2.status(), StatusCode::NOT_IMPLEMENTED);
-    let t1 = String::from_utf8_lossy(
-        &axum::body::to_bytes(j1.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .to_string();
-    let t2 = String::from_utf8_lossy(
-        &axum::body::to_bytes(j2.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .to_string();
-    assert!(
-        !t1.contains("alice@example.com") && !t2.contains("alice@example.com"),
-        "join leaks PII"
+    // 4. Join read stable-encrypts `email`; the same email yields identical
+    //    ciphertext across records (joinable without plaintext).
+    let read_join = |id: u32| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/dashboard/api/demo/read?id={id}&mode=join"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let text = String::from_utf8_lossy(
+                &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .to_string();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(value["body"].as_str().unwrap()).unwrap();
+            body["email"].as_str().unwrap().to_string()
+        }
+    };
+    let email1 = read_join(1).await;
+    let email2 = read_join(2).await;
+    assert_ne!(email1, "alice@example.com", "join leaks plaintext email");
+    assert_eq!(
+        email1, email2,
+        "join must produce identical ciphertext for the same email"
     );
-    assert!(t1.contains("<Code>NotImplemented</Code>"), "{t1}");
-    assert!(t2.contains("<Code>NotImplemented</Code>"), "{t2}");
 }

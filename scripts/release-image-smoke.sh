@@ -53,6 +53,7 @@ docker run --rm --network "$NETWORK" -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-co
 docker run -d --name "$GATEWAY_NAME" --network "$NETWORK" \
   -p "127.0.0.1:${GATEWAY_PORT}:8080" \
   -e AUTH_DISABLED=true \
+  -e S4_STREAMING_WRITE_MODE=all \
   -e S4_KEYS_FILE=/tmp/keys.json \
   -e S3_ENDPOINT="http://${MINIO_NAME}:9000" \
   -e S3_ACCESS_KEY_ID=minioadmin \

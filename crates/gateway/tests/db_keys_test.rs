@@ -10,14 +10,17 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use s4_gateway::entity::api_key;
+use s4_gateway::entity::managed_namespace;
+use s4_gateway::entity::managed_namespace_purge;
 use s4_gateway::entity::managed_object_authority;
 use s4_gateway::entity::managed_object_repair;
+use s4_gateway::entity::managed_physical_object_version;
 use s4_gateway::entity::multipart_upload;
 use s4_gateway::entity::object_operation;
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
 use s4_gateway::managed::{
-    CopyStatus, LogicalObjectKey, ManagedRepository, ObjectAuthority, Placement,
-    PostgresManagedRepository,
+    CopyStatus, LogicalObjectKey, ManagedRepository, NamespacePurgeRequest, NamespacePurgeStatus,
+    ObjectAuthority, PhysicalWriteIntent, Placement, PostgresManagedRepository,
 };
 use s4_gateway::multipart_staging::{
     CompletePart, CompletionAcquire, MultipartCompletionResult, MultipartIdentity,
@@ -27,7 +30,7 @@ use s4_gateway::multipart_staging::{
 use s4_gateway::store::{KeyRepository, PostgresKeyStore, sha256_hash};
 use s4_gateway::transaction::{
     EvidenceRecord, ExpectedObject, ObjectDestination, OperationJournal, OperationRecord,
-    OperationState, PartRecord, PostgresOperationJournal,
+    OperationState, PartRecord, PostgresOperationJournal, StoredObjectMeta,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, SqlxPostgresConnector};
@@ -52,6 +55,247 @@ fn unix_time_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+async fn ledger_managed_test_version(
+    repository: &PostgresManagedRepository,
+    tenant_id: &str,
+    backend_id: &str,
+    physical_key: &str,
+) {
+    let intent_id = uuid::Uuid::now_v7();
+    let lease = repository
+        .begin_physical_write(PhysicalWriteIntent {
+            intent_id,
+            tenant_id: tenant_id.to_string(),
+            backend_id: backend_id.to_string(),
+            backend_fingerprint: "test-fingerprint".to_string(),
+            provider_bucket: "test-provider-bucket".to_string(),
+            physical_key: physical_key.to_string(),
+            versioning_mode: s4_gateway::managed::BackendVersioningMode::Enabled,
+            versioning_capability: s4_gateway::managed::BackendVersioningCapability::Optional,
+            lease_owner: "db-test-writer".to_string(),
+        })
+        .await
+        .unwrap();
+    repository
+        .commit_physical_write(&lease, &[], Some(&format!("version-{intent_id}")))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn postgres_namespace_purge_fences_late_writes_and_completes_idempotently() {
+    with_pool(|pool| async move {
+        let db = sea_db(pool.clone());
+        let journal = PostgresOperationJournal::new(pool.clone());
+        let repository = PostgresManagedRepository::new(pool);
+        let tenant = format!("purge-unit-{}", uuid::Uuid::new_v4());
+        let intent_id = uuid::Uuid::now_v7();
+        let lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id,
+                tenant_id: tenant.clone(),
+                backend_id: "provider:bucket".to_string(),
+                backend_fingerprint: "test-fingerprint".to_string(),
+                provider_bucket: "bucket".to_string(),
+                physical_key: "managed/physical-key".to_string(),
+                versioning_mode: s4_gateway::managed::BackendVersioningMode::Enabled,
+                versioning_capability: s4_gateway::managed::BackendVersioningCapability::Optional,
+                lease_owner: "db-test-writer".to_string(),
+            })
+            .await
+            .unwrap();
+        let duplicate = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id,
+                tenant_id: tenant.clone(),
+                backend_id: "provider:bucket".to_string(),
+                backend_fingerprint: "test-fingerprint".to_string(),
+                provider_bucket: "bucket".to_string(),
+                physical_key: "managed/physical-key".to_string(),
+                versioning_mode: s4_gateway::managed::BackendVersioningMode::Enabled,
+                versioning_capability: s4_gateway::managed::BackendVersioningCapability::Optional,
+                lease_owner: "db-test-writer".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(duplicate, lease);
+        assert!(matches!(
+            repository
+                .begin_physical_write(PhysicalWriteIntent {
+                    intent_id,
+                    tenant_id: tenant.clone(),
+                    backend_id: "provider:bucket".to_string(),
+                    backend_fingerprint: "test-fingerprint".to_string(),
+                    provider_bucket: "bucket".to_string(),
+                    physical_key: "managed/different-key".to_string(),
+                    versioning_mode: s4_gateway::managed::BackendVersioningMode::Enabled,
+                    versioning_capability:
+                        s4_gateway::managed::BackendVersioningCapability::Optional,
+                    lease_owner: "db-test-writer".to_string(),
+                })
+                .await,
+            Err(s4_gateway::managed::ManagedError::Conflict)
+        ));
+        journal
+            .insert_intent(OperationRecord::scoped_intent(
+                intent_id,
+                ObjectDestination {
+                    backend_id: "provider:bucket".to_string(),
+                    bucket: "bucket".to_string(),
+                    logical_key: "bucket/key".to_string(),
+                    physical_key: "managed/physical-key".to_string(),
+                },
+                ExpectedObject::default(),
+                tenant.clone(),
+                lease.namespace_epoch,
+            ))
+            .await
+            .unwrap();
+        journal.set_open(intent_id, None).await.unwrap();
+        journal
+            .transition(
+                intent_id,
+                OperationState::Open,
+                OperationState::Completing,
+                None,
+            )
+            .await
+            .unwrap();
+        let unresolved_operation_id = uuid::Uuid::now_v7();
+        journal
+            .insert_intent(OperationRecord::scoped_intent(
+                unresolved_operation_id,
+                ObjectDestination {
+                    backend_id: "provider:bucket".to_string(),
+                    bucket: "bucket".to_string(),
+                    logical_key: "bucket/unresolved".to_string(),
+                    physical_key: "managed/unresolved".to_string(),
+                },
+                ExpectedObject::default(),
+                tenant.clone(),
+                lease.namespace_epoch,
+            ))
+            .await
+            .unwrap();
+        journal
+            .transition(
+                intent_id,
+                OperationState::Completing,
+                OperationState::Committed,
+                Some(&StoredObjectMeta {
+                    etag: Some("etag".to_string()),
+                    version_id: Some("version-2".to_string()),
+                    superseded_version_ids: vec!["version-1".to_string()],
+                    version_history_complete: true,
+                }),
+            )
+            .await
+            .unwrap();
+        let request = NamespacePurgeRequest {
+            tenant_id: tenant.clone(),
+            operation_id: uuid::Uuid::now_v7(),
+        };
+
+        assert_eq!(
+            repository.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Running,
+            "the pre-fence write intent prevents false completion"
+        );
+        assert!(matches!(
+            repository.assert_namespace_active(&tenant).await,
+            Err(s4_gateway::managed::ManagedError::NamespaceFenced)
+        ));
+        assert!(matches!(
+            repository
+                .begin_physical_write(PhysicalWriteIntent {
+                    intent_id: uuid::Uuid::now_v7(),
+                    tenant_id: tenant.clone(),
+                    backend_id: "provider:bucket".to_string(),
+                    backend_fingerprint: "test-fingerprint".to_string(),
+                    provider_bucket: "bucket".to_string(),
+                    physical_key: "must-not-start".to_string(),
+                    versioning_mode: s4_gateway::managed::BackendVersioningMode::Enabled,
+                    versioning_capability:
+                        s4_gateway::managed::BackendVersioningCapability::Optional,
+                    lease_owner: "stale-writer".to_string(),
+                })
+                .await,
+            Err(s4_gateway::managed::ManagedError::NamespaceFenced)
+        ));
+
+        repository
+            .commit_physical_write(&lease, &["version-1".to_string()], Some("version-2"))
+            .await
+            .unwrap();
+        let targets = repository.purge_targets(&request, 10).await.unwrap();
+        assert_eq!(targets.len(), 2);
+        for target in targets {
+            repository
+                .mark_purge_target_deleted(&request, &target)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            repository.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Blocked { reason }
+                if reason.contains("unresolved operation journal")
+        ));
+        journal
+            .transition(
+                unresolved_operation_id,
+                OperationState::Intent,
+                OperationState::Aborting,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .transition(
+                unresolved_operation_id,
+                OperationState::Aborting,
+                OperationState::ProvenAborted,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Complete {
+                deleted_versions: 2,
+            }
+        );
+        assert_eq!(
+            repository.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Complete {
+                deleted_versions: 2,
+            },
+            "restarting the same purge operation is idempotent"
+        );
+        repository
+            .assert_namespace_active(&tenant)
+            .await
+            .expect("completion reactivates an empty next epoch");
+        assert!(journal.get(intent_id).await.unwrap().is_none());
+        assert!(
+            journal
+                .get(unresolved_operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        managed_namespace_purge::Entity::delete_many()
+            .filter(managed_namespace_purge::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_namespace::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
+    });
 }
 
 fn sea_db(pool: PgPool) -> DatabaseConnection {
@@ -296,6 +540,7 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
         repository
             .create(MultipartUpload {
                 identity: identity.clone(),
+                namespace_epoch: None,
                 snapshot: MultipartSnapshot {
                     metadata: Default::default(),
                     tags: Default::default(),
@@ -439,6 +684,14 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             updated_at_ms: 0,
         };
 
+        ledger_managed_test_version(
+            &repository,
+            &tenant,
+            "primary",
+            &s4_gateway::managed::generation_physical_key(&logical, generation),
+        )
+        .await;
+
         let published = repository.publish(authority.clone(), None).await.unwrap();
         assert_eq!(published.cas_version, 1);
         let persisted = repository.get(&logical).await.unwrap().unwrap();
@@ -494,14 +747,32 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
                 .await
                 .is_err()
         );
+        ledger_managed_test_version(
+            &repository,
+            &tenant,
+            &restarted_claim[0].target_backend_id,
+            &restarted_claim[0].physical_key,
+        )
+        .await;
         assert!(
             repository
                 .complete_repair(&restarted_claim[0])
                 .await
                 .unwrap()
         );
+        let current_after_repair = repository.get(&logical).await.unwrap().unwrap();
         repository
-            .enqueue(restarted_claim[0].clone())
+            .enqueue(s4_gateway::managed::RepairRecord::copy(
+                s4_gateway::managed::RepairKind::Replica,
+                &current_after_repair,
+                Some(current_after_repair.primary_backend_id.clone()),
+                current_after_repair
+                    .replica_backend_id
+                    .clone()
+                    .expect("replica backend"),
+                s4_gateway::managed::RepairTargetRole::Replica,
+                current_after_repair.placement_version,
+            ))
             .await
             .expect("completed repair can be re-enqueued without poisoning the transaction");
         let requeued = repository
@@ -533,6 +804,13 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .await
             .unwrap();
         assert_eq!(replica_migration.len(), 1);
+        ledger_managed_test_version(
+            &repository,
+            &tenant,
+            &replica_migration[0].target_backend_id,
+            &replica_migration[0].physical_key,
+        )
+        .await;
         assert!(
             repository
                 .complete_repair(&replica_migration[0])
@@ -575,6 +853,15 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .await
             .unwrap();
         assert_eq!(migration_repairs.len(), 2);
+        for repair in &migration_repairs {
+            ledger_managed_test_version(
+                &repository,
+                &tenant,
+                &repair.target_backend_id,
+                &repair.physical_key,
+            )
+            .await;
+        }
         let (left, right) = tokio::join!(
             repository.complete_repair(&migration_repairs[0]),
             repository.complete_repair(&migration_repairs[1]),
@@ -623,6 +910,15 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .unwrap();
         managed_object_authority::Entity::delete_many()
             .filter(managed_object_authority::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_physical_object_version::Entity::delete_many()
+            .filter(managed_physical_object_version::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_namespace::Entity::delete_by_id(&tenant)
             .exec(&db)
             .await
             .unwrap();

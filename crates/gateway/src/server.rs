@@ -1757,6 +1757,8 @@ impl CompatibilitySpoolUploader for PresignedSpoolUploader {
                             .get("x-amz-version-id")
                             .and_then(|value| value.to_str().ok())
                             .map(ToOwned::to_owned),
+                        superseded_version_ids: Vec::new(),
+                        version_history_complete: true,
                     });
                 }
                 Ok(response) => {
@@ -2538,7 +2540,8 @@ async fn cleanup_staged_parts(
     upload_id: &str,
     parts: Vec<MultipartPart>,
     kind: &str,
-) {
+) -> bool {
+    let mut complete = true;
     for part in parts {
         let result = staging.artifacts.delete(&part.artifact_key).await;
         let detail = match result {
@@ -2551,10 +2554,12 @@ async fn cleanup_staged_parts(
                     serde_json::json!({"part_number":part.part_number,"attempt":part.attempt})
                 }
                 Err(error) => {
+                    complete = false;
                     serde_json::json!({"part_number":part.part_number,"attempt":part.attempt,"error":error.to_string()})
                 }
             },
             Err(error) => {
+                complete = false;
                 serde_json::json!({"part_number":part.part_number,"attempt":part.attempt,"error":error.to_string()})
             }
         };
@@ -2572,6 +2577,7 @@ async fn cleanup_staged_parts(
             warn!("multipart cleanup audit failed: {error}");
         }
     }
+    complete
 }
 
 #[derive(Debug)]
@@ -2972,23 +2978,39 @@ async fn s3_upload_part(
     let Some(staging) = staged_multipart(&state).cloned() else {
         return s3_error::multipart_not_supported(&key);
     };
-    if resolve_backend(
+    let multipart_backend = match resolve_backend(
         &state,
         &authentication.auth,
         &parts.headers,
         StorageOperation::Multipart,
     )
     .await
-    .is_err()
     {
-        return s3_error::internal_error(&key, "multipart backend resolution failed");
-    }
+        Ok(backend) => backend,
+        Err(_) => return s3_error::internal_error(&key, "multipart backend resolution failed"),
+    };
     let identity = multipart_identity(&authentication.auth, &bucket, &key, &upload_id);
     let upload = match staging.repository.get_authorized(&identity).await {
         Ok(upload) => upload,
         Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
         Err(error) => return s3_error::internal_error(&key, &error.to_string()),
     };
+    if let ResolvedBackend::Managed(storage) = &multipart_backend {
+        let Some(epoch) = upload.namespace_epoch else {
+            return s3_error::service_unavailable(&key, "managed multipart upload has no epoch");
+        };
+        if let Err(error) = storage
+            .assert_managed_multipart(
+                &upload_id,
+                authentication.auth.workspace_id().as_str(),
+                epoch,
+                false,
+            )
+            .await
+        {
+            return s3_error::service_unavailable(&key, &error.to_string());
+        }
+    }
     if upload.lifecycle != MultipartLifecycle::Open || upload.expires_at_ms <= now_ms() {
         return s3_error::no_such_upload(&key);
     }
@@ -3850,12 +3872,12 @@ async fn s3_get(
         return s3_error::transformed_read_not_supported(&key);
     }
     if params.upload_id.is_some() {
-        if resolve_backend(&state, &auth, &headers, StorageOperation::Multipart)
+        let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart)
             .await
-            .is_err()
         {
-            return s3_error::internal_error(&key, "multipart backend resolution failed");
-        }
+            Ok(backend) => backend,
+            Err(_) => return s3_error::internal_error(&key, "multipart backend resolution failed"),
+        };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
@@ -3865,6 +3887,30 @@ async fn s3_get(
             &key,
             params.upload_id.as_deref().unwrap_or_default(),
         );
+        if let ResolvedBackend::Managed(storage) = &backend {
+            let upload = match staging.repository.get_authorized(&identity).await {
+                Ok(upload) => upload,
+                Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+                Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+            };
+            let Some(epoch) = upload.namespace_epoch else {
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed multipart upload has no namespace epoch",
+                );
+            };
+            if let Err(error) = storage
+                .assert_managed_multipart(
+                    &identity.upload_id,
+                    auth.workspace_id().as_str(),
+                    epoch,
+                    false,
+                )
+                .await
+            {
+                return s3_error::service_unavailable(&key, &error.to_string());
+            }
+        }
         let limit = params.max_parts.unwrap_or(1000).clamp(1, 1000) as usize;
         return match staging
             .repository
@@ -4416,17 +4462,37 @@ async fn s3_delete(
     info!("DELETE /{bucket}/{key} user={}", auth.user_id());
 
     if params.upload_id.is_some() {
-        if resolve_backend(&state, &auth, &headers, StorageOperation::Multipart)
-            .await
-            .is_err()
-        {
-            return s3_error::internal_error(&key, "multipart backend resolution failed");
-        }
+        let backend =
+            match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
+                Ok(backend) => backend,
+                Err(_) => {
+                    return s3_error::internal_error(&key, "multipart backend resolution failed");
+                }
+            };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
         let upload_id = params.upload_id.as_deref().unwrap_or_default();
         let identity = multipart_identity(&auth, &bucket, &key, upload_id);
+        let upload = match staging.repository.get_authorized(&identity).await {
+            Ok(upload) => upload,
+            Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+        };
+        if let ResolvedBackend::Managed(storage) = &backend {
+            let Some(epoch) = upload.namespace_epoch else {
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed multipart upload has no namespace epoch",
+                );
+            };
+            if let Err(error) = storage
+                .assert_managed_multipart(upload_id, auth.workspace_id().as_str(), epoch, true)
+                .await
+            {
+                return s3_error::service_unavailable(&key, &error.to_string());
+            }
+        }
         return match staging.repository.abort(&identity, now_ms()).await {
             Ok(parts) => {
                 cleanup_staged_parts(&staging, upload_id, parts, "abort").await;
@@ -4592,6 +4658,26 @@ async fn s3_post(
             Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
             Err(error) => return s3_error::internal_error(&key, &error.to_string()),
         };
+        let backend =
+            match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
+            {
+                Ok(backend) => backend,
+                Err(error) => return s3_error::internal_error(&key, &error),
+            };
+        if let ResolvedBackend::Managed(storage) = &backend {
+            let Some(epoch) = upload.namespace_epoch else {
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed multipart upload has no namespace epoch",
+                );
+            };
+            if let Err(error) = storage
+                .assert_managed_multipart(upload_id, auth.workspace_id().as_str(), epoch, false)
+                .await
+            {
+                return s3_error::service_unavailable(&key, &error.to_string());
+            }
+        }
         let fingerprint = match completion_fingerprint(&upload, &selected) {
             Ok(fingerprint) => fingerprint,
             Err(error) => return s3_error::internal_error(&key, &error.to_string()),
@@ -4636,12 +4722,6 @@ async fn s3_post(
             }
             Err(error) => return s3_error::internal_error(&key, &error.to_string()),
         };
-        let backend =
-            match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
-            {
-                Ok(backend) => backend,
-                Err(error) => return s3_error::internal_error(&key, &error),
-            };
         let complete = tokio::time::timeout(
             Duration::from_secs(MAX_MULTIPART_COMPLETION_SECS),
             complete_staged_multipart(&state, &staging, &identity, &upload, &lease, &auth, backend),
@@ -4718,6 +4798,13 @@ async fn s3_post(
                 Ok(backend) => backend,
                 Err(error) => return s3_error::internal_error(&key, &error),
             };
+        if let ResolvedBackend::Managed(storage) = &backend
+            && let Err(error) = storage
+                .assert_namespace_active(auth.workspace_id().as_str())
+                .await
+        {
+            return s3_error::service_unavailable(&key, &error.to_string());
+        }
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
@@ -4731,9 +4818,21 @@ async fn s3_post(
             return s3_error::multipart_not_supported(&key);
         }
         let upload_id = Uuid::now_v7().to_string();
+        let managed_registration = if let ResolvedBackend::Managed(storage) = &backend {
+            match storage
+                .begin_managed_multipart(&upload_id, auth.workspace_id().as_str())
+                .await
+            {
+                Ok(epoch) => Some((storage.clone(), epoch)),
+                Err(error) => return s3_error::service_unavailable(&key, &error.to_string()),
+            }
+        } else {
+            None
+        };
         let now = now_ms();
         let upload = MultipartUpload {
             identity: multipart_identity(&auth, &bucket, &key, &upload_id),
+            namespace_epoch: managed_registration.as_ref().map(|(_, epoch)| *epoch),
             snapshot: multipart_snapshot(
                 &parts.headers,
                 &backend,
@@ -4754,9 +4853,33 @@ async fn s3_post(
             completion_result: None,
         };
         return match staging.repository.create(upload).await {
-            Ok(()) => s3_xml_ok(create_multipart_xml(&bucket, &key, &upload_id)),
-            Err(StagingError::QuotaExceeded) => s3_error::slow_down(&key),
-            Err(error) => s3_error::internal_error(&key, &error.to_string()),
+            Ok(()) => {
+                if let Some((storage, epoch)) = &managed_registration
+                    && let Err(error) = storage
+                        .confirm_managed_multipart(&upload_id, auth.workspace_id().as_str(), *epoch)
+                        .await
+                {
+                    let identity = multipart_identity(&auth, &bucket, &key, &upload_id);
+                    let _ = staging.repository.abort(&identity, now_ms()).await;
+                    let _ = staging.repository.delete_terminal_upload(&identity).await;
+                    let _ = storage
+                        .finish_managed_multipart(&upload_id, auth.workspace_id().as_str(), *epoch)
+                        .await;
+                    return s3_error::service_unavailable(&key, &error.to_string());
+                }
+                s3_xml_ok(create_multipart_xml(&bucket, &key, &upload_id))
+            }
+            Err(error) => {
+                if let Some((storage, epoch)) = managed_registration {
+                    let _ = storage
+                        .finish_managed_multipart(&upload_id, auth.workspace_id().as_str(), epoch)
+                        .await;
+                }
+                match error {
+                    StagingError::QuotaExceeded => s3_error::slow_down(&key),
+                    error => s3_error::internal_error(&key, &error.to_string()),
+                }
+            }
         };
     }
     s3_error::not_implemented(&key)
@@ -6063,12 +6186,35 @@ pub async fn build_state(
             "managed observe/enforce mode requires S4_MANAGED_STREAMING_TRANSACTIONAL=true"
         );
     }
-    let service_storage = Arc::new(ServiceStorage::with_management(
-        service_backends,
-        managed_repository,
-        managed_mode,
-        managed_placement_version,
-    ));
+    let service_storage = Arc::new(
+        ServiceStorage::with_management(
+            service_backends,
+            managed_repository,
+            managed_mode,
+            managed_placement_version,
+        )
+        .with_managed_capabilities(managed_streaming_capabilities),
+    );
+    if multipart_staging.is_some() && managed_mode != ManagedStreamingMode::Off {
+        service_storage
+            .reconcile_managed_multipart_activities(256)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+    if managed_mode == ManagedStreamingMode::Enforce
+        && let (Some(journal), Some(capabilities)) =
+            (operation_journal.clone(), managed_streaming_capabilities)
+    {
+        service_storage
+            .reconcile_managed_write_intents(
+                journal,
+                capabilities,
+                Duration::from_millis(crate::managed::PHYSICAL_WRITE_LEASE_MS as u64),
+                256,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
 
     // Local mode: ensure a demo key exists and print it so SDK demos and
     // `aws s3 --endpoint-url` work out of the box.
@@ -6132,6 +6278,17 @@ pub async fn build_state(
             let owner = format!("managed-repair-{}", uuid::Uuid::now_v7());
             loop {
                 if let Err(error) = storage
+                    .reconcile_managed_write_intents(
+                        journal.clone(),
+                        capabilities,
+                        Duration::from_millis(crate::managed::PHYSICAL_WRITE_LEASE_MS as u64),
+                        64,
+                    )
+                    .await
+                {
+                    warn!("managed write-intent reconciliation failed: {error}");
+                }
+                if let Err(error) = storage
                     .repair_due(journal.clone(), capabilities, &owner, 16)
                     .await
                 {
@@ -6142,6 +6299,7 @@ pub async fn build_state(
         });
     }
     if let Some(staging) = state.multipart_staging.clone() {
+        let storage = state.service_storage.clone();
         tokio::spawn(async move {
             loop {
                 match staging.repository.reap_expired(now_ms(), 64).await {
@@ -6163,6 +6321,31 @@ pub async fn build_state(
                 }
                 if let Err(error) = reconcile_staged_artifacts(&staging).await {
                     warn!("multipart artifact reconciliation failed: {error}");
+                }
+                match staging
+                    .repository
+                    .retire_terminal_uploads(now_ms(), 64)
+                    .await
+                {
+                    Ok(retired) => {
+                        for upload in retired {
+                            if let Some(epoch) = upload.namespace_epoch {
+                                let _ = storage
+                                    .finish_managed_multipart(
+                                        &upload.upload_id,
+                                        &upload.tenant_id,
+                                        epoch,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(error) => warn!("multipart terminal retirement failed: {error}"),
+                }
+                if storage.managed_mode() != ManagedStreamingMode::Off
+                    && let Err(error) = storage.reconcile_managed_multipart_activities(64).await
+                {
+                    warn!("managed multipart registration reconciliation failed: {error}");
                 }
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }

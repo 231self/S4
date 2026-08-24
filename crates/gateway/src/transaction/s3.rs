@@ -119,6 +119,8 @@ impl AwsS3TransactionBackend {
             Ok(StoredObjectMeta {
                 etag: output.e_tag().map(ToOwned::to_owned),
                 version_id: output.version_id().map(ToOwned::to_owned),
+                superseded_version_ids: Vec::new(),
+                version_history_complete: true,
             })
         }
         .await;
@@ -165,6 +167,8 @@ impl AwsS3TransactionBackend {
                     return Ok(CompletionProbe::Committed(StoredObjectMeta {
                         etag: output.e_tag().map(ToOwned::to_owned),
                         version_id: output.version_id().map(ToOwned::to_owned),
+                        superseded_version_ids: Vec::new(),
+                        version_history_complete: false,
                     }));
                 }
                 self.rewrite_completed_multipart_metadata(operation)
@@ -262,6 +266,8 @@ impl TransactionBackend for AwsS3TransactionBackend {
         Ok(StoredObjectMeta {
             etag: output.e_tag().map(ToOwned::to_owned),
             version_id: output.version_id().map(ToOwned::to_owned),
+            superseded_version_ids: Vec::new(),
+            version_history_complete: true,
         })
     }
 
@@ -328,7 +334,8 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     .collect(),
             ))
             .build();
-        self.client
+        let first = self
+            .client
             .complete_multipart_upload()
             .bucket(&operation.destination.bucket)
             .key(&operation.destination.physical_key)
@@ -337,7 +344,15 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .send()
             .await
             .map_err(ambiguous)?;
-        self.rewrite_completed_multipart_metadata(operation).await
+        let mut rewritten = self.rewrite_completed_multipart_metadata(operation).await?;
+        if let Some(version_id) = first.version_id()
+            && rewritten.version_id.as_deref() != Some(version_id)
+        {
+            rewritten
+                .superseded_version_ids
+                .push(version_id.to_string());
+        }
+        Ok(rewritten)
     }
 
     async fn abort_multipart(
@@ -440,8 +455,49 @@ impl DirectS3Sink {
         max_attempts: usize,
         abort_signal: AbortSignal,
     ) -> Result<Self, TransactionError> {
+        Self::from_operation(
+            journal,
+            backend,
+            OperationRecord::intent(destination, expected),
+            max_attempts,
+            abort_signal,
+        )
+        .await
+    }
+
+    pub async fn new_scoped(
+        journal: Arc<dyn OperationJournal>,
+        backend: Arc<dyn TransactionBackend>,
+        scope: super::ManagedOperationScope,
+        destination: ObjectDestination,
+        expected: super::ExpectedObject,
+        max_attempts: usize,
+        abort_signal: AbortSignal,
+    ) -> Result<Self, TransactionError> {
+        Self::from_operation(
+            journal,
+            backend,
+            OperationRecord::scoped_intent(
+                scope.operation_id,
+                destination,
+                expected,
+                scope.tenant_id,
+                scope.namespace_epoch,
+            ),
+            max_attempts,
+            abort_signal,
+        )
+        .await
+    }
+
+    async fn from_operation(
+        journal: Arc<dyn OperationJournal>,
+        backend: Arc<dyn TransactionBackend>,
+        operation: OperationRecord,
+        max_attempts: usize,
+        abort_signal: AbortSignal,
+    ) -> Result<Self, TransactionError> {
         backend.capabilities().streaming_eligibility()?;
-        let operation = OperationRecord::intent(destination, expected);
         journal.insert_intent(operation.clone()).await?;
         Ok(Self {
             journal,
@@ -575,7 +631,10 @@ impl DirectS3Sink {
             )
             .await?;
             match self.backend.put_object(&self.operation, body.clone()).await {
-                Ok(meta) => {
+                Ok(mut meta) => {
+                    if attempt > 1 {
+                        meta.version_history_complete = false;
+                    }
                     self.journal
                         .transition(
                             self.operation.id,
@@ -627,7 +686,10 @@ impl DirectS3Sink {
                 .complete_multipart(&self.operation, upload_id, &self.parts)
                 .await
             {
-                Ok(meta) => {
+                Ok(mut meta) => {
+                    if attempt > 1 {
+                        meta.version_history_complete = false;
+                    }
                     self.journal
                         .transition(
                             self.operation.id,
@@ -905,6 +967,8 @@ mod tests {
             let meta = StoredObjectMeta {
                 etag: Some("put-etag".to_string()),
                 version_id: None,
+                superseded_version_ids: Vec::new(),
+                version_history_complete: true,
             };
             self.state
                 .lock()
@@ -955,6 +1019,8 @@ mod tests {
             let meta = StoredObjectMeta {
                 etag: Some("multipart-etag".to_string()),
                 version_id: None,
+                superseded_version_ids: Vec::new(),
+                version_history_complete: true,
             };
             self.state
                 .lock()
@@ -1157,6 +1223,16 @@ mod tests {
         assert_eq!(
             journal.get(operation_id).await.unwrap().unwrap().state,
             OperationState::Committed
+        );
+        assert!(
+            !journal
+                .get(operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .committed
+                .unwrap()
+                .version_history_complete
         );
         assert!(
             !backend

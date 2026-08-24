@@ -118,6 +118,8 @@ pub struct OperationRecord {
     pub id: Uuid,
     pub state: OperationState,
     pub destination: ObjectDestination,
+    pub tenant_id: Option<String>,
+    pub namespace_epoch: Option<u64>,
     pub expected: ExpectedObject,
     pub upload_id: Option<String>,
     pub committed: Option<StoredObjectMeta>,
@@ -127,6 +129,13 @@ pub struct OperationRecord {
     pub updated_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedOperationScope {
+    pub operation_id: Uuid,
+    pub tenant_id: String,
+    pub namespace_epoch: u64,
+}
+
 impl OperationRecord {
     pub fn intent(destination: ObjectDestination, expected: ExpectedObject) -> Self {
         let now = unix_time_ms();
@@ -134,6 +143,8 @@ impl OperationRecord {
             id: Uuid::now_v7(),
             state: OperationState::Intent,
             destination,
+            tenant_id: None,
+            namespace_epoch: None,
             expected,
             upload_id: None,
             committed: None,
@@ -142,6 +153,20 @@ impl OperationRecord {
             created_at_ms: now,
             updated_at_ms: now,
         }
+    }
+
+    pub fn scoped_intent(
+        id: Uuid,
+        destination: ObjectDestination,
+        expected: ExpectedObject,
+        tenant_id: String,
+        namespace_epoch: u64,
+    ) -> Self {
+        let mut operation = Self::intent(destination, expected);
+        operation.id = id;
+        operation.tenant_id = Some(tenant_id);
+        operation.namespace_epoch = Some(namespace_epoch);
+        operation
     }
 }
 
@@ -180,6 +205,8 @@ impl EvidenceRecord {
 pub struct StoredObjectMeta {
     pub etag: Option<String>,
     pub version_id: Option<String>,
+    pub superseded_version_ids: Vec<String>,
+    pub version_history_complete: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -227,6 +254,13 @@ pub trait OperationJournal: Send + Sync {
         lease_until_ms: i64,
         limit: u64,
     ) -> Result<Vec<OperationRecord>, JournalError>;
+    async fn claim_reconcilable_operation(
+        &self,
+        operation_id: Uuid,
+        owner: &str,
+        stale_before_ms: i64,
+        lease_until_ms: i64,
+    ) -> Result<Option<OperationRecord>, JournalError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -505,6 +539,29 @@ impl OperationReconciler {
         Ok(count)
     }
 
+    pub async fn reconcile_operation(
+        &self,
+        operation_id: Uuid,
+        stale_after: Duration,
+    ) -> Result<bool, TransactionError> {
+        let now = unix_time_ms();
+        let operation = self
+            .journal
+            .claim_reconcilable_operation(
+                operation_id,
+                &self.owner,
+                now.saturating_sub(duration_ms(stale_after)),
+                now.saturating_add(duration_ms(self.lease)),
+            )
+            .await?;
+        if let Some(operation) = operation {
+            self.reconcile(operation).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn reconcile(&self, operation: OperationRecord) -> Result<(), TransactionError> {
         self.journal
             .append_evidence(EvidenceRecord::new(
@@ -576,7 +633,10 @@ impl OperationReconciler {
 
     async fn reconcile_unknown(&self, operation: &OperationRecord) -> Result<(), TransactionError> {
         match self.backend.probe_completion(operation).await? {
-            CompletionProbe::Committed(meta) => {
+            CompletionProbe::Committed(mut meta) => {
+                // A completion discovered after an ambiguous response cannot
+                // prove that no earlier provider version was also created.
+                meta.version_history_complete = false;
                 self.journal
                     .transition(
                         operation.id,

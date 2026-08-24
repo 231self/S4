@@ -10,8 +10,8 @@ use tracing::{info, warn};
 
 use crate::managed::{
     CopyStatus, LogicalObjectKey, ManagedError, ManagedRepository, ManagedStreamingMode,
-    ObjectAuthority, PLACEMENT_VERSION_V1, Placement, RepairKind, RepairRecord, RepairTargetRole,
-    generation_physical_key, rendezvous_placement,
+    NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, Placement,
+    RepairKind, RepairRecord, RepairTargetRole, generation_physical_key, rendezvous_placement,
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, DirectS3Sink, ExpectedObject,
@@ -112,6 +112,36 @@ impl ServiceStorage {
 
     pub fn authority_repository(&self) -> Option<&Arc<dyn ManagedRepository>> {
         self.authority.as_ref()
+    }
+
+    /// Start an idempotent authority-backed namespace purge. Physical deletion
+    /// policy belongs to the authority implementation; this method never lists
+    /// or deletes backend objects itself.
+    pub async fn purge_namespace(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        let Some(authority) = &self.authority else {
+            return Ok(NamespacePurgeStatus::Unsupported {
+                reason: "managed namespace purge requires an authority repository".to_string(),
+            });
+        };
+        authority.purge_namespace(request).await
+    }
+
+    /// Query an authority-backed namespace purge without starting or advancing
+    /// it. An unconfigured authority is explicitly unsupported, not complete.
+    pub async fn namespace_purge_status(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        let Some(authority) = &self.authority else {
+            return Ok(NamespacePurgeStatus::Unsupported {
+                reason: "managed namespace purge status requires an authority repository"
+                    .to_string(),
+            });
+        };
+        authority.namespace_purge_status(request).await
     }
 
     pub fn placement(&self, logical: &LogicalObjectKey) -> Option<Placement> {
@@ -1058,7 +1088,7 @@ pub fn parse_service_backends(env_value: &str) -> Vec<ServiceBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed::InMemoryManagedRepository;
+    use crate::managed::{InMemoryManagedRepository, PostgresManagedRepository};
     use std::sync::Mutex;
 
     fn authority() -> ObjectAuthority {
@@ -1078,6 +1108,69 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    fn purge_request() -> NamespacePurgeRequest {
+        NamespacePurgeRequest {
+            tenant_id: "tenant".to_string(),
+            operation_id: uuid::Uuid::now_v7(),
+        }
+    }
+
+    async fn assert_default_purge_is_unsupported(storage: &ServiceStorage) {
+        let request = purge_request();
+        assert!(matches!(
+            storage.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported { .. }
+        ));
+        assert!(matches!(
+            storage.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn namespace_purge_without_authority_is_explicitly_unsupported() {
+        let storage = ServiceStorage::new(Vec::new());
+        let request = purge_request();
+        assert_eq!(
+            storage.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported {
+                reason: "managed namespace purge requires an authority repository".to_string(),
+            }
+        );
+        assert_eq!(
+            storage.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported {
+                reason: "managed namespace purge status requires an authority repository"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_purge_delegates_to_default_in_memory_authority() {
+        let storage = ServiceStorage::with_management(
+            Vec::new(),
+            Arc::new(InMemoryManagedRepository::new()),
+            ManagedStreamingMode::Off,
+            PLACEMENT_VERSION_V1,
+        );
+        assert_default_purge_is_unsupported(&storage).await;
+    }
+
+    #[tokio::test]
+    async fn namespace_purge_delegates_to_default_postgres_authority_without_connecting() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/postgres")
+            .unwrap();
+        let storage = ServiceStorage::with_management(
+            Vec::new(),
+            Arc::new(PostgresManagedRepository::new(pool)),
+            ManagedStreamingMode::Off,
+            PLACEMENT_VERSION_V1,
+        );
+        assert_default_purge_is_unsupported(&storage).await;
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use s4_gateway::control::NoopControlPlane;
 use s4_gateway::key_cipher::default_wrapping;
 use s4_gateway::server::{build_router, build_state};
+use s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
 use tracing::info;
 
 #[tokio::main]
@@ -14,7 +15,12 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
     // OSS self-host: no policy. Authorization/metering is a no-op.
-    let state = build_state(Arc::new(NoopControlPlane), default_wrapping()?).await?;
+    let state = build_state(
+        Arc::new(NoopControlPlane),
+        default_wrapping()?,
+        Arc::new(InMemoryWorkspaceStorageRepository::new()),
+    )
+    .await?;
     let app = build_router(state);
 
     info!("S4 gateway listening on {listen_addr} (OSS, no control plane)");

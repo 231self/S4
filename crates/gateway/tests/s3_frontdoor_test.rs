@@ -11,13 +11,16 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
-use s4_gateway::control::{ControlPlane, NoopControlPlane, RequestKind, StreamingWriteMode};
+use s4_gateway::control::{
+    AuthenticatedRequestContext, ControlPlane, NoopControlPlane, RequestKind, StreamingWriteMode,
+};
 use s4_gateway::key_cipher::default_wrapping;
 use s4_gateway::object::BodyLimits;
 use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
 use s4_gateway::sigv4::SigV4Policy;
 use s4_gateway::store::FileKeyStore;
 use s4_gateway::transaction::SpoolQuota;
+use s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -69,15 +72,25 @@ struct StreamingOffControl;
 impl ControlPlane for StreamingOffControl {
     async fn authorize(
         &self,
-        _user_id: &str,
+        _context: &AuthenticatedRequestContext,
         _kind: RequestKind,
     ) -> Option<s4_gateway::control::BlockReason> {
         None
     }
 
-    async fn record(&self, _user_id: &str, _kind: RequestKind, _bytes: u64) {}
+    async fn record(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _bucket: &str,
+        _kind: RequestKind,
+        _bytes: u64,
+    ) {
+    }
 
-    async fn streaming_write_mode(&self, _user_id: &str) -> Option<StreamingWriteMode> {
+    async fn streaming_write_mode(
+        &self,
+        _context: &AuthenticatedRequestContext,
+    ) -> Option<StreamingWriteMode> {
         Some(StreamingWriteMode::Off)
     }
 }
@@ -137,6 +150,7 @@ async fn test_state() -> Arc<AppState> {
     build_state(
         Arc::new(NoopControlPlane),
         default_wrapping().expect("wrapping"),
+        Arc::new(InMemoryWorkspaceStorageRepository::new()),
     )
     .await
     .expect("build_state")
@@ -145,6 +159,122 @@ async fn test_state() -> Arc<AppState> {
 async fn router() -> (Router, Arc<AppState>) {
     let state = test_state().await;
     (build_router(state.clone()), state)
+}
+
+#[tokio::test]
+async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_returns_secrets() {
+    let mut state = test_state().await;
+    let secret = b"dashboard-test-secret";
+    let issuer = "https://example.supabase.co/auth/v1";
+    let claims = serde_json::json!({
+        "sub": "dashboard-user",
+        "iss": issuer,
+        "aud": "authenticated",
+        "exp": u64::MAX,
+    });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret),
+    )
+    .unwrap();
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.supabase_url = "https://example.supabase.co".to_string();
+    state_mut.jwt_decoder = Some(Arc::new(jsonwebtoken::DecodingKey::from_secret(secret)));
+    let app = build_router(state);
+
+    let unauthenticated = Request::builder()
+        .method("PUT")
+        .uri("/dashboard/api/backend")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"backend_type":"s3_compatible","endpoint":"https://objects.example","access_key":"access","secret_key":"secret","region":"us-east-1"}"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unauthenticated).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let unsupported = Request::builder()
+        .method("PUT")
+        .uri("/dashboard/api/backend")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"backend_type":"aws_role","role_arn":"arn:aws:iam::123456789012:role/s4"}"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unsupported).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let configured = Request::builder()
+        .method("PUT")
+        .uri("/dashboard/api/backend")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"backend_type":"s3_compatible","endpoint":"https://objects.example","access_key":"access","secret_key":"secret","region":"us-east-1"}"#,
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(configured).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response_json["configured"], true);
+    assert!(response_json.get("access_key").is_none());
+    assert!(response_json.get("secret_key").is_none());
+
+    let get = Request::builder()
+        .uri("/dashboard/api/backend")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response_json["endpoint"], "https://objects.example");
+    assert_eq!(response_json["access_key_configured"], true);
+    assert_eq!(response_json["secret_key_configured"], true);
+    assert!(!String::from_utf8_lossy(&body).contains("\"access_key\":"));
+    assert!(!String::from_utf8_lossy(&body).contains("\"secret_key\":"));
+
+    let managed = Request::builder()
+        .method("PUT")
+        .uri("/dashboard/api/backend")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"backend_type":"managed"}"#))
+        .unwrap();
+    let response = app.oneshot(managed).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        response_json,
+        serde_json::json!({
+            "configured": true,
+            "backend_type": "managed",
+            "endpoint": null,
+            "region": null,
+            "role_arn": null,
+            "access_key_configured": false,
+            "secret_key_configured": false,
+        })
+    );
 }
 
 #[tokio::test]

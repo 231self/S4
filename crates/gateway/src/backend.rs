@@ -10,7 +10,8 @@ use axum::http::HeaderMap;
 use reqwest::Url;
 
 use crate::service_storage::ServiceStorage;
-use crate::store::{BackendRegistry, MemoryStore};
+use crate::store::MemoryStore;
+use crate::workspace_storage::{RuntimeBackendConfig, WorkspaceId, WorkspaceStorageRepository};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StorageOperation {
@@ -52,7 +53,7 @@ impl ResolvedBackend {
 
 #[derive(Clone)]
 pub struct BackendResolver {
-    backends: Arc<BackendRegistry>,
+    workspace_storage: Arc<dyn WorkspaceStorageRepository>,
     managed: Arc<ServiceStorage>,
     global_s3: Option<Client>,
     memory: Arc<MemoryStore>,
@@ -60,13 +61,13 @@ pub struct BackendResolver {
 
 impl BackendResolver {
     pub fn new(
-        backends: Arc<BackendRegistry>,
+        workspace_storage: Arc<dyn WorkspaceStorageRepository>,
         managed: Arc<ServiceStorage>,
         global_s3: Option<Client>,
         memory: Arc<MemoryStore>,
     ) -> Self {
         Self {
-            backends,
+            workspace_storage,
             managed,
             global_s3,
             memory,
@@ -75,7 +76,7 @@ impl BackendResolver {
 
     pub async fn resolve(
         &self,
-        user_id: &str,
+        workspace_id: &WorkspaceId,
         headers: &HeaderMap,
         _operation: StorageOperation,
     ) -> Result<ResolvedBackend, String> {
@@ -103,32 +104,44 @@ impl BackendResolver {
             return Ok(ResolvedBackend::PresignedHttp(url));
         }
 
-        if let Some(config) = self.backends.get(user_id)
-            && config.is_configured()
-            && !config.endpoint.is_empty()
+        match self
+            .workspace_storage
+            .get_runtime_config(workspace_id)
+            .await
+            .map_err(|error| error.to_string())?
         {
-            let credentials = Credentials::new(
-                config.access_key,
-                config.secret_key,
-                None,
-                None,
-                "s4-backend",
-            );
-            let region = if config.region.is_empty() {
-                "us-east-1".to_string()
-            } else {
-                config.region
-            };
-            let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new(region))
-                .endpoint_url(config.endpoint)
-                .credentials_provider(credentials)
-                .load()
-                .await;
-            return Ok(ResolvedBackend::S3 {
-                kind: BackendKind::PerUserS3,
-                client: Client::new(&sdk_config),
-            });
+            Some(RuntimeBackendConfig::Managed) => {
+                if self.managed.is_empty() {
+                    return Err(
+                        "workspace requires managed storage, but S4_SERVICE_BUCKETS is not configured"
+                            .to_string(),
+                    );
+                }
+                return Ok(ResolvedBackend::Managed(self.managed.clone()));
+            }
+            Some(RuntimeBackendConfig::S3Compatible {
+                endpoint,
+                access_key,
+                secret_key,
+                region,
+            }) => {
+                let credentials =
+                    Credentials::new(access_key, secret_key, None, None, "s4-backend");
+                let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(Region::new(region))
+                    .endpoint_url(endpoint)
+                    .credentials_provider(credentials)
+                    .load()
+                    .await;
+                let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+                    .force_path_style(true)
+                    .build();
+                return Ok(ResolvedBackend::S3 {
+                    kind: BackendKind::PerUserS3,
+                    client: Client::from_conf(s3_config),
+                });
+            }
+            None => {}
         }
 
         if !self.managed.is_empty() {
@@ -442,6 +455,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::{StatusCode, Uri};
+    use axum::routing::any;
+
+    async fn capture_request_path(
+        State(paths): State<Arc<std::sync::Mutex<Vec<String>>>>,
+        uri: Uri,
+    ) -> StatusCode {
+        paths.lock().unwrap().push(uri.path().to_string());
+        StatusCode::OK
+    }
+
     struct StaticResolver {
         addresses: Vec<SocketAddr>,
         calls: AtomicUsize,
@@ -499,7 +525,7 @@ mod tests {
         ] {
             assert_eq!(
                 resolver
-                    .resolve("user", headers, operation)
+                    .resolve(&WorkspaceId::new("workspace").unwrap(), headers, operation)
                     .await
                     .unwrap()
                     .kind(),
@@ -512,13 +538,15 @@ mod tests {
     #[tokio::test]
     async fn resolver_uses_one_priority_matrix_for_every_operation() {
         use crate::service_storage::ServiceBackend;
-        use crate::store::BackendConfig;
+        use crate::workspace_storage::{
+            BackendConfigRequest, BackendType, InMemoryWorkspaceStorageRepository,
+        };
 
         let memory = Arc::new(MemoryStore::new());
-        let registry = Arc::new(BackendRegistry::new());
+        let repository = Arc::new(InMemoryWorkspaceStorageRepository::new());
         let empty_managed = Arc::new(ServiceStorage::new(Vec::new()));
         let resolver = BackendResolver::new(
-            registry.clone(),
+            repository.clone(),
             empty_managed.clone(),
             None,
             memory.clone(),
@@ -527,7 +555,7 @@ mod tests {
 
         let global = test_s3_client().await;
         let resolver = BackendResolver::new(
-            registry.clone(),
+            repository.clone(),
             empty_managed,
             Some(global.clone()),
             memory.clone(),
@@ -543,26 +571,29 @@ mod tests {
             secret_key: "secret".to_string(),
         }]));
         let resolver = BackendResolver::new(
-            registry.clone(),
+            repository.clone(),
             managed.clone(),
             Some(global.clone()),
             memory.clone(),
         );
         assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::Managed).await;
 
-        registry.set(
-            "user",
-            BackendConfig {
-                backend_type: "s3_compatible".to_string(),
-                role_arn: String::new(),
-                external_id: String::new(),
-                endpoint: "https://user.example".to_string(),
-                access_key: "key".to_string(),
-                secret_key: "secret".to_string(),
-                region: "us-east-1".to_string(),
-            },
-        );
-        let resolver = BackendResolver::new(registry, managed, Some(global), memory.clone());
+        let workspace = WorkspaceId::new("workspace").unwrap();
+        repository
+            .put_config(
+                &workspace,
+                BackendConfigRequest {
+                    backend_type: BackendType::S3Compatible,
+                    endpoint: "https://user.example".to_string(),
+                    access_key: "key".to_string(),
+                    secret_key: "secret".to_string(),
+                    region: "us-east-1".to_string(),
+                    role_arn: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let resolver = BackendResolver::new(repository, managed, Some(global), memory.clone());
         assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::PerUserS3).await;
 
         // S7a: x-s4-storage-mode: managed forces managed storage even for a
@@ -576,14 +607,14 @@ mod tests {
 
         // x-s4-storage-mode: managed errors when no managed backend is configured.
         let no_managed = BackendResolver::new(
-            Arc::new(BackendRegistry::new()),
+            Arc::new(InMemoryWorkspaceStorageRepository::new()),
             Arc::new(ServiceStorage::new(Vec::new())),
             None,
             memory.clone(),
         );
         assert!(
             no_managed
-                .resolve("user", &managed_override, StorageOperation::Put)
+                .resolve(&workspace, &managed_override, StorageOperation::Put)
                 .await
                 .is_err()
         );
@@ -596,6 +627,120 @@ mod tests {
                 .unwrap(),
         );
         assert_operations_resolve_to(&resolver, &presigned, BackendKind::PresignedHttp).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_managed_config_is_fail_closed_without_service_storage() {
+        use crate::service_storage::ServiceBackend;
+        use crate::workspace_storage::{
+            BackendConfigRequest, BackendType, InMemoryWorkspaceStorageRepository,
+        };
+
+        let workspace = WorkspaceId::new("workspace").unwrap();
+        let repository = Arc::new(InMemoryWorkspaceStorageRepository::new());
+        repository
+            .put_config(
+                &workspace,
+                BackendConfigRequest {
+                    backend_type: BackendType::Managed,
+                    endpoint: String::new(),
+                    access_key: String::new(),
+                    secret_key: String::new(),
+                    region: String::new(),
+                    role_arn: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let memory = Arc::new(MemoryStore::new());
+        let global = test_s3_client().await;
+        let unavailable = BackendResolver::new(
+            repository.clone(),
+            Arc::new(ServiceStorage::new(Vec::new())),
+            Some(global),
+            memory.clone(),
+        );
+        for operation in [
+            StorageOperation::Get,
+            StorageOperation::Head,
+            StorageOperation::Put,
+            StorageOperation::Delete,
+            StorageOperation::List,
+            StorageOperation::Multipart,
+        ] {
+            assert!(
+                unavailable
+                    .resolve(&workspace, &HeaderMap::new(), operation)
+                    .await
+                    .is_err(),
+                "explicit managed config must not fall through for {operation:?}",
+            );
+        }
+
+        let managed = Arc::new(ServiceStorage::new(vec![ServiceBackend {
+            provider: "test".to_string(),
+            endpoint: "https://managed.example".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "managed".to_string(),
+            access_key: "key".to_string(),
+            secret_key: "secret".to_string(),
+        }]));
+        let available = BackendResolver::new(repository, managed, None, memory);
+        assert_operations_resolve_to(&available, &HeaderMap::new(), BackendKind::Managed).await;
+    }
+
+    #[tokio::test]
+    async fn byo_s3_custom_endpoint_uses_path_style_addressing() {
+        use crate::workspace_storage::{
+            BackendConfigRequest, BackendType, InMemoryWorkspaceStorageRepository,
+        };
+
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(capture_request_path))
+            .with_state(paths.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let workspace = WorkspaceId::new("workspace").unwrap();
+        let repository = Arc::new(InMemoryWorkspaceStorageRepository::new());
+        repository
+            .put_config(
+                &workspace,
+                BackendConfigRequest {
+                    backend_type: BackendType::S3Compatible,
+                    endpoint,
+                    access_key: "key".to_string(),
+                    secret_key: "secret".to_string(),
+                    region: "us-east-1".to_string(),
+                    role_arn: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let resolver = BackendResolver::new(
+            repository,
+            Arc::new(ServiceStorage::new(Vec::new())),
+            None,
+            Arc::new(MemoryStore::new()),
+        );
+        let ResolvedBackend::S3 { client, .. } = resolver
+            .resolve(&workspace, &HeaderMap::new(), StorageOperation::Head)
+            .await
+            .unwrap()
+        else {
+            panic!("expected BYO S3 backend");
+        };
+        client
+            .head_bucket()
+            .bucket("bucket.with.dots")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(paths.lock().unwrap().as_slice(), ["/bucket.with.dots/"]);
+        server.abort();
     }
 
     #[tokio::test]

@@ -8,6 +8,14 @@
 
 use async_trait::async_trait;
 
+use crate::workspace_storage::WorkspaceId;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedRequestContext {
+    pub user_id: String,
+    pub workspace_id: WorkspaceId,
+}
+
 /// Kind of S3 operation, for metering and authorization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RequestKind {
@@ -41,16 +49,32 @@ impl BlockReason {
 /// successful operation.
 #[async_trait]
 pub trait ControlPlane: Send + Sync + 'static {
-    /// Authorize a request for `user_id`. Return `Some(BlockReason)` to reject
-    /// (e.g. 402 Payment Required), or `None` to allow.
-    async fn authorize(&self, user_id: &str, kind: RequestKind) -> Option<BlockReason>;
+    /// Authorize an authenticated user/workspace context. Return
+    /// `Some(BlockReason)` to reject (e.g. 402 Payment Required), or `None` to
+    /// allow.
+    async fn authorize(
+        &self,
+        context: &AuthenticatedRequestContext,
+        kind: RequestKind,
+    ) -> Option<BlockReason>;
 
-    /// Record usage after a successful operation (`bytes` processed).
-    async fn record(&self, user_id: &str, kind: RequestKind, bytes: u64);
+    /// Record usage after a successful operation. `bytes` is the committed
+    /// representation size for writes and the completed response-body size for
+    /// reads; HEAD and DELETE explicitly report zero.
+    async fn record(
+        &self,
+        context: &AuthenticatedRequestContext,
+        bucket: &str,
+        kind: RequestKind,
+        bytes: u64,
+    );
 
     /// Optional tenant ceiling. `None` inherits the deployment ceiling; a
     /// tenant can only lower, never raise, the configured mode.
-    async fn streaming_write_mode(&self, _user_id: &str) -> Option<StreamingWriteMode> {
+    async fn streaming_write_mode(
+        &self,
+        _context: &AuthenticatedRequestContext,
+    ) -> Option<StreamingWriteMode> {
         None
     }
 }
@@ -62,11 +86,22 @@ pub struct NoopControlPlane;
 
 #[async_trait]
 impl ControlPlane for NoopControlPlane {
-    async fn authorize(&self, _user_id: &str, _kind: RequestKind) -> Option<BlockReason> {
+    async fn authorize(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _kind: RequestKind,
+    ) -> Option<BlockReason> {
         None
     }
 
-    async fn record(&self, _user_id: &str, _kind: RequestKind, _bytes: u64) {}
+    async fn record(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _bucket: &str,
+        _kind: RequestKind,
+        _bytes: u64,
+    ) {
+    }
 }
 
 #[cfg(test)]
@@ -76,14 +111,23 @@ mod tests {
     #[tokio::test]
     async fn noop_authorizes_everything() {
         let cp = NoopControlPlane;
-        assert_eq!(cp.authorize("any-user", RequestKind::Write).await, None);
-        assert_eq!(cp.authorize("any-user", RequestKind::Read).await, None);
+        let context = AuthenticatedRequestContext {
+            user_id: "any-user".to_string(),
+            workspace_id: WorkspaceId::new("workspace").unwrap(),
+        };
+        assert_eq!(cp.authorize(&context, RequestKind::Write).await, None);
+        assert_eq!(cp.authorize(&context, RequestKind::Read).await, None);
     }
 
     #[tokio::test]
     async fn noop_records_without_effect() {
         let cp = NoopControlPlane;
-        cp.record("u", RequestKind::Write, 12345).await;
+        let context = AuthenticatedRequestContext {
+            user_id: "u".to_string(),
+            workspace_id: WorkspaceId::new("workspace").unwrap(),
+        };
+        cp.record(&context, "bucket", RequestKind::Write, 12345)
+            .await;
     }
 
     #[test]

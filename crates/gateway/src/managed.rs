@@ -329,6 +329,23 @@ pub enum ManagedError {
     Persistence(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamespacePurgeRequest {
+    pub tenant_id: String,
+    /// Idempotency key owned by the caller and persisted by implementations
+    /// that support complete physical generation deletion.
+    pub operation_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamespacePurgeStatus {
+    Pending,
+    Running,
+    Complete { deleted_generations: u64 },
+    Blocked { reason: String },
+    Unsupported { reason: String },
+}
+
 #[async_trait]
 pub trait ManagedRepository: Send + Sync {
     fn is_durable(&self) -> bool;
@@ -362,6 +379,28 @@ pub trait ManagedRepository: Send + Sync {
     ) -> Result<(), ManagedError>;
     async fn complete_repair(&self, repair: &RepairRecord) -> Result<bool, ManagedError>;
     async fn fail_repair(&self, lease_token: Uuid, error: &str) -> Result<(), ManagedError>;
+
+    /// Purge every physical generation owned by a managed tenant namespace.
+    /// The default is deliberately unsupported: authority rows are not a full
+    /// version ledger, so ListObjects-based deletion cannot prove completeness.
+    async fn purge_namespace(
+        &self,
+        _request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        Ok(NamespacePurgeStatus::Unsupported {
+            reason: "managed storage has no complete physical version ledger".to_string(),
+        })
+    }
+
+    /// Query an idempotent purge operation without starting or advancing it.
+    async fn namespace_purge_status(
+        &self,
+        _request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        Ok(NamespacePurgeStatus::Unsupported {
+            reason: "managed storage has no complete physical version ledger".to_string(),
+        })
+    }
 }
 
 fn cleanup_repairs(authority: &ObjectAuthority) -> Vec<RepairRecord> {
@@ -1327,6 +1366,23 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn namespace_purge_is_explicitly_unsupported_without_a_version_ledger() {
+        let repository = InMemoryManagedRepository::new();
+        let request = NamespacePurgeRequest {
+            tenant_id: "tenant-a".to_string(),
+            operation_id: Uuid::now_v7(),
+        };
+        assert!(matches!(
+            repository.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported { .. }
+        ));
+        assert!(matches!(
+            repository.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported { .. }
+        ));
     }
 
     #[test]

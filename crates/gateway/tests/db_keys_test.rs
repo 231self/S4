@@ -378,6 +378,7 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
                     etag: Some("\"result\"".to_string()),
                     checksum_sha256: "result-sha".to_string(),
                     version_id: Some("version".to_string()),
+                    size_bytes: 42,
                 },
                 now + 12,
             )
@@ -1056,6 +1057,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         let state = build_state(
             Arc::new(NoopControlPlane),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
+            Arc::new(s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
         )
         .await
         .expect("build_state with durable staged multipart");

@@ -1,9 +1,11 @@
 .gitattributes
 .gitignore
 .openapi-generator-ignore
+BackendApi.md
 KeysApi.md
 ObjectsApi.md
 README.md
+apis/BackendApi.ts
 apis/KeysApi.ts
 apis/ObjectsApi.ts
 apis/baseapi.ts
@@ -16,6 +18,9 @@ http/isomorphic-fetch.ts
 index.ts
 middleware.ts
 models/ApiKeyResponse.ts
+models/BackendConfigRequest.ts
+models/BackendConfigResponse.ts
+models/BackendType.ts
 models/CreateKeyRequest.ts
 models/DeleteKeyRequest.ts
 models/ListKeyResponse.ts

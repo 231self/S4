@@ -51,6 +51,11 @@ fn operation_from_model(model: object_operation::Model) -> Result<OperationRecor
         Some(StoredObjectMeta {
             etag: model.committed_etag,
             version_id: model.committed_version_id,
+            superseded_version_ids: serde_json::from_value(model.committed_superseded_version_ids)
+                .map_err(|error| {
+                    JournalError::Corrupt(format!("invalid committed version history: {error}"))
+                })?,
+            version_history_complete: model.committed_version_history_complete,
         })
     } else {
         None
@@ -58,6 +63,14 @@ fn operation_from_model(model: object_operation::Model) -> Result<OperationRecor
     Ok(OperationRecord {
         id: model.id,
         state: OperationState::parse(&model.state)?,
+        tenant_id: model.tenant_id,
+        namespace_epoch: model
+            .namespace_epoch
+            .map(|epoch| {
+                u64::try_from(epoch)
+                    .map_err(|_| JournalError::Corrupt("negative namespace epoch".to_string()))
+            })
+            .transpose()?,
         destination: ObjectDestination {
             backend_id: model.backend_id,
             bucket: model.bucket,
@@ -130,12 +143,22 @@ impl OperationJournal for PostgresOperationJournal {
             bucket: Set(operation.destination.bucket),
             logical_key: Set(operation.destination.logical_key),
             physical_key: Set(operation.destination.physical_key),
+            tenant_id: Set(operation.tenant_id),
+            namespace_epoch: Set(operation
+                .namespace_epoch
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    JournalError::Conflict("namespace epoch exceeds BIGINT".to_string())
+                })?),
             expected_digest: Set(operation.expected.digest),
             expected_size: Set(expected_size),
             expected_metadata: Set(expected_metadata),
             upload_id: Set(None),
             committed_etag: Set(None),
             committed_version_id: Set(None),
+            committed_superseded_version_ids: Set(serde_json::json!([])),
+            committed_version_history_complete: Set(true),
             lease_owner: Set(None),
             lease_expires_at_ms: Set(None),
             created_at_ms: Set(operation.created_at_ms),
@@ -275,6 +298,14 @@ impl OperationJournal for PostgresOperationJournal {
                 .col_expr(
                     object_operation::Column::CommittedVersionId,
                     Expr::value(committed.version_id.clone()),
+                )
+                .col_expr(
+                    object_operation::Column::CommittedSupersededVersionIds,
+                    Expr::value(serde_json::json!(committed.superseded_version_ids)),
+                )
+                .col_expr(
+                    object_operation::Column::CommittedVersionHistoryComplete,
+                    Expr::value(committed.version_history_complete),
                 );
         }
         let result = update
@@ -412,6 +443,57 @@ impl OperationJournal for PostgresOperationJournal {
             }
         }
         Ok(claimed)
+    }
+
+    async fn claim_reconcilable_operation(
+        &self,
+        operation_id: Uuid,
+        owner: &str,
+        stale_before_ms: i64,
+        lease_until_ms: i64,
+    ) -> Result<Option<OperationRecord>, JournalError> {
+        let candidate = object_operation::Entity::find_by_id(operation_id)
+            .filter(object_operation::Column::State.is_not_in([
+                OperationState::Committed.as_str(),
+                OperationState::ProvenAborted.as_str(),
+            ]))
+            .filter(object_operation::Column::UpdatedAtMs.lte(stale_before_ms))
+            .filter(
+                Condition::any()
+                    .add(object_operation::Column::LeaseExpiresAtMs.is_null())
+                    .add(object_operation::Column::LeaseExpiresAtMs.lt(unix_time_ms())),
+            )
+            .one(&self.db)
+            .await
+            .map_err(persistence)?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let result = object_operation::Entity::update_many()
+            .col_expr(
+                object_operation::Column::LeaseOwner,
+                Expr::value(Some(owner.to_string())),
+            )
+            .col_expr(
+                object_operation::Column::LeaseExpiresAtMs,
+                Expr::value(Some(lease_until_ms)),
+            )
+            .filter(object_operation::Column::Id.eq(operation_id))
+            .filter(
+                Condition::any()
+                    .add(object_operation::Column::LeaseExpiresAtMs.is_null())
+                    .add(object_operation::Column::LeaseExpiresAtMs.lt(unix_time_ms())),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected != 1 {
+            return Ok(None);
+        }
+        let mut operation = operation_from_model(candidate)?;
+        operation.lease_owner = Some(owner.to_string());
+        operation.lease_expires_at_ms = Some(lease_until_ms);
+        Ok(Some(operation))
     }
 }
 
@@ -631,6 +713,31 @@ impl OperationJournal for InMemoryOperationJournal {
             }
         }
         Ok(claimed)
+    }
+
+    async fn claim_reconcilable_operation(
+        &self,
+        operation_id: Uuid,
+        owner: &str,
+        stale_before_ms: i64,
+        lease_until_ms: i64,
+    ) -> Result<Option<OperationRecord>, JournalError> {
+        let now = unix_time_ms();
+        let mut state = self.state.lock().await;
+        let Some(operation) = state.operations.get_mut(&operation_id) else {
+            return Ok(None);
+        };
+        if operation.state.is_terminal()
+            || operation.updated_at_ms > stale_before_ms
+            || operation
+                .lease_expires_at_ms
+                .is_some_and(|expiry| expiry >= now)
+        {
+            return Ok(None);
+        }
+        operation.lease_owner = Some(owner.to_string());
+        operation.lease_expires_at_ms = Some(lease_until_ms);
+        Ok(Some(operation.clone()))
     }
 }
 

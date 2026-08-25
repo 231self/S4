@@ -5,6 +5,10 @@
 .travis.yml
 README.md
 docs/ApiKeyResponse.md
+docs/BackendApi.md
+docs/BackendConfigRequest.md
+docs/BackendConfigResponse.md
+docs/BackendType.md
 docs/CreateKeyRequest.md
 docs/DeleteKeyRequest.md
 docs/KeysApi.md
@@ -16,6 +20,7 @@ pyproject.toml
 requirements.txt
 s4_client/__init__.py
 s4_client/api/__init__.py
+s4_client/api/backend_api.py
 s4_client/api/keys_api.py
 s4_client/api/objects_api.py
 s4_client/api_client.py
@@ -24,6 +29,9 @@ s4_client/configuration.py
 s4_client/exceptions.py
 s4_client/models/__init__.py
 s4_client/models/api_key_response.py
+s4_client/models/backend_config_request.py
+s4_client/models/backend_config_response.py
+s4_client/models/backend_type.py
 s4_client/models/create_key_request.py
 s4_client/models/delete_key_request.py
 s4_client/models/list_key_response.py
@@ -35,6 +43,10 @@ setup.py
 test-requirements.txt
 test/__init__.py
 test/test_api_key_response.py
+test/test_backend_api.py
+test/test_backend_config_request.py
+test/test_backend_config_response.py
+test/test_backend_type.py
 test/test_create_key_request.py
 test/test_delete_key_request.py
 test/test_keys_api.py

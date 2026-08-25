@@ -117,6 +117,8 @@ pub enum MultipartLifecycle {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub identity: MultipartIdentity,
+    #[serde(default)]
+    pub namespace_epoch: Option<u64>,
     pub snapshot: MultipartSnapshot,
     pub lifecycle: MultipartLifecycle,
     pub staged_bytes: u64,
@@ -159,6 +161,8 @@ pub struct MultipartCompletionResult {
     pub etag: Option<String>,
     pub checksum_sha256: String,
     pub version_id: Option<String>,
+    #[serde(default)]
+    pub size_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +188,13 @@ pub struct CleanupAudit {
     pub kind: String,
     pub detail: serde_json::Value,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetiredMultipartUpload {
+    pub upload_id: String,
+    pub tenant_id: String,
+    pub namespace_epoch: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -295,6 +306,15 @@ pub trait MultipartRepository: Send + Sync {
         identity: &MultipartIdentity,
         now_ms: i64,
     ) -> Result<Vec<MultipartPart>, StagingError>;
+    async fn delete_terminal_upload(
+        &self,
+        identity: &MultipartIdentity,
+    ) -> Result<(), StagingError>;
+    async fn retire_terminal_uploads(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<RetiredMultipartUpload>, StagingError>;
     async fn reap_expired(
         &self,
         now_ms: i64,
@@ -471,6 +491,13 @@ fn upload_model(upload: &MultipartUpload) -> Result<multipart_upload::ActiveMode
         upload_id: Set(upload.identity.upload_id.clone()),
         lifecycle: Set(lifecycle_name(upload.lifecycle).to_string()),
         tenant_id: Set(upload.identity.tenant_id.clone()),
+        namespace_epoch: Set(upload
+            .namespace_epoch
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                StagingError::Persistence("namespace epoch exceeds BIGINT".to_string())
+            })?),
         credential_policy_id: Set(upload.identity.credential_policy_id.clone()),
         bucket: Set(upload.identity.bucket.clone()),
         object_key: Set(upload.identity.key.clone()),
@@ -545,6 +572,11 @@ fn upload_from_model(model: multipart_upload::Model) -> Result<MultipartUpload, 
             key: model.object_key,
             upload_id: model.upload_id,
         },
+        namespace_epoch: model
+            .namespace_epoch
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| StagingError::Persistence("invalid namespace epoch".to_string()))?,
         snapshot: MultipartSnapshot {
             metadata,
             tags,
@@ -1430,6 +1462,9 @@ impl MultipartRepository for PostgresMultipartRepository {
         now: i64,
     ) -> Result<Vec<MultipartPart>, StagingError> {
         let upload = self.get_authorized(identity).await?;
+        if upload.lifecycle == MultipartLifecycle::Aborted {
+            return Ok(Vec::new());
+        }
         if upload.lifecycle != MultipartLifecycle::Open {
             return Err(StagingError::NotOpen);
         }
@@ -1454,6 +1489,80 @@ impl MultipartRepository for PostgresMultipartRepository {
             .await
             .map(|value| value.0)
     }
+    async fn delete_terminal_upload(
+        &self,
+        identity: &MultipartIdentity,
+    ) -> Result<(), StagingError> {
+        let upload = multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::UploadId.eq(&identity.upload_id))
+            .filter(multipart_upload::Column::TenantId.eq(&identity.tenant_id))
+            .filter(multipart_upload::Column::CredentialPolicyId.eq(&identity.credential_policy_id))
+            .filter(multipart_upload::Column::Bucket.eq(&identity.bucket))
+            .filter(multipart_upload::Column::ObjectKey.eq(&identity.key))
+            .one(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .ok_or(StagingError::NotFound)?;
+        if !matches!(upload.lifecycle.as_str(), "ABORTED" | "EXPIRED") {
+            return Err(StagingError::NotOpen);
+        }
+        let attempts = multipart_part_attempt::Entity::find()
+            .filter(multipart_part_attempt::Column::UploadId.eq(&identity.upload_id))
+            .count(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        if attempts > 0 {
+            return Err(StagingError::Persistence(
+                "multipart artifacts remain after cleanup".to_string(),
+            ));
+        }
+        multipart_upload::Entity::delete_by_id(upload.id)
+            .exec(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+    async fn retire_terminal_uploads(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<RetiredMultipartUpload>, StagingError> {
+        let candidates = multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::Lifecycle.is_in(["COMPLETED", "ABORTED", "EXPIRED"]))
+            .filter(multipart_upload::Column::TombstoneUntilMs.lte(now_ms))
+            .order_by_asc(multipart_upload::Column::UpdatedAtMs)
+            .limit(limit as u64)
+            .all(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        let mut retired = Vec::new();
+        for upload in candidates {
+            let attempts = multipart_part_attempt::Entity::find()
+                .filter(multipart_part_attempt::Column::UploadId.eq(&upload.upload_id))
+                .count(&self.db)
+                .await
+                .map_err(|error| StagingError::Persistence(error.to_string()))?;
+            if attempts > 0 {
+                continue;
+            }
+            multipart_upload::Entity::delete_by_id(upload.id)
+                .exec(&self.db)
+                .await
+                .map_err(|error| StagingError::Persistence(error.to_string()))?;
+            retired.push(RetiredMultipartUpload {
+                upload_id: upload.upload_id,
+                tenant_id: upload.tenant_id,
+                namespace_epoch: upload
+                    .namespace_epoch
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        StagingError::Persistence("invalid namespace epoch".to_string())
+                    })?,
+            });
+        }
+        Ok(retired)
+    }
     async fn reap_expired(
         &self,
         now: i64,
@@ -1473,6 +1582,11 @@ impl MultipartRepository for PostgresMultipartRepository {
                     multipart_upload::Column::Lifecycle,
                     sea_orm::sea_query::Expr::value("EXPIRED"),
                 )
+                .col_expr(
+                    multipart_upload::Column::TombstoneUntilMs,
+                    Expr::value(Some(now + DEFAULT_EXPIRY.as_millis() as i64)),
+                )
+                .col_expr(multipart_upload::Column::UpdatedAtMs, Expr::value(now))
                 .filter(multipart_upload::Column::UploadId.eq(model.upload_id.clone()))
                 .filter(multipart_upload::Column::Lifecycle.eq("OPEN"))
                 .exec(&self.db)
@@ -2058,6 +2172,9 @@ impl MultipartRepository for InMemoryMultipartRepository {
             .filter(|upload| same_identity(upload, identity))
             .ok_or(StagingError::NotFound)?;
         if upload.lifecycle != MultipartLifecycle::Open {
+            if upload.lifecycle == MultipartLifecycle::Aborted {
+                return Ok(Vec::new());
+            }
             return Err(StagingError::NotOpen);
         }
         upload.lifecycle = MultipartLifecycle::Aborted;
@@ -2067,6 +2184,76 @@ impl MultipartRepository for InMemoryMultipartRepository {
             .parts
             .extract_if(|(upload_id, _), _| upload_id == &identity.upload_id)
             .map(|(_, part)| part)
+            .collect())
+    }
+
+    async fn delete_terminal_upload(
+        &self,
+        identity: &MultipartIdentity,
+    ) -> Result<(), StagingError> {
+        let mut state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get(&identity.upload_id)
+            .filter(|upload| same_identity(upload, identity))
+            .ok_or(StagingError::NotFound)?;
+        if !matches!(
+            upload.lifecycle,
+            MultipartLifecycle::Aborted | MultipartLifecycle::Expired
+        ) || state
+            .attempts
+            .values()
+            .any(|attempt| attempt.part.upload_id == identity.upload_id)
+            || state
+                .pending
+                .values()
+                .any(|pending| pending.upload_id == identity.upload_id)
+        {
+            return Err(StagingError::Persistence(
+                "multipart artifacts remain after cleanup".to_string(),
+            ));
+        }
+        state.uploads.remove(&identity.upload_id);
+        Ok(())
+    }
+    async fn retire_terminal_uploads(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<RetiredMultipartUpload>, StagingError> {
+        let mut state = self.state.lock().await;
+        let ids: Vec<_> = state
+            .uploads
+            .values()
+            .filter(|upload| {
+                matches!(
+                    upload.lifecycle,
+                    MultipartLifecycle::Completed
+                        | MultipartLifecycle::Aborted
+                        | MultipartLifecycle::Expired
+                ) && upload
+                    .tombstone_until_ms
+                    .is_some_and(|until| until <= now_ms)
+                    && !state
+                        .attempts
+                        .values()
+                        .any(|attempt| attempt.part.upload_id == upload.identity.upload_id)
+                    && !state
+                        .pending
+                        .values()
+                        .any(|pending| pending.upload_id == upload.identity.upload_id)
+            })
+            .take(limit)
+            .map(|upload| upload.identity.upload_id.clone())
+            .collect();
+        Ok(ids
+            .into_iter()
+            .filter_map(|upload_id| state.uploads.remove(&upload_id))
+            .map(|upload| RetiredMultipartUpload {
+                upload_id: upload.identity.upload_id,
+                tenant_id: upload.identity.tenant_id,
+                namespace_epoch: upload.namespace_epoch,
+            })
             .collect())
     }
 
@@ -2600,6 +2787,7 @@ mod tests {
         let now = now_ms();
         MultipartUpload {
             identity: identity(),
+            namespace_epoch: None,
             snapshot: snapshot(),
             lifecycle: MultipartLifecycle::Open,
             staged_bytes: 0,
@@ -2998,6 +3186,7 @@ mod tests {
                 etag: Some("\"output\"".to_string()),
                 checksum_sha256: "output-sha".to_string(),
                 version_id: Some("version-a".to_string()),
+                size_bytes: 42,
             },
             1,
         )
@@ -3006,7 +3195,7 @@ mod tests {
         assert!(matches!(
             repo.acquire_completion(&identity(), "fingerprint", &request, "worker-b", 200, 2)
                 .await,
-            Ok(CompletionAcquire::Replayed(MultipartCompletionResult { ref etag, ref checksum_sha256, ref version_id }))
+            Ok(CompletionAcquire::Replayed(MultipartCompletionResult { ref etag, ref checksum_sha256, ref version_id, size_bytes: 42 }))
                 if etag.as_deref() == Some("\"output\"")
                     && checksum_sha256 == "output-sha"
                     && version_id.as_deref() == Some("version-a")
@@ -3109,11 +3298,19 @@ mod tests {
         let repo = InMemoryMultipartRepository::new();
         repo.create(upload()).await.unwrap();
         current_part(&repo, 1, "\"one\"", "sha-one").await;
-        assert_eq!(repo.abort(&identity(), 1).await.unwrap().len(), 1);
-        assert!(matches!(
-            repo.abort(&identity(), 2).await,
-            Err(StagingError::NotOpen)
-        ));
+        let parts = repo.abort(&identity(), 1).await.unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(repo.abort(&identity(), 2).await.unwrap().is_empty());
+        repo.confirm_artifact_deleted(&parts[0].artifact_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.retire_terminal_uploads(i64::MAX, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(matches!(
             repo.acquire_completion(
                 &identity(),
@@ -3124,7 +3321,7 @@ mod tests {
                 2,
             )
             .await,
-            Err(StagingError::NotOpen)
+            Err(StagingError::NotFound)
         ));
     }
 }

@@ -1,4 +1,7 @@
 export * from '../models/ApiKeyResponse'
+export * from '../models/BackendConfigRequest'
+export * from '../models/BackendConfigResponse'
+export * from '../models/BackendType'
 export * from '../models/CreateKeyRequest'
 export * from '../models/DeleteKeyRequest'
 export * from '../models/ListKeyResponse'

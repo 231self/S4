@@ -15,6 +15,9 @@
 
 # import models into model package
 from s4_client.models.api_key_response import ApiKeyResponse
+from s4_client.models.backend_config_request import BackendConfigRequest
+from s4_client.models.backend_config_response import BackendConfigResponse
+from s4_client.models.backend_type import BackendType
 from s4_client.models.create_key_request import CreateKeyRequest
 from s4_client.models.delete_key_request import DeleteKeyRequest
 from s4_client.models.list_key_response import ListKeyResponse

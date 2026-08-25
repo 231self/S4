@@ -8,6 +8,7 @@ pub struct Model {
     pub upload_id: String,
     pub lifecycle: String,
     pub tenant_id: String,
+    pub namespace_epoch: Option<i64>,
     pub credential_policy_id: String,
     pub bucket: String,
     pub object_key: String,

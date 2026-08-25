@@ -15,6 +15,7 @@ pub mod service_storage;
 pub mod sigv4;
 pub mod store;
 pub mod transaction;
+pub mod workspace_storage;
 
 use plugin_registry::PluginRegistry;
 use s4_wasm_runtime::FilterEngine;

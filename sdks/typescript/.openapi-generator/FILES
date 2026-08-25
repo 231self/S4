@@ -1,5 +1,6 @@
 .gitattributes
 .gitignore
+.openapi-generator-ignore
 BackendApi.md
 KeysApi.md
 ObjectsApi.md

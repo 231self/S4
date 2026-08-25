@@ -36,7 +36,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::backend::{BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation};
-use crate::control::{ControlPlane, RequestKind, StreamingWriteMode};
+use crate::control::{AuthenticatedRequestContext, ControlPlane, RequestKind, StreamingWriteMode};
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::managed::{
@@ -60,8 +60,7 @@ use crate::s3_error;
 use crate::service_storage::{ServiceStorage, parse_service_backends};
 use crate::sigv4::{RequestAuthorization, SigV4Error, SigV4Policy, SigningKeyCache};
 use crate::store::{
-    BackendConfig, BackendRegistry, FileKeyStore, KeyRepository, KeyStore, MemoryStore,
-    PostgresKeyStore, sha256_hash,
+    FileKeyStore, KeyRepository, KeyStore, MemoryStore, PostgresKeyStore, sha256_hash,
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, CompatibilitySpoolConfig,
@@ -71,6 +70,9 @@ use crate::transaction::{
     ObjectSinkTransaction, OperationJournal, OperationReconciler, ResponseChecksumCapability,
     SpoolQuota, StoredObjectMeta, TransactionError, VersioningCapability,
 };
+use crate::workspace_storage::{
+    BackendConfigRequest, BackendConfigResponse, WorkspaceStorageError, WorkspaceStorageRepository,
+};
 use crate::{Format, Gateway};
 
 #[derive(Clone)]
@@ -78,7 +80,7 @@ pub struct AppState {
     pub gateway: Arc<Gateway>,
     pub store: Arc<MemoryStore>,
     pub keys: Arc<dyn KeyRepository>,
-    pub backends: Arc<BackendRegistry>,
+    pub workspace_storage: Arc<dyn WorkspaceStorageRepository>,
     pub plugins: Arc<PluginRegistry>,
     pub service_storage: Arc<ServiceStorage>,
     pub s3_client: Option<Client>,
@@ -108,10 +110,90 @@ pub struct AppState {
 }
 
 pub struct Auth {
-    user_id: String,
+    context: AuthenticatedRequestContext,
     credential_policy_id: String,
     public_key_pem: Option<String>,
     stable_key: Option<Vec<u8>>,
+}
+
+impl Auth {
+    fn user_id(&self) -> &str {
+        &self.context.user_id
+    }
+
+    fn workspace_id(&self) -> &crate::workspace_storage::WorkspaceId {
+        &self.context.workspace_id
+    }
+}
+
+struct MeteredBody {
+    inner: axum::body::Body,
+    control: Arc<dyn ControlPlane>,
+    context: AuthenticatedRequestContext,
+    bucket: String,
+    bytes: u64,
+    finished: bool,
+}
+
+impl http_body::Body for MeteredBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.finished {
+            return std::task::Poll::Ready(None);
+        }
+        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.bytes = self.bytes.saturating_add(data.len() as u64);
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                self.finished = true;
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                self.finished = true;
+                let control = self.control.clone();
+                let context = self.context.clone();
+                let bucket = self.bucket.clone();
+                let bytes = self.bytes;
+                tokio::spawn(async move {
+                    control
+                        .record(&context, &bucket, RequestKind::Read, bytes)
+                        .await;
+                });
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+fn metered_read_response(
+    control: Arc<dyn ControlPlane>,
+    auth: &Auth,
+    bucket: &str,
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
+        return response;
+    }
+    let body = std::mem::replace(response.body_mut(), axum::body::Body::empty());
+    *response.body_mut() = axum::body::Body::new(MeteredBody {
+        inner: body,
+        control,
+        context: auth.context.clone(),
+        bucket: bucket.to_string(),
+        bytes: 0,
+        finished: false,
+    });
+    response
 }
 
 struct MultipartStaging {
@@ -395,8 +477,8 @@ struct S3Query {
         version = "0.3.5",
         description = "Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline."
     ),
-    paths(get_keys, create_key, delete_key, list_objects),
-    components(schemas(ApiKeyResponse, ListKeyResponse, CreateKeyRequest, DeleteKeyRequest, ObjectResponse)),
+    paths(get_keys, create_key, delete_key, get_backend, put_backend, list_objects),
+    components(schemas(ApiKeyResponse, ListKeyResponse, CreateKeyRequest, DeleteKeyRequest, ObjectResponse, BackendConfigRequest, BackendConfigResponse)),
     tags(
         (name = "keys", description = "API key management"),
         (name = "objects", description = "Object store listing")
@@ -429,7 +511,7 @@ fn url_encode(s: &str) -> String {
 
 fn backend_resolver(state: &AppState) -> BackendResolver {
     BackendResolver::new(
-        state.backends.clone(),
+        state.workspace_storage.clone(),
         state.service_storage.clone(),
         state.s3_client.clone(),
         state.store.clone(),
@@ -438,12 +520,12 @@ fn backend_resolver(state: &AppState) -> BackendResolver {
 
 async fn resolve_backend(
     state: &AppState,
-    user_id: &str,
+    auth: &Auth,
     headers: &HeaderMap,
     operation: StorageOperation,
 ) -> Result<ResolvedBackend, String> {
     backend_resolver(state)
-        .resolve(user_id, headers, operation)
+        .resolve(auth.workspace_id(), headers, operation)
         .await
 }
 
@@ -784,7 +866,7 @@ fn memory_range(
 async fn open_backend_object(
     state: &AppState,
     backend: ResolvedBackend,
-    user_id: &str,
+    auth: &Auth,
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
@@ -856,7 +938,8 @@ async fn open_backend_object(
             ))
         }
         ResolvedBackend::Managed(storage) => {
-            let logical = LogicalObjectKey::new(user_id, bucket, key);
+            let logical = managed_logical_key(auth, bucket, key);
+            let workspace_id = auth.workspace_id().as_str();
             if head_only {
                 let output = if storage.managed_mode() == ManagedStreamingMode::Off
                     || (storage.managed_mode() == ManagedStreamingMode::Observe
@@ -866,7 +949,7 @@ async fn open_backend_object(
                             .map_err(|error| OpenObjectError::Backend(error.to_string()))?)
                 {
                     storage
-                        .head_output(&format!("{user_id}/{bucket}/{key}"))
+                        .head_output(&format!("{workspace_id}/{bucket}/{key}"))
                         .await
                 } else {
                     storage
@@ -890,7 +973,7 @@ async fn open_backend_object(
                         .map_err(|error| OpenObjectError::Backend(error.to_string()))?)
             {
                 storage
-                    .open(&format!("{user_id}/{bucket}/{key}"), range)
+                    .open(&format!("{workspace_id}/{bucket}/{key}"), range)
                     .await
             } else {
                 storage
@@ -985,6 +1068,30 @@ impl HeaderAuthentication {
 enum HeaderAuthError {
     Denied,
     InvalidPayload(IntegrityError),
+    Unavailable(String),
+}
+
+async fn authenticated_request(
+    state: &AppState,
+    user_id: String,
+    credential_policy_id: String,
+    public_key_pem: Option<String>,
+    stable_key: Option<Vec<u8>>,
+) -> Result<Auth, HeaderAuthError> {
+    let workspace_id = state
+        .workspace_storage
+        .resolve_workspace(&user_id)
+        .await
+        .map_err(|error| HeaderAuthError::Unavailable(error.to_string()))?;
+    Ok(Auth {
+        context: AuthenticatedRequestContext {
+            user_id,
+            workspace_id,
+        },
+        credential_policy_id,
+        public_key_pem,
+        stable_key,
+    })
 }
 
 impl From<SigV4Error> for HeaderAuthError {
@@ -992,6 +1099,19 @@ impl From<SigV4Error> for HeaderAuthError {
         match error {
             SigV4Error::Payload(error) => Self::InvalidPayload(error),
             _ => Self::Denied,
+        }
+    }
+}
+
+fn authentication_error_response(key: &str, error: HeaderAuthError) -> axum::response::Response {
+    match error {
+        HeaderAuthError::Denied => s3_error::signature_mismatch(key),
+        HeaderAuthError::InvalidPayload(error) => {
+            s3_error::invalid_request(key, &error.to_string())
+        }
+        HeaderAuthError::Unavailable(error) => {
+            warn!("workspace resolution failed: {error}");
+            s3_error::service_unavailable(key, "workspace storage is temporarily unavailable")
         }
     }
 }
@@ -1008,12 +1128,16 @@ async fn authenticate_headers(
         // development S3 front door. Production always takes the strict
         // authorization and integrity path below.
         if state.auth_disabled {
-            return Ok(HeaderAuthentication::without_body(Auth {
-                user_id: "demo-user".to_string(),
-                credential_policy_id: "local-demo".to_string(),
-                public_key_pem: None,
-                stable_key: None,
-            }));
+            return Ok(HeaderAuthentication::without_body(
+                authenticated_request(
+                    state,
+                    "demo-user".to_string(),
+                    "local-demo".to_string(),
+                    None,
+                    None,
+                )
+                .await?,
+            ));
         }
         let key = keys
             .get_key(sigv4.access_key())
@@ -1038,12 +1162,14 @@ async fn authenticate_headers(
             )
             .map_err(HeaderAuthError::from)?;
         return Ok(HeaderAuthentication {
-            auth: Auth {
-                user_id: key.user_id.clone(),
-                credential_policy_id: key.key_id.clone(),
-                public_key_pem: key.public_key_pem.clone(),
-                stable_key: Some(derive_stable_key(&secret)),
-            },
+            auth: authenticated_request(
+                state,
+                key.user_id.clone(),
+                key.key_id.clone(),
+                key.public_key_pem.clone(),
+                Some(derive_stable_key(&secret)),
+            )
+            .await?,
             body_verifier: Some(body_verifier),
         });
     }
@@ -1055,12 +1181,16 @@ async fn authenticate_headers(
             // MCP bearer token (s4m_...): a self-contained credential.
             if token.starts_with("s4m_") {
                 if let Some(user_id) = keys.resolve_mcp_token(token).await {
-                    return Ok(HeaderAuthentication::without_body(Auth {
-                        user_id,
-                        credential_policy_id: format!("mcp:{}", sha256_hash(token)),
-                        public_key_pem: None,
-                        stable_key: None,
-                    }));
+                    return Ok(HeaderAuthentication::without_body(
+                        authenticated_request(
+                            state,
+                            user_id,
+                            format!("mcp:{}", sha256_hash(token)),
+                            None,
+                            None,
+                        )
+                        .await?,
+                    ));
                 }
                 return Err(HeaderAuthError::Denied);
             }
@@ -1070,23 +1200,24 @@ async fn authenticate_headers(
                     .resolve_credentials(ak, sk)
                     .await
                     .ok_or(HeaderAuthError::Denied)?;
-                return Ok(HeaderAuthentication::without_body(Auth {
-                    user_id,
-                    credential_policy_id: ak.to_string(),
-                    public_key_pem,
-                    stable_key: Some(derive_stable_key(sk)),
-                }));
+                return Ok(HeaderAuthentication::without_body(
+                    authenticated_request(
+                        state,
+                        user_id,
+                        ak.to_string(),
+                        public_key_pem,
+                        Some(derive_stable_key(sk)),
+                    )
+                    .await?,
+                ));
             }
             // Try JWT
             if state.jwt_decoder.is_some() {
                 let uid = get_user_id(headers, state);
                 if uid != "demo-user" {
-                    return Ok(HeaderAuthentication::without_body(Auth {
-                        user_id: uid,
-                        credential_policy_id: "jwt".to_string(),
-                        public_key_pem: None,
-                        stable_key: None,
-                    }));
+                    return Ok(HeaderAuthentication::without_body(
+                        authenticated_request(state, uid, "jwt".to_string(), None, None).await?,
+                    ));
                 }
             }
             return Err(HeaderAuthError::Denied);
@@ -1098,12 +1229,16 @@ async fn authenticate_headers(
         if tok.starts_with("s4m_")
             && let Some(user_id) = keys.resolve_mcp_token(tok).await
         {
-            return Ok(HeaderAuthentication::without_body(Auth {
-                user_id,
-                credential_policy_id: format!("mcp:{}", sha256_hash(tok)),
-                public_key_pem: None,
-                stable_key: None,
-            }));
+            return Ok(HeaderAuthentication::without_body(
+                authenticated_request(
+                    state,
+                    user_id,
+                    format!("mcp:{}", sha256_hash(tok)),
+                    None,
+                    None,
+                )
+                .await?,
+            ));
         }
         return Err(HeaderAuthError::Denied);
     }
@@ -1116,24 +1251,32 @@ async fn authenticate_headers(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if let Some((user_id, public_key_pem)) = keys.resolve_credentials(ak, sk).await {
-        return Ok(HeaderAuthentication::without_body(Auth {
-            user_id,
-            credential_policy_id: ak.to_string(),
-            public_key_pem,
-            stable_key: Some(derive_stable_key(sk)),
-        }));
+        return Ok(HeaderAuthentication::without_body(
+            authenticated_request(
+                state,
+                user_id,
+                ak.to_string(),
+                public_key_pem,
+                Some(derive_stable_key(sk)),
+            )
+            .await?,
+        ));
     }
     // Allow access in demo mode only when auth is explicitly disabled or
     // when using an in-memory keystore with no keys (dev/first-run mode).
     // Never allow unauthenticated access when keys are persisted — this
     // prevents an empty database from becoming an open door in production.
     if state.auth_disabled {
-        return Ok(HeaderAuthentication::without_body(Auth {
-            user_id: "demo-user".to_string(),
-            credential_policy_id: "local-demo".to_string(),
-            public_key_pem: None,
-            stable_key: None,
-        }));
+        return Ok(HeaderAuthentication::without_body(
+            authenticated_request(
+                state,
+                "demo-user".to_string(),
+                "local-demo".to_string(),
+                None,
+                None,
+            )
+            .await?,
+        ));
     }
     Err(HeaderAuthError::Denied)
 }
@@ -1145,12 +1288,11 @@ async fn authenticate(
     body: &[u8],
     keys: &Arc<dyn KeyRepository>,
     state: &AppState,
-) -> Option<Auth> {
+) -> Result<Auth, HeaderAuthError> {
     authenticate_headers(method, uri, headers, keys, state)
-        .await
-        .ok()?
+        .await?
         .verify_body(body)
-        .ok()
+        .map_err(HeaderAuthError::InvalidPayload)
 }
 
 fn key_expired(expires_at: Option<&str>) -> bool {
@@ -1615,6 +1757,8 @@ impl CompatibilitySpoolUploader for PresignedSpoolUploader {
                             .get("x-amz-version-id")
                             .and_then(|value| value.to_str().ok())
                             .map(ToOwned::to_owned),
+                        superseded_version_ids: Vec::new(),
+                        version_history_complete: true,
                     });
                 }
                 Ok(response) => {
@@ -1756,7 +1900,7 @@ fn streaming_format_content_type(
 async fn begin_streaming_sink(
     state: &AppState,
     backend: ResolvedBackend,
-    user_id: &str,
+    auth: &Auth,
     bucket: &str,
     key: &str,
     content_type: &str,
@@ -1852,7 +1996,7 @@ async fn begin_streaming_sink(
                 .begin_authoritative_sink(
                     journal,
                     capabilities,
-                    LogicalObjectKey::new(user_id, bucket, key),
+                    managed_logical_key(auth, bucket, key),
                     content_type,
                 )
                 .await
@@ -1934,7 +2078,7 @@ async fn streaming_single_put(
     let sink = begin_streaming_sink(
         state,
         backend,
-        &authentication.auth.user_id,
+        &authentication.auth,
         bucket,
         key,
         &content_type,
@@ -2052,14 +2196,14 @@ async fn streaming_single_put(
         let mut sink = sink.lock().await;
         sink.verify_output(output_bytes, &output_digest).await?;
         let stored = sink.complete().await?;
-        Ok((stored, input_bytes))
+        Ok((stored, output_bytes))
     }
     .await;
 
     match processing {
-        Ok((stored, input_bytes)) => {
+        Ok((stored, output_bytes)) => {
             sink_guard.disarm();
-            Ok((authentication.auth, stored, input_bytes))
+            Ok((authentication.auth, stored, output_bytes))
         }
         Err(error) => {
             cancellation.cancel();
@@ -2128,12 +2272,16 @@ async fn read_verified_body(
 
 fn multipart_identity(auth: &Auth, bucket: &str, key: &str, upload_id: &str) -> MultipartIdentity {
     MultipartIdentity {
-        tenant_id: auth.user_id.clone(),
+        tenant_id: auth.workspace_id().as_str().to_string(),
         credential_policy_id: auth.credential_policy_id.clone(),
         bucket: bucket.to_string(),
         key: key.to_string(),
         upload_id: upload_id.to_string(),
     }
+}
+
+fn managed_logical_key(auth: &Auth, bucket: &str, key: &str) -> LogicalObjectKey {
+    LogicalObjectKey::new(auth.workspace_id().as_str(), bucket, key)
 }
 
 fn staged_multipart(state: &AppState) -> Option<&Arc<MultipartStaging>> {
@@ -2392,7 +2540,8 @@ async fn cleanup_staged_parts(
     upload_id: &str,
     parts: Vec<MultipartPart>,
     kind: &str,
-) {
+) -> bool {
+    let mut complete = true;
     for part in parts {
         let result = staging.artifacts.delete(&part.artifact_key).await;
         let detail = match result {
@@ -2405,10 +2554,12 @@ async fn cleanup_staged_parts(
                     serde_json::json!({"part_number":part.part_number,"attempt":part.attempt})
                 }
                 Err(error) => {
+                    complete = false;
                     serde_json::json!({"part_number":part.part_number,"attempt":part.attempt,"error":error.to_string()})
                 }
             },
             Err(error) => {
+                complete = false;
                 serde_json::json!({"part_number":part.part_number,"attempt":part.attempt,"error":error.to_string()})
             }
         };
@@ -2426,6 +2577,7 @@ async fn cleanup_staged_parts(
             warn!("multipart cleanup audit failed: {error}");
         }
     }
+    complete
 }
 
 #[derive(Debug)]
@@ -2554,7 +2706,7 @@ async fn complete_staged_multipart(
     let mut sink = begin_streaming_sink(
         state,
         backend,
-        &auth.user_id,
+        auth,
         &identity.bucket,
         &identity.key,
         &content_type,
@@ -2716,6 +2868,7 @@ async fn complete_staged_multipart(
             etag: stored.etag,
             checksum_sha256,
             version_id: stored.version_id,
+            size_bytes: output_bytes,
         };
         renew_and_fence_completion(staging, identity, lease).await?;
         staging
@@ -2804,21 +2957,18 @@ async fn s3_upload_part(
     .await
     {
         Ok(value) => value,
-        Err(HeaderAuthError::InvalidPayload(error)) => {
-            return s3_error::invalid_request(&key, &error.to_string());
-        }
-        Err(HeaderAuthError::Denied) => return s3_error::signature_mismatch(&key),
+        Err(error) => return authentication_error_response(&key, error),
     };
     if let Some(reason) = state
         .control
-        .authorize(&authentication.auth.user_id, RequestKind::Write)
+        .authorize(&authentication.auth.context, RequestKind::Write)
         .await
     {
         return s3_error::payment_required(&key, reason.message);
     }
     if state
         .control
-        .streaming_write_mode(&authentication.auth.user_id)
+        .streaming_write_mode(&authentication.auth.context)
         .await
         .unwrap_or(state.streaming_write_mode)
         < StreamingWriteMode::All
@@ -2828,23 +2978,39 @@ async fn s3_upload_part(
     let Some(staging) = staged_multipart(&state).cloned() else {
         return s3_error::multipart_not_supported(&key);
     };
-    if resolve_backend(
+    let multipart_backend = match resolve_backend(
         &state,
-        &authentication.auth.user_id,
+        &authentication.auth,
         &parts.headers,
         StorageOperation::Multipart,
     )
     .await
-    .is_err()
     {
-        return s3_error::internal_error(&key, "multipart backend resolution failed");
-    }
+        Ok(backend) => backend,
+        Err(_) => return s3_error::internal_error(&key, "multipart backend resolution failed"),
+    };
     let identity = multipart_identity(&authentication.auth, &bucket, &key, &upload_id);
     let upload = match staging.repository.get_authorized(&identity).await {
         Ok(upload) => upload,
         Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
         Err(error) => return s3_error::internal_error(&key, &error.to_string()),
     };
+    if let ResolvedBackend::Managed(storage) = &multipart_backend {
+        let Some(epoch) = upload.namespace_epoch else {
+            return s3_error::service_unavailable(&key, "managed multipart upload has no epoch");
+        };
+        if let Err(error) = storage
+            .assert_managed_multipart(
+                &upload_id,
+                authentication.auth.workspace_id().as_str(),
+                epoch,
+                false,
+            )
+            .await
+        {
+            return s3_error::service_unavailable(&key, &error.to_string());
+        }
+    }
     if upload.lifecycle != MultipartLifecycle::Open || upload.expires_at_ms <= now_ms() {
         return s3_error::no_such_upload(&key);
     }
@@ -3044,30 +3210,26 @@ async fn s3_put(
     .await
     {
         Ok(authentication) => authentication,
-        Err(HeaderAuthError::InvalidPayload(error)) => {
-            return s3_error::invalid_request(&key, &error.to_string());
-        }
-        Err(HeaderAuthError::Denied) => return s3_error::signature_mismatch(&key),
+        Err(error) => return authentication_error_response(&key, error),
     };
     let auth = &header_auth.auth;
     if let Some(reason) = state
         .control
-        .authorize(&auth.user_id, RequestKind::Write)
+        .authorize(&auth.context, RequestKind::Write)
         .await
     {
         return s3_error::payment_required(&key, reason.message);
     }
     let tenant_write_mode = state
         .control
-        .streaming_write_mode(&auth.user_id)
+        .streaming_write_mode(&auth.context)
         .await
         .unwrap_or(state.streaming_write_mode);
     let effective_write_mode = state.streaming_write_mode.min(tenant_write_mode);
-    let backend =
-        match resolve_backend(&state, &auth.user_id, &parts.headers, StorageOperation::Put).await {
-            Ok(backend) => backend,
-            Err(error) => return s3_error::internal_error(&key, &error),
-        };
+    let backend = match resolve_backend(&state, auth, &parts.headers, StorageOperation::Put).await {
+        Ok(backend) => backend,
+        Err(error) => return s3_error::internal_error(&key, &error),
+    };
     if let ResolvedBackend::Managed(storage) = &backend {
         match storage.managed_mode() {
             ManagedStreamingMode::Observe => {
@@ -3099,14 +3261,14 @@ async fn s3_put(
     )
     .await
     {
-        Ok((auth, stored, input_bytes)) => {
+        Ok((auth, stored, stored_bytes)) => {
             state
                 .control
-                .record(&auth.user_id, RequestKind::Write, input_bytes)
+                .record(&auth.context, &bucket, RequestKind::Write, stored_bytes)
                 .await;
             info!(
-                "streaming PUT /{bucket}/{key} committed ({input_bytes} input bytes, user={})",
-                auth.user_id
+                "streaming PUT /{bucket}/{key} committed ({stored_bytes} stored bytes, user={})",
+                auth.user_id()
             );
             let mut response = axum::response::Response::builder().status(StatusCode::OK);
             if let Some(etag) = stored.etag {
@@ -3693,13 +3855,13 @@ async fn s3_get(
     uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
-    else {
-        return s3_error::access_denied(&key);
+    let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
+        Ok(auth) => auth,
+        Err(error) => return authentication_error_response(&key, error),
     };
     if let Some(reason) = state
         .control
-        .authorize(&auth.user_id, RequestKind::Read)
+        .authorize(&auth.context, RequestKind::Read)
         .await
     {
         return s3_error::payment_required(&key, reason.message);
@@ -3710,12 +3872,12 @@ async fn s3_get(
         return s3_error::transformed_read_not_supported(&key);
     }
     if params.upload_id.is_some() {
-        if resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Multipart)
+        let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart)
             .await
-            .is_err()
         {
-            return s3_error::internal_error(&key, "multipart backend resolution failed");
-        }
+            Ok(backend) => backend,
+            Err(_) => return s3_error::internal_error(&key, "multipart backend resolution failed"),
+        };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
@@ -3725,6 +3887,30 @@ async fn s3_get(
             &key,
             params.upload_id.as_deref().unwrap_or_default(),
         );
+        if let ResolvedBackend::Managed(storage) = &backend {
+            let upload = match staging.repository.get_authorized(&identity).await {
+                Ok(upload) => upload,
+                Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+                Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+            };
+            let Some(epoch) = upload.namespace_epoch else {
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed multipart upload has no namespace epoch",
+                );
+            };
+            if let Err(error) = storage
+                .assert_managed_multipart(
+                    &identity.upload_id,
+                    auth.workspace_id().as_str(),
+                    epoch,
+                    false,
+                )
+                .await
+            {
+                return s3_error::service_unavailable(&key, &error.to_string());
+            }
+        }
         let limit = params.max_parts.unwrap_or(1000).clamp(1, 1000) as usize;
         return match staging
             .repository
@@ -3742,11 +3928,10 @@ async fn s3_get(
             Err(error) => s3_error::internal_error(&key, &error.to_string()),
         };
     }
-    let backend =
-        match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Get).await {
-            Ok(backend) => backend,
-            Err(error) => return s3_error::internal_error(&key, &error),
-        };
+    let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Get).await {
+        Ok(backend) => backend,
+        Err(error) => return s3_error::internal_error(&key, &error),
+    };
     // A transformed representation must be admitted from authoritative object
     // metadata before a source GET can start delivering bytes. Passthrough keeps
     // its existing one-request behavior below.
@@ -3762,7 +3947,7 @@ async fn s3_get(
         let metadata = match open_backend_object(
             &state,
             backend.clone(),
-            &auth.user_id,
+            &auth,
             &bucket,
             &key,
             &headers,
@@ -3777,20 +3962,12 @@ async fn s3_get(
             Ok(preflight) => preflight,
             Err(error) => return transformed_read_error_response(&key, error),
         };
-        let object = match open_backend_object(
-            &state,
-            backend,
-            &auth.user_id,
-            &bucket,
-            &key,
-            &headers,
-            false,
-        )
-        .await
-        {
-            Ok(object) => object,
-            Err(error) => return open_error_response(&key, error),
-        };
+        let object =
+            match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false).await
+            {
+                Ok(object) => object,
+                Err(error) => return open_error_response(&key, error),
+            };
         let source_preflight = match transformed_read_preflight(&headers, &params, &object.metadata)
         {
             Ok(preflight) => preflight,
@@ -3810,14 +3987,14 @@ async fn s3_get(
         }
         if let Some(response) = conditional_read_response(&headers, &object.metadata) {
             object.cancellation.cancel();
+            state
+                .control
+                .record(&auth.context, &bucket, RequestKind::Read, 0)
+                .await;
             return response;
         }
-        state
-            .control
-            .record(&auth.user_id, RequestKind::Read, 0)
-            .await;
         let response_metadata = object.metadata.clone();
-        return transformed_read_response(
+        let response = transformed_read_response(
             &state,
             &auth,
             &headers,
@@ -3827,32 +4004,29 @@ async fn s3_get(
             &key,
         )
         .await;
+        return metered_read_response(state.control.clone(), &auth, &bucket, response);
     }
-    let object = match open_backend_object(
-        &state,
-        backend,
-        &auth.user_id,
-        &bucket,
-        &key,
-        &headers,
-        false,
-    )
-    .await
-    {
-        Ok(object) => object,
-        Err(error) => return open_error_response(&key, error),
-    };
+    let object =
+        match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false).await {
+            Ok(object) => object,
+            Err(error) => return open_error_response(&key, error),
+        };
     if let Some(response) = conditional_read_response(&headers, &object.metadata) {
         object.cancellation.cancel();
+        state
+            .control
+            .record(&auth.context, &bucket, RequestKind::Read, 0)
+            .await;
         return response;
     }
-    state
-        .control
-        .record(&auth.user_id, RequestKind::Read, 0)
-        .await;
 
     if state.streaming_read_mode.streams_passthrough() {
-        return object.into_response();
+        return metered_read_response(
+            state.control.clone(),
+            &auth,
+            &bucket,
+            object.into_response(),
+        );
     }
 
     // Legacy whole-object GET buffering was removed in Phase 12. With reads
@@ -3874,6 +4048,99 @@ mod tests {
     use http_body::{Frame, SizeHint};
 
     use super::*;
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    struct UsageCall {
+        context: AuthenticatedRequestContext,
+        bucket: String,
+        kind: RequestKind,
+        bytes: u64,
+    }
+
+    #[derive(Default)]
+    struct RecordingControlPlane {
+        calls: std::sync::Mutex<Vec<UsageCall>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlPlane for RecordingControlPlane {
+        async fn authorize(
+            &self,
+            _context: &AuthenticatedRequestContext,
+            _kind: RequestKind,
+        ) -> Option<crate::control::BlockReason> {
+            None
+        }
+
+        async fn record(
+            &self,
+            context: &AuthenticatedRequestContext,
+            bucket: &str,
+            kind: RequestKind,
+            bytes: u64,
+        ) {
+            self.calls.lock().unwrap().push(UsageCall {
+                context: context.clone(),
+                bucket: bucket.to_string(),
+                kind,
+                bytes,
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn metered_body_records_exact_completed_response_bytes_and_workspace() {
+        let control = Arc::new(RecordingControlPlane::default());
+        let auth = Auth {
+            context: AuthenticatedRequestContext {
+                user_id: "user-a".to_string(),
+                workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
+            },
+            credential_policy_id: "test".to_string(),
+            public_key_pem: None,
+            stable_key: None,
+        };
+        let response = metered_read_response(
+            control.clone(),
+            &auth,
+            "bucket-a",
+            axum::response::Response::new(Body::from("range")),
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"range");
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *control.calls.lock().unwrap(),
+            vec![UsageCall {
+                context: auth.context,
+                bucket: "bucket-a".to_string(),
+                kind: RequestKind::Read,
+                bytes: 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn managed_and_multipart_namespaces_use_workspace_identity_not_user_identity() {
+        let auth = Auth {
+            context: AuthenticatedRequestContext {
+                user_id: "user-a".to_string(),
+                workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-b").unwrap(),
+            },
+            credential_policy_id: "credential".to_string(),
+            public_key_pem: None,
+            stable_key: None,
+        };
+
+        let logical = managed_logical_key(&auth, "bucket", "key");
+        let multipart = multipart_identity(&auth, "bucket", "key", "upload");
+        assert_eq!(logical.tenant_id, "workspace-b");
+        assert_eq!(multipart.tenant_id, "workspace-b");
+        assert_ne!(logical.tenant_id, auth.user_id());
+    }
 
     struct PollTrackingBody {
         polls: Arc<AtomicUsize>,
@@ -4131,13 +4398,13 @@ async fn s3_head(
     uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
-    else {
-        return s3_error::access_denied(&key);
+    let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
+        Ok(auth) => auth,
+        Err(error) => return authentication_error_response(&key, error),
     };
     if let Some(reason) = state
         .control
-        .authorize(&auth.user_id, RequestKind::Read)
+        .authorize(&auth.context, RequestKind::Read)
         .await
     {
         return s3_error::payment_required(&key, reason.message);
@@ -4149,30 +4416,23 @@ async fn s3_head(
         );
     }
 
-    let backend =
-        match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Head).await {
-            Ok(backend) => backend,
-            Err(error) => return s3_error::internal_error(&key, &error),
-        };
-    match open_backend_object(
-        &state,
-        backend,
-        &auth.user_id,
-        &bucket,
-        &key,
-        &headers,
-        true,
-    )
-    .await
-    {
+    let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Head).await {
+        Ok(backend) => backend,
+        Err(error) => return s3_error::internal_error(&key, &error),
+    };
+    match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, true).await {
         Ok(object) => {
             if let Some(response) = conditional_read_response(&headers, &object.metadata) {
                 object.cancellation.cancel();
+                state
+                    .control
+                    .record(&auth.context, &bucket, RequestKind::Read, 0)
+                    .await;
                 return response;
             }
             state
                 .control
-                .record(&auth.user_id, RequestKind::Read, 0)
+                .record(&auth.context, &bucket, RequestKind::Read, 0)
                 .await;
             object.into_response()
         }
@@ -4188,47 +4448,76 @@ async fn s3_delete(
     uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
-    else {
-        return s3_error::access_denied(&key);
+    let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
+        Ok(auth) => auth,
+        Err(error) => return authentication_error_response(&key, error),
     };
     if let Some(reason) = state
         .control
-        .authorize(&auth.user_id, RequestKind::Write)
+        .authorize(&auth.context, RequestKind::Write)
         .await
     {
         return s3_error::payment_required(&key, reason.message);
     }
-    info!("DELETE /{bucket}/{key} user={}", auth.user_id);
+    info!("DELETE /{bucket}/{key} user={}", auth.user_id());
 
     if params.upload_id.is_some() {
-        if resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Multipart)
-            .await
-            .is_err()
-        {
-            return s3_error::internal_error(&key, "multipart backend resolution failed");
-        }
+        let backend =
+            match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
+                Ok(backend) => backend,
+                Err(_) => {
+                    return s3_error::internal_error(&key, "multipart backend resolution failed");
+                }
+            };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
         let upload_id = params.upload_id.as_deref().unwrap_or_default();
         let identity = multipart_identity(&auth, &bucket, &key, upload_id);
+        let upload = match staging.repository.get_authorized(&identity).await {
+            Ok(upload) => upload,
+            Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+        };
+        if let ResolvedBackend::Managed(storage) = &backend {
+            let Some(epoch) = upload.namespace_epoch else {
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed multipart upload has no namespace epoch",
+                );
+            };
+            if let Err(error) = storage
+                .assert_managed_multipart(upload_id, auth.workspace_id().as_str(), epoch, true)
+                .await
+            {
+                return s3_error::service_unavailable(&key, &error.to_string());
+            }
+        }
         return match staging.repository.abort(&identity, now_ms()).await {
             Ok(parts) => {
                 cleanup_staged_parts(&staging, upload_id, parts, "abort").await;
+                state
+                    .control
+                    .record(&auth.context, &bucket, RequestKind::Write, 0)
+                    .await;
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(StagingError::NotFound) => s3_error::no_such_upload(&key),
-            Err(StagingError::NotOpen) => StatusCode::NO_CONTENT.into_response(),
+            Err(StagingError::NotOpen) => {
+                state
+                    .control
+                    .record(&auth.context, &bucket, RequestKind::Write, 0)
+                    .await;
+                StatusCode::NO_CONTENT.into_response()
+            }
             Err(error) => s3_error::internal_error(&key, &error.to_string()),
         };
     }
 
-    let backend =
-        match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::Delete).await {
-            Ok(backend) => backend,
-            Err(error) => return s3_error::internal_error(&key, &error),
-        };
+    let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Delete).await {
+        Ok(backend) => backend,
+        Err(error) => return s3_error::internal_error(&key, &error),
+    };
     match backend {
         ResolvedBackend::PresignedHttp(url) => {
             let client = match state.presigned_http_policy.client_for(&url).await {
@@ -4239,7 +4528,7 @@ async fn s3_delete(
                 Ok(response) if response.status().is_success() => {
                     state
                         .control
-                        .record(&auth.user_id, RequestKind::Write, 0)
+                        .record(&auth.context, &bucket, RequestKind::Write, 0)
                         .await;
                     StatusCode::NO_CONTENT.into_response()
                 }
@@ -4260,7 +4549,7 @@ async fn s3_delete(
             Ok(_) => {
                 state
                     .control
-                    .record(&auth.user_id, RequestKind::Write, 0)
+                    .record(&auth.context, &bucket, RequestKind::Write, 0)
                     .await;
                 StatusCode::NO_CONTENT.into_response()
             }
@@ -4269,14 +4558,14 @@ async fn s3_delete(
         ResolvedBackend::Managed(storage) => {
             let result = match storage.managed_mode() {
                 ManagedStreamingMode::Off => storage
-                    .delete(&format!("{}/{bucket}/{key}", auth.user_id))
+                    .delete(&format!("{}/{bucket}/{key}", auth.workspace_id().as_str()))
                     .await
                     .map_err(|error| error.to_string()),
                 ManagedStreamingMode::Observe => {
                     Err("managed mutations are disabled in observe mode".to_string())
                 }
                 ManagedStreamingMode::Enforce => storage
-                    .tombstone_authoritative(&LogicalObjectKey::new(&auth.user_id, &bucket, &key))
+                    .tombstone_authoritative(&managed_logical_key(&auth, &bucket, &key))
                     .await
                     .map_err(|error| error.to_string()),
             };
@@ -4285,7 +4574,7 @@ async fn s3_delete(
             }
             state
                 .control
-                .record(&auth.user_id, RequestKind::Write, 0)
+                .record(&auth.context, &bucket, RequestKind::Write, 0)
                 .await;
             StatusCode::NO_CONTENT.into_response()
         }
@@ -4293,7 +4582,7 @@ async fn s3_delete(
             store.delete(&bucket, &key);
             state
                 .control
-                .record(&auth.user_id, RequestKind::Write, 0)
+                .record(&auth.context, &bucket, RequestKind::Write, 0)
                 .await;
             StatusCode::NO_CONTENT.into_response()
         }
@@ -4318,10 +4607,7 @@ async fn s3_post(
         .await
         {
             Ok(value) => value,
-            Err(HeaderAuthError::InvalidPayload(error)) => {
-                return s3_error::invalid_request(&key, &error.to_string());
-            }
-            Err(HeaderAuthError::Denied) => return s3_error::signature_mismatch(&key),
+            Err(error) => return authentication_error_response(&key, error),
         };
         let (auth, body) =
             match read_verified_body(authentication, body, MAX_COMPLETE_XML_BYTES).await {
@@ -4344,14 +4630,14 @@ async fn s3_post(
             };
         if let Some(reason) = state
             .control
-            .authorize(&auth.user_id, RequestKind::Write)
+            .authorize(&auth.context, RequestKind::Write)
             .await
         {
             return s3_error::payment_required(&key, reason.message);
         }
         if state
             .control
-            .streaming_write_mode(&auth.user_id)
+            .streaming_write_mode(&auth.context)
             .await
             .unwrap_or(state.streaming_write_mode)
             < StreamingWriteMode::All
@@ -4372,6 +4658,26 @@ async fn s3_post(
             Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
             Err(error) => return s3_error::internal_error(&key, &error.to_string()),
         };
+        let backend =
+            match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
+            {
+                Ok(backend) => backend,
+                Err(error) => return s3_error::internal_error(&key, &error),
+            };
+        if let ResolvedBackend::Managed(storage) = &backend {
+            let Some(epoch) = upload.namespace_epoch else {
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed multipart upload has no namespace epoch",
+                );
+            };
+            if let Err(error) = storage
+                .assert_managed_multipart(upload_id, auth.workspace_id().as_str(), epoch, false)
+                .await
+            {
+                return s3_error::service_unavailable(&key, &error.to_string());
+            }
+        }
         let fingerprint = match completion_fingerprint(&upload, &selected) {
             Ok(fingerprint) => fingerprint,
             Err(error) => return s3_error::internal_error(&key, &error.to_string()),
@@ -4416,17 +4722,6 @@ async fn s3_post(
             }
             Err(error) => return s3_error::internal_error(&key, &error.to_string()),
         };
-        let backend = match resolve_backend(
-            &state,
-            &auth.user_id,
-            &parts.headers,
-            StorageOperation::Multipart,
-        )
-        .await
-        {
-            Ok(backend) => backend,
-            Err(error) => return s3_error::internal_error(&key, &error),
-        };
         let complete = tokio::time::timeout(
             Duration::from_secs(MAX_MULTIPART_COMPLETION_SECS),
             complete_staged_multipart(&state, &staging, &identity, &upload, &lease, &auth, backend),
@@ -4457,13 +4752,14 @@ async fn s3_post(
             }
         };
         cleanup_staged_parts(&staging, upload_id, lease.cleanup_parts, "complete").await;
-        let selected_bytes = lease
-            .selected_parts
-            .iter()
-            .fold(0_u64, |total, part| total.saturating_add(part.size_bytes));
         state
             .control
-            .record(&auth.user_id, RequestKind::Write, selected_bytes)
+            .record(
+                &auth.context,
+                &bucket,
+                RequestKind::Write,
+                result.size_bytes,
+            )
             .await;
         let mut response = s3_xml_ok(complete_multipart_xml(&bucket, &key, &result));
         if let Some(version) = result.version_id
@@ -4473,7 +4769,7 @@ async fn s3_post(
         }
         return response;
     }
-    let Some(auth) = authenticate(
+    let auth = match authenticate(
         parts.method.as_str(),
         &parts.uri,
         &parts.headers,
@@ -4482,36 +4778,39 @@ async fn s3_post(
         &state,
     )
     .await
-    else {
-        return s3_error::access_denied(&key);
+    {
+        Ok(auth) => auth,
+        Err(error) => return authentication_error_response(&key, error),
     };
     if let Some(reason) = state
         .control
-        .authorize(&auth.user_id, RequestKind::Write)
+        .authorize(&auth.context, RequestKind::Write)
         .await
     {
         return s3_error::payment_required(&key, reason.message);
     }
-    info!("POST /{bucket}/{key} user={}", auth.user_id);
+    info!("POST /{bucket}/{key} user={}", auth.user_id());
 
     if params.uploads.is_some() {
-        let backend = match resolve_backend(
-            &state,
-            &auth.user_id,
-            &parts.headers,
-            StorageOperation::Multipart,
-        )
-        .await
+        let backend =
+            match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
+            {
+                Ok(backend) => backend,
+                Err(error) => return s3_error::internal_error(&key, &error),
+            };
+        if let ResolvedBackend::Managed(storage) = &backend
+            && let Err(error) = storage
+                .assert_namespace_active(auth.workspace_id().as_str())
+                .await
         {
-            Ok(backend) => backend,
-            Err(error) => return s3_error::internal_error(&key, &error),
-        };
+            return s3_error::service_unavailable(&key, &error.to_string());
+        }
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
         if state
             .control
-            .streaming_write_mode(&auth.user_id)
+            .streaming_write_mode(&auth.context)
             .await
             .unwrap_or(state.streaming_write_mode)
             < StreamingWriteMode::All
@@ -4519,9 +4818,21 @@ async fn s3_post(
             return s3_error::multipart_not_supported(&key);
         }
         let upload_id = Uuid::now_v7().to_string();
+        let managed_registration = if let ResolvedBackend::Managed(storage) = &backend {
+            match storage
+                .begin_managed_multipart(&upload_id, auth.workspace_id().as_str())
+                .await
+            {
+                Ok(epoch) => Some((storage.clone(), epoch)),
+                Err(error) => return s3_error::service_unavailable(&key, &error.to_string()),
+            }
+        } else {
+            None
+        };
         let now = now_ms();
         let upload = MultipartUpload {
             identity: multipart_identity(&auth, &bucket, &key, &upload_id),
+            namespace_epoch: managed_registration.as_ref().map(|(_, epoch)| *epoch),
             snapshot: multipart_snapshot(
                 &parts.headers,
                 &backend,
@@ -4542,9 +4853,33 @@ async fn s3_post(
             completion_result: None,
         };
         return match staging.repository.create(upload).await {
-            Ok(()) => s3_xml_ok(create_multipart_xml(&bucket, &key, &upload_id)),
-            Err(StagingError::QuotaExceeded) => s3_error::slow_down(&key),
-            Err(error) => s3_error::internal_error(&key, &error.to_string()),
+            Ok(()) => {
+                if let Some((storage, epoch)) = &managed_registration
+                    && let Err(error) = storage
+                        .confirm_managed_multipart(&upload_id, auth.workspace_id().as_str(), *epoch)
+                        .await
+                {
+                    let identity = multipart_identity(&auth, &bucket, &key, &upload_id);
+                    let _ = staging.repository.abort(&identity, now_ms()).await;
+                    let _ = staging.repository.delete_terminal_upload(&identity).await;
+                    let _ = storage
+                        .finish_managed_multipart(&upload_id, auth.workspace_id().as_str(), *epoch)
+                        .await;
+                    return s3_error::service_unavailable(&key, &error.to_string());
+                }
+                s3_xml_ok(create_multipart_xml(&bucket, &key, &upload_id))
+            }
+            Err(error) => {
+                if let Some((storage, epoch)) = managed_registration {
+                    let _ = storage
+                        .finish_managed_multipart(&upload_id, auth.workspace_id().as_str(), epoch)
+                        .await;
+                }
+                match error {
+                    StagingError::QuotaExceeded => s3_error::slow_down(&key),
+                    error => s3_error::internal_error(&key, &error.to_string()),
+                }
+            }
         };
     }
     s3_error::not_implemented(&key)
@@ -4559,23 +4894,22 @@ async fn s3_list_objects(
     uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
-    else {
-        return s3_error::access_denied(&bucket);
+    let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
+        Ok(auth) => auth,
+        Err(error) => return authentication_error_response(&bucket, error),
     };
     if let Some(reason) = state
         .control
-        .authorize(&auth.user_id, RequestKind::Read)
+        .authorize(&auth.context, RequestKind::Read)
         .await
     {
         return s3_error::payment_required(&bucket, reason.message);
     }
 
-    let backend =
-        match resolve_backend(&state, &auth.user_id, &headers, StorageOperation::List).await {
-            Ok(backend) => backend,
-            Err(error) => return s3_error::internal_error(&bucket, &error),
-        };
+    let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
+        Ok(backend) => backend,
+        Err(error) => return s3_error::internal_error(&bucket, &error),
+    };
     match backend {
         ResolvedBackend::S3 { client, .. } => match list_from_s3(&client, &bucket, &params).await {
             Ok(xml) => s3_xml_ok(xml),
@@ -5004,9 +5338,9 @@ async fn root(
     if !is_s3 {
         return Html(dashboard_html()).into_response();
     }
-    let Some(auth) = authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
-    else {
-        return s3_error::access_denied("").into_response();
+    let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
+        Ok(auth) => auth,
+        Err(error) => return authentication_error_response("", error).into_response(),
     };
     match list_buckets(&state, &auth, &headers).await {
         Ok(xml) => s3_xml_ok(xml).into_response(),
@@ -5020,7 +5354,7 @@ async fn list_buckets(
     headers: &HeaderMap,
 ) -> anyhow::Result<String> {
     let mut names: Vec<String> = Vec::new();
-    match resolve_backend(state, &auth.user_id, headers, StorageOperation::List)
+    match resolve_backend(state, auth, headers, StorageOperation::List)
         .await
         .map_err(anyhow::Error::msg)?
     {
@@ -5065,11 +5399,10 @@ async fn s3_bucket_put(
     uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state)
-        .await
-        .is_none()
+    if let Err(error) =
+        authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
     {
-        return s3_error::access_denied(&bucket);
+        return authentication_error_response(&bucket, error);
     }
     s3_error::bucket_not_allowed(&bucket)
 }
@@ -5082,11 +5415,10 @@ async fn s3_bucket_delete(
     uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state)
-        .await
-        .is_none()
+    if let Err(error) =
+        authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
     {
-        return s3_error::access_denied(&bucket);
+        return authentication_error_response(&bucket, error);
     }
     s3_error::bucket_not_allowed(&bucket)
 }
@@ -5325,6 +5657,15 @@ async fn delete_mcp_token(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/backend",
+    responses(
+        (status = 200, description = "Redacted workspace backend configuration", body = BackendConfigResponse),
+        (status = 401, description = "Not authenticated")
+    ),
+    tag = "backend"
+)]
 async fn get_backend(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -5332,30 +5673,69 @@ async fn get_backend(
     let Some(uid) = require_user_id(&headers, &state).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let config = state.backends.get(&uid).unwrap_or(BackendConfig {
-        backend_type: String::new(),
-        role_arn: String::new(),
-        external_id: state.backends.generate_external_id(&uid),
-        endpoint: String::new(),
-        access_key: String::new(),
-        secret_key: String::new(),
-        region: String::new(),
-    });
-    Json(config).into_response()
+    let workspace = match state.workspace_storage.resolve_workspace(&uid).await {
+        Ok(workspace) => workspace,
+        Err(error) => return workspace_storage_error_response(error),
+    };
+    match state.workspace_storage.get_public_config(&workspace).await {
+        Ok(config) => Json(config).into_response(),
+        Err(error) => workspace_storage_error_response(error),
+    }
 }
 
+fn workspace_storage_error_response(error: WorkspaceStorageError) -> axum::response::Response {
+    let (status, code, message) = match &error {
+        WorkspaceStorageError::InvalidConfig(_) | WorkspaceStorageError::UnsupportedConfig(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_backend_config",
+            error.to_string(),
+        ),
+        WorkspaceStorageError::Repository(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_storage_unavailable",
+            "workspace storage is temporarily unavailable".to_string(),
+        ),
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "code": code,
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
+#[utoipa::path(
+    put,
+    path = "/dashboard/api/backend",
+    request_body = BackendConfigRequest,
+    responses(
+        (status = 200, description = "Redacted saved workspace backend configuration", body = BackendConfigResponse),
+        (status = 400, description = "Incomplete or unsupported configuration"),
+        (status = 401, description = "A real authenticated user is required")
+    ),
+    tag = "backend"
+)]
 async fn put_backend(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(config): Json<BackendConfig>,
+    Json(config): Json<BackendConfigRequest>,
 ) -> impl IntoResponse {
-    let uid = get_user_id(&headers, &state);
-    let mut config = config;
-    if config.external_id.is_empty() {
-        config.external_id = state.backends.generate_external_id(&uid);
+    if state.auth_disabled {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
-    state.backends.set(&uid, config);
-    StatusCode::OK.into_response()
+    let Some(uid) = require_user_id(&headers, &state).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let workspace = match state.workspace_storage.resolve_workspace(&uid).await {
+        Ok(workspace) => workspace,
+        Err(error) => return workspace_storage_error_response(error),
+    };
+    match state.workspace_storage.put_config(&workspace, config).await {
+        Ok(config) => Json(config).into_response(),
+        Err(error) => workspace_storage_error_response(error),
+    }
 }
 
 async fn get_plugins(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -5504,6 +5884,7 @@ fn component_path() -> PathBuf {
 pub async fn build_state(
     control: Arc<dyn ControlPlane>,
     wrapping: Arc<dyn KeyWrapping>,
+    workspace_storage: Arc<dyn WorkspaceStorageRepository>,
 ) -> anyhow::Result<Arc<AppState>> {
     let s3_endpoint = std::env::var("S3_ENDPOINT").ok();
 
@@ -5805,12 +6186,35 @@ pub async fn build_state(
             "managed observe/enforce mode requires S4_MANAGED_STREAMING_TRANSACTIONAL=true"
         );
     }
-    let service_storage = Arc::new(ServiceStorage::with_management(
-        service_backends,
-        managed_repository,
-        managed_mode,
-        managed_placement_version,
-    ));
+    let service_storage = Arc::new(
+        ServiceStorage::with_management(
+            service_backends,
+            managed_repository,
+            managed_mode,
+            managed_placement_version,
+        )
+        .with_managed_capabilities(managed_streaming_capabilities),
+    );
+    if multipart_staging.is_some() && managed_mode != ManagedStreamingMode::Off {
+        service_storage
+            .reconcile_managed_multipart_activities(256)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+    if managed_mode == ManagedStreamingMode::Enforce
+        && let (Some(journal), Some(capabilities)) =
+            (operation_journal.clone(), managed_streaming_capabilities)
+    {
+        service_storage
+            .reconcile_managed_write_intents(
+                journal,
+                capabilities,
+                Duration::from_millis(crate::managed::PHYSICAL_WRITE_LEASE_MS as u64),
+                256,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
 
     // Local mode: ensure a demo key exists and print it so SDK demos and
     // `aws s3 --endpoint-url` work out of the box.
@@ -5836,7 +6240,7 @@ pub async fn build_state(
         gateway: Arc::new(gateway),
         store: Arc::new(MemoryStore::new()),
         keys,
-        backends: Arc::new(BackendRegistry::new()),
+        workspace_storage,
         plugins,
         service_storage,
         s3_client,
@@ -5874,6 +6278,17 @@ pub async fn build_state(
             let owner = format!("managed-repair-{}", uuid::Uuid::now_v7());
             loop {
                 if let Err(error) = storage
+                    .reconcile_managed_write_intents(
+                        journal.clone(),
+                        capabilities,
+                        Duration::from_millis(crate::managed::PHYSICAL_WRITE_LEASE_MS as u64),
+                        64,
+                    )
+                    .await
+                {
+                    warn!("managed write-intent reconciliation failed: {error}");
+                }
+                if let Err(error) = storage
                     .repair_due(journal.clone(), capabilities, &owner, 16)
                     .await
                 {
@@ -5884,6 +6299,7 @@ pub async fn build_state(
         });
     }
     if let Some(staging) = state.multipart_staging.clone() {
+        let storage = state.service_storage.clone();
         tokio::spawn(async move {
             loop {
                 match staging.repository.reap_expired(now_ms(), 64).await {
@@ -5905,6 +6321,31 @@ pub async fn build_state(
                 }
                 if let Err(error) = reconcile_staged_artifacts(&staging).await {
                     warn!("multipart artifact reconciliation failed: {error}");
+                }
+                match staging
+                    .repository
+                    .retire_terminal_uploads(now_ms(), 64)
+                    .await
+                {
+                    Ok(retired) => {
+                        for upload in retired {
+                            if let Some(epoch) = upload.namespace_epoch {
+                                let _ = storage
+                                    .finish_managed_multipart(
+                                        &upload.upload_id,
+                                        &upload.tenant_id,
+                                        epoch,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(error) => warn!("multipart terminal retirement failed: {error}"),
+                }
+                if storage.managed_mode() != ManagedStreamingMode::Off
+                    && let Err(error) = storage.reconcile_managed_multipart_activities(64).await
+                {
+                    warn!("managed multipart registration reconciliation failed: {error}");
                 }
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }

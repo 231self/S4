@@ -3,10 +3,66 @@ import { Configuration, PromiseConfigurationOptions, wrapOptions } from '../conf
 import { PromiseMiddleware, Middleware, PromiseMiddlewareWrapper } from '../middleware';
 
 import { ApiKeyResponse } from '../models/ApiKeyResponse';
+import { BackendConfigRequest } from '../models/BackendConfigRequest';
+import { BackendConfigResponse } from '../models/BackendConfigResponse';
+import { BackendType } from '../models/BackendType';
 import { CreateKeyRequest } from '../models/CreateKeyRequest';
 import { DeleteKeyRequest } from '../models/DeleteKeyRequest';
 import { ListKeyResponse } from '../models/ListKeyResponse';
 import { ObjectResponse } from '../models/ObjectResponse';
+import { ObservableBackendApi } from './ObservableAPI';
+
+import { BackendApiRequestFactory, BackendApiResponseProcessor} from "../apis/BackendApi";
+export class PromiseBackendApi {
+    private api: ObservableBackendApi
+
+    public constructor(
+        configuration: Configuration,
+        requestFactory?: BackendApiRequestFactory,
+        responseProcessor?: BackendApiResponseProcessor
+    ) {
+        this.api = new ObservableBackendApi(configuration, requestFactory, responseProcessor);
+    }
+
+    /**
+     */
+    public getBackendWithHttpInfo(_options?: PromiseConfigurationOptions): Promise<HttpInfo<BackendConfigResponse>> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.getBackendWithHttpInfo(observableOptions);
+        return result.toPromise();
+    }
+
+    /**
+     */
+    public getBackend(_options?: PromiseConfigurationOptions): Promise<BackendConfigResponse> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.getBackend(observableOptions);
+        return result.toPromise();
+    }
+
+    /**
+     * @param backendConfigRequest
+     */
+    public putBackendWithHttpInfo(backendConfigRequest: BackendConfigRequest, _options?: PromiseConfigurationOptions): Promise<HttpInfo<BackendConfigResponse>> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.putBackendWithHttpInfo(backendConfigRequest, observableOptions);
+        return result.toPromise();
+    }
+
+    /**
+     * @param backendConfigRequest
+     */
+    public putBackend(backendConfigRequest: BackendConfigRequest, _options?: PromiseConfigurationOptions): Promise<BackendConfigResponse> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.putBackend(backendConfigRequest, observableOptions);
+        return result.toPromise();
+    }
+
+
+}
+
+
+
 import { ObservableKeysApi } from './ObservableAPI';
 
 import { KeysApiRequestFactory, KeysApiResponseProcessor} from "../apis/KeysApi";

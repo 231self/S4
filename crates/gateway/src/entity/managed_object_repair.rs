@@ -8,6 +8,8 @@ pub struct Model {
     pub kind: String,
     pub state: String,
     pub tenant_id: String,
+    pub namespace_epoch: i64,
+    pub authority_cas_version: i64,
     pub bucket: String,
     pub logical_key: String,
     pub generation: Uuid,

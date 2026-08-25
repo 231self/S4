@@ -1,19 +1,25 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, LockType, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, SqlxPostgresConnector, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, SqlxPostgresConnector,
+    TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::entity::{managed_object_authority, managed_object_repair};
+use crate::entity::{
+    managed_multipart_activity, managed_namespace, managed_namespace_purge,
+    managed_object_authority, managed_object_repair, managed_physical_object_version,
+    managed_physical_write_intent, object_operation,
+};
 
 pub const PLACEMENT_VERSION_V1: u32 = 1;
+pub const PHYSICAL_WRITE_LEASE_MS: i64 = 2 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ManagedStreamingMode {
@@ -237,6 +243,8 @@ pub struct RepairRecord {
     pub repair_id: Uuid,
     pub kind: RepairKind,
     pub logical: LogicalObjectKey,
+    pub namespace_epoch: u64,
+    pub authority_cas_version: u64,
     pub generation: Uuid,
     pub digest: String,
     pub size: u64,
@@ -272,6 +280,8 @@ impl RepairRecord {
             repair_id,
             kind,
             logical: authority.logical.clone(),
+            namespace_epoch: 0,
+            authority_cas_version: authority.cas_version,
             generation: authority.generation,
             digest: authority.digest.clone(),
             size: authority.size,
@@ -327,11 +337,179 @@ pub enum ManagedError {
     Corrupt(String),
     #[error("managed authority persistence failed: {0}")]
     Persistence(String),
+    #[error("managed namespace is fenced for purge")]
+    NamespaceFenced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamespacePurgeRequest {
+    pub tenant_id: String,
+    /// Idempotency key owned by the caller and persisted by implementations
+    /// that support complete physical generation deletion.
+    pub operation_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamespacePurgeStatus {
+    Pending,
+    Running,
+    Complete { deleted_versions: u64 },
+    Blocked { reason: String },
+    Unsupported { reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalWriteIntent {
+    pub intent_id: Uuid,
+    pub tenant_id: String,
+    pub backend_id: String,
+    pub backend_fingerprint: String,
+    pub provider_bucket: String,
+    pub physical_key: String,
+    pub versioning_mode: BackendVersioningMode,
+    pub versioning_capability: BackendVersioningCapability,
+    pub lease_owner: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalWriteLease {
+    pub intent_id: Uuid,
+    pub namespace_epoch: u64,
+    pub owner: String,
+    pub token: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurablePhysicalWriteIntent {
+    pub intent: PhysicalWriteIntent,
+    pub namespace_epoch: u64,
+    pub blocked_reason: Option<String>,
+    pub lease_expires_at_ms: i64,
+    pub lease: PhysicalWriteLease,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalVersionTarget {
+    pub tenant_id: String,
+    pub namespace_epoch: u64,
+    pub backend_id: String,
+    pub backend_fingerprint: String,
+    pub provider_bucket: String,
+    pub physical_key: String,
+    pub version_id: Option<String>,
+    pub versioning_mode: BackendVersioningMode,
+    pub versioning_capability: BackendVersioningCapability,
+    pub write_operation_id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendVersioningMode {
+    Unversioned,
+    Enabled,
+    Suspended,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendVersioningCapability {
+    Unsupported,
+    Optional,
+    Required,
+}
+
+impl BackendVersioningCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "UNSUPPORTED",
+            Self::Optional => "OPTIONAL",
+            Self::Required => "REQUIRED",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, ManagedError> {
+        match value {
+            "UNSUPPORTED" => Ok(Self::Unsupported),
+            "OPTIONAL" => Ok(Self::Optional),
+            "REQUIRED" => Ok(Self::Required),
+            value => Err(ManagedError::Corrupt(format!(
+                "unknown backend versioning capability {value:?}"
+            ))),
+        }
+    }
+}
+
+impl BackendVersioningMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unversioned => "UNVERSIONED",
+            Self::Enabled => "ENABLED",
+            Self::Suspended => "SUSPENDED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, ManagedError> {
+        match value {
+            "UNVERSIONED" => Ok(Self::Unversioned),
+            "ENABLED" => Ok(Self::Enabled),
+            "SUSPENDED" => Ok(Self::Suspended),
+            "UNKNOWN" => Ok(Self::Unknown),
+            value => Err(ManagedError::Corrupt(format!(
+                "unknown backend versioning mode {value:?}"
+            ))),
+        }
+    }
 }
 
 #[async_trait]
 pub trait ManagedRepository: Send + Sync {
     fn is_durable(&self) -> bool;
+    async fn assert_namespace_active(&self, _tenant_id: &str) -> Result<(), ManagedError> {
+        Ok(())
+    }
+    async fn begin_multipart_activity(
+        &self,
+        _upload_id: &str,
+        _tenant_id: &str,
+    ) -> Result<u64, ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed multipart epoch fencing is unsupported".to_string(),
+        ))
+    }
+    async fn assert_multipart_activity(
+        &self,
+        _upload_id: &str,
+        _tenant_id: &str,
+        _namespace_epoch: u64,
+        _allow_purging: bool,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed multipart epoch fencing is unsupported".to_string(),
+        ))
+    }
+    async fn confirm_multipart_activity(
+        &self,
+        _upload_id: &str,
+        _tenant_id: &str,
+        _namespace_epoch: u64,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed multipart epoch fencing is unsupported".to_string(),
+        ))
+    }
+    async fn reconcile_multipart_activities(&self, _limit: u64) -> Result<u64, ManagedError> {
+        Ok(0)
+    }
+    async fn finish_multipart_activity(
+        &self,
+        _upload_id: &str,
+        _tenant_id: &str,
+        _namespace_epoch: u64,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed multipart epoch fencing is unsupported".to_string(),
+        ))
+    }
     async fn any_authority(&self) -> Result<bool, ManagedError>;
     async fn get(
         &self,
@@ -362,6 +540,142 @@ pub trait ManagedRepository: Send + Sync {
     ) -> Result<(), ManagedError>;
     async fn complete_repair(&self, repair: &RepairRecord) -> Result<bool, ManagedError>;
     async fn fail_repair(&self, lease_token: Uuid, error: &str) -> Result<(), ManagedError>;
+
+    /// Persist a write intent before any provider operation can create a
+    /// physical version. Implementations must reject a fenced namespace.
+    async fn begin_physical_write(
+        &self,
+        _intent: PhysicalWriteIntent,
+    ) -> Result<PhysicalWriteLease, ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed physical-version ledger is unsupported".to_string(),
+        ))
+    }
+
+    async fn pending_physical_write_intents(
+        &self,
+        _limit: u64,
+    ) -> Result<Vec<DurablePhysicalWriteIntent>, ManagedError> {
+        Ok(Vec::new())
+    }
+    async fn renew_physical_write_intent(
+        &self,
+        _lease: &PhysicalWriteLease,
+        _lease_expires_at_ms: i64,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed physical write lease is unsupported".to_string(),
+        ))
+    }
+    async fn claim_expired_physical_write_intent(
+        &self,
+        _intent_id: Uuid,
+        _owner: &str,
+        _lease_expires_at_ms: i64,
+    ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
+        Ok(None)
+    }
+
+    /// Atomically replace a durable write intent with its exact provider
+    /// version. `None` denotes an unversioned object.
+    async fn commit_physical_write(
+        &self,
+        _lease: &PhysicalWriteLease,
+        _superseded_version_ids: &[String],
+        _version_id: Option<&str>,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed physical-version ledger is unsupported".to_string(),
+        ))
+    }
+
+    async fn abort_physical_write(&self, _lease: &PhysicalWriteLease) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed physical-version ledger is unsupported".to_string(),
+        ))
+    }
+
+    async fn block_physical_write(
+        &self,
+        _lease: &PhysicalWriteLease,
+        _reason: &str,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed physical-version ledger is unsupported".to_string(),
+        ))
+    }
+
+    async fn physical_versions(
+        &self,
+        _tenant_id: &str,
+        _backend_id: &str,
+        _provider_bucket: &str,
+        _physical_key: &str,
+    ) -> Result<Vec<PhysicalVersionTarget>, ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed physical-version ledger is unsupported".to_string(),
+        ))
+    }
+
+    async fn forget_physical_version(
+        &self,
+        _target: &PhysicalVersionTarget,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed physical-version ledger is unsupported".to_string(),
+        ))
+    }
+
+    async fn purge_targets(
+        &self,
+        _request: &NamespacePurgeRequest,
+        _limit: u64,
+    ) -> Result<Vec<PhysicalVersionTarget>, ManagedError> {
+        Ok(Vec::new())
+    }
+
+    async fn mark_purge_target_deleted(
+        &self,
+        _request: &NamespacePurgeRequest,
+        _target: &PhysicalVersionTarget,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed namespace purge target tracking is unsupported".to_string(),
+        ))
+    }
+
+    async fn mark_purge_target_blocked(
+        &self,
+        _request: &NamespacePurgeRequest,
+        _target: &PhysicalVersionTarget,
+        _reason: &str,
+    ) -> Result<(), ManagedError> {
+        Err(ManagedError::Persistence(
+            "managed namespace purge target tracking is unsupported".to_string(),
+        ))
+    }
+
+    /// Purge every physical generation owned by a managed tenant namespace.
+    /// The default is deliberately unsupported: authority rows are not a full
+    /// version ledger, so ListObjects-based deletion cannot prove completeness.
+    async fn purge_namespace(
+        &self,
+        _request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        Ok(NamespacePurgeStatus::Unsupported {
+            reason: "managed storage has no complete physical version ledger".to_string(),
+        })
+    }
+
+    /// Query an idempotent purge operation without starting or advancing it.
+    async fn namespace_purge_status(
+        &self,
+        _request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        Ok(NamespacePurgeStatus::Unsupported {
+            reason: "managed storage has no complete physical version ledger".to_string(),
+        })
+    }
 }
 
 fn cleanup_repairs(authority: &ObjectAuthority) -> Vec<RepairRecord> {
@@ -506,6 +820,10 @@ fn repair_from_model(model: managed_object_repair::Model) -> Result<RepairRecord
             bucket: model.bucket,
             key: model.logical_key,
         },
+        namespace_epoch: u64::try_from(model.namespace_epoch)
+            .map_err(|_| ManagedError::Corrupt("invalid repair namespace epoch".to_string()))?,
+        authority_cas_version: u64::try_from(model.authority_cas_version)
+            .map_err(|_| ManagedError::Corrupt("invalid repair authority CAS".to_string()))?,
         generation: model.generation,
         digest: model.digest,
         size: u64::try_from(model.size_bytes)
@@ -536,6 +854,12 @@ fn repair_active(repair: RepairRecord) -> Result<managed_object_repair::ActiveMo
         kind: Set(repair.kind.as_str().to_string()),
         state: Set("PENDING".to_string()),
         tenant_id: Set(repair.logical.tenant_id),
+        namespace_epoch: Set(i64::try_from(repair.namespace_epoch).map_err(|_| {
+            ManagedError::Corrupt("repair namespace epoch exceeds BIGINT".to_string())
+        })?),
+        authority_cas_version: Set(i64::try_from(repair.authority_cas_version).map_err(|_| {
+            ManagedError::Corrupt("repair authority CAS exceeds BIGINT".to_string())
+        })?),
         bucket: Set(repair.logical.bucket),
         logical_key: Set(repair.logical.key),
         generation: Set(repair.generation),
@@ -566,6 +890,88 @@ fn persistence(error: impl std::fmt::Display) -> ManagedError {
     ManagedError::Persistence(error.to_string())
 }
 
+async fn locked_namespace<C>(
+    db: &C,
+    tenant_id: &str,
+) -> Result<managed_namespace::Model, ManagedError>
+where
+    C: ConnectionTrait,
+{
+    let now = crate::transaction::unix_time_ms();
+    managed_namespace::Entity::insert(managed_namespace::ActiveModel {
+        tenant_id: Set(tenant_id.to_string()),
+        epoch: Set(1),
+        state: Set("ACTIVE".to_string()),
+        purge_operation_id: Set(None),
+        created_at_ms: Set(now),
+        updated_at_ms: Set(now),
+    })
+    .on_conflict(
+        OnConflict::column(managed_namespace::Column::TenantId)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await
+    .map_err(persistence)?;
+    managed_namespace::Entity::find_by_id(tenant_id.to_string())
+        .lock(LockType::Update)
+        .one(db)
+        .await
+        .map_err(persistence)?
+        .ok_or_else(|| ManagedError::Persistence("managed namespace disappeared".to_string()))
+}
+
+async fn require_active_namespace<C>(db: &C, tenant_id: &str) -> Result<i64, ManagedError>
+where
+    C: ConnectionTrait,
+{
+    let namespace = locked_namespace(db, tenant_id).await?;
+    if namespace.state != "ACTIVE" {
+        return Err(ManagedError::NamespaceFenced);
+    }
+    Ok(namespace.epoch)
+}
+
+fn purge_status_from_model(
+    purge: managed_namespace_purge::Model,
+) -> Result<NamespacePurgeStatus, ManagedError> {
+    match purge.state.as_str() {
+        "RUNNING" => Ok(NamespacePurgeStatus::Running),
+        "BLOCKED" => Ok(NamespacePurgeStatus::Blocked {
+            reason: purge
+                .blocked_reason
+                .unwrap_or_else(|| "managed namespace purge is blocked".to_string()),
+        }),
+        "COMPLETE" => Ok(NamespacePurgeStatus::Complete {
+            deleted_versions: u64::try_from(purge.deleted_versions).map_err(|_| {
+                ManagedError::Corrupt("purge deleted-version count is invalid".to_string())
+            })?,
+        }),
+        state => Err(ManagedError::Corrupt(format!(
+            "unknown managed namespace purge state {state:?}"
+        ))),
+    }
+}
+
+fn physical_target_from_model(
+    model: managed_physical_object_version::Model,
+) -> Result<PhysicalVersionTarget, ManagedError> {
+    Ok(PhysicalVersionTarget {
+        tenant_id: model.tenant_id,
+        namespace_epoch: u64::try_from(model.epoch)
+            .map_err(|_| ManagedError::Corrupt("physical version epoch is invalid".to_string()))?,
+        backend_id: model.backend_id,
+        backend_fingerprint: model.backend_fingerprint,
+        provider_bucket: model.provider_bucket,
+        physical_key: model.physical_key,
+        version_id: (!model.version_id.is_empty()).then_some(model.version_id),
+        versioning_mode: BackendVersioningMode::parse(&model.versioning_mode)?,
+        versioning_capability: BackendVersioningCapability::parse(&model.versioning_capability)?,
+        write_operation_id: model.write_operation_id,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct PostgresManagedRepository {
     db: DatabaseConnection,
@@ -576,6 +982,265 @@ impl PostgresManagedRepository {
         Self {
             db: SqlxPostgresConnector::from_sqlx_postgres_pool(pool),
         }
+    }
+
+    async fn finalize_purge_if_ready(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let purge = managed_namespace_purge::Entity::find_by_id(request.operation_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await
+            .map_err(persistence)?
+            .filter(|purge| purge.tenant_id == request.tenant_id);
+        let Some(purge) = purge else {
+            return Ok(NamespacePurgeStatus::Blocked {
+                reason: "managed namespace purge operation was not found".to_string(),
+            });
+        };
+        if purge.state == "COMPLETE" {
+            return purge_status_from_model(purge);
+        }
+
+        let now = crate::transaction::unix_time_ms();
+        managed_physical_object_version::Entity::update_many()
+            .col_expr(
+                managed_physical_object_version::Column::State,
+                Expr::value("PURGE_PENDING"),
+            )
+            .col_expr(
+                managed_physical_object_version::Column::PurgeOperationId,
+                Expr::value(Some(request.operation_id)),
+            )
+            .col_expr(
+                managed_physical_object_version::Column::LastError,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                managed_physical_object_version::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_physical_object_version::Column::TenantId.eq(&request.tenant_id))
+            .filter(managed_physical_object_version::Column::Epoch.lte(purge.epoch))
+            .filter(managed_physical_object_version::Column::State.eq("LIVE"))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+
+        let intents = managed_physical_write_intent::Entity::find()
+            .filter(managed_physical_write_intent::Column::TenantId.eq(&request.tenant_id))
+            .filter(managed_physical_write_intent::Column::Epoch.lte(purge.epoch))
+            .all(&txn)
+            .await
+            .map_err(persistence)?;
+        let targets = managed_physical_object_version::Entity::find()
+            .filter(managed_physical_object_version::Column::TenantId.eq(&request.tenant_id))
+            .filter(
+                managed_physical_object_version::Column::PurgeOperationId.eq(request.operation_id),
+            )
+            .all(&txn)
+            .await
+            .map_err(persistence)?;
+        if let Some(intent) = intents.iter().find(|intent| intent.state == "BLOCKED") {
+            let reason = intent
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "physical provider version history is ambiguous".to_string());
+            managed_namespace_purge::Entity::update_many()
+                .col_expr(
+                    managed_namespace_purge::Column::State,
+                    Expr::value("BLOCKED"),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::BlockedReason,
+                    Expr::value(Some(reason.clone())),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::UpdatedAtMs,
+                    Expr::value(now),
+                )
+                .filter(managed_namespace_purge::Column::OperationId.eq(request.operation_id))
+                .exec(&txn)
+                .await
+                .map_err(persistence)?;
+            txn.commit().await.map_err(persistence)?;
+            return Ok(NamespacePurgeStatus::Blocked { reason });
+        }
+        if !intents.is_empty() || targets.iter().any(|target| target.state == "PURGE_PENDING") {
+            txn.commit().await.map_err(persistence)?;
+            return Ok(NamespacePurgeStatus::Running);
+        }
+        if let Some(target) = targets
+            .iter()
+            .find(|target| target.state == "PURGE_BLOCKED")
+        {
+            let reason = target
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "physical version deletion is blocked".to_string());
+            managed_namespace_purge::Entity::update_many()
+                .col_expr(
+                    managed_namespace_purge::Column::State,
+                    Expr::value("BLOCKED"),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::BlockedReason,
+                    Expr::value(Some(reason.clone())),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::UpdatedAtMs,
+                    Expr::value(now),
+                )
+                .filter(managed_namespace_purge::Column::OperationId.eq(request.operation_id))
+                .exec(&txn)
+                .await
+                .map_err(persistence)?;
+            txn.commit().await.map_err(persistence)?;
+            return Ok(NamespacePurgeStatus::Blocked { reason });
+        }
+
+        let unresolved_journal_rows = object_operation::Entity::find()
+            .filter(object_operation::Column::TenantId.eq(&request.tenant_id))
+            .filter(object_operation::Column::NamespaceEpoch.lte(purge.epoch))
+            .filter(object_operation::Column::State.is_not_in([
+                crate::transaction::OperationState::Committed.as_str(),
+                crate::transaction::OperationState::ProvenAborted.as_str(),
+            ]))
+            .count(&txn)
+            .await
+            .map_err(persistence)?;
+        if unresolved_journal_rows > 0 {
+            let reason = "managed namespace has unresolved operation journal rows".to_string();
+            managed_namespace_purge::Entity::update_many()
+                .col_expr(
+                    managed_namespace_purge::Column::State,
+                    Expr::value("BLOCKED"),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::BlockedReason,
+                    Expr::value(Some(reason.clone())),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::UpdatedAtMs,
+                    Expr::value(now),
+                )
+                .filter(managed_namespace_purge::Column::OperationId.eq(request.operation_id))
+                .exec(&txn)
+                .await
+                .map_err(persistence)?;
+            txn.commit().await.map_err(persistence)?;
+            return Ok(NamespacePurgeStatus::Blocked { reason });
+        }
+
+        // Multipart staging owns encrypted artifacts and quota accounting in a
+        // separate repository. Completing purge while rows remain would leak
+        // those artifacts, so fail closed instead of deleting metadata alone.
+        let multipart_uploads = crate::entity::multipart_upload::Entity::find()
+            .filter(crate::entity::multipart_upload::Column::TenantId.eq(&request.tenant_id))
+            .filter(
+                Condition::any()
+                    .add(crate::entity::multipart_upload::Column::NamespaceEpoch.is_null())
+                    .add(crate::entity::multipart_upload::Column::NamespaceEpoch.lte(purge.epoch)),
+            )
+            .count(&txn)
+            .await
+            .map_err(persistence)?;
+        let multipart_activities = managed_multipart_activity::Entity::find()
+            .filter(managed_multipart_activity::Column::TenantId.eq(&request.tenant_id))
+            .filter(managed_multipart_activity::Column::NamespaceEpoch.lte(purge.epoch))
+            .count(&txn)
+            .await
+            .map_err(persistence)?;
+        if multipart_uploads > 0 || multipart_activities > 0 {
+            let reason =
+                "managed namespace has multipart staging artifacts that must be aborted first"
+                    .to_string();
+            managed_namespace_purge::Entity::update_many()
+                .col_expr(
+                    managed_namespace_purge::Column::State,
+                    Expr::value("BLOCKED"),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::BlockedReason,
+                    Expr::value(Some(reason.clone())),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::UpdatedAtMs,
+                    Expr::value(now),
+                )
+                .filter(managed_namespace_purge::Column::OperationId.eq(request.operation_id))
+                .exec(&txn)
+                .await
+                .map_err(persistence)?;
+            txn.commit().await.map_err(persistence)?;
+            return Ok(NamespacePurgeStatus::Blocked { reason });
+        }
+
+        managed_object_repair::Entity::delete_many()
+            .filter(managed_object_repair::Column::TenantId.eq(&request.tenant_id))
+            .filter(managed_object_repair::Column::NamespaceEpoch.lte(purge.epoch))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        object_operation::Entity::delete_many()
+            .filter(object_operation::Column::TenantId.eq(&request.tenant_id))
+            .filter(object_operation::Column::NamespaceEpoch.lte(purge.epoch))
+            .filter(object_operation::Column::State.is_in([
+                crate::transaction::OperationState::Committed.as_str(),
+                crate::transaction::OperationState::ProvenAborted.as_str(),
+            ]))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        managed_object_authority::Entity::delete_many()
+            .filter(managed_object_authority::Column::TenantId.eq(&request.tenant_id))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        managed_namespace::Entity::update_many()
+            .col_expr(
+                managed_namespace::Column::Epoch,
+                Expr::value(purge.epoch.saturating_add(1)),
+            )
+            .col_expr(managed_namespace::Column::State, Expr::value("ACTIVE"))
+            .col_expr(
+                managed_namespace::Column::PurgeOperationId,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(managed_namespace::Column::UpdatedAtMs, Expr::value(now))
+            .filter(managed_namespace::Column::TenantId.eq(&request.tenant_id))
+            .filter(managed_namespace::Column::PurgeOperationId.eq(request.operation_id))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        managed_namespace_purge::Entity::update_many()
+            .col_expr(
+                managed_namespace_purge::Column::State,
+                Expr::value("COMPLETE"),
+            )
+            .col_expr(
+                managed_namespace_purge::Column::BlockedReason,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                managed_namespace_purge::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .col_expr(
+                managed_namespace_purge::Column::CompletedAtMs,
+                Expr::value(Some(now)),
+            )
+            .filter(managed_namespace_purge::Column::OperationId.eq(request.operation_id))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        txn.commit().await.map_err(persistence)?;
+        let mut complete = purge;
+        complete.state = "COMPLETE".to_string();
+        complete.completed_at_ms = Some(now);
+        purge_status_from_model(complete)
     }
 }
 
@@ -633,6 +1298,18 @@ where
             .col_expr(
                 managed_object_repair::Column::UpdatedAtMs,
                 Expr::value(crate::transaction::unix_time_ms()),
+            )
+            .col_expr(
+                managed_object_repair::Column::NamespaceEpoch,
+                Expr::value(i64::try_from(revival.namespace_epoch).map_err(|_| {
+                    ManagedError::Corrupt("repair namespace epoch exceeds BIGINT".to_string())
+                })?),
+            )
+            .col_expr(
+                managed_object_repair::Column::AuthorityCasVersion,
+                Expr::value(i64::try_from(revival.authority_cas_version).map_err(|_| {
+                    ManagedError::Corrupt("repair authority CAS exceeds BIGINT".to_string())
+                })?),
             )
             .col_expr(
                 managed_object_repair::Column::SourceBackendId,
@@ -715,6 +1392,182 @@ impl ManagedRepository for PostgresManagedRepository {
         true
     }
 
+    async fn assert_namespace_active(&self, tenant_id: &str) -> Result<(), ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        require_active_namespace(&txn, tenant_id).await?;
+        txn.commit().await.map_err(persistence)
+    }
+
+    async fn begin_multipart_activity(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+    ) -> Result<u64, ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let epoch = require_active_namespace(&txn, tenant_id).await?;
+        let now = crate::transaction::unix_time_ms();
+        managed_multipart_activity::ActiveModel {
+            upload_id: Set(upload_id.to_string()),
+            tenant_id: Set(tenant_id.to_string()),
+            namespace_epoch: Set(epoch),
+            state: Set("REGISTERING".to_string()),
+            registration_expires_at_ms: Set(Some(now.saturating_add(10 * 60 * 1000))),
+            created_at_ms: Set(now),
+            updated_at_ms: Set(now),
+        }
+        .insert(&txn)
+        .await
+        .map_err(persistence)?;
+        txn.commit().await.map_err(persistence)?;
+        u64::try_from(epoch)
+            .map_err(|_| ManagedError::Corrupt("namespace epoch is invalid".to_string()))
+    }
+
+    async fn assert_multipart_activity(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+        allow_purging: bool,
+    ) -> Result<(), ManagedError> {
+        let epoch = i64::try_from(namespace_epoch).map_err(|_| ManagedError::Conflict)?;
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace = locked_namespace(&txn, tenant_id).await?;
+        if namespace.epoch != epoch
+            || (namespace.state != "ACTIVE" && !(allow_purging && namespace.state == "PURGING"))
+        {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        let activity = managed_multipart_activity::Entity::find_by_id(upload_id.to_string())
+            .one(&txn)
+            .await
+            .map_err(persistence)?;
+        if activity.is_none_or(|activity| {
+            activity.tenant_id != tenant_id
+                || activity.namespace_epoch != epoch
+                || activity.state != "ACTIVE"
+        }) {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        txn.commit().await.map_err(persistence)
+    }
+
+    async fn confirm_multipart_activity(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+    ) -> Result<(), ManagedError> {
+        let epoch = i64::try_from(namespace_epoch).map_err(|_| ManagedError::Conflict)?;
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace = locked_namespace(&txn, tenant_id).await?;
+        if namespace.state != "ACTIVE" || namespace.epoch != epoch {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        if let Some(existing) =
+            managed_multipart_activity::Entity::find_by_id(upload_id.to_string())
+                .one(&txn)
+                .await
+                .map_err(persistence)?
+            && existing.tenant_id == tenant_id
+            && existing.namespace_epoch == epoch
+            && existing.state == "ACTIVE"
+        {
+            txn.commit().await.map_err(persistence)?;
+            return Ok(());
+        }
+        let result = managed_multipart_activity::Entity::update_many()
+            .col_expr(
+                managed_multipart_activity::Column::State,
+                Expr::value("ACTIVE"),
+            )
+            .col_expr(
+                managed_multipart_activity::Column::RegistrationExpiresAtMs,
+                Expr::value(Option::<i64>::None),
+            )
+            .col_expr(
+                managed_multipart_activity::Column::UpdatedAtMs,
+                Expr::value(crate::transaction::unix_time_ms()),
+            )
+            .filter(managed_multipart_activity::Column::UploadId.eq(upload_id))
+            .filter(managed_multipart_activity::Column::TenantId.eq(tenant_id))
+            .filter(managed_multipart_activity::Column::NamespaceEpoch.eq(epoch))
+            .filter(managed_multipart_activity::Column::State.eq("REGISTERING"))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected != 1 {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        txn.commit().await.map_err(persistence)
+    }
+
+    async fn reconcile_multipart_activities(&self, limit: u64) -> Result<u64, ManagedError> {
+        let now = crate::transaction::unix_time_ms();
+        let candidates = managed_multipart_activity::Entity::find()
+            .filter(managed_multipart_activity::Column::State.eq("REGISTERING"))
+            .filter(managed_multipart_activity::Column::RegistrationExpiresAtMs.lte(now))
+            .limit(limit)
+            .all(&self.db)
+            .await
+            .map_err(persistence)?;
+        let count = candidates.len() as u64;
+        for activity in candidates {
+            let upload = crate::entity::multipart_upload::Entity::find()
+                .filter(crate::entity::multipart_upload::Column::UploadId.eq(&activity.upload_id))
+                .filter(crate::entity::multipart_upload::Column::TenantId.eq(&activity.tenant_id))
+                .filter(
+                    crate::entity::multipart_upload::Column::NamespaceEpoch
+                        .eq(activity.namespace_epoch),
+                )
+                .one(&self.db)
+                .await
+                .map_err(persistence)?;
+            if upload.is_some() {
+                managed_multipart_activity::Entity::update_many()
+                    .col_expr(
+                        managed_multipart_activity::Column::State,
+                        Expr::value("ACTIVE"),
+                    )
+                    .col_expr(
+                        managed_multipart_activity::Column::RegistrationExpiresAtMs,
+                        Expr::value(Option::<i64>::None),
+                    )
+                    .filter(managed_multipart_activity::Column::UploadId.eq(&activity.upload_id))
+                    .filter(managed_multipart_activity::Column::State.eq("REGISTERING"))
+                    .exec(&self.db)
+                    .await
+                    .map_err(persistence)?;
+            } else {
+                managed_multipart_activity::Entity::delete_many()
+                    .filter(managed_multipart_activity::Column::UploadId.eq(&activity.upload_id))
+                    .filter(managed_multipart_activity::Column::State.eq("REGISTERING"))
+                    .filter(managed_multipart_activity::Column::RegistrationExpiresAtMs.lte(now))
+                    .exec(&self.db)
+                    .await
+                    .map_err(persistence)?;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn finish_multipart_activity(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+    ) -> Result<(), ManagedError> {
+        let epoch = i64::try_from(namespace_epoch).map_err(|_| ManagedError::Conflict)?;
+        managed_multipart_activity::Entity::delete_many()
+            .filter(managed_multipart_activity::Column::UploadId.eq(upload_id))
+            .filter(managed_multipart_activity::Column::TenantId.eq(tenant_id))
+            .filter(managed_multipart_activity::Column::NamespaceEpoch.eq(epoch))
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        Ok(())
+    }
+
     async fn any_authority(&self) -> Result<bool, ManagedError> {
         Ok(managed_object_authority::Entity::find()
             .limit(1)
@@ -728,16 +1581,20 @@ impl ManagedRepository for PostgresManagedRepository {
         &self,
         logical: &LogicalObjectKey,
     ) -> Result<Option<ObjectAuthority>, ManagedError> {
-        managed_object_authority::Entity::find_by_id((
+        let txn = self.db.begin().await.map_err(persistence)?;
+        require_active_namespace(&txn, &logical.tenant_id).await?;
+        let authority = managed_object_authority::Entity::find_by_id((
             logical.tenant_id.clone(),
             logical.bucket.clone(),
             logical.key.clone(),
         ))
-        .one(&self.db)
+        .one(&txn)
         .await
         .map_err(persistence)?
         .map(authority_from_model)
-        .transpose()
+        .transpose()?;
+        txn.commit().await.map_err(persistence)?;
+        Ok(authority)
     }
 
     async fn publish(
@@ -746,6 +1603,49 @@ impl ManagedRepository for PostgresManagedRepository {
         expected_cas: Option<u64>,
     ) -> Result<ObjectAuthority, ManagedError> {
         let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace_epoch = require_active_namespace(&txn, &authority.logical.tenant_id).await?;
+        if !authority.tombstone {
+            let physical_key = generation_physical_key(&authority.logical, authority.generation);
+            let primary_versions = managed_physical_object_version::Entity::find()
+                .filter(
+                    managed_physical_object_version::Column::TenantId
+                        .eq(&authority.logical.tenant_id),
+                )
+                .filter(
+                    managed_physical_object_version::Column::BackendId
+                        .eq(&authority.primary_backend_id),
+                )
+                .filter(managed_physical_object_version::Column::PhysicalKey.eq(&physical_key))
+                .count(&txn)
+                .await
+                .map_err(persistence)?;
+            if primary_versions == 0 {
+                return Err(ManagedError::Persistence(
+                    "managed primary cannot publish before its physical versions are ledgered"
+                        .to_string(),
+                ));
+            }
+            if authority.replica_status == CopyStatus::Ready
+                && let Some(replica) = &authority.replica_backend_id
+            {
+                let replica_versions = managed_physical_object_version::Entity::find()
+                    .filter(
+                        managed_physical_object_version::Column::TenantId
+                            .eq(&authority.logical.tenant_id),
+                    )
+                    .filter(managed_physical_object_version::Column::BackendId.eq(replica))
+                    .filter(managed_physical_object_version::Column::PhysicalKey.eq(&physical_key))
+                    .count(&txn)
+                    .await
+                    .map_err(persistence)?;
+                if replica_versions == 0 {
+                    return Err(ManagedError::Persistence(
+                        "managed replica cannot publish before its physical versions are ledgered"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         let existing = managed_object_authority::Entity::find_by_id((
             authority.logical.tenant_id.clone(),
             authority.logical.bucket.clone(),
@@ -791,11 +1691,34 @@ impl ManagedRepository for PostgresManagedRepository {
                 }
             }
         }
-        for repair in publication_repairs(&authority) {
+        for mut repair in publication_repairs(&authority) {
+            repair.namespace_epoch = u64::try_from(namespace_epoch)
+                .map_err(|_| ManagedError::Corrupt("namespace epoch is invalid".to_string()))?;
             insert_repair(&txn, repair).await?;
         }
         if let Some(existing) = existing.filter(|value| !value.tombstone) {
-            for repair in cleanup_repairs(&existing) {
+            for mut repair in cleanup_repairs(&existing) {
+                let targets = managed_physical_object_version::Entity::find()
+                    .filter(
+                        managed_physical_object_version::Column::TenantId
+                            .eq(&repair.logical.tenant_id),
+                    )
+                    .filter(
+                        managed_physical_object_version::Column::BackendId
+                            .eq(&repair.target_backend_id),
+                    )
+                    .filter(
+                        managed_physical_object_version::Column::PhysicalKey
+                            .eq(&repair.physical_key),
+                    )
+                    .count(&txn)
+                    .await
+                    .map_err(persistence)?;
+                if targets == 0 {
+                    continue;
+                }
+                repair.namespace_epoch = u64::try_from(namespace_epoch)
+                    .map_err(|_| ManagedError::Corrupt("namespace epoch is invalid".to_string()))?;
                 insert_repair(&txn, repair).await?;
             }
         }
@@ -834,8 +1757,52 @@ impl ManagedRepository for PostgresManagedRepository {
         self.publish(tombstone, expected_cas).await
     }
 
-    async fn enqueue(&self, repair: RepairRecord) -> Result<(), ManagedError> {
-        insert_repair(&self.db, repair).await
+    async fn enqueue(&self, mut repair: RepairRecord) -> Result<(), ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace_epoch = require_active_namespace(&txn, &repair.logical.tenant_id).await?;
+        let current = managed_object_authority::Entity::find_by_id((
+            repair.logical.tenant_id.clone(),
+            repair.logical.bucket.clone(),
+            repair.logical.key.clone(),
+        ))
+        .lock(LockType::Update)
+        .one(&txn)
+        .await
+        .map_err(persistence)?
+        .map(authority_from_model)
+        .transpose()?;
+        if repair.kind == RepairKind::DeleteGeneration {
+            let targets = managed_physical_object_version::Entity::find()
+                .filter(
+                    managed_physical_object_version::Column::TenantId.eq(&repair.logical.tenant_id),
+                )
+                .filter(
+                    managed_physical_object_version::Column::BackendId
+                        .eq(&repair.target_backend_id),
+                )
+                .filter(
+                    managed_physical_object_version::Column::PhysicalKey.eq(&repair.physical_key),
+                )
+                .all(&txn)
+                .await
+                .map_err(persistence)?;
+            if targets.is_empty() {
+                txn.commit().await.map_err(persistence)?;
+                return Ok(());
+            }
+            if targets.iter().any(|target| target.epoch != namespace_epoch) {
+                return Err(ManagedError::Conflict);
+            }
+        } else if current.as_ref().is_none_or(|authority| {
+            authority.generation != repair.generation
+                || authority.cas_version != repair.authority_cas_version
+        }) {
+            return Err(ManagedError::Conflict);
+        }
+        repair.namespace_epoch = u64::try_from(namespace_epoch)
+            .map_err(|_| ManagedError::Corrupt("namespace epoch is invalid".to_string()))?;
+        insert_repair(&txn, repair).await?;
+        txn.commit().await.map_err(persistence)
     }
 
     async fn claim_repairs(
@@ -862,6 +1829,13 @@ impl ManagedRepository for PostgresManagedRepository {
             .map_err(persistence)?;
         let mut claimed = Vec::new();
         for candidate in candidates {
+            let txn = self.db.begin().await.map_err(persistence)?;
+            match require_active_namespace(&txn, &candidate.tenant_id).await {
+                Ok(epoch) if epoch == candidate.namespace_epoch => {}
+                Ok(_) => continue,
+                Err(ManagedError::NamespaceFenced) => continue,
+                Err(error) => return Err(error),
+            }
             let lease_token = Uuid::now_v7();
             let result = managed_object_repair::Entity::update_many()
                 .col_expr(managed_object_repair::Column::State, Expr::value("LEASED"))
@@ -888,7 +1862,7 @@ impl ManagedRepository for PostgresManagedRepository {
                                 .add(managed_object_repair::Column::LeaseExpiresAtMs.lte(now)),
                         ),
                 )
-                .exec(&self.db)
+                .exec(&txn)
                 .await
                 .map_err(persistence)?;
             if result.rows_affected == 1 {
@@ -899,6 +1873,7 @@ impl ManagedRepository for PostgresManagedRepository {
                 record.lease_expires_at_ms = Some(lease_until_ms);
                 claimed.push(record);
             }
+            txn.commit().await.map_err(persistence)?;
         }
         Ok(claimed)
     }
@@ -929,6 +1904,10 @@ impl ManagedRepository for PostgresManagedRepository {
 
     async fn complete_repair(&self, repair: &RepairRecord) -> Result<bool, ManagedError> {
         let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace_epoch = require_active_namespace(&txn, &repair.logical.tenant_id).await?;
+        if u64::try_from(namespace_epoch).ok() != Some(repair.namespace_epoch) {
+            return Err(ManagedError::Conflict);
+        }
         let now = crate::transaction::unix_time_ms();
         if repair.lease_token != Some(repair.id) {
             return Err(ManagedError::Conflict);
@@ -960,6 +1939,26 @@ impl ManagedRepository for PostgresManagedRepository {
         }
         let mut authority_updated = false;
         if repair.kind != RepairKind::DeleteGeneration {
+            let target_versions = managed_physical_object_version::Entity::find()
+                .filter(
+                    managed_physical_object_version::Column::TenantId.eq(&repair.logical.tenant_id),
+                )
+                .filter(
+                    managed_physical_object_version::Column::BackendId
+                        .eq(&repair.target_backend_id),
+                )
+                .filter(
+                    managed_physical_object_version::Column::PhysicalKey.eq(&repair.physical_key),
+                )
+                .count(&txn)
+                .await
+                .map_err(persistence)?;
+            if target_versions == 0 {
+                return Err(ManagedError::Persistence(
+                    "managed repair cannot publish before target physical versions are ledgered"
+                        .to_string(),
+                ));
+            }
             let current = managed_object_authority::Entity::find_by_id((
                 repair.logical.tenant_id.clone(),
                 repair.logical.bucket.clone(),
@@ -972,6 +1971,8 @@ impl ManagedRepository for PostgresManagedRepository {
             if let Some(current) = current {
                 let mut authority = authority_from_model(current.clone())?;
                 if authority.generation == repair.generation
+                    && (repair.kind == RepairKind::Placement
+                        || authority.cas_version == repair.authority_cas_version)
                     && !authority.tombstone
                     && apply_repair_to_authority(&mut authority, repair)?
                 {
@@ -1041,12 +2042,703 @@ impl ManagedRepository for PostgresManagedRepository {
         }
         Ok(())
     }
+
+    async fn begin_physical_write(
+        &self,
+        intent: PhysicalWriteIntent,
+    ) -> Result<PhysicalWriteLease, ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let epoch = require_active_namespace(&txn, &intent.tenant_id).await?;
+        let now = crate::transaction::unix_time_ms();
+        let lease_token = Uuid::now_v7();
+        let expected = intent.clone();
+        let inserted = managed_physical_write_intent::Entity::insert(
+            managed_physical_write_intent::ActiveModel {
+                intent_id: Set(intent.intent_id),
+                tenant_id: Set(intent.tenant_id),
+                epoch: Set(epoch),
+                backend_id: Set(intent.backend_id),
+                backend_fingerprint: Set(intent.backend_fingerprint),
+                provider_bucket: Set(intent.provider_bucket),
+                physical_key: Set(intent.physical_key),
+                versioning_mode: Set(intent.versioning_mode.as_str().to_string()),
+                versioning_capability: Set(intent.versioning_capability.as_str().to_string()),
+                state: Set("PENDING".to_string()),
+                last_error: Set(None),
+                lease_owner: Set(intent.lease_owner.clone()),
+                lease_token: Set(lease_token),
+                lease_expires_at_ms: Set(now.saturating_add(PHYSICAL_WRITE_LEASE_MS)),
+                created_at_ms: Set(now),
+                updated_at_ms: Set(now),
+            },
+        )
+        .on_conflict(
+            OnConflict::column(managed_physical_write_intent::Column::IntentId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(&txn)
+        .await
+        .map_err(persistence)?;
+        if inserted == 0 {
+            let existing = managed_physical_write_intent::Entity::find_by_id(expected.intent_id)
+                .one(&txn)
+                .await
+                .map_err(persistence)?
+                .ok_or(ManagedError::Conflict)?;
+            if existing.tenant_id != expected.tenant_id
+                || existing.epoch != epoch
+                || existing.backend_id != expected.backend_id
+                || existing.backend_fingerprint != expected.backend_fingerprint
+                || existing.provider_bucket != expected.provider_bucket
+                || existing.physical_key != expected.physical_key
+                || existing.versioning_mode != expected.versioning_mode.as_str()
+                || existing.versioning_capability != expected.versioning_capability.as_str()
+                || existing.lease_owner != expected.lease_owner
+            {
+                return Err(ManagedError::Conflict);
+            }
+            txn.commit().await.map_err(persistence)?;
+            return Ok(PhysicalWriteLease {
+                intent_id: existing.intent_id,
+                namespace_epoch: u64::try_from(existing.epoch)
+                    .map_err(|_| ManagedError::Conflict)?,
+                owner: existing.lease_owner,
+                token: existing.lease_token,
+            });
+        }
+        txn.commit().await.map_err(persistence)?;
+        Ok(PhysicalWriteLease {
+            intent_id: intent.intent_id,
+            namespace_epoch: u64::try_from(epoch)
+                .map_err(|_| ManagedError::Corrupt("namespace epoch is invalid".to_string()))?,
+            owner: intent.lease_owner,
+            token: lease_token,
+        })
+    }
+
+    async fn pending_physical_write_intents(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<DurablePhysicalWriteIntent>, ManagedError> {
+        managed_physical_write_intent::Entity::find()
+            .order_by_asc(managed_physical_write_intent::Column::UpdatedAtMs)
+            .limit(limit)
+            .all(&self.db)
+            .await
+            .map_err(persistence)?
+            .into_iter()
+            .map(|intent| {
+                Ok(DurablePhysicalWriteIntent {
+                    namespace_epoch: u64::try_from(intent.epoch).map_err(|_| {
+                        ManagedError::Corrupt("physical write intent epoch is invalid".to_string())
+                    })?,
+                    blocked_reason: intent.last_error,
+                    lease_expires_at_ms: intent.lease_expires_at_ms,
+                    lease: PhysicalWriteLease {
+                        intent_id: intent.intent_id,
+                        namespace_epoch: u64::try_from(intent.epoch).map_err(|_| {
+                            ManagedError::Corrupt(
+                                "physical write intent epoch is invalid".to_string(),
+                            )
+                        })?,
+                        owner: intent.lease_owner.clone(),
+                        token: intent.lease_token,
+                    },
+                    intent: PhysicalWriteIntent {
+                        intent_id: intent.intent_id,
+                        tenant_id: intent.tenant_id,
+                        backend_id: intent.backend_id,
+                        backend_fingerprint: intent.backend_fingerprint,
+                        provider_bucket: intent.provider_bucket,
+                        physical_key: intent.physical_key,
+                        versioning_mode: BackendVersioningMode::parse(&intent.versioning_mode)?,
+                        versioning_capability: BackendVersioningCapability::parse(
+                            &intent.versioning_capability,
+                        )?,
+                        lease_owner: intent.lease_owner,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    async fn renew_physical_write_intent(
+        &self,
+        lease: &PhysicalWriteLease,
+        lease_expires_at_ms: i64,
+    ) -> Result<(), ManagedError> {
+        let result = managed_physical_write_intent::Entity::update_many()
+            .col_expr(
+                managed_physical_write_intent::Column::LeaseExpiresAtMs,
+                Expr::value(lease_expires_at_ms),
+            )
+            .col_expr(
+                managed_physical_write_intent::Column::UpdatedAtMs,
+                Expr::value(crate::transaction::unix_time_ms()),
+            )
+            .filter(managed_physical_write_intent::Column::IntentId.eq(lease.intent_id))
+            .filter(managed_physical_write_intent::Column::LeaseOwner.eq(&lease.owner))
+            .filter(managed_physical_write_intent::Column::LeaseToken.eq(lease.token))
+            .filter(
+                managed_physical_write_intent::Column::LeaseExpiresAtMs
+                    .gt(crate::transaction::unix_time_ms()),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected != 1 {
+            return Err(ManagedError::Conflict);
+        }
+        Ok(())
+    }
+
+    async fn claim_expired_physical_write_intent(
+        &self,
+        intent_id: Uuid,
+        owner: &str,
+        lease_expires_at_ms: i64,
+    ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
+        let token = Uuid::now_v7();
+        let result = managed_physical_write_intent::Entity::update_many()
+            .col_expr(
+                managed_physical_write_intent::Column::LeaseOwner,
+                Expr::value(owner.to_string()),
+            )
+            .col_expr(
+                managed_physical_write_intent::Column::LeaseToken,
+                Expr::value(token),
+            )
+            .col_expr(
+                managed_physical_write_intent::Column::LeaseExpiresAtMs,
+                Expr::value(lease_expires_at_ms),
+            )
+            .filter(managed_physical_write_intent::Column::IntentId.eq(intent_id))
+            .filter(
+                managed_physical_write_intent::Column::LeaseExpiresAtMs
+                    .lte(crate::transaction::unix_time_ms()),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected != 1 {
+            return Ok(None);
+        }
+        let intent = managed_physical_write_intent::Entity::find_by_id(intent_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .ok_or(ManagedError::Conflict)?;
+        Ok(Some(PhysicalWriteLease {
+            intent_id,
+            namespace_epoch: u64::try_from(intent.epoch).map_err(|_| ManagedError::Conflict)?,
+            owner: owner.to_string(),
+            token,
+        }))
+    }
+
+    async fn commit_physical_write(
+        &self,
+        lease: &PhysicalWriteLease,
+        superseded_version_ids: &[String],
+        version_id: Option<&str>,
+    ) -> Result<(), ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let Some(intent) = managed_physical_write_intent::Entity::find_by_id(lease.intent_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await
+            .map_err(persistence)?
+        else {
+            // A committed retry and a confirmed abort are both terminal and
+            // safe; neither can create a new provider version here.
+            txn.commit().await.map_err(persistence)?;
+            return Ok(());
+        };
+        if intent.lease_owner != lease.owner
+            || intent.lease_token != lease.token
+            || intent.lease_expires_at_ms <= crate::transaction::unix_time_ms()
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let namespace = locked_namespace(&txn, &intent.tenant_id).await?;
+        let now = crate::transaction::unix_time_ms();
+        let purging = namespace.state == "PURGING";
+        for recorded_version_id in superseded_version_ids
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(version_id.unwrap_or_default()))
+        {
+            managed_physical_object_version::Entity::insert(
+                managed_physical_object_version::ActiveModel {
+                    tenant_id: Set(intent.tenant_id.clone()),
+                    backend_id: Set(intent.backend_id.clone()),
+                    backend_fingerprint: Set(intent.backend_fingerprint.clone()),
+                    provider_bucket: Set(intent.provider_bucket.clone()),
+                    physical_key: Set(intent.physical_key.clone()),
+                    versioning_mode: Set(intent.versioning_mode.clone()),
+                    versioning_capability: Set(intent.versioning_capability.clone()),
+                    write_operation_id: Set(lease.intent_id),
+                    version_id: Set(recorded_version_id.to_string()),
+                    epoch: Set(intent.epoch),
+                    state: Set(if purging {
+                        "PURGE_PENDING".to_string()
+                    } else {
+                        "LIVE".to_string()
+                    }),
+                    purge_operation_id: Set(if purging {
+                        namespace.purge_operation_id
+                    } else {
+                        None
+                    }),
+                    last_error: Set(None),
+                    created_at_ms: Set(now),
+                    updated_at_ms: Set(now),
+                },
+            )
+            .on_conflict(
+                OnConflict::columns([
+                    managed_physical_object_version::Column::TenantId,
+                    managed_physical_object_version::Column::BackendId,
+                    managed_physical_object_version::Column::ProviderBucket,
+                    managed_physical_object_version::Column::PhysicalKey,
+                    managed_physical_object_version::Column::VersionId,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec_without_returning(&txn)
+            .await
+            .map_err(persistence)?;
+        }
+        managed_physical_write_intent::Entity::delete_by_id(lease.intent_id)
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        txn.commit().await.map_err(persistence)
+    }
+
+    async fn abort_physical_write(&self, lease: &PhysicalWriteLease) -> Result<(), ManagedError> {
+        let result = managed_physical_write_intent::Entity::delete_many()
+            .filter(managed_physical_write_intent::Column::IntentId.eq(lease.intent_id))
+            .filter(managed_physical_write_intent::Column::LeaseOwner.eq(&lease.owner))
+            .filter(managed_physical_write_intent::Column::LeaseToken.eq(lease.token))
+            .filter(
+                managed_physical_write_intent::Column::LeaseExpiresAtMs
+                    .gt(crate::transaction::unix_time_ms()),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        (result.rows_affected == 1)
+            .then_some(())
+            .ok_or(ManagedError::Conflict)
+    }
+
+    async fn block_physical_write(
+        &self,
+        lease: &PhysicalWriteLease,
+        reason: &str,
+    ) -> Result<(), ManagedError> {
+        let result = managed_physical_write_intent::Entity::update_many()
+            .col_expr(
+                managed_physical_write_intent::Column::State,
+                Expr::value("BLOCKED"),
+            )
+            .col_expr(
+                managed_physical_write_intent::Column::LastError,
+                Expr::value(Some(reason.chars().take(1024).collect::<String>())),
+            )
+            .col_expr(
+                managed_physical_write_intent::Column::UpdatedAtMs,
+                Expr::value(crate::transaction::unix_time_ms()),
+            )
+            .filter(managed_physical_write_intent::Column::IntentId.eq(lease.intent_id))
+            .filter(managed_physical_write_intent::Column::LeaseOwner.eq(&lease.owner))
+            .filter(managed_physical_write_intent::Column::LeaseToken.eq(lease.token))
+            .filter(
+                managed_physical_write_intent::Column::LeaseExpiresAtMs
+                    .gt(crate::transaction::unix_time_ms()),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        (result.rows_affected == 1)
+            .then_some(())
+            .ok_or(ManagedError::Conflict)
+    }
+
+    async fn physical_versions(
+        &self,
+        tenant_id: &str,
+        backend_id: &str,
+        provider_bucket: &str,
+        physical_key: &str,
+    ) -> Result<Vec<PhysicalVersionTarget>, ManagedError> {
+        managed_physical_object_version::Entity::find()
+            .filter(managed_physical_object_version::Column::TenantId.eq(tenant_id))
+            .filter(managed_physical_object_version::Column::BackendId.eq(backend_id))
+            .filter(managed_physical_object_version::Column::ProviderBucket.eq(provider_bucket))
+            .filter(managed_physical_object_version::Column::PhysicalKey.eq(physical_key))
+            .all(&self.db)
+            .await
+            .map_err(persistence)?
+            .into_iter()
+            .map(physical_target_from_model)
+            .collect()
+    }
+
+    async fn forget_physical_version(
+        &self,
+        target: &PhysicalVersionTarget,
+    ) -> Result<(), ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        managed_physical_object_version::Entity::delete_many()
+            .filter(managed_physical_object_version::Column::TenantId.eq(&target.tenant_id))
+            .filter(managed_physical_object_version::Column::BackendId.eq(&target.backend_id))
+            .filter(
+                managed_physical_object_version::Column::ProviderBucket.eq(&target.provider_bucket),
+            )
+            .filter(managed_physical_object_version::Column::PhysicalKey.eq(&target.physical_key))
+            .filter(
+                managed_physical_object_version::Column::VersionId
+                    .eq(target.version_id.as_deref().unwrap_or_default()),
+            )
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        let remaining = managed_physical_object_version::Entity::find()
+            .filter(
+                managed_physical_object_version::Column::WriteOperationId
+                    .eq(target.write_operation_id),
+            )
+            .count(&txn)
+            .await
+            .map_err(persistence)?;
+        if remaining == 0 {
+            object_operation::Entity::delete_many()
+                .filter(object_operation::Column::Id.eq(target.write_operation_id))
+                .filter(object_operation::Column::State.is_in([
+                    crate::transaction::OperationState::Committed.as_str(),
+                    crate::transaction::OperationState::ProvenAborted.as_str(),
+                ]))
+                .exec(&txn)
+                .await
+                .map_err(persistence)?;
+        }
+        txn.commit().await.map_err(persistence)
+    }
+
+    async fn purge_namespace(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        if let Some(existing) = managed_namespace_purge::Entity::find_by_id(request.operation_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+        {
+            if existing.tenant_id != request.tenant_id {
+                return Ok(NamespacePurgeStatus::Blocked {
+                    reason: "purge operation belongs to another namespace".to_string(),
+                });
+            }
+            return self.finalize_purge_if_ready(request).await;
+        }
+
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace = locked_namespace(&txn, &request.tenant_id).await?;
+        if let Some(existing) = managed_namespace_purge::Entity::find_by_id(request.operation_id)
+            .one(&txn)
+            .await
+            .map_err(persistence)?
+        {
+            txn.commit().await.map_err(persistence)?;
+            if existing.tenant_id != request.tenant_id {
+                return Ok(NamespacePurgeStatus::Blocked {
+                    reason: "purge operation belongs to another namespace".to_string(),
+                });
+            }
+            return self.finalize_purge_if_ready(request).await;
+        }
+        if namespace.state == "PURGING" {
+            return Ok(NamespacePurgeStatus::Blocked {
+                reason: "another managed namespace purge is already running".to_string(),
+            });
+        }
+        let authorities = managed_object_authority::Entity::find()
+            .filter(managed_object_authority::Column::TenantId.eq(&request.tenant_id))
+            .all(&txn)
+            .await
+            .map_err(persistence)?;
+        for authority_model in authorities {
+            let authority = authority_from_model(authority_model)?;
+            if authority.tombstone {
+                continue;
+            }
+            let physical_key = generation_physical_key(&authority.logical, authority.generation);
+            let required_backends = std::iter::once(authority.primary_backend_id.as_str()).chain(
+                authority
+                    .replica_backend_id
+                    .as_deref()
+                    .filter(|_| authority.replica_status == CopyStatus::Ready),
+            );
+            for backend_id in required_backends {
+                let versions = managed_physical_object_version::Entity::find()
+                    .filter(
+                        managed_physical_object_version::Column::TenantId.eq(&request.tenant_id),
+                    )
+                    .filter(managed_physical_object_version::Column::BackendId.eq(backend_id))
+                    .filter(managed_physical_object_version::Column::PhysicalKey.eq(&physical_key))
+                    .count(&txn)
+                    .await
+                    .map_err(persistence)?;
+                if versions == 0 {
+                    return Ok(NamespacePurgeStatus::Blocked {
+                        reason: format!(
+                            "managed authority references unledgered physical versions on backend {backend_id}"
+                        ),
+                    });
+                }
+            }
+        }
+        let now = crate::transaction::unix_time_ms();
+        managed_namespace_purge::Entity::insert(managed_namespace_purge::ActiveModel {
+            operation_id: Set(request.operation_id),
+            tenant_id: Set(request.tenant_id.clone()),
+            epoch: Set(namespace.epoch),
+            state: Set("RUNNING".to_string()),
+            blocked_reason: Set(None),
+            deleted_versions: Set(0),
+            created_at_ms: Set(now),
+            updated_at_ms: Set(now),
+            completed_at_ms: Set(None),
+        })
+        .exec(&txn)
+        .await
+        .map_err(persistence)?;
+        managed_namespace::Entity::update_many()
+            .col_expr(managed_namespace::Column::State, Expr::value("PURGING"))
+            .col_expr(
+                managed_namespace::Column::PurgeOperationId,
+                Expr::value(Some(request.operation_id)),
+            )
+            .col_expr(managed_namespace::Column::UpdatedAtMs, Expr::value(now))
+            .filter(managed_namespace::Column::TenantId.eq(&request.tenant_id))
+            .filter(managed_namespace::Column::State.eq("ACTIVE"))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        managed_physical_object_version::Entity::update_many()
+            .col_expr(
+                managed_physical_object_version::Column::State,
+                Expr::value("PURGE_PENDING"),
+            )
+            .col_expr(
+                managed_physical_object_version::Column::PurgeOperationId,
+                Expr::value(Some(request.operation_id)),
+            )
+            .col_expr(
+                managed_physical_object_version::Column::LastError,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                managed_physical_object_version::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_physical_object_version::Column::TenantId.eq(&request.tenant_id))
+            .filter(managed_physical_object_version::Column::Epoch.lte(namespace.epoch))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        txn.commit().await.map_err(persistence)?;
+        self.finalize_purge_if_ready(request).await
+    }
+
+    async fn namespace_purge_status(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        self.finalize_purge_if_ready(request).await
+    }
+
+    async fn purge_targets(
+        &self,
+        request: &NamespacePurgeRequest,
+        limit: u64,
+    ) -> Result<Vec<PhysicalVersionTarget>, ManagedError> {
+        let purge = managed_namespace_purge::Entity::find_by_id(request.operation_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?;
+        if purge.as_ref().map(|value| value.tenant_id.as_str()) != Some(&request.tenant_id) {
+            return Err(ManagedError::Conflict);
+        }
+        managed_physical_object_version::Entity::find()
+            .filter(managed_physical_object_version::Column::TenantId.eq(&request.tenant_id))
+            .filter(
+                managed_physical_object_version::Column::PurgeOperationId.eq(request.operation_id),
+            )
+            .filter(
+                Condition::any()
+                    .add(managed_physical_object_version::Column::State.eq("PURGE_PENDING"))
+                    .add(managed_physical_object_version::Column::State.eq("PURGE_BLOCKED")),
+            )
+            .order_by_asc(managed_physical_object_version::Column::UpdatedAtMs)
+            .limit(limit)
+            .all(&self.db)
+            .await
+            .map_err(persistence)?
+            .into_iter()
+            .map(physical_target_from_model)
+            .collect()
+    }
+
+    async fn mark_purge_target_deleted(
+        &self,
+        request: &NamespacePurgeRequest,
+        target: &PhysicalVersionTarget,
+    ) -> Result<(), ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let result = managed_physical_object_version::Entity::delete_many()
+            .filter(managed_physical_object_version::Column::TenantId.eq(&target.tenant_id))
+            .filter(managed_physical_object_version::Column::BackendId.eq(&target.backend_id))
+            .filter(
+                managed_physical_object_version::Column::ProviderBucket.eq(&target.provider_bucket),
+            )
+            .filter(managed_physical_object_version::Column::PhysicalKey.eq(&target.physical_key))
+            .filter(
+                managed_physical_object_version::Column::VersionId
+                    .eq(target.version_id.as_deref().unwrap_or_default()),
+            )
+            .filter(
+                managed_physical_object_version::Column::PurgeOperationId.eq(request.operation_id),
+            )
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected == 1 {
+            managed_namespace_purge::Entity::update_many()
+                .col_expr(
+                    managed_namespace_purge::Column::DeletedVersions,
+                    Expr::col(managed_namespace_purge::Column::DeletedVersions).add(1),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::State,
+                    Expr::value("RUNNING"),
+                )
+                .col_expr(
+                    managed_namespace_purge::Column::BlockedReason,
+                    Expr::value(Option::<String>::None),
+                )
+                .filter(managed_namespace_purge::Column::OperationId.eq(request.operation_id))
+                .exec(&txn)
+                .await
+                .map_err(persistence)?;
+            let remaining = managed_physical_object_version::Entity::find()
+                .filter(
+                    managed_physical_object_version::Column::WriteOperationId
+                        .eq(target.write_operation_id),
+                )
+                .count(&txn)
+                .await
+                .map_err(persistence)?;
+            if remaining == 0 {
+                object_operation::Entity::delete_many()
+                    .filter(object_operation::Column::Id.eq(target.write_operation_id))
+                    .filter(object_operation::Column::State.is_in([
+                        crate::transaction::OperationState::Committed.as_str(),
+                        crate::transaction::OperationState::ProvenAborted.as_str(),
+                    ]))
+                    .exec(&txn)
+                    .await
+                    .map_err(persistence)?;
+            }
+        }
+        txn.commit().await.map_err(persistence)
+    }
+
+    async fn mark_purge_target_blocked(
+        &self,
+        request: &NamespacePurgeRequest,
+        target: &PhysicalVersionTarget,
+        reason: &str,
+    ) -> Result<(), ManagedError> {
+        let reason = reason.chars().take(1024).collect::<String>();
+        let now = crate::transaction::unix_time_ms();
+        let txn = self.db.begin().await.map_err(persistence)?;
+        managed_physical_object_version::Entity::update_many()
+            .col_expr(
+                managed_physical_object_version::Column::State,
+                Expr::value("PURGE_BLOCKED"),
+            )
+            .col_expr(
+                managed_physical_object_version::Column::LastError,
+                Expr::value(Some(reason.clone())),
+            )
+            .col_expr(
+                managed_physical_object_version::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_physical_object_version::Column::TenantId.eq(&target.tenant_id))
+            .filter(managed_physical_object_version::Column::BackendId.eq(&target.backend_id))
+            .filter(
+                managed_physical_object_version::Column::ProviderBucket.eq(&target.provider_bucket),
+            )
+            .filter(managed_physical_object_version::Column::PhysicalKey.eq(&target.physical_key))
+            .filter(
+                managed_physical_object_version::Column::VersionId
+                    .eq(target.version_id.as_deref().unwrap_or_default()),
+            )
+            .filter(
+                managed_physical_object_version::Column::PurgeOperationId.eq(request.operation_id),
+            )
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        managed_namespace_purge::Entity::update_many()
+            .col_expr(
+                managed_namespace_purge::Column::State,
+                Expr::value("BLOCKED"),
+            )
+            .col_expr(
+                managed_namespace_purge::Column::BlockedReason,
+                Expr::value(Some(reason)),
+            )
+            .col_expr(
+                managed_namespace_purge::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_namespace_purge::Column::OperationId.eq(request.operation_id))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        txn.commit().await.map_err(persistence)
+    }
 }
 
 #[derive(Default)]
 struct MemoryState {
     authorities: HashMap<LogicalObjectKey, ObjectAuthority>,
     repairs: HashMap<Uuid, (RepairRecord, String)>,
+    physical_write_intents: HashMap<Uuid, PhysicalWriteIntent>,
+    blocked_write_intents: HashMap<Uuid, String>,
+    physical_write_leases: HashMap<Uuid, i64>,
+    physical_write_tokens: HashMap<Uuid, Uuid>,
+    physical_versions: Vec<PhysicalVersionTarget>,
+    fenced_namespaces: HashMap<String, Uuid>,
+    purges: HashMap<Uuid, MemoryPurge>,
+    namespace_epochs: HashMap<String, u64>,
+    multipart_activities: HashMap<String, (String, u64)>,
+    confirmed_multipart_activities: HashSet<String>,
+    multipart_registration_expiry: HashMap<String, i64>,
+}
+
+#[derive(Clone)]
+struct MemoryPurge {
+    tenant_id: String,
+    status: NamespacePurgeStatus,
+    deleted_versions: u64,
 }
 
 #[derive(Clone, Default)]
@@ -1057,6 +2749,67 @@ pub struct InMemoryManagedRepository {
 impl InMemoryManagedRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn finish_purge(state: &mut MemoryState, operation_id: Uuid) -> NamespacePurgeStatus {
+        let Some(purge) = state.purges.get(&operation_id).cloned() else {
+            return NamespacePurgeStatus::Blocked {
+                reason: "managed namespace purge operation was not found".to_string(),
+            };
+        };
+        if matches!(purge.status, NamespacePurgeStatus::Complete { .. }) {
+            return purge.status;
+        }
+        if let Some(reason) = state
+            .blocked_write_intents
+            .iter()
+            .find_map(|(intent_id, reason)| {
+                state
+                    .physical_write_intents
+                    .get(intent_id)
+                    .filter(|intent| intent.tenant_id == purge.tenant_id)
+                    .map(|_| reason.clone())
+            })
+        {
+            let blocked = NamespacePurgeStatus::Blocked { reason };
+            if let Some(purge) = state.purges.get_mut(&operation_id) {
+                purge.status = blocked.clone();
+            }
+            return blocked;
+        }
+        if state
+            .physical_write_intents
+            .values()
+            .any(|intent| intent.tenant_id == purge.tenant_id)
+            || state
+                .physical_versions
+                .iter()
+                .any(|target| target.tenant_id == purge.tenant_id)
+            || state
+                .multipart_activities
+                .values()
+                .any(|(tenant_id, _)| tenant_id == &purge.tenant_id)
+        {
+            return purge.status;
+        }
+        state
+            .authorities
+            .retain(|logical, _| logical.tenant_id != purge.tenant_id);
+        state
+            .repairs
+            .retain(|_, (repair, _)| repair.logical.tenant_id != purge.tenant_id);
+        state.fenced_namespaces.remove(&purge.tenant_id);
+        *state
+            .namespace_epochs
+            .entry(purge.tenant_id.clone())
+            .or_insert(1) += 1;
+        let complete = NamespacePurgeStatus::Complete {
+            deleted_versions: purge.deleted_versions,
+        };
+        if let Some(purge) = state.purges.get_mut(&operation_id) {
+            purge.status = complete.clone();
+        }
+        complete
     }
 }
 
@@ -1091,6 +2844,116 @@ impl ManagedRepository for InMemoryManagedRepository {
         false
     }
 
+    async fn assert_namespace_active(&self, tenant_id: &str) -> Result<(), ManagedError> {
+        if self
+            .state
+            .lock()
+            .await
+            .fenced_namespaces
+            .contains_key(tenant_id)
+        {
+            Err(ManagedError::NamespaceFenced)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn begin_multipart_activity(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+    ) -> Result<u64, ManagedError> {
+        let mut state = self.state.lock().await;
+        if state.fenced_namespaces.contains_key(tenant_id) {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        let epoch = *state
+            .namespace_epochs
+            .entry(tenant_id.to_string())
+            .or_insert(1);
+        state
+            .multipart_activities
+            .insert(upload_id.to_string(), (tenant_id.to_string(), epoch));
+        state.multipart_registration_expiry.insert(
+            upload_id.to_string(),
+            crate::transaction::unix_time_ms().saturating_add(10 * 60 * 1000),
+        );
+        Ok(epoch)
+    }
+
+    async fn assert_multipart_activity(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+        allow_purging: bool,
+    ) -> Result<(), ManagedError> {
+        let state = self.state.lock().await;
+        if state.namespace_epochs.get(tenant_id).copied().unwrap_or(1) != namespace_epoch
+            || (state.fenced_namespaces.contains_key(tenant_id) && !allow_purging)
+            || state.multipart_activities.get(upload_id)
+                != Some(&(tenant_id.to_string(), namespace_epoch))
+            || !state.confirmed_multipart_activities.contains(upload_id)
+        {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        Ok(())
+    }
+
+    async fn confirm_multipart_activity(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+    ) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        if state.fenced_namespaces.contains_key(tenant_id)
+            || state.multipart_activities.get(upload_id)
+                != Some(&(tenant_id.to_string(), namespace_epoch))
+        {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        state
+            .confirmed_multipart_activities
+            .insert(upload_id.to_string());
+        state.multipart_registration_expiry.remove(upload_id);
+        Ok(())
+    }
+
+    async fn reconcile_multipart_activities(&self, limit: u64) -> Result<u64, ManagedError> {
+        let mut state = self.state.lock().await;
+        let now = crate::transaction::unix_time_ms();
+        let expired: Vec<_> = state
+            .multipart_registration_expiry
+            .iter()
+            .filter(|(_, expires)| **expires <= now)
+            .take(limit as usize)
+            .map(|(upload_id, _)| upload_id.clone())
+            .collect();
+        for upload_id in &expired {
+            state.multipart_registration_expiry.remove(upload_id);
+            state.multipart_activities.remove(upload_id);
+        }
+        Ok(expired.len() as u64)
+    }
+
+    async fn finish_multipart_activity(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+    ) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        if state.multipart_activities.get(upload_id)
+            == Some(&(tenant_id.to_string(), namespace_epoch))
+        {
+            state.multipart_activities.remove(upload_id);
+            state.confirmed_multipart_activities.remove(upload_id);
+            state.multipart_registration_expiry.remove(upload_id);
+        }
+        Ok(())
+    }
+
     async fn any_authority(&self) -> Result<bool, ManagedError> {
         Ok(!self.state.lock().await.authorities.is_empty())
     }
@@ -1099,7 +2962,11 @@ impl ManagedRepository for InMemoryManagedRepository {
         &self,
         logical: &LogicalObjectKey,
     ) -> Result<Option<ObjectAuthority>, ManagedError> {
-        Ok(self.state.lock().await.authorities.get(logical).cloned())
+        let state = self.state.lock().await;
+        if state.fenced_namespaces.contains_key(&logical.tenant_id) {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        Ok(state.authorities.get(logical).cloned())
     }
 
     async fn publish(
@@ -1108,6 +2975,12 @@ impl ManagedRepository for InMemoryManagedRepository {
         expected_cas: Option<u64>,
     ) -> Result<ObjectAuthority, ManagedError> {
         let mut state = self.state.lock().await;
+        if state
+            .fenced_namespaces
+            .contains_key(&authority.logical.tenant_id)
+        {
+            return Err(ManagedError::NamespaceFenced);
+        }
         let existing = state.authorities.get(&authority.logical).cloned();
         if existing.as_ref().map(|value| value.cas_version) != expected_cas {
             return Err(ManagedError::Conflict);
@@ -1116,14 +2989,27 @@ impl ManagedRepository for InMemoryManagedRepository {
         authority.cas_version = expected_cas.unwrap_or(0).saturating_add(1);
         authority.created_at_ms = existing.as_ref().map_or(now, |value| value.created_at_ms);
         authority.updated_at_ms = now;
+        let namespace_epoch = *state
+            .namespace_epochs
+            .entry(authority.logical.tenant_id.clone())
+            .or_insert(1);
         state
             .authorities
             .insert(authority.logical.clone(), authority.clone());
-        for repair in publication_repairs(&authority) {
+        for mut repair in publication_repairs(&authority) {
+            repair.namespace_epoch = namespace_epoch;
             insert_memory_repair(&mut state, repair);
         }
         if let Some(existing) = existing.filter(|value| !value.tombstone) {
-            for repair in cleanup_repairs(&existing) {
+            for mut repair in cleanup_repairs(&existing) {
+                if !state.physical_versions.iter().any(|target| {
+                    target.tenant_id == repair.logical.tenant_id
+                        && target.backend_id == repair.target_backend_id
+                        && target.physical_key == repair.physical_key
+                }) {
+                    continue;
+                }
+                repair.namespace_epoch = namespace_epoch;
                 insert_memory_repair(&mut state, repair);
             }
         }
@@ -1159,8 +3045,48 @@ impl ManagedRepository for InMemoryManagedRepository {
         .await
     }
 
-    async fn enqueue(&self, repair: RepairRecord) -> Result<(), ManagedError> {
+    async fn enqueue(&self, mut repair: RepairRecord) -> Result<(), ManagedError> {
         let mut state = self.state.lock().await;
+        if state
+            .fenced_namespaces
+            .contains_key(&repair.logical.tenant_id)
+        {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        let current_epoch = *state
+            .namespace_epochs
+            .entry(repair.logical.tenant_id.clone())
+            .or_insert(1);
+        if repair.kind == RepairKind::DeleteGeneration {
+            let targets: Vec<_> = state
+                .physical_versions
+                .iter()
+                .filter(|target| {
+                    target.tenant_id == repair.logical.tenant_id
+                        && target.backend_id == repair.target_backend_id
+                        && target.physical_key == repair.physical_key
+                })
+                .collect();
+            if targets.is_empty() {
+                return Ok(());
+            }
+            if targets
+                .iter()
+                .any(|target| target.namespace_epoch != current_epoch)
+            {
+                return Err(ManagedError::Conflict);
+            }
+        } else if state
+            .authorities
+            .get(&repair.logical)
+            .is_none_or(|authority| {
+                authority.generation != repair.generation
+                    || authority.cas_version != repair.authority_cas_version
+            })
+        {
+            return Err(ManagedError::Conflict);
+        }
+        repair.namespace_epoch = current_epoch;
         insert_memory_repair(&mut state, repair);
         Ok(())
     }
@@ -1173,15 +3099,23 @@ impl ManagedRepository for InMemoryManagedRepository {
     ) -> Result<Vec<RepairRecord>, ManagedError> {
         let now = crate::transaction::unix_time_ms();
         let mut state = self.state.lock().await;
+        let fenced_namespaces = state.fenced_namespaces.clone();
+        let namespace_epochs = state.namespace_epochs.clone();
         let mut candidates: Vec<_> = state
             .repairs
             .values_mut()
             .filter(|(repair, status)| {
-                status.as_str() == "PENDING"
-                    || (status.as_str() == "LEASED"
-                        && repair
-                            .lease_expires_at_ms
-                            .is_some_and(|expiry| expiry <= now))
+                !fenced_namespaces.contains_key(&repair.logical.tenant_id)
+                    && namespace_epochs
+                        .get(&repair.logical.tenant_id)
+                        .copied()
+                        .unwrap_or(1)
+                        == repair.namespace_epoch
+                    && (status.as_str() == "PENDING"
+                        || (status.as_str() == "LEASED"
+                            && repair
+                                .lease_expires_at_ms
+                                .is_some_and(|expiry| expiry <= now)))
             })
             .collect();
         candidates.sort_by_key(|(repair, _)| repair.updated_at_ms);
@@ -1231,6 +3165,15 @@ impl ManagedRepository for InMemoryManagedRepository {
         if repair.lease_token != Some(repair.id) {
             return Err(ManagedError::Conflict);
         }
+        if state
+            .namespace_epochs
+            .get(&repair.logical.tenant_id)
+            .copied()
+            .unwrap_or(1)
+            != repair.namespace_epoch
+        {
+            return Err(ManagedError::Conflict);
+        }
         {
             let Some((stored, status)) = state.repairs.get_mut(&repair.repair_id) else {
                 return Err(ManagedError::Conflict);
@@ -1253,6 +3196,8 @@ impl ManagedRepository for InMemoryManagedRepository {
         if repair.kind != RepairKind::DeleteGeneration
             && let Some(authority) = state.authorities.get_mut(&repair.logical)
             && authority.generation == repair.generation
+            && (repair.kind == RepairKind::Placement
+                || authority.cas_version == repair.authority_cas_version)
             && !authority.tombstone
             && apply_repair_to_authority(authority, repair)?
         {
@@ -1286,6 +3231,366 @@ impl ManagedRepository for InMemoryManagedRepository {
         repair.lease_expires_at_ms = None;
         repair.updated_at_ms = now;
         *status = "PENDING".to_string();
+        Ok(())
+    }
+
+    async fn begin_physical_write(
+        &self,
+        intent: PhysicalWriteIntent,
+    ) -> Result<PhysicalWriteLease, ManagedError> {
+        let mut state = self.state.lock().await;
+        if state.fenced_namespaces.contains_key(&intent.tenant_id) {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        let intent_id = intent.intent_id;
+        let owner = intent.lease_owner.clone();
+        let token = Uuid::now_v7();
+        state.physical_write_intents.insert(intent_id, intent);
+        state.physical_write_leases.insert(
+            intent_id,
+            crate::transaction::unix_time_ms().saturating_add(PHYSICAL_WRITE_LEASE_MS),
+        );
+        state.physical_write_tokens.insert(intent_id, token);
+        Ok(PhysicalWriteLease {
+            intent_id,
+            namespace_epoch: 1,
+            owner,
+            token,
+        })
+    }
+
+    async fn pending_physical_write_intents(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<DurablePhysicalWriteIntent>, ManagedError> {
+        let state = self.state.lock().await;
+        Ok(state
+            .physical_write_intents
+            .values()
+            .take(limit as usize)
+            .map(|intent| DurablePhysicalWriteIntent {
+                intent: intent.clone(),
+                namespace_epoch: 1,
+                blocked_reason: state.blocked_write_intents.get(&intent.intent_id).cloned(),
+                lease_expires_at_ms: state
+                    .physical_write_leases
+                    .get(&intent.intent_id)
+                    .copied()
+                    .unwrap_or(0),
+                lease: PhysicalWriteLease {
+                    intent_id: intent.intent_id,
+                    namespace_epoch: 1,
+                    owner: intent.lease_owner.clone(),
+                    token: state
+                        .physical_write_tokens
+                        .get(&intent.intent_id)
+                        .copied()
+                        .unwrap_or(Uuid::nil()),
+                },
+            })
+            .collect())
+    }
+
+    async fn renew_physical_write_intent(
+        &self,
+        lease: &PhysicalWriteLease,
+        lease_expires_at_ms: i64,
+    ) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        if state
+            .physical_write_intents
+            .get(&lease.intent_id)
+            .is_none_or(|intent| intent.lease_owner != lease.owner)
+            || state.physical_write_tokens.get(&lease.intent_id) != Some(&lease.token)
+            || state
+                .physical_write_leases
+                .get(&lease.intent_id)
+                .is_none_or(|expires| *expires <= crate::transaction::unix_time_ms())
+        {
+            return Err(ManagedError::Conflict);
+        }
+        state
+            .physical_write_leases
+            .insert(lease.intent_id, lease_expires_at_ms);
+        Ok(())
+    }
+
+    async fn claim_expired_physical_write_intent(
+        &self,
+        intent_id: Uuid,
+        owner: &str,
+        lease_expires_at_ms: i64,
+    ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
+        let mut state = self.state.lock().await;
+        if state
+            .physical_write_leases
+            .get(&intent_id)
+            .is_none_or(|expires| *expires > crate::transaction::unix_time_ms())
+        {
+            return Ok(None);
+        }
+        let token = Uuid::now_v7();
+        let intent = state
+            .physical_write_intents
+            .get_mut(&intent_id)
+            .ok_or(ManagedError::Conflict)?;
+        intent.lease_owner = owner.to_string();
+        state.physical_write_tokens.insert(intent_id, token);
+        state
+            .physical_write_leases
+            .insert(intent_id, lease_expires_at_ms);
+        Ok(Some(PhysicalWriteLease {
+            intent_id,
+            namespace_epoch: 1,
+            owner: owner.to_string(),
+            token,
+        }))
+    }
+
+    async fn commit_physical_write(
+        &self,
+        lease: &PhysicalWriteLease,
+        superseded_version_ids: &[String],
+        version_id: Option<&str>,
+    ) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        if state
+            .physical_write_intents
+            .get(&lease.intent_id)
+            .is_none_or(|intent| intent.lease_owner != lease.owner)
+            || state.physical_write_tokens.get(&lease.intent_id) != Some(&lease.token)
+            || state
+                .physical_write_leases
+                .get(&lease.intent_id)
+                .is_none_or(|expires| *expires <= crate::transaction::unix_time_ms())
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let intent = state
+            .physical_write_intents
+            .remove(&lease.intent_id)
+            .unwrap();
+        state.blocked_write_intents.remove(&lease.intent_id);
+        state.physical_write_leases.remove(&lease.intent_id);
+        state.physical_write_tokens.remove(&lease.intent_id);
+        for version_id in superseded_version_ids
+            .iter()
+            .map(|value| Some(value.clone()))
+            .chain(std::iter::once(version_id.map(ToOwned::to_owned)))
+        {
+            state.physical_versions.push(PhysicalVersionTarget {
+                tenant_id: intent.tenant_id.clone(),
+                namespace_epoch: 1,
+                backend_id: intent.backend_id.clone(),
+                backend_fingerprint: intent.backend_fingerprint.clone(),
+                provider_bucket: intent.provider_bucket.clone(),
+                physical_key: intent.physical_key.clone(),
+                version_id,
+                versioning_mode: intent.versioning_mode,
+                versioning_capability: intent.versioning_capability,
+                write_operation_id: lease.intent_id,
+            });
+        }
+        Ok(())
+    }
+
+    async fn abort_physical_write(&self, lease: &PhysicalWriteLease) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        if state.physical_write_tokens.get(&lease.intent_id) != Some(&lease.token)
+            || state
+                .physical_write_leases
+                .get(&lease.intent_id)
+                .is_none_or(|expires| *expires <= crate::transaction::unix_time_ms())
+        {
+            return Err(ManagedError::Conflict);
+        }
+        state.physical_write_intents.remove(&lease.intent_id);
+        state.blocked_write_intents.remove(&lease.intent_id);
+        state.physical_write_leases.remove(&lease.intent_id);
+        state.physical_write_tokens.remove(&lease.intent_id);
+        Ok(())
+    }
+
+    async fn block_physical_write(
+        &self,
+        lease: &PhysicalWriteLease,
+        reason: &str,
+    ) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        if state.physical_write_tokens.get(&lease.intent_id) != Some(&lease.token)
+            || state
+                .physical_write_leases
+                .get(&lease.intent_id)
+                .is_none_or(|expires| *expires <= crate::transaction::unix_time_ms())
+        {
+            return Err(ManagedError::Conflict);
+        }
+        state
+            .blocked_write_intents
+            .insert(lease.intent_id, reason.to_string());
+        Ok(())
+    }
+
+    async fn physical_versions(
+        &self,
+        tenant_id: &str,
+        backend_id: &str,
+        provider_bucket: &str,
+        physical_key: &str,
+    ) -> Result<Vec<PhysicalVersionTarget>, ManagedError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .physical_versions
+            .iter()
+            .filter(|target| {
+                target.tenant_id == tenant_id
+                    && target.backend_id == backend_id
+                    && target.provider_bucket == provider_bucket
+                    && target.physical_key == physical_key
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn forget_physical_version(
+        &self,
+        target: &PhysicalVersionTarget,
+    ) -> Result<(), ManagedError> {
+        self.state
+            .lock()
+            .await
+            .physical_versions
+            .retain(|candidate| candidate != target);
+        Ok(())
+    }
+
+    async fn purge_namespace(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        let mut state = self.state.lock().await;
+        if let Some(purge) = state.purges.get(&request.operation_id) {
+            if purge.tenant_id != request.tenant_id {
+                return Ok(NamespacePurgeStatus::Blocked {
+                    reason: "purge operation belongs to another namespace".to_string(),
+                });
+            }
+            return Ok(Self::finish_purge(&mut state, request.operation_id));
+        }
+        if state.fenced_namespaces.contains_key(&request.tenant_id) {
+            return Ok(NamespacePurgeStatus::Blocked {
+                reason: "another managed namespace purge is already running".to_string(),
+            });
+        }
+        for authority in state
+            .authorities
+            .values()
+            .filter(|authority| authority.logical.tenant_id == request.tenant_id)
+            .filter(|authority| !authority.tombstone)
+        {
+            let physical_key = generation_physical_key(&authority.logical, authority.generation);
+            let required_backends = std::iter::once(authority.primary_backend_id.as_str()).chain(
+                authority
+                    .replica_backend_id
+                    .as_deref()
+                    .filter(|_| authority.replica_status == CopyStatus::Ready),
+            );
+            for backend_id in required_backends {
+                if !state.physical_versions.iter().any(|target| {
+                    target.tenant_id == request.tenant_id
+                        && target.backend_id == backend_id
+                        && target.physical_key == physical_key
+                }) {
+                    return Ok(NamespacePurgeStatus::Blocked {
+                        reason: format!(
+                            "managed authority references unledgered physical versions on backend {backend_id}"
+                        ),
+                    });
+                }
+            }
+        }
+        state
+            .fenced_namespaces
+            .insert(request.tenant_id.clone(), request.operation_id);
+        state.purges.insert(
+            request.operation_id,
+            MemoryPurge {
+                tenant_id: request.tenant_id.clone(),
+                status: NamespacePurgeStatus::Running,
+                deleted_versions: 0,
+            },
+        );
+        Ok(Self::finish_purge(&mut state, request.operation_id))
+    }
+
+    async fn namespace_purge_status(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        let mut state = self.state.lock().await;
+        Ok(Self::finish_purge(&mut state, request.operation_id))
+    }
+
+    async fn purge_targets(
+        &self,
+        request: &NamespacePurgeRequest,
+        limit: u64,
+    ) -> Result<Vec<PhysicalVersionTarget>, ManagedError> {
+        let state = self.state.lock().await;
+        if state
+            .purges
+            .get(&request.operation_id)
+            .is_none_or(|purge| purge.tenant_id != request.tenant_id)
+        {
+            return Err(ManagedError::Conflict);
+        }
+        Ok(state
+            .physical_versions
+            .iter()
+            .filter(|target| target.tenant_id == request.tenant_id)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn mark_purge_target_deleted(
+        &self,
+        request: &NamespacePurgeRequest,
+        target: &PhysicalVersionTarget,
+    ) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        let before = state.physical_versions.len();
+        state
+            .physical_versions
+            .retain(|candidate| candidate != target);
+        if state.physical_versions.len() != before
+            && let Some(purge) = state.purges.get_mut(&request.operation_id)
+        {
+            purge.deleted_versions = purge.deleted_versions.saturating_add(1);
+            purge.status = NamespacePurgeStatus::Running;
+        }
+        Ok(())
+    }
+
+    async fn mark_purge_target_blocked(
+        &self,
+        request: &NamespacePurgeRequest,
+        _target: &PhysicalVersionTarget,
+        reason: &str,
+    ) -> Result<(), ManagedError> {
+        if let Some(purge) = self
+            .state
+            .lock()
+            .await
+            .purges
+            .get_mut(&request.operation_id)
+        {
+            purge.status = NamespacePurgeStatus::Blocked {
+                reason: reason.to_string(),
+            };
+        }
         Ok(())
     }
 }
@@ -1327,6 +3632,268 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn empty_in_memory_namespace_purge_completes_idempotently() {
+        let repository = InMemoryManagedRepository::new();
+        let request = NamespacePurgeRequest {
+            tenant_id: "tenant-a".to_string(),
+            operation_id: Uuid::now_v7(),
+        };
+        let complete = NamespacePurgeStatus::Complete {
+            deleted_versions: 0,
+        };
+        assert_eq!(
+            repository.purge_namespace(&request).await.unwrap(),
+            complete
+        );
+        assert_eq!(
+            repository.namespace_purge_status(&request).await.unwrap(),
+            complete
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_purge_fences_concurrent_writes_and_blocks_ambiguous_history() {
+        let repository = InMemoryManagedRepository::new();
+        let intent_id = Uuid::now_v7();
+        let lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id,
+                tenant_id: "tenant-a".to_string(),
+                backend_id: "provider:bucket".to_string(),
+                backend_fingerprint: "fingerprint".to_string(),
+                provider_bucket: "bucket".to_string(),
+                physical_key: "managed/key".to_string(),
+                versioning_mode: BackendVersioningMode::Unversioned,
+                versioning_capability: BackendVersioningCapability::Unsupported,
+                lease_owner: "writer-a".to_string(),
+            })
+            .await
+            .unwrap();
+        let request = NamespacePurgeRequest {
+            tenant_id: "tenant-a".to_string(),
+            operation_id: Uuid::now_v7(),
+        };
+        assert_eq!(
+            repository.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Running
+        );
+        assert!(matches!(
+            repository
+                .begin_physical_write(PhysicalWriteIntent {
+                    intent_id: Uuid::now_v7(),
+                    tenant_id: "tenant-a".to_string(),
+                    backend_id: "provider:bucket".to_string(),
+                    backend_fingerprint: "fingerprint".to_string(),
+                    provider_bucket: "bucket".to_string(),
+                    physical_key: "managed/new-key".to_string(),
+                    versioning_mode: BackendVersioningMode::Unversioned,
+                    versioning_capability: BackendVersioningCapability::Unsupported,
+                    lease_owner: "writer-b".to_string(),
+                })
+                .await,
+            Err(ManagedError::NamespaceFenced)
+        ));
+        repository
+            .block_physical_write(&lease, "provider response was ambiguous")
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Blocked {
+                reason: "provider response was ambiguous".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_authority_snapshot_cannot_enqueue_repair_after_cas_changes() {
+        let repository = InMemoryManagedRepository::new();
+        let first = repository
+            .publish(
+                authority(
+                    LogicalObjectKey::new("tenant-stale", "bucket", "key"),
+                    Uuid::now_v7(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let stale_repair = RepairRecord::copy(
+            RepairKind::Replica,
+            &first,
+            Some(first.primary_backend_id.clone()),
+            first.replica_backend_id.clone().unwrap(),
+            RepairTargetRole::Replica,
+            first.placement_version,
+        );
+        let mut replacement = first.clone();
+        replacement.generation = Uuid::now_v7();
+        repository
+            .publish(replacement, Some(first.cas_version))
+            .await
+            .unwrap();
+        assert!(matches!(
+            repository.enqueue(stale_repair).await,
+            Err(ManagedError::Conflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_without_matching_physical_ledger_is_already_complete() {
+        let repository = InMemoryManagedRepository::new();
+        let mut source = authority(
+            LogicalObjectKey::new("tenant-cleanup", "bucket", "key"),
+            Uuid::now_v7(),
+        );
+        source.replica_backend_id = None;
+        source.replica_status = CopyStatus::Absent;
+        let published = repository.publish(source, None).await.unwrap();
+        let cleanup = cleanup_repairs(&published).pop().unwrap();
+        repository.enqueue(cleanup).await.unwrap();
+        assert!(
+            repository
+                .claim_repairs("worker", crate::transaction::unix_time_ms() + 60_000, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_activity_fences_parts_and_blocks_purge_until_abort_cleanup() {
+        let repository = InMemoryManagedRepository::new();
+        let epoch = repository
+            .begin_multipart_activity("upload", "tenant-a")
+            .await
+            .unwrap();
+        repository
+            .confirm_multipart_activity("upload", "tenant-a", epoch)
+            .await
+            .unwrap();
+        let request = NamespacePurgeRequest {
+            tenant_id: "tenant-a".to_string(),
+            operation_id: Uuid::now_v7(),
+        };
+        assert_eq!(
+            repository.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Running
+        );
+        assert!(matches!(
+            repository
+                .assert_multipart_activity("upload", "tenant-a", epoch, false)
+                .await,
+            Err(ManagedError::NamespaceFenced)
+        ));
+        repository
+            .assert_multipart_activity("upload", "tenant-a", epoch, true)
+            .await
+            .unwrap();
+        repository
+            .finish_multipart_activity("upload", "tenant-a", epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Complete {
+                deleted_versions: 0,
+            }
+        );
+        assert!(matches!(
+            repository
+                .assert_multipart_activity("upload", "tenant-a", epoch, false)
+                .await,
+            Err(ManagedError::NamespaceFenced)
+        ));
+    }
+
+    #[tokio::test]
+    async fn crashed_multipart_registration_expires_without_racing_confirmed_upload() {
+        let repository = InMemoryManagedRepository::new();
+        let orphan_epoch = repository
+            .begin_multipart_activity("orphan", "tenant-a")
+            .await
+            .unwrap();
+        repository
+            .state
+            .lock()
+            .await
+            .multipart_registration_expiry
+            .insert("orphan".to_string(), crate::transaction::unix_time_ms() - 1);
+        let valid_epoch = repository
+            .begin_multipart_activity("valid", "tenant-a")
+            .await
+            .unwrap();
+        repository
+            .confirm_multipart_activity("valid", "tenant-a", valid_epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.reconcile_multipart_activities(10).await.unwrap(),
+            1
+        );
+        assert!(matches!(
+            repository
+                .assert_multipart_activity("orphan", "tenant-a", orphan_epoch, false)
+                .await,
+            Err(ManagedError::NamespaceFenced)
+        ));
+        repository
+            .assert_multipart_activity("valid", "tenant-a", valid_epoch, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reclaimed_physical_write_lease_fences_stale_writer() {
+        let repository = InMemoryManagedRepository::new();
+        let intent_id = Uuid::now_v7();
+        let stale = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id,
+                tenant_id: "tenant-lease".to_string(),
+                backend_id: "provider:bucket".to_string(),
+                backend_fingerprint: "fingerprint".to_string(),
+                provider_bucket: "bucket".to_string(),
+                physical_key: "managed/key".to_string(),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Optional,
+                lease_owner: "writer-a".to_string(),
+            })
+            .await
+            .unwrap();
+        repository
+            .renew_physical_write_intent(
+                &stale,
+                crate::transaction::unix_time_ms().saturating_sub(1),
+            )
+            .await
+            .unwrap();
+        let current = repository
+            .claim_expired_physical_write_intent(
+                intent_id,
+                "writer-b",
+                crate::transaction::unix_time_ms().saturating_add(60_000),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            repository
+                .commit_physical_write(&stale, &[], Some("stale-version"))
+                .await,
+            Err(ManagedError::Conflict)
+        ));
+        assert!(matches!(
+            repository.abort_physical_write(&stale).await,
+            Err(ManagedError::Conflict)
+        ));
+        repository
+            .commit_physical_write(&current, &[], Some("current-version"))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1509,7 +4076,7 @@ mod tests {
             .claim_repairs("gc", crate::transaction::unix_time_ms() + 30_000, 10)
             .await
             .unwrap();
-        assert_eq!(cleanup.len(), 2);
+        assert!(cleanup.is_empty());
         assert!(
             cleanup
                 .iter()
@@ -1716,14 +4283,15 @@ mod tests {
         );
         repository.complete_repair(&claim).await.unwrap();
 
+        let current = repository.get(&pending.logical).await.unwrap().unwrap();
         repository
             .enqueue(RepairRecord::copy(
                 RepairKind::Replica,
-                &pending,
+                &current,
                 Some("a".to_string()),
                 "b".to_string(),
                 RepairTargetRole::Replica,
-                pending.placement_version,
+                current.placement_version,
             ))
             .await
             .unwrap();

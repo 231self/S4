@@ -4,10 +4,89 @@ import type { Middleware } from '../middleware';
 import { Observable, of, from } from '../rxjsStub';
 import {mergeMap, map} from  '../rxjsStub';
 import { ApiKeyResponse } from '../models/ApiKeyResponse';
+import { BackendConfigRequest } from '../models/BackendConfigRequest';
+import { BackendConfigResponse } from '../models/BackendConfigResponse';
+import { BackendType } from '../models/BackendType';
 import { CreateKeyRequest } from '../models/CreateKeyRequest';
 import { DeleteKeyRequest } from '../models/DeleteKeyRequest';
 import { ListKeyResponse } from '../models/ListKeyResponse';
 import { ObjectResponse } from '../models/ObjectResponse';
+
+import { BackendApiRequestFactory, BackendApiResponseProcessor} from "../apis/BackendApi";
+export class ObservableBackendApi {
+    private requestFactory: BackendApiRequestFactory;
+    private responseProcessor: BackendApiResponseProcessor;
+    private configuration: Configuration;
+
+    public constructor(
+        configuration: Configuration,
+        requestFactory?: BackendApiRequestFactory,
+        responseProcessor?: BackendApiResponseProcessor
+    ) {
+        this.configuration = configuration;
+        this.requestFactory = requestFactory || new BackendApiRequestFactory(configuration);
+        this.responseProcessor = responseProcessor || new BackendApiResponseProcessor();
+    }
+
+    /**
+     */
+    public getBackendWithHttpInfo(_options?: ConfigurationOptions): Observable<HttpInfo<BackendConfigResponse>> {
+        const _config = mergeConfiguration(this.configuration, _options);
+
+        const requestContextPromise = this.requestFactory.getBackend(_config);
+        // build promise chain
+        let middlewarePreObservable = from<RequestContext>(requestContextPromise);
+        for (const middleware of _config.middleware) {
+            middlewarePreObservable = middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => middleware.pre(ctx)));
+        }
+
+        return middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => _config.httpApi.send(ctx))).
+            pipe(mergeMap((response: ResponseContext) => {
+                let middlewarePostObservable = of(response);
+                for (const middleware of _config.middleware.reverse()) {
+                    middlewarePostObservable = middlewarePostObservable.pipe(mergeMap((rsp: ResponseContext) => middleware.post(rsp)));
+                }
+                return middlewarePostObservable.pipe(map((rsp: ResponseContext) => this.responseProcessor.getBackendWithHttpInfo(rsp)));
+            }));
+    }
+
+    /**
+     */
+    public getBackend(_options?: ConfigurationOptions): Observable<BackendConfigResponse> {
+        return this.getBackendWithHttpInfo(_options).pipe(map((apiResponse: HttpInfo<BackendConfigResponse>) => apiResponse.data));
+    }
+
+    /**
+     * @param backendConfigRequest
+     */
+    public putBackendWithHttpInfo(backendConfigRequest: BackendConfigRequest, _options?: ConfigurationOptions): Observable<HttpInfo<BackendConfigResponse>> {
+        const _config = mergeConfiguration(this.configuration, _options);
+
+        const requestContextPromise = this.requestFactory.putBackend(backendConfigRequest, _config);
+        // build promise chain
+        let middlewarePreObservable = from<RequestContext>(requestContextPromise);
+        for (const middleware of _config.middleware) {
+            middlewarePreObservable = middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => middleware.pre(ctx)));
+        }
+
+        return middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => _config.httpApi.send(ctx))).
+            pipe(mergeMap((response: ResponseContext) => {
+                let middlewarePostObservable = of(response);
+                for (const middleware of _config.middleware.reverse()) {
+                    middlewarePostObservable = middlewarePostObservable.pipe(mergeMap((rsp: ResponseContext) => middleware.post(rsp)));
+                }
+                return middlewarePostObservable.pipe(map((rsp: ResponseContext) => this.responseProcessor.putBackendWithHttpInfo(rsp)));
+            }));
+    }
+
+    /**
+     * @param backendConfigRequest
+     */
+    public putBackend(backendConfigRequest: BackendConfigRequest, _options?: ConfigurationOptions): Observable<BackendConfigResponse> {
+        return this.putBackendWithHttpInfo(backendConfigRequest, _options).pipe(map((apiResponse: HttpInfo<BackendConfigResponse>) => apiResponse.data));
+    }
+
+}
 
 import { KeysApiRequestFactory, KeysApiResponseProcessor} from "../apis/KeysApi";
 export class ObservableKeysApi {

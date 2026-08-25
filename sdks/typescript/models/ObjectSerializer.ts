@@ -1,10 +1,16 @@
 export * from '../models/ApiKeyResponse';
+export * from '../models/BackendConfigRequest';
+export * from '../models/BackendConfigResponse';
+export * from '../models/BackendType';
 export * from '../models/CreateKeyRequest';
 export * from '../models/DeleteKeyRequest';
 export * from '../models/ListKeyResponse';
 export * from '../models/ObjectResponse';
 
 import { ApiKeyResponse } from '../models/ApiKeyResponse';
+import { BackendConfigRequest       } from '../models/BackendConfigRequest';
+import { BackendConfigResponse        } from '../models/BackendConfigResponse';
+import { BackendType } from '../models/BackendType';
 import { CreateKeyRequest } from '../models/CreateKeyRequest';
 import { DeleteKeyRequest } from '../models/DeleteKeyRequest';
 import { ListKeyResponse } from '../models/ListKeyResponse';
@@ -23,10 +29,13 @@ let primitives = [
                  ];
 
 let enumsMap: Set<string> = new Set<string>([
+    "BackendType",
 ]);
 
 let typeMap: {[index: string]: any} = {
     "ApiKeyResponse": ApiKeyResponse,
+    "BackendConfigRequest": BackendConfigRequest,
+    "BackendConfigResponse": BackendConfigResponse,
     "CreateKeyRequest": CreateKeyRequest,
     "DeleteKeyRequest": DeleteKeyRequest,
     "ListKeyResponse": ListKeyResponse,

@@ -1,6 +1,8 @@
+use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -9,14 +11,17 @@ use tokio::sync::{RwLock, watch};
 use tracing::{info, warn};
 
 use crate::managed::{
-    CopyStatus, LogicalObjectKey, ManagedError, ManagedRepository, ManagedStreamingMode,
-    ObjectAuthority, PLACEMENT_VERSION_V1, Placement, RepairKind, RepairRecord, RepairTargetRole,
+    BackendVersioningCapability, BackendVersioningMode, CopyStatus, DurablePhysicalWriteIntent,
+    LogicalObjectKey, ManagedError, ManagedRepository, ManagedStreamingMode, NamespacePurgeRequest,
+    NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget,
+    PhysicalWriteIntent, Placement, RepairKind, RepairRecord, RepairTargetRole,
     generation_physical_key, rendezvous_placement,
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, DirectS3Sink, ExpectedObject,
-    ObjectDestination, ObjectSinkTransaction, OperationJournal, OperationReconciler,
-    OperationState, StoredObjectMeta, TransactionBackend, TransactionError,
+    ManagedOperationScope, ObjectDestination, ObjectSinkTransaction, OperationJournal,
+    OperationReconciler, OperationState, StoredObjectMeta, TransactionBackend, TransactionError,
+    VersioningCapability,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +39,14 @@ impl ServiceBackend {
         format!("{}:{}", self.provider, self.bucket)
     }
 
+    pub fn fingerprint(&self) -> String {
+        let identity = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            self.provider, self.endpoint, self.region, self.bucket, self.access_key
+        );
+        hex::encode(Sha256::digest(identity.as_bytes()))
+    }
+
     pub async fn build_client(&self) -> Option<Client> {
         let access_key = self.access_key.clone();
         let secret_key = self.secret_key.clone();
@@ -44,9 +57,14 @@ impl ServiceBackend {
             .region(Region::new(region))
             .endpoint_url(&endpoint)
             .credentials_provider(creds)
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
             .load()
             .await;
-        Some(Client::new(&config))
+        Some(Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&config)
+                .force_path_style(true)
+                .build(),
+        ))
     }
 }
 
@@ -57,6 +75,7 @@ pub struct ServiceStorage {
     authority: Option<Arc<dyn ManagedRepository>>,
     managed_mode: ManagedStreamingMode,
     placement_version: u32,
+    managed_versioning_capability: Option<BackendVersioningCapability>,
 }
 
 const LEGACY_VIRTUAL_NODES: usize = 150;
@@ -86,6 +105,7 @@ impl ServiceStorage {
             authority: None,
             managed_mode: ManagedStreamingMode::Off,
             placement_version: PLACEMENT_VERSION_V1,
+            managed_versioning_capability: None,
         }
     }
 
@@ -102,6 +122,16 @@ impl ServiceStorage {
         storage
     }
 
+    pub fn with_managed_capabilities(mut self, capabilities: Option<BackendCapabilities>) -> Self {
+        self.managed_versioning_capability =
+            capabilities.map(|capabilities| match capabilities.versioning {
+                VersioningCapability::Unsupported => BackendVersioningCapability::Unsupported,
+                VersioningCapability::Optional => BackendVersioningCapability::Optional,
+                VersioningCapability::Required => BackendVersioningCapability::Required,
+            });
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.backends.is_empty()
     }
@@ -112,6 +142,242 @@ impl ServiceStorage {
 
     pub fn authority_repository(&self) -> Option<&Arc<dyn ManagedRepository>> {
         self.authority.as_ref()
+    }
+
+    pub async fn assert_namespace_active(&self, tenant_id: &str) -> Result<(), ManagedError> {
+        self.authority_repository_required()?
+            .assert_namespace_active(tenant_id)
+            .await
+    }
+
+    pub async fn begin_managed_multipart(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+    ) -> Result<u64, ManagedError> {
+        self.authority_repository_required()?
+            .begin_multipart_activity(upload_id, tenant_id)
+            .await
+    }
+
+    pub async fn assert_managed_multipart(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+        allow_purging: bool,
+    ) -> Result<(), ManagedError> {
+        self.authority_repository_required()?
+            .assert_multipart_activity(upload_id, tenant_id, namespace_epoch, allow_purging)
+            .await
+    }
+
+    pub async fn confirm_managed_multipart(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+    ) -> Result<(), ManagedError> {
+        self.authority_repository_required()?
+            .confirm_multipart_activity(upload_id, tenant_id, namespace_epoch)
+            .await
+    }
+
+    pub async fn reconcile_managed_multipart_activities(
+        &self,
+        limit: u64,
+    ) -> Result<u64, ManagedError> {
+        self.authority_repository_required()?
+            .reconcile_multipart_activities(limit)
+            .await
+    }
+
+    pub async fn finish_managed_multipart(
+        &self,
+        upload_id: &str,
+        tenant_id: &str,
+        namespace_epoch: u64,
+    ) -> Result<(), ManagedError> {
+        self.authority_repository_required()?
+            .finish_multipart_activity(upload_id, tenant_id, namespace_epoch)
+            .await
+    }
+
+    /// Start an idempotent authority-backed namespace purge. Physical deletion
+    /// policy belongs to the authority implementation; this method never lists
+    /// or deletes backend objects itself.
+    pub async fn purge_namespace(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        let Some(authority) = &self.authority else {
+            return Ok(NamespacePurgeStatus::Unsupported {
+                reason: "managed namespace purge requires an authority repository".to_string(),
+            });
+        };
+        if self.managed_mode != ManagedStreamingMode::Enforce {
+            return Ok(NamespacePurgeStatus::Unsupported {
+                reason: "complete managed namespace purge requires enforce mode and its exact physical-version ledger"
+                    .to_string(),
+            });
+        }
+        let status = authority.purge_namespace(request).await?;
+        if matches!(
+            status,
+            NamespacePurgeStatus::Running | NamespacePurgeStatus::Blocked { .. }
+        ) {
+            self.drive_namespace_purge(authority, request).await
+        } else {
+            Ok(status)
+        }
+    }
+
+    /// Query an authority-backed namespace purge without starting or advancing
+    /// it. An unconfigured authority is explicitly unsupported, not complete.
+    pub async fn namespace_purge_status(
+        &self,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        let Some(authority) = &self.authority else {
+            return Ok(NamespacePurgeStatus::Unsupported {
+                reason: "managed namespace purge status requires an authority repository"
+                    .to_string(),
+            });
+        };
+        if self.managed_mode != ManagedStreamingMode::Enforce {
+            return Ok(NamespacePurgeStatus::Unsupported {
+                reason: "complete managed namespace purge requires enforce mode and its exact physical-version ledger"
+                    .to_string(),
+            });
+        }
+        let status = authority.namespace_purge_status(request).await?;
+        if matches!(
+            status,
+            NamespacePurgeStatus::Running | NamespacePurgeStatus::Blocked { .. }
+        ) {
+            self.drive_namespace_purge(authority, request).await
+        } else {
+            Ok(status)
+        }
+    }
+
+    async fn drive_namespace_purge(
+        &self,
+        authority: &Arc<dyn ManagedRepository>,
+        request: &NamespacePurgeRequest,
+    ) -> Result<NamespacePurgeStatus, ManagedError> {
+        for target in authority.purge_targets(request, 64).await? {
+            if let Err(reason) = self.delete_and_verify_purge_target(&target).await {
+                authority
+                    .mark_purge_target_blocked(request, &target, &reason)
+                    .await?;
+                continue;
+            }
+            authority
+                .mark_purge_target_deleted(request, &target)
+                .await?;
+        }
+        authority.namespace_purge_status(request).await
+    }
+
+    async fn delete_and_verify_purge_target(
+        &self,
+        target: &PhysicalVersionTarget,
+    ) -> Result<(), String> {
+        let index = self
+            .index_for_id(&target.backend_id)
+            .ok_or_else(|| format!("unknown managed backend {}", target.backend_id))?;
+        let current_fingerprint = self.backends[index].fingerprint();
+        if current_fingerprint != target.backend_fingerprint {
+            return Err(format!(
+                "managed backend {} identity changed since the physical version was written",
+                target.backend_id
+            ));
+        }
+        if self.backends[index].bucket != target.provider_bucket {
+            return Err(format!(
+                "managed backend {} bucket changed from {} to {}",
+                target.backend_id, target.provider_bucket, self.backends[index].bucket
+            ));
+        }
+        let current_versioning = self.versioning_mode(index).await;
+        if target.versioning_mode == BackendVersioningMode::Unknown
+            || current_versioning == BackendVersioningMode::Unknown
+        {
+            return Err(format!(
+                "managed backend {} bucket versioning mode is unknown",
+                target.backend_id
+            ));
+        }
+        if current_versioning != target.versioning_mode {
+            return Err(format!(
+                "managed backend {} bucket versioning mode changed from {} to {}",
+                target.backend_id,
+                target.versioning_mode.as_str(),
+                current_versioning.as_str()
+            ));
+        }
+        if self.managed_versioning_capability != Some(target.versioning_capability) {
+            return Err(format!(
+                "managed backend {} versioning capability is unknown or changed",
+                target.backend_id
+            ));
+        }
+        if target.version_id.is_none()
+            && (target.versioning_mode != BackendVersioningMode::Unversioned
+                || target.versioning_capability != BackendVersioningCapability::Unsupported)
+        {
+            return Err(format!(
+                "managed backend {} cannot prove an unversioned ledger target has no historical versions",
+                target.backend_id
+            ));
+        }
+        let client = self
+            .client_for(index)
+            .await
+            .ok_or_else(|| format!("managed backend {} is unavailable", target.backend_id))?;
+        let mut delete = client
+            .delete_object()
+            .bucket(&target.provider_bucket)
+            .key(&target.physical_key);
+        if let Some(version_id) = &target.version_id {
+            delete = delete.version_id(version_id);
+        }
+        if let Err(error) = delete.send().await
+            && !error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 404)
+        {
+            return Err(format!(
+                "deleting managed physical version from {} failed: {error}",
+                target.backend_id
+            ));
+        }
+
+        let mut head = client
+            .head_object()
+            .bucket(&target.provider_bucket)
+            .key(&target.physical_key);
+        if let Some(version_id) = &target.version_id {
+            head = head.version_id(version_id);
+        }
+        match head.send().await {
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_not_found()) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "verifying managed physical version absence from {} failed: {error}",
+                target.backend_id
+            )),
+            Ok(_) => Err(format!(
+                "managed physical version on {} is still present after deletion",
+                target.backend_id
+            )),
+        }
     }
 
     pub fn placement(&self, logical: &LogicalObjectKey) -> Option<Placement> {
@@ -173,6 +439,207 @@ impl ServiceStorage {
             clients[index] = Some(c.clone());
         }
         client
+    }
+
+    async fn versioning_mode(&self, index: usize) -> BackendVersioningMode {
+        let Some(client) = self.client_for(index).await else {
+            return BackendVersioningMode::Unknown;
+        };
+        match client
+            .get_bucket_versioning()
+            .bucket(&self.backends[index].bucket)
+            .send()
+            .await
+        {
+            Ok(output) => match output.status().map(|status| status.as_str()) {
+                Some("Enabled") => BackendVersioningMode::Enabled,
+                Some("Suspended") => BackendVersioningMode::Suspended,
+                None => BackendVersioningMode::Unversioned,
+                Some(_) => BackendVersioningMode::Unknown,
+            },
+            Err(_) => BackendVersioningMode::Unknown,
+        }
+    }
+
+    async fn validate_durable_intent_backend(
+        &self,
+        durable: &DurablePhysicalWriteIntent,
+    ) -> Result<usize, String> {
+        let intent = &durable.intent;
+        let index = self
+            .index_for_id(&intent.backend_id)
+            .ok_or_else(|| format!("unknown managed backend {}", intent.backend_id))?;
+        if self.backends[index].fingerprint() != intent.backend_fingerprint {
+            return Err(format!(
+                "managed backend {} identity changed while a write intent was unresolved",
+                intent.backend_id
+            ));
+        }
+        if self.backends[index].bucket != intent.provider_bucket {
+            return Err(format!(
+                "managed backend {} bucket changed while a write intent was unresolved",
+                intent.backend_id
+            ));
+        }
+        let current_versioning = self.versioning_mode(index).await;
+        if current_versioning == BackendVersioningMode::Unknown
+            || intent.versioning_mode == BackendVersioningMode::Unknown
+            || current_versioning != intent.versioning_mode
+        {
+            return Err(format!(
+                "managed backend {} versioning mode is unknown or changed while a write intent was unresolved",
+                intent.backend_id
+            ));
+        }
+        if self.managed_versioning_capability != Some(intent.versioning_capability) {
+            return Err(format!(
+                "managed backend {} versioning capability changed while a write intent was unresolved",
+                intent.backend_id
+            ));
+        }
+        Ok(index)
+    }
+
+    pub async fn reconcile_managed_write_intents(
+        &self,
+        journal: Arc<dyn OperationJournal>,
+        capabilities: BackendCapabilities,
+        stale_after: Duration,
+        limit: u64,
+    ) -> Result<usize, ManagedError> {
+        let repository = self.authority_repository_required()?;
+        let intents = repository.pending_physical_write_intents(limit).await?;
+        let count = intents.len();
+        for durable in intents {
+            if durable.lease_expires_at_ms > crate::transaction::unix_time_ms() {
+                continue;
+            }
+            let intent = &durable.intent;
+            let owner = format!("managed-reconciler-{}", uuid::Uuid::now_v7());
+            let Some(lease) = repository
+                .claim_expired_physical_write_intent(
+                    intent.intent_id,
+                    &owner,
+                    crate::transaction::unix_time_ms()
+                        .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+                )
+                .await?
+            else {
+                continue;
+            };
+            let index = match self.validate_durable_intent_backend(&durable).await {
+                Ok(index) => index,
+                Err(reason) => {
+                    repository.block_physical_write(&lease, &reason).await?;
+                    continue;
+                }
+            };
+            let Some(mut operation) = journal
+                .get(intent.intent_id)
+                .await
+                .map_err(|error| ManagedError::Persistence(error.to_string()))?
+            else {
+                repository
+                    .block_physical_write(
+                        &lease,
+                        "managed write intent has no operation journal row",
+                    )
+                    .await?;
+                continue;
+            };
+            if operation.tenant_id.as_deref() != Some(intent.tenant_id.as_str())
+                || operation.namespace_epoch != Some(durable.namespace_epoch)
+                || operation.destination.backend_id != intent.backend_id
+                || operation.destination.bucket != intent.provider_bucket
+                || operation.destination.physical_key != intent.physical_key
+            {
+                repository
+                    .block_physical_write(
+                        &lease,
+                        "managed write intent does not match its operation journal identity",
+                    )
+                    .await?;
+                continue;
+            }
+            if !operation.state.is_terminal() {
+                let client = self.client_for(index).await.ok_or_else(|| {
+                    ManagedError::Persistence(format!(
+                        "managed backend {} is unavailable",
+                        intent.backend_id
+                    ))
+                })?;
+                let backend: Arc<dyn TransactionBackend> =
+                    Arc::new(AwsS3TransactionBackend::new(client, capabilities));
+                let reconciler = OperationReconciler::new(
+                    journal.clone(),
+                    backend,
+                    format!("managed-intent-{}", uuid::Uuid::now_v7()),
+                )
+                .map_err(|error| ManagedError::Persistence(error.to_string()))?;
+                if let Err(error) = reconciler
+                    .reconcile_operation(intent.intent_id, stale_after)
+                    .await
+                {
+                    repository
+                        .block_physical_write(
+                            &lease,
+                            &format!("managed operation reconciliation failed: {error}"),
+                        )
+                        .await?;
+                    continue;
+                }
+                operation = journal
+                    .get(intent.intent_id)
+                    .await
+                    .map_err(|error| ManagedError::Persistence(error.to_string()))?
+                    .ok_or_else(|| {
+                        ManagedError::Persistence(
+                            "managed operation disappeared after reconciliation".to_string(),
+                        )
+                    })?;
+            }
+            match (operation.state, operation.committed) {
+                (OperationState::ProvenAborted, _) => {
+                    repository.abort_physical_write(&lease).await?;
+                }
+                (OperationState::Committed, Some(stored)) if stored.version_history_complete => {
+                    repository
+                        .commit_physical_write(
+                            &lease,
+                            &stored.superseded_version_ids,
+                            stored.version_id.as_deref(),
+                        )
+                        .await?;
+                }
+                (OperationState::Committed, _) => {
+                    repository
+                        .block_physical_write(
+                            &lease,
+                            "managed operation committed with ambiguous or missing version history",
+                        )
+                        .await?;
+                }
+                (state, _) => {
+                    // A fresh operation not claimed by the stale lease remains
+                    // pending. Purge cannot complete while its intent exists.
+                    if operation.updated_at_ms
+                        <= crate::transaction::unix_time_ms()
+                            .saturating_sub(stale_after.as_millis() as i64)
+                    {
+                        repository
+                            .block_physical_write(
+                                &lease,
+                                &format!(
+                                    "managed operation remains unresolved in journal state {}",
+                                    state.as_str()
+                                ),
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 
     pub async fn open(
@@ -635,6 +1102,30 @@ impl ServiceStorage {
         })?;
         let backend: Arc<dyn TransactionBackend> =
             Arc::new(AwsS3TransactionBackend::new(client, capabilities));
+        let operation_id = uuid::Uuid::now_v7();
+        let repository = self
+            .authority_repository_required()
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        let versioning_mode = self.versioning_mode(index).await;
+        let writer_owner = format!("managed-writer-{}", uuid::Uuid::now_v7());
+        let lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id: operation_id,
+                tenant_id: logical.tenant_id.clone(),
+                backend_id: backend_id.to_string(),
+                backend_fingerprint: self.backends[index].fingerprint(),
+                provider_bucket: self.backends[index].bucket.clone(),
+                physical_key: physical_key.to_string(),
+                versioning_mode,
+                versioning_capability: match capabilities.versioning {
+                    VersioningCapability::Unsupported => BackendVersioningCapability::Unsupported,
+                    VersioningCapability::Optional => BackendVersioningCapability::Optional,
+                    VersioningCapability::Required => BackendVersioningCapability::Required,
+                },
+                lease_owner: writer_owner,
+            })
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
         let destination = ObjectDestination {
             backend_id: backend_id.to_string(),
             bucket: self.backends[index].bucket.clone(),
@@ -648,15 +1139,23 @@ impl ServiceStorage {
             format!("managed-request-{}", uuid::Uuid::now_v7()),
         )?;
         tokio::spawn(async move {
-            while abort_receiver.recv().await.is_some() {
-                if let Err(error) = reconciler.reconcile_due(Duration::ZERO, 16).await {
+            while let Some(operation_id) = abort_receiver.recv().await {
+                if let Err(error) = reconciler
+                    .reconcile_operation(operation_id, Duration::ZERO)
+                    .await
+                {
                     warn!("managed transaction cleanup failed: {error}");
                 }
             }
         });
-        let sink = DirectS3Sink::new(
+        let sink = match DirectS3Sink::new_scoped(
             journal.clone(),
             backend.clone(),
+            ManagedOperationScope {
+                operation_id,
+                tenant_id: logical.tenant_id.clone(),
+                namespace_epoch: lease.namespace_epoch,
+            },
             destination,
             ExpectedObject {
                 metadata,
@@ -665,13 +1164,54 @@ impl ServiceStorage {
             3,
             abort_signal,
         )
-        .await?;
-        let operation_id = sink.operation_id();
+        .await
+        {
+            Ok(sink) => sink,
+            Err(error) => {
+                repository
+                    .abort_physical_write(&lease)
+                    .await
+                    .map_err(|ledger_error| {
+                        TransactionError::Publication(format!(
+                            "managed journal initialization failed: {error}; intent cleanup failed: {ledger_error}"
+                        ))
+                    })?;
+                return Err(error);
+            }
+        };
+        let (lease_stop, mut lease_stopped) = watch::channel(());
+        let lease_repository = repository.clone();
+        let heartbeat_lease = lease.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = lease_stopped.changed() => break,
+                    _ = interval.tick() => {
+                        if lease_repository
+                            .renew_physical_write_intent(
+                                &heartbeat_lease,
+                                crate::transaction::unix_time_ms()
+                                    .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         Ok(Box::new(ManagedDirectSink {
             sink,
             backend,
             journal: journal.clone(),
             operation_id,
+            repository,
+            lease,
+            lease_stop: Some(lease_stop),
         }))
     }
 
@@ -811,17 +1351,28 @@ impl ServiceStorage {
         let index = self
             .index_for_id(&repair.target_backend_id)
             .ok_or_else(|| format!("unknown cleanup backend {}", repair.target_backend_id))?;
-        let client = self
-            .client_for(index)
-            .await
-            .ok_or_else(|| "cleanup backend is unavailable".to_string())?;
-        client
-            .delete_object()
-            .bucket(&self.backends[index].bucket)
-            .key(&repair.physical_key)
-            .send()
+        let repository = self
+            .authority_repository_required()
+            .map_err(|error| error.to_string())?;
+        let versions = repository
+            .physical_versions(
+                &repair.logical.tenant_id,
+                &repair.target_backend_id,
+                &self.backends[index].bucket,
+                &repair.physical_key,
+            )
             .await
             .map_err(|error| error.to_string())?;
+        if versions.is_empty() {
+            return Err("cleanup has no exact physical-version ledger targets".to_string());
+        }
+        for target in versions {
+            self.delete_and_verify_purge_target(&target).await?;
+            repository
+                .forget_physical_version(&target)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 }
@@ -831,6 +1382,67 @@ struct ManagedDirectSink {
     backend: Arc<dyn TransactionBackend>,
     journal: Arc<dyn OperationJournal>,
     operation_id: uuid::Uuid,
+    repository: Arc<dyn ManagedRepository>,
+    lease: crate::managed::PhysicalWriteLease,
+    lease_stop: Option<watch::Sender<()>>,
+}
+
+impl Drop for ManagedDirectSink {
+    fn drop(&mut self) {
+        if let Some(stop) = self.lease_stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+async fn settle_managed_intent_from_journal(
+    repository: &Arc<dyn ManagedRepository>,
+    lease: &crate::managed::PhysicalWriteLease,
+    operation: &crate::transaction::OperationRecord,
+) -> Result<(), TransactionError> {
+    match operation.state {
+        OperationState::ProvenAborted => repository
+            .abort_physical_write(lease)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string())),
+        OperationState::Committed => {
+            let Some(stored) = &operation.committed else {
+                let reason = "committed managed operation has no provider result metadata";
+                repository
+                    .block_physical_write(lease, reason)
+                    .await
+                    .map_err(|error| TransactionError::Publication(error.to_string()))?;
+                return Err(TransactionError::Publication(reason.to_string()));
+            };
+            if !stored.version_history_complete {
+                let reason = "committed managed operation has ambiguous provider version history";
+                repository
+                    .block_physical_write(lease, reason)
+                    .await
+                    .map_err(|error| TransactionError::Publication(error.to_string()))?;
+                return Err(TransactionError::CompletionAmbiguous);
+            }
+            repository
+                .commit_physical_write(
+                    lease,
+                    &stored.superseded_version_ids,
+                    stored.version_id.as_deref(),
+                )
+                .await
+                .map_err(|error| TransactionError::Publication(error.to_string()))
+        }
+        state => {
+            let reason = format!(
+                "managed operation remains unresolved in journal state {}",
+                state.as_str()
+            );
+            repository
+                .block_physical_write(lease, &reason)
+                .await
+                .map_err(|error| TransactionError::Publication(error.to_string()))?;
+            Err(TransactionError::CompletionAmbiguous)
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -848,6 +1460,14 @@ trait ManagedDestination: Send {
 #[async_trait::async_trait]
 impl ManagedDestination for ManagedDirectSink {
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
+        self.repository
+            .renew_physical_write_intent(
+                &self.lease,
+                crate::transaction::unix_time_ms()
+                    .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+            )
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
         self.sink.write(chunk).await
     }
 
@@ -856,18 +1476,97 @@ impl ManagedDestination for ManagedDirectSink {
         expected_size: u64,
         expected_sha256: &str,
     ) -> Result<(), TransactionError> {
+        self.repository
+            .renew_physical_write_intent(
+                &self.lease,
+                crate::transaction::unix_time_ms()
+                    .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+            )
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
         self.sink
             .verify_output(expected_size, expected_sha256)
             .await
     }
 
     async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+        self.repository
+            .renew_physical_write_intent(
+                &self.lease,
+                crate::transaction::unix_time_ms()
+                    .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+            )
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
         let journal = self.journal.clone();
-        complete_reconciled(self, &journal).await
+        let stored = match complete_reconciled(self, &journal).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                let reason =
+                    format!("provider completion did not prove exact version history: {error}");
+                self.repository
+                    .block_physical_write(&self.lease, &reason)
+                    .await
+                    .map_err(|ledger_error| {
+                        TransactionError::Publication(format!(
+                            "{reason}; additionally failed to block its physical write intent: {ledger_error}"
+                        ))
+                    })?;
+                return Err(error);
+            }
+        };
+        if !stored.version_history_complete {
+            let reason = "provider version history is ambiguous; exact namespace purge is blocked";
+            self.repository
+                .block_physical_write(&self.lease, reason)
+                .await
+                .map_err(|error| TransactionError::Publication(error.to_string()))?;
+            return Err(TransactionError::Publication(reason.to_string()));
+        }
+        if let Err(error) = self
+            .repository
+            .commit_physical_write(
+                &self.lease,
+                &stored.superseded_version_ids,
+                stored.version_id.as_deref(),
+            )
+            .await
+        {
+            let reason = format!("physical version ledger commit failed: {error}");
+            let _ = self
+                .repository
+                .block_physical_write(&self.lease, &reason)
+                .await;
+            return Err(TransactionError::Publication(reason));
+        }
+        Ok(stored)
     }
 
     async fn abort(&mut self) -> Result<(), TransactionError> {
-        self.sink.abort().await
+        self.repository
+            .renew_physical_write_intent(
+                &self.lease,
+                crate::transaction::unix_time_ms()
+                    .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+            )
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        if let Some(operation) = self.journal.get(self.operation_id).await?
+            && matches!(
+                operation.state,
+                OperationState::Committed
+                    | OperationState::CommitUnknown
+                    | OperationState::Completing
+            )
+        {
+            settle_managed_intent_from_journal(&self.repository, &self.lease, &operation).await?;
+            return Err(TransactionError::CompletionAmbiguous);
+        }
+        self.sink.abort().await?;
+        let operation = self.journal.get(self.operation_id).await?.ok_or_else(|| {
+            TransactionError::Publication("managed operation journal row disappeared".to_string())
+        })?;
+        settle_managed_intent_from_journal(&self.repository, &self.lease, &operation).await
     }
 }
 
@@ -1058,8 +1757,46 @@ pub fn parse_service_backends(env_value: &str) -> Vec<ServiceBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed::InMemoryManagedRepository;
+    use crate::managed::{InMemoryManagedRepository, PostgresManagedRepository};
     use std::sync::Mutex;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::routing::any;
+
+    type ProviderRequests = Arc<Mutex<Vec<(Method, String)>>>;
+
+    async fn purge_provider_mock(
+        State(requests): State<ProviderRequests>,
+        method: Method,
+        uri: Uri,
+    ) -> axum::response::Response {
+        requests
+            .lock()
+            .unwrap()
+            .push((method.clone(), uri.to_string()));
+        if method == Method::GET && uri.query() == Some("versioning") {
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/xml")
+                .body(Body::from(
+                    r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#,
+                ))
+                .unwrap()
+        } else if method == Method::HEAD {
+            axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap()
+        } else {
+            axum::response::Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap()
+        }
+    }
 
     fn authority() -> ObjectAuthority {
         ObjectAuthority {
@@ -1078,6 +1815,451 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    fn purge_request() -> NamespacePurgeRequest {
+        NamespacePurgeRequest {
+            tenant_id: "tenant".to_string(),
+            operation_id: uuid::Uuid::now_v7(),
+        }
+    }
+
+    fn managed_test_capabilities() -> BackendCapabilities {
+        BackendCapabilities {
+            incomplete_upload_discovery:
+                crate::transaction::IncompleteUploadDiscovery::ExactKeyAndStartTime,
+            abort_incomplete_upload: true,
+            cleanup_sla: Some(Duration::from_secs(60)),
+            lifecycle_rule: true,
+            versioning: crate::transaction::VersioningCapability::Optional,
+            conditional_reads: crate::transaction::ConditionalReadCapability::VersionAndEtag,
+            response_checksums: crate::transaction::ResponseChecksumCapability::Standard,
+            list_operations: crate::transaction::ListCapability::V1AndV2,
+            multipart_responses: crate::transaction::MultipartResponseCapability::Standard,
+            completion_reconciliation:
+                crate::transaction::CompletionReconciliation::HeadWithOperationIdentity,
+        }
+    }
+
+    async fn assert_default_purge_is_unsupported(storage: &ServiceStorage) {
+        let request = purge_request();
+        assert!(matches!(
+            storage.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported { .. }
+        ));
+        assert!(matches!(
+            storage.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn namespace_purge_without_authority_is_explicitly_unsupported() {
+        let storage = ServiceStorage::new(Vec::new());
+        let request = purge_request();
+        assert_eq!(
+            storage.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported {
+                reason: "managed namespace purge requires an authority repository".to_string(),
+            }
+        );
+        assert_eq!(
+            storage.namespace_purge_status(&request).await.unwrap(),
+            NamespacePurgeStatus::Unsupported {
+                reason: "managed namespace purge status requires an authority repository"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_namespace_purge_delegates_and_completes_in_memory() {
+        let storage = ServiceStorage::with_management(
+            Vec::new(),
+            Arc::new(InMemoryManagedRepository::new()),
+            ManagedStreamingMode::Enforce,
+            PLACEMENT_VERSION_V1,
+        )
+        .with_managed_capabilities(Some(managed_test_capabilities()));
+        assert_eq!(
+            storage.purge_namespace(&purge_request()).await.unwrap(),
+            NamespacePurgeStatus::Complete {
+                deleted_versions: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_purge_requires_enforce_mode_without_connecting_to_postgres() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/postgres")
+            .unwrap();
+        let storage = ServiceStorage::with_management(
+            Vec::new(),
+            Arc::new(PostgresManagedRepository::new(pool)),
+            ManagedStreamingMode::Off,
+            PLACEMENT_VERSION_V1,
+        );
+        assert_default_purge_is_unsupported(&storage).await;
+    }
+
+    #[tokio::test]
+    async fn namespace_purge_deletes_and_verifies_exact_provider_version() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(purge_provider_mock))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = ServiceBackend {
+            provider: "mock".to_string(),
+            endpoint,
+            region: "us-east-1".to_string(),
+            bucket: "bucket".to_string(),
+            access_key: "key".to_string(),
+            secret_key: "secret".to_string(),
+        };
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let intent_id = uuid::Uuid::now_v7();
+        let lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id,
+                tenant_id: "tenant".to_string(),
+                backend_id: "mock:bucket".to_string(),
+                backend_fingerprint: provider.fingerprint(),
+                provider_bucket: "bucket".to_string(),
+                physical_key: "managed/physical".to_string(),
+                versioning_mode: BackendVersioningMode::Unversioned,
+                versioning_capability: BackendVersioningCapability::Optional,
+                lease_owner: "writer".to_string(),
+            })
+            .await
+            .unwrap();
+        repository
+            .commit_physical_write(&lease, &[], Some("version-1"))
+            .await
+            .unwrap();
+        let storage = ServiceStorage::with_management(
+            vec![provider],
+            repository,
+            ManagedStreamingMode::Enforce,
+            PLACEMENT_VERSION_V1,
+        )
+        .with_managed_capabilities(Some(managed_test_capabilities()));
+        assert_eq!(
+            storage.purge_namespace(&purge_request()).await.unwrap(),
+            NamespacePurgeStatus::Complete {
+                deleted_versions: 1,
+            }
+        );
+        {
+            let requests = requests.lock().unwrap();
+            assert!(requests.iter().any(|(method, uri)| {
+                method == Method::DELETE
+                    && uri.starts_with("/bucket/managed/physical?")
+                    && uri.contains("versionId=version-1")
+            }));
+            assert!(requests.iter().any(|(method, uri)| {
+                method == Method::HEAD
+                    && uri.starts_with("/bucket/managed/physical?")
+                    && uri.contains("versionId=version-1")
+            }));
+        }
+        let mismatched_identity = PhysicalVersionTarget {
+            tenant_id: "tenant".to_string(),
+            namespace_epoch: 1,
+            backend_id: "mock:bucket".to_string(),
+            backend_fingerprint: "different-account-or-endpoint".to_string(),
+            provider_bucket: "bucket".to_string(),
+            physical_key: "managed/physical".to_string(),
+            version_id: Some("version-2".to_string()),
+            versioning_mode: BackendVersioningMode::Unversioned,
+            versioning_capability: BackendVersioningCapability::Optional,
+            write_operation_id: uuid::Uuid::now_v7(),
+        };
+        assert!(
+            storage
+                .delete_and_verify_purge_target(&mismatched_identity)
+                .await
+                .unwrap_err()
+                .contains("identity changed")
+        );
+        let changed_versioning = PhysicalVersionTarget {
+            backend_fingerprint: storage.backends[0].fingerprint(),
+            version_id: None,
+            versioning_mode: BackendVersioningMode::Enabled,
+            ..mismatched_identity
+        };
+        assert!(
+            storage
+                .delete_and_verify_purge_target(&changed_versioning)
+                .await
+                .unwrap_err()
+                .contains("versioning mode changed")
+        );
+        let unprovable_unversioned = PhysicalVersionTarget {
+            versioning_mode: BackendVersioningMode::Unversioned,
+            ..changed_versioning
+        };
+        assert!(
+            storage
+                .delete_and_verify_purge_target(&unprovable_unversioned)
+                .await
+                .unwrap_err()
+                .contains("cannot prove an unversioned ledger target")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn namespace_purge_blocks_unknown_provider_without_forgetting_target() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let intent_id = uuid::Uuid::now_v7();
+        let lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id,
+                tenant_id: "tenant".to_string(),
+                backend_id: "missing:bucket".to_string(),
+                backend_fingerprint: "missing-fingerprint".to_string(),
+                provider_bucket: "bucket".to_string(),
+                physical_key: "managed/physical".to_string(),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Optional,
+                lease_owner: "writer".to_string(),
+            })
+            .await
+            .unwrap();
+        repository
+            .commit_physical_write(&lease, &[], Some("version-1"))
+            .await
+            .unwrap();
+        let storage = ServiceStorage::with_management(
+            Vec::new(),
+            repository,
+            ManagedStreamingMode::Enforce,
+            PLACEMENT_VERSION_V1,
+        );
+        assert!(matches!(
+            storage.purge_namespace(&purge_request()).await.unwrap(),
+            NamespacePurgeStatus::Blocked { reason }
+                if reason.contains("unknown managed backend")
+        ));
+    }
+
+    #[tokio::test]
+    async fn abort_after_lost_put_response_and_retry_ambiguity_preserves_blocking_intent() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let operation_id = uuid::Uuid::now_v7();
+        let lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id: operation_id,
+                tenant_id: "tenant".to_string(),
+                backend_id: "mock:bucket".to_string(),
+                backend_fingerprint: "fingerprint".to_string(),
+                provider_bucket: "bucket".to_string(),
+                physical_key: "managed/physical".to_string(),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Optional,
+                lease_owner: "writer".to_string(),
+            })
+            .await
+            .unwrap();
+        let journal = Arc::new(crate::transaction::InMemoryOperationJournal::new());
+        let operation = crate::transaction::OperationRecord::scoped_intent(
+            operation_id,
+            ObjectDestination {
+                backend_id: "mock:bucket".to_string(),
+                bucket: "bucket".to_string(),
+                logical_key: "bucket/key".to_string(),
+                physical_key: "managed/physical".to_string(),
+            },
+            ExpectedObject::default(),
+            "tenant".to_string(),
+            lease.namespace_epoch,
+        );
+        journal.insert_intent(operation).await.unwrap();
+        journal.set_open(operation_id, None).await.unwrap();
+        journal
+            .transition(
+                operation_id,
+                OperationState::Open,
+                OperationState::Completing,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .transition(
+                operation_id,
+                OperationState::Completing,
+                OperationState::Committed,
+                Some(&StoredObjectMeta {
+                    etag: Some("retry-etag".to_string()),
+                    version_id: Some("observed-retry-version".to_string()),
+                    superseded_version_ids: Vec::new(),
+                    version_history_complete: false,
+                }),
+            )
+            .await
+            .unwrap();
+        let committed = journal.get(operation_id).await.unwrap().unwrap();
+        let authority: Arc<dyn ManagedRepository> = repository.clone();
+        assert!(matches!(
+            settle_managed_intent_from_journal(&authority, &lease, &committed).await,
+            Err(TransactionError::CompletionAmbiguous)
+        ));
+        let request = NamespacePurgeRequest {
+            tenant_id: "tenant".to_string(),
+            operation_id: uuid::Uuid::now_v7(),
+        };
+        assert!(matches!(
+            repository.purge_namespace(&request).await.unwrap(),
+            NamespacePurgeStatus::Blocked { reason }
+                if reason.contains("ambiguous provider version history")
+        ));
+        assert_eq!(
+            repository
+                .pending_physical_write_intents(10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_instance_reconciler_skips_fresh_and_recovers_expired_terminal_intent() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(purge_provider_mock))
+            .with_state(requests);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = ServiceBackend {
+            provider: "mock".to_string(),
+            endpoint: format!("http://{}", listener.local_addr().unwrap()),
+            region: "us-east-1".to_string(),
+            bucket: "bucket".to_string(),
+            access_key: "key".to_string(),
+            secret_key: "secret".to_string(),
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let operation_id = uuid::Uuid::now_v7();
+        let lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id: operation_id,
+                tenant_id: "tenant".to_string(),
+                backend_id: provider.id(),
+                backend_fingerprint: provider.fingerprint(),
+                provider_bucket: provider.bucket.clone(),
+                physical_key: "managed/physical".to_string(),
+                versioning_mode: BackendVersioningMode::Unversioned,
+                versioning_capability: BackendVersioningCapability::Optional,
+                lease_owner: "writer".to_string(),
+            })
+            .await
+            .unwrap();
+        let journal = Arc::new(crate::transaction::InMemoryOperationJournal::new());
+        journal
+            .insert_intent(crate::transaction::OperationRecord::scoped_intent(
+                operation_id,
+                ObjectDestination {
+                    backend_id: provider.id(),
+                    bucket: provider.bucket.clone(),
+                    logical_key: "bucket/key".to_string(),
+                    physical_key: "managed/physical".to_string(),
+                },
+                ExpectedObject::default(),
+                "tenant".to_string(),
+                lease.namespace_epoch,
+            ))
+            .await
+            .unwrap();
+        journal.set_open(operation_id, None).await.unwrap();
+        journal
+            .transition(
+                operation_id,
+                OperationState::Open,
+                OperationState::Completing,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .transition(
+                operation_id,
+                OperationState::Completing,
+                OperationState::Committed,
+                Some(&StoredObjectMeta {
+                    etag: Some("etag".to_string()),
+                    version_id: None,
+                    superseded_version_ids: Vec::new(),
+                    version_history_complete: true,
+                }),
+            )
+            .await
+            .unwrap();
+        let storage = ServiceStorage::with_management(
+            vec![provider],
+            repository.clone(),
+            ManagedStreamingMode::Enforce,
+            PLACEMENT_VERSION_V1,
+        )
+        .with_managed_capabilities(Some(managed_test_capabilities()));
+        assert_eq!(
+            storage
+                .reconcile_managed_write_intents(
+                    journal.clone(),
+                    managed_test_capabilities(),
+                    Duration::ZERO,
+                    10,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            repository
+                .pending_physical_write_intents(10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "another instance must not claim a fresh leased intent"
+        );
+        repository
+            .renew_physical_write_intent(
+                &lease,
+                crate::transaction::unix_time_ms().saturating_sub(1),
+            )
+            .await
+            .unwrap();
+        storage
+            .reconcile_managed_write_intents(
+                journal,
+                managed_test_capabilities(),
+                Duration::ZERO,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .pending_physical_write_intents(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repository
+                .physical_versions("tenant", "mock:bucket", "bucket", "managed/physical")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        server.abort();
     }
 
     #[test]

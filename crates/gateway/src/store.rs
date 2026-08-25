@@ -1101,64 +1101,6 @@ fn chrono_now() -> String {
     format!("{}", ts)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackendConfig {
-    #[serde(default)]
-    pub backend_type: String, // "aws_role", "s3_compatible", or empty (none)
-    #[serde(default)]
-    pub role_arn: String,
-    #[serde(default)]
-    pub external_id: String,
-    #[serde(default)]
-    pub endpoint: String,
-    #[serde(default)]
-    pub access_key: String,
-    #[serde(default)]
-    pub secret_key: String,
-    #[serde(default)]
-    pub region: String,
-}
-
-impl BackendConfig {
-    pub fn is_configured(&self) -> bool {
-        !self.backend_type.is_empty()
-    }
-}
-
-#[derive(Debug)]
-pub struct BackendRegistry {
-    backends: RwLock<HashMap<String, BackendConfig>>,
-}
-
-impl BackendRegistry {
-    pub fn new() -> Self {
-        Self {
-            backends: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn set(&self, user_id: &str, config: BackendConfig) {
-        self.backends
-            .write()
-            .unwrap()
-            .insert(user_id.to_string(), config);
-    }
-
-    pub fn get(&self, user_id: &str) -> Option<BackendConfig> {
-        self.backends.read().unwrap().get(user_id).cloned()
-    }
-
-    pub fn generate_external_id(&self, user_id: &str) -> String {
-        format!("s4_ext_{}", sha256_hash(user_id))
-    }
-}
-
-impl Default for BackendRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -93,6 +93,8 @@ impl ObjectSinkTransaction for MemorySinkTransaction {
         Ok(StoredObjectMeta {
             etag: Some(object.etag),
             version_id: None,
+            superseded_version_ids: Vec::new(),
+            version_history_complete: true,
         })
     }
 

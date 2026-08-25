@@ -66,16 +66,14 @@ configuration = s4_client.Configuration(
 # Enter a context with an instance of the API client
 with s4_client.ApiClient(configuration) as api_client:
     # Create an instance of the API class
-    api_instance = s4_client.KeysApi(api_client)
-    create_key_request = s4_client.CreateKeyRequest() # CreateKeyRequest | 
+    api_instance = s4_client.BackendApi(api_client)
 
     try:
-        # Create a new API key
-        api_response = api_instance.create_key(create_key_request)
-        print("The response of KeysApi->create_key:\n")
+        api_response = api_instance.get_backend()
+        print("The response of BackendApi->get_backend:\n")
         pprint(api_response)
     except ApiException as e:
-        print("Exception when calling KeysApi->create_key: %s\n" % e)
+        print("Exception when calling BackendApi->get_backend: %s\n" % e)
 
 ```
 
@@ -85,6 +83,8 @@ All URIs are relative to *http://localhost*
 
 Class | Method | HTTP request | Description
 ------------ | ------------- | ------------- | -------------
+*BackendApi* | [**get_backend**](docs/BackendApi.md#get_backend) | **GET** /dashboard/api/backend | 
+*BackendApi* | [**put_backend**](docs/BackendApi.md#put_backend) | **PUT** /dashboard/api/backend | 
 *KeysApi* | [**create_key**](docs/KeysApi.md#create_key) | **POST** /dashboard/api/keys | Create a new API key
 *KeysApi* | [**delete_key**](docs/KeysApi.md#delete_key) | **DELETE** /dashboard/api/keys | Revoke an API key
 *KeysApi* | [**get_keys**](docs/KeysApi.md#get_keys) | **GET** /dashboard/api/keys | List API keys for the authenticated user
@@ -94,6 +94,9 @@ Class | Method | HTTP request | Description
 ## Documentation For Models
 
  - [ApiKeyResponse](docs/ApiKeyResponse.md)
+ - [BackendConfigRequest](docs/BackendConfigRequest.md)
+ - [BackendConfigResponse](docs/BackendConfigResponse.md)
+ - [BackendType](docs/BackendType.md)
  - [CreateKeyRequest](docs/CreateKeyRequest.md)
  - [DeleteKeyRequest](docs/DeleteKeyRequest.md)
  - [ListKeyResponse](docs/ListKeyResponse.md)

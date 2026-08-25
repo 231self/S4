@@ -3,10 +3,65 @@ import { Configuration, ConfigurationOptions } from '../configuration'
 import type { Middleware } from '../middleware';
 
 import { ApiKeyResponse } from '../models/ApiKeyResponse';
+import { BackendConfigRequest } from '../models/BackendConfigRequest';
+import { BackendConfigResponse } from '../models/BackendConfigResponse';
+import { BackendType } from '../models/BackendType';
 import { CreateKeyRequest } from '../models/CreateKeyRequest';
 import { DeleteKeyRequest } from '../models/DeleteKeyRequest';
 import { ListKeyResponse } from '../models/ListKeyResponse';
 import { ObjectResponse } from '../models/ObjectResponse';
+
+import { ObservableBackendApi } from "./ObservableAPI";
+import { BackendApiRequestFactory, BackendApiResponseProcessor} from "../apis/BackendApi";
+
+export interface BackendApiGetBackendRequest {
+}
+
+export interface BackendApiPutBackendRequest {
+    /**
+     * 
+     * @type BackendConfigRequest
+     * @memberof BackendApiputBackend
+     */
+    backendConfigRequest: BackendConfigRequest
+}
+
+export class ObjectBackendApi {
+    private api: ObservableBackendApi
+
+    public constructor(configuration: Configuration, requestFactory?: BackendApiRequestFactory, responseProcessor?: BackendApiResponseProcessor) {
+        this.api = new ObservableBackendApi(configuration, requestFactory, responseProcessor);
+    }
+
+    /**
+     * @param param the request object
+     */
+    public getBackendWithHttpInfo(param: BackendApiGetBackendRequest = {}, options?: ConfigurationOptions): Promise<HttpInfo<BackendConfigResponse>> {
+        return this.api.getBackendWithHttpInfo( options).toPromise();
+    }
+
+    /**
+     * @param param the request object
+     */
+    public getBackend(param: BackendApiGetBackendRequest = {}, options?: ConfigurationOptions): Promise<BackendConfigResponse> {
+        return this.api.getBackend( options).toPromise();
+    }
+
+    /**
+     * @param param the request object
+     */
+    public putBackendWithHttpInfo(param: BackendApiPutBackendRequest, options?: ConfigurationOptions): Promise<HttpInfo<BackendConfigResponse>> {
+        return this.api.putBackendWithHttpInfo(param.backendConfigRequest,  options).toPromise();
+    }
+
+    /**
+     * @param param the request object
+     */
+    public putBackend(param: BackendApiPutBackendRequest, options?: ConfigurationOptions): Promise<BackendConfigResponse> {
+        return this.api.putBackend(param.backendConfigRequest,  options).toPromise();
+    }
+
+}
 
 import { ObservableKeysApi } from "./ObservableAPI";
 import { KeysApiRequestFactory, KeysApiResponseProcessor} from "../apis/KeysApi";

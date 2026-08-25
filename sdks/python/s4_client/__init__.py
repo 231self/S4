@@ -18,6 +18,7 @@ __version__ = "1.0.0"
 
 # Define package exports
 __all__ = [
+    "BackendApi",
     "KeysApi",
     "ObjectsApi",
     "ApiResponse",
@@ -30,6 +31,9 @@ __all__ = [
     "ApiAttributeError",
     "ApiException",
     "ApiKeyResponse",
+    "BackendConfigRequest",
+    "BackendConfigResponse",
+    "BackendType",
     "CreateKeyRequest",
     "DeleteKeyRequest",
     "ListKeyResponse",
@@ -37,6 +41,7 @@ __all__ = [
 ]
 
 # import apis into sdk package
+from s4_client.api.backend_api import BackendApi as BackendApi
 from s4_client.api.keys_api import KeysApi as KeysApi
 from s4_client.api.objects_api import ObjectsApi as ObjectsApi
 
@@ -53,6 +58,9 @@ from s4_client.exceptions import ApiException as ApiException
 
 # import models into sdk package
 from s4_client.models.api_key_response import ApiKeyResponse as ApiKeyResponse
+from s4_client.models.backend_config_request import BackendConfigRequest as BackendConfigRequest
+from s4_client.models.backend_config_response import BackendConfigResponse as BackendConfigResponse
+from s4_client.models.backend_type import BackendType as BackendType
 from s4_client.models.create_key_request import CreateKeyRequest as CreateKeyRequest
 from s4_client.models.delete_key_request import DeleteKeyRequest as DeleteKeyRequest
 from s4_client.models.list_key_response import ListKeyResponse as ListKeyResponse

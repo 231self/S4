@@ -135,6 +135,34 @@ struct MeteredBody {
     finished: bool,
 }
 
+impl MeteredBody {
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let control = self.control.clone();
+        let context = self.context.clone();
+        let bucket = self.bucket.clone();
+        let bytes = self.bytes;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                control
+                    .record(&context, &bucket, RequestKind::Read, bytes)
+                    .await;
+            });
+        }
+    }
+}
+
+impl Drop for MeteredBody {
+    fn drop(&mut self) {
+        // Hyper can stop polling after the final Content-Length data frame,
+        // without polling the body once more for `None`.
+        self.finish();
+    }
+}
+
 impl http_body::Body for MeteredBody {
     type Data = bytes::Bytes;
     type Error = axum::Error;
@@ -158,16 +186,7 @@ impl http_body::Body for MeteredBody {
                 std::task::Poll::Ready(Some(Err(error)))
             }
             std::task::Poll::Ready(None) => {
-                self.finished = true;
-                let control = self.control.clone();
-                let context = self.context.clone();
-                let bucket = self.bucket.clone();
-                let bytes = self.bytes;
-                tokio::spawn(async move {
-                    control
-                        .record(&context, &bucket, RequestKind::Read, bytes)
-                        .await;
-                });
+                self.finish();
                 std::task::Poll::Ready(None)
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
@@ -4116,6 +4135,43 @@ mod tests {
             *control.calls.lock().unwrap(),
             vec![UsageCall {
                 context: auth.context,
+                bucket: "bucket-a".to_string(),
+                kind: RequestKind::Read,
+                bytes: 5,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn metered_body_records_when_dropped_after_final_data_frame() {
+        let control = Arc::new(RecordingControlPlane::default());
+        let context = AuthenticatedRequestContext {
+            user_id: "user-a".to_string(),
+            workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
+        };
+        let mut body = MeteredBody {
+            inner: Body::from("range"),
+            control: control.clone(),
+            context: context.clone(),
+            bucket: "bucket-a".to_string(),
+            bytes: 0,
+            finished: false,
+        };
+
+        let frame = std::future::poll_fn(|cx| {
+            http_body::Body::poll_frame(std::pin::Pin::new(&mut body), cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(frame.data_ref().unwrap().as_ref(), b"range");
+        drop(body);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *control.calls.lock().unwrap(),
+            vec![UsageCall {
+                context,
                 bucket: "bucket-a".to_string(),
                 kind: RequestKind::Read,
                 bytes: 5,

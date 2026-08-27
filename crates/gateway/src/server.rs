@@ -6413,7 +6413,7 @@ pub async fn build_state(
 /// Build the axum router for the engine. The SaaS crate merges its own
 /// control-plane routes (workspaces, billing, dashboard) onto this.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/", get(root))
         .route("/dashboard/api/keys", get(get_keys))
@@ -6429,12 +6429,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/dashboard/api/demo/read", get(demo_read))
         .route("/dashboard/api/backend", get(get_backend))
         .route("/dashboard/api/backend", put(put_backend))
-        .route("/dashboard/api/plugins", get(get_plugins))
-        .route("/dashboard/api/plugins", post(create_plugin))
-        .route("/dashboard/api/plugins/reorder", put(reorder_plugins))
-        .route("/dashboard/api/plugins/{id}", put(update_plugin))
-        .route("/dashboard/api/plugins/{id}", delete(delete_plugin))
-        .route("/dashboard/api/objects", get(list_objects))
         .route("/{bucket}", get(s3_list_objects))
         .route("/{bucket}", put(s3_bucket_put))
         .route("/{bucket}", delete(s3_bucket_delete))
@@ -6442,7 +6436,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/{bucket}/{*key}", get(s3_get))
         .route("/{bucket}/{*key}", head(s3_head))
         .route("/{bucket}/{*key}", delete(s3_delete))
-        .route("/{bucket}/{*key}", post(s3_post))
+        .route("/{bucket}/{*key}", post(s3_post));
+    if state.auth_disabled {
+        router = router
+            .route("/dashboard/api/plugins", get(get_plugins))
+            .route("/dashboard/api/plugins", post(create_plugin))
+            .route("/dashboard/api/plugins/reorder", put(reorder_plugins))
+            .route("/dashboard/api/plugins/{id}", put(update_plugin))
+            .route("/dashboard/api/plugins/{id}", delete(delete_plugin))
+            .route("/dashboard/api/objects", get(list_objects));
+    }
+    router
         .layer(CorsLayer::permissive())
         .with_state(state)
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))

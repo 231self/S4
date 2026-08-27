@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
@@ -13,6 +13,142 @@ use s4_wasm_runtime::CancellationToken;
 
 pub const DEFAULT_MAX_SOURCE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_SOURCE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+const OBJECT_DOWNLOAD_CSP: &str =
+    "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'";
+
+pub(crate) fn harden_object_response_headers(headers: &mut HeaderMap) {
+    headers.remove(header::AGE);
+    headers.remove(header::EXPIRES);
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(OBJECT_DOWNLOAD_CSP),
+    );
+}
+
+/// Keep only object representation and S3-compatible response metadata from an
+/// untrusted presigned HTTP backend.
+pub(crate) fn filter_presigned_response_headers(headers: &mut HeaderMap) {
+    strip_hop_by_hop_headers(headers);
+    let blocked: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| !is_allowed_presigned_response_header(name))
+        .cloned()
+        .collect();
+    for name in blocked {
+        headers.remove(name);
+    }
+}
+
+fn is_allowed_presigned_response_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    name.starts_with("x-amz-meta-")
+        || name.starts_with("x-goog-meta-")
+        || matches!(
+            name,
+            // Representation, range, and validator metadata. Backend cache
+            // policy is intentionally excluded and replaced at the boundary.
+            "accept-ranges"
+                | "content-encoding"
+                | "content-language"
+                | "content-length"
+                | "content-range"
+                | "content-type"
+                | "etag"
+                | "last-modified"
+                // S3 object metadata surfaced by GetObject/HeadObject.
+                | "x-amz-archive-status"
+                | "x-amz-checksum-crc32"
+                | "x-amz-checksum-crc32c"
+                | "x-amz-checksum-crc64nvme"
+                | "x-amz-checksum-md5"
+                | "x-amz-checksum-sha1"
+                | "x-amz-checksum-sha256"
+                | "x-amz-checksum-sha512"
+                | "x-amz-checksum-type"
+                | "x-amz-checksum-xxhash3"
+                | "x-amz-checksum-xxhash64"
+                | "x-amz-checksum-xxhash128"
+                | "x-amz-delete-marker"
+                | "x-amz-expiration"
+                | "x-amz-missing-meta"
+                | "x-amz-mp-parts-count"
+                | "x-amz-object-lock-legal-hold"
+                | "x-amz-object-lock-mode"
+                | "x-amz-object-lock-retain-until-date"
+                | "x-amz-replication-status"
+                | "x-amz-request-charged"
+                | "x-amz-restore"
+                | "x-amz-server-side-encryption"
+                | "x-amz-server-side-encryption-aws-kms-key-id"
+                | "x-amz-server-side-encryption-bucket-key-enabled"
+                | "x-amz-server-side-encryption-customer-algorithm"
+                | "x-amz-server-side-encryption-customer-key-md5"
+                | "x-amz-storage-class"
+                | "x-amz-tagging-count"
+                | "x-amz-version-id"
+                | "x-amz-website-redirect-location"
+                // GCS representation, version, and checksum metadata.
+                | "x-goog-component-count"
+                | "x-goog-custom-time"
+                | "x-goog-encryption-algorithm"
+                | "x-goog-encryption-key-sha256"
+                | "x-goog-expiration"
+                | "x-goog-generation"
+                | "x-goog-hash"
+                | "x-goog-metageneration"
+                | "x-goog-object-lock-mode"
+                | "x-goog-object-lock-retain-until-date"
+                | "x-goog-storage-class"
+                | "x-goog-stored-content-encoding"
+                | "x-goog-stored-content-length"
+        )
+}
+
+fn filter_object_response_trailers(trailers: &mut HeaderMap) {
+    let blocked: Vec<HeaderName> = trailers
+        .keys()
+        .filter(|name| !is_allowed_object_response_trailer(name))
+        .cloned()
+        .collect();
+    for name in blocked {
+        trailers.remove(name);
+    }
+}
+
+fn is_allowed_object_response_trailer(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "content-digest"
+            | "content-md5"
+            | "digest"
+            | "repr-digest"
+            | "x-amz-checksum-crc32"
+            | "x-amz-checksum-crc32c"
+            | "x-amz-checksum-crc64nvme"
+            | "x-amz-checksum-md5"
+            | "x-amz-checksum-sha1"
+            | "x-amz-checksum-sha256"
+            | "x-amz-checksum-sha512"
+            | "x-amz-checksum-type"
+            | "x-amz-checksum-xxhash3"
+            | "x-amz-checksum-xxhash64"
+            | "x-amz-checksum-xxhash128"
+            | "x-goog-hash"
+    )
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ObjectMetadata {
@@ -225,8 +361,45 @@ impl OpenedObject {
         let mut response = Response::builder().status(self.status);
         if let Some(headers) = response.headers_mut() {
             headers.extend(self.metadata.headers);
+            harden_object_response_headers(headers);
         }
-        response.body(self.body).expect("valid object response")
+        response
+            .body(Body::new(ObjectResponseBody { inner: self.body }))
+            .expect("valid object response")
+    }
+}
+
+#[derive(Debug)]
+struct ObjectResponseBody {
+    inner: Body,
+}
+
+impl http_body::Body for ObjectResponseBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => match frame.into_trailers() {
+                Ok(mut trailers) => {
+                    filter_object_response_trailers(&mut trailers);
+                    Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                }
+                Err(frame) => Poll::Ready(Some(Ok(frame))),
+            },
+            result => result,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -371,32 +544,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trailers_and_exact_size_hint_are_preserved() {
+    async fn response_trailers_keep_only_integrity_fields_and_preserve_size_hint() {
         let mut trailers = HeaderMap::new();
-        trailers.insert("x-checksum", HeaderValue::from_static("done"));
+        trailers.insert(
+            "x-amz-checksum-sha256",
+            HeaderValue::from_static("checksum"),
+        );
+        trailers.insert("x-goog-hash", HeaderValue::from_static("crc32c=abcd"));
+        trailers.insert("set-cookie", HeaderValue::from_static("attacker=1"));
+        trailers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        trailers.insert("www-authenticate", HeaderValue::from_static("Basic"));
+        trailers.insert("x-unknown", HeaderValue::from_static("attacker"));
         let body = ScriptedBody {
             polls: Arc::new(AtomicUsize::new(0)),
             frames: VecDeque::from([
                 Ok(Frame::data(Bytes::from_static(b"data"))),
-                Ok(Frame::trailers(trailers.clone())),
+                Ok(Frame::trailers(trailers)),
             ]),
             hint: SizeHint::with_exact(4),
         };
-        let mut body = opened(body).body;
+        let mut body = opened(body).into_response().into_body();
         assert_eq!(body.size_hint().exact(), Some(4));
         assert_eq!(
             body.frame().await.unwrap().unwrap().into_data().unwrap(),
             Bytes::from_static(b"data")
         );
-        assert_eq!(
-            body.frame()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_trailers()
-                .unwrap(),
-            trailers
-        );
+        let trailers = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers["x-amz-checksum-sha256"], "checksum");
+        assert_eq!(trailers["x-goog-hash"], "crc32c=abcd");
+        for dropped in [
+            "set-cookie",
+            "access-control-allow-origin",
+            "www-authenticate",
+            "x-unknown",
+        ] {
+            assert!(
+                !trailers.contains_key(dropped),
+                "trailer {dropped} survived"
+            );
+        }
     }
 
     #[tokio::test]
@@ -526,5 +718,103 @@ mod tests {
         assert!(!headers.contains_key("keep-alive"));
         assert!(!headers.contains_key("x-private"));
         assert_eq!(headers["content-type"], "text/plain");
+    }
+
+    #[test]
+    fn presigned_response_headers_use_a_strict_allowlist() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/html"));
+        headers.insert("etag", HeaderValue::from_static("\"safe\""));
+        headers.insert("cache-control", HeaderValue::from_static("public"));
+        headers.insert("age", HeaderValue::from_static("600"));
+        headers.insert(
+            "expires",
+            HeaderValue::from_static("Wed, 19 Aug 2026 10:00:00 GMT"),
+        );
+        headers.insert(
+            "x-amz-meta-project",
+            HeaderValue::from_static("safe-metadata"),
+        );
+        headers.insert("x-amz-version-id", HeaderValue::from_static("version-1"));
+        headers.insert(
+            "x-goog-meta-project",
+            HeaderValue::from_static("safe-gcs-metadata"),
+        );
+        headers.insert("x-goog-generation", HeaderValue::from_static("123"));
+        headers.insert(
+            "x-goog-stored-content-length",
+            HeaderValue::from_static("4"),
+        );
+        headers.insert("set-cookie", HeaderValue::from_static("attacker=1"));
+        headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        headers.insert(
+            "location",
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        headers.insert("report-to", HeaderValue::from_static("attacker"));
+        headers.insert("x-unknown-extension", HeaderValue::from_static("attacker"));
+        headers.insert("connection", HeaderValue::from_static("x-amz-meta-project"));
+
+        filter_presigned_response_headers(&mut headers);
+
+        assert_eq!(headers["content-type"], "text/html");
+        assert_eq!(headers["etag"], "\"safe\"");
+        assert_eq!(headers["x-amz-version-id"], "version-1");
+        assert_eq!(headers["x-goog-meta-project"], "safe-gcs-metadata");
+        assert_eq!(headers["x-goog-generation"], "123");
+        assert_eq!(headers["x-goog-stored-content-length"], "4");
+        assert!(!headers.contains_key("x-amz-meta-project"));
+        for dropped in [
+            "cache-control",
+            "age",
+            "expires",
+            "set-cookie",
+            "access-control-allow-origin",
+            "location",
+            "report-to",
+            "x-unknown-extension",
+            "connection",
+        ] {
+            assert!(!headers.contains_key(dropped), "header {dropped} survived");
+        }
+    }
+
+    #[test]
+    fn opened_object_hardens_non_success_and_overrides_backend_values() {
+        let mut metadata = ObjectMetadata::default();
+        metadata.insert(header::CONTENT_TYPE, "text/html");
+        metadata.insert(header::CONTENT_RANGE, "bytes 0-3/10");
+        metadata.insert(
+            header::CONTENT_DISPOSITION,
+            "inline; filename=attacker.html",
+        );
+        metadata.insert(header::CACHE_CONTROL, "public, max-age=3600");
+        metadata.insert(header::AGE, "600");
+        metadata.insert(header::EXPIRES, "Wed, 19 Aug 2026 10:00:00 GMT");
+        metadata.insert(HeaderName::from_static("x-content-type-options"), "off");
+        metadata.insert(
+            HeaderName::from_static("content-security-policy"),
+            "default-src *",
+        );
+        let response = OpenedObject::new(
+            StatusCode::NOT_FOUND,
+            metadata,
+            Body::from("data"),
+            BodyLimits::default(),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["content-type"], "text/html");
+        assert_eq!(response.headers()["content-range"], "bytes 0-3/10");
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        assert!(!response.headers().contains_key("age"));
+        assert!(!response.headers().contains_key("expires"));
+        assert_eq!(response.headers()["content-disposition"], "attachment");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            OBJECT_DOWNLOAD_CSP
+        );
     }
 }

@@ -67,3 +67,4 @@ x509-parser = "0.16"
 aes-siv = { version = "0.7", default-features = false, features = ["alloc"] }
 hmac = "0.12"
 wasmtime = "47"
+xmlparser = "0.13"

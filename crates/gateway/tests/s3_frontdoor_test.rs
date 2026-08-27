@@ -381,6 +381,58 @@ fn add_headers(req: Request<Body>, hdrs: &[(&'static str, String)]) -> Request<B
 }
 
 #[tokio::test]
+async fn global_admin_routes_only_mount_in_local_auth_disabled_mode() {
+    let state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let headers = auth_headers(&access_key, &secret_key);
+    let app = build_router(state.clone());
+    let plugin_count = state.plugins.list().len();
+
+    let import = add_headers(
+        Request::builder()
+            .method("POST")
+            .uri("/dashboard/api/plugins")
+            .header(header::CONTENT_TYPE, "application/wasm")
+            .body(Body::from("not a wasm component"))
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(import).await.unwrap().status(),
+        StatusCode::NOT_IMPLEMENTED
+    );
+    assert_eq!(state.plugins.list().len(), plugin_count);
+
+    let objects = add_headers(
+        Request::builder()
+            .uri("/dashboard/api/objects")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.oneshot(objects).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let mut local_state = test_state().await;
+    Arc::get_mut(&mut local_state)
+        .expect("test state is uniquely owned")
+        .auth_disabled = true;
+    let local_app = build_router(local_state);
+    let response = local_app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/plugins")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn put_get_roundtrip_filters_pii() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;

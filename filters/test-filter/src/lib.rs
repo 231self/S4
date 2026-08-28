@@ -26,6 +26,9 @@ mod guest {
             if context.stable_fields.as_deref() == Some("finish-trap") {
                 finish.extend_from_slice(b"trap");
             }
+            if context.stable_fields.as_deref() == Some("finish-large") {
+                finish.resize(64 * 1024 + 1, b'x');
+            }
             if context.content_type == "test/begin-reject" {
                 return Err("begin rejected".to_string());
             }

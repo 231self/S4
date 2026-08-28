@@ -4306,6 +4306,7 @@ dependencies = [
  "wasmtime",
  "x509-parser",
  "xmlparser",
+ "zeroize",
 ]
 
 [[package]]
@@ -4331,6 +4332,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wit-bindgen 0.60.0",
+ "zeroize",
 ]
 
 [[package]]

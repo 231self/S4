@@ -17,6 +17,7 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::p2::add_to_linker_sync as add_wasi_to_linker;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use zeroize::Zeroize;
 
 const DEFAULT_GUEST_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_MEMORIES: usize = 4;
@@ -93,6 +94,18 @@ pub struct Session {
     pub public_key_pem: Option<String>,
     pub stable_key: Option<Vec<u8>>,
     pub stable_fields: Option<String>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        zeroize_stable_key(&mut self.stable_key);
+    }
+}
+
+fn zeroize_stable_key(stable_key: &mut Option<Vec<u8>>) {
+    if let Some(mut key) = stable_key.take() {
+        key.zeroize();
+    }
 }
 
 pub struct FilterEngine {
@@ -325,6 +338,7 @@ impl FilterEngine {
         &self,
         cancellation: &CancellationToken,
         object_deadline: Instant,
+        initial_fuel: u64,
     ) -> Result<(Store<S4HostState>, Arc<CallControl>), S4Error> {
         let wasi = WasiCtxBuilder::new()
             .inherit_stdout()
@@ -342,7 +356,7 @@ impl FilterEngine {
         };
         let mut store = Store::new(&self.epoch_engine.engine, state);
         store
-            .set_fuel(self.limits.cumulative_fuel)
+            .set_fuel(initial_fuel)
             .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
         store.limiter(|s| &mut s.resource_limiter);
         let control = Arc::new(CallControl {
@@ -419,22 +433,39 @@ impl FilterEngine {
         object_deadline: Instant,
     ) -> Result<FilterSession, S4Error> {
         let object_deadline = object_deadline.min(Instant::now() + self.limits.object_timeout);
+        check_start_control(&cancellation, object_deadline)?;
+        let initial_fuel = self.limits.cumulative_fuel.min(begin_fuel_limit);
+        if initial_fuel == 0 {
+            return Err(S4Error::new(
+                codes::WASM_FUEL,
+                "Wasm startup fuel budget exhausted",
+            ));
+        }
         let (mut store, control) = self
-            .create_store(&cancellation, object_deadline)
+            .create_store(&cancellation, object_deadline, initial_fuel)
             .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
         let mut linker = Linker::new(&self.epoch_engine.engine);
         add_wasi_to_linker(&mut linker)
             .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
+        check_start_control(&cancellation, object_deadline)?;
         let instance = linker
             .instantiate(&mut store, &self.component)
-            .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
+            .map_err(|error| startup_error("instantiate", error, &cancellation, object_deadline))?;
 
-        let funcs = Filter::new(&mut store, &instance)
-            .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
+        let remaining_after_start = store
+            .get_fuel()
+            .map_err(|error| S4Error::new(codes::WASM_FUEL, error.to_string()))?;
+        let startup_fuel = initial_fuel.saturating_sub(remaining_after_start);
+        check_start_control(&cancellation, object_deadline)?;
+
+        let funcs = Filter::new(&mut store, &instance).map_err(|error| {
+            startup_error("bind exports", error, &cancellation, object_deadline)
+        })?;
+        check_start_control(&cancellation, object_deadline)?;
 
         let entropy_seed: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
 
-        let ctx = Context {
+        let mut ctx = Context {
             format: session.format.clone(),
             content_type: session.content_type.clone(),
             policy_version: session.policy_version,
@@ -451,9 +482,14 @@ impl FilterEngine {
             control,
             limits: self.limits.clone(),
             object_deadline,
-            fuel_consumed: 0,
+            fuel_consumed: startup_fuel,
         };
-        filter_session.call_begin(&ctx, begin_fuel_limit)?;
+        let begin = filter_session.call_begin(&ctx, begin_fuel_limit);
+        zeroize_stable_key(&mut ctx.stable_key);
+        // The trusted guest receives its own linear-memory copy. That memory is
+        // destroyed with this per-request store, but Wasmtime does not
+        // synchronously scrub every guest byte before releasing the pages.
+        begin?;
         Ok(filter_session)
     }
 
@@ -465,6 +501,43 @@ impl FilterEngine {
         }
         Ok(out)
     }
+}
+
+fn check_start_control(
+    cancellation: &CancellationToken,
+    object_deadline: Instant,
+) -> Result<(), S4Error> {
+    if cancellation.is_cancelled() {
+        return Err(S4Error::new(
+            codes::WASM_CANCELLED,
+            "Wasm startup was cancelled",
+        ));
+    }
+    if Instant::now() >= object_deadline {
+        return Err(S4Error::new(
+            codes::WASM_DEADLINE,
+            "Wasm startup deadline exceeded",
+        ));
+    }
+    Ok(())
+}
+
+fn startup_error(
+    stage: &str,
+    error: wasmtime::Error,
+    cancellation: &CancellationToken,
+    object_deadline: Instant,
+) -> S4Error {
+    let code = if cancellation.is_cancelled() {
+        codes::WASM_CANCELLED
+    } else if Instant::now() >= object_deadline {
+        codes::WASM_DEADLINE
+    } else if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+        codes::WASM_FUEL
+    } else {
+        codes::WASM_INIT
+    };
+    S4Error::new(code, format!("{stage}: {error}"))
 }
 
 fn register_epoch_engine(engine: &Arc<EpochEngine>) {
@@ -527,8 +600,31 @@ mod tests {
             format: "text".to_string(),
             content_type: "text/plain".to_string(),
             policy_version: 1,
-            ..Session::default()
+            public_key_pem: None,
+            stable_key: None,
+            stable_fields: None,
         }
+    }
+
+    fn hostile_start_component() -> &'static [u8] {
+        br#"(component
+            (core module $hostile
+                (func $start
+                    (loop $forever
+                        br $forever
+                    )
+                )
+                (start $start)
+            )
+            (core instance $instance (instantiate $hostile))
+        )"#
+    }
+
+    #[test]
+    fn stable_key_zeroization_hook_removes_host_copy() {
+        let mut stable_key = Some(vec![0x5a; 64]);
+        zeroize_stable_key(&mut stable_key);
+        assert!(stable_key.is_none());
     }
 
     #[test]
@@ -697,6 +793,54 @@ mod tests {
             filter.transform(b"loop").unwrap_err().code(),
             codes::WASM_DEADLINE
         );
+    }
+
+    #[test]
+    fn constrained_fuel_interrupts_a_hostile_core_start_function() {
+        let engine = FilterEngine::with_limits(
+            hostile_start_component(),
+            RuntimeLimits {
+                cumulative_fuel: u64::MAX,
+                per_call_fuel: u64::MAX,
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap();
+        let error = engine
+            .start_session_with_control(
+                &session(),
+                CancellationToken::new(),
+                1_000,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .err()
+            .expect("hostile start must exhaust constrained fuel");
+        assert_eq!(error.code(), codes::WASM_FUEL);
+    }
+
+    #[test]
+    fn object_deadline_interrupts_a_hostile_core_start_function() {
+        let engine = FilterEngine::with_limits(
+            hostile_start_component(),
+            RuntimeLimits {
+                cumulative_fuel: u64::MAX,
+                per_call_fuel: u64::MAX,
+                per_call_timeout: Duration::from_secs(1),
+                object_timeout: Duration::from_secs(1),
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap();
+        let error = engine
+            .start_session_with_control(
+                &session(),
+                CancellationToken::new(),
+                u64::MAX,
+                Instant::now() + Duration::from_millis(25),
+            )
+            .err()
+            .expect("hostile start must hit the object deadline");
+        assert_eq!(error.code(), codes::WASM_DEADLINE);
     }
 
     #[test]

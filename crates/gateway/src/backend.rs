@@ -297,7 +297,7 @@ impl PresignedHttpPolicy {
             .resolver
             .resolve(&host, port)
             .await
-            .map_err(|error| format!("presigned URL DNS resolution failed: {error}"))?;
+            .map_err(|_| "presigned URL DNS resolution failed".to_string())?;
         if addresses.is_empty() {
             return Err("presigned URL DNS resolution returned no addresses".to_string());
         }
@@ -312,7 +312,7 @@ impl PresignedHttpPolicy {
             .no_proxy()
             .resolve(&host, pinned)
             .build()
-            .map_err(|error| format!("presigned HTTP client construction failed: {error}"))
+            .map_err(|_| "presigned HTTP client construction failed".to_string())
     }
 
     fn host_allowed(&self, host: &str) -> bool {

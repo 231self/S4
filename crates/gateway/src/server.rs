@@ -52,7 +52,8 @@ use crate::multipart_staging::{
     completion_fingerprint, now_ms,
 };
 use crate::object::{
-    BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, strip_hop_by_hop_headers,
+    BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, filter_presigned_response_headers,
+    harden_object_response_headers,
 };
 use crate::plugin_registry::{PluginCapabilities, PluginRegistry, StreamingPipelineSession};
 use crate::read_spool::EncryptedReadSpool;
@@ -551,18 +552,45 @@ async fn resolve_backend(
 #[derive(Debug)]
 enum OpenObjectError {
     NotFound,
-    InvalidRange,
+    InvalidRange { object_length: u64 },
     Rejected(String),
     Backend(String),
+    PresignedTransport(PresignedTransportFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PresignedTransportFailure {
+    Timeout,
+    Connect,
+    Request,
+}
+
+impl PresignedTransportFailure {
+    fn from_reqwest(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else {
+            Self::Request
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Request => "request",
+        }
+    }
 }
 
 fn open_error_response(key: &str, error: OpenObjectError) -> axum::response::Response {
     match error {
         OpenObjectError::NotFound => s3_error::no_such_key(key),
-        OpenObjectError::InvalidRange => axum::response::Response::builder()
-            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-            .body(axum::body::Body::empty())
-            .expect("valid range response"),
+        OpenObjectError::InvalidRange { object_length } => {
+            s3_error::invalid_range(key, object_length)
+        }
         OpenObjectError::Rejected(detail) => {
             warn!("presigned source rejected for {key}: {detail}");
             s3_error::access_denied(key)
@@ -570,6 +598,14 @@ fn open_error_response(key: &str, error: OpenObjectError) -> axum::response::Res
         OpenObjectError::Backend(detail) => {
             warn!("backend read failed for {key}: {detail}");
             s3_error::internal_error(key, &detail)
+        }
+        OpenObjectError::PresignedTransport(failure) => {
+            warn!(
+                key,
+                category = failure.as_str(),
+                "presigned source transport failed"
+            );
+            s3_error::internal_error(key, "presigned backend request failed")
         }
     }
 }
@@ -776,6 +812,7 @@ fn forwarded_read_headers(headers: &HeaderMap) -> HeaderMap {
         header::IF_NONE_MATCH,
         header::IF_MODIFIED_SINCE,
         header::IF_UNMODIFIED_SINCE,
+        HeaderName::from_static("x-amz-checksum-mode"),
     ] {
         for value in headers.get_all(&name) {
             forwarded.append(name.clone(), value.clone());
@@ -805,7 +842,9 @@ async fn open_http_object(
         .headers(forwarded_read_headers(headers))
         .send()
         .await
-        .map_err(|error| OpenObjectError::Backend(error.to_string()))?;
+        .map_err(|error| {
+            OpenObjectError::PresignedTransport(PresignedTransportFailure::from_reqwest(&error))
+        })?;
     if response.status().is_redirection() {
         return Err(OpenObjectError::Rejected(
             "presigned HTTP source redirects are forbidden".to_string(),
@@ -814,7 +853,7 @@ async fn open_http_object(
     let response: axum::http::Response<reqwest::Body> = response.into();
     let (parts, body) = response.into_parts();
     let mut response_headers = parts.headers;
-    strip_hop_by_hop_headers(&mut response_headers);
+    filter_presigned_response_headers(&mut response_headers);
     let version_id = response_headers
         .get("x-amz-version-id")
         .or_else(|| response_headers.get("x-goog-generation"))
@@ -841,38 +880,36 @@ fn memory_range(
     data: &bytes::Bytes,
     range: Option<&str>,
 ) -> Result<(bytes::Bytes, Option<String>), OpenObjectError> {
+    let length = data.len();
+    let invalid_range = || OpenObjectError::InvalidRange {
+        object_length: length as u64,
+    };
     let Some(range) = range else {
         return Ok((data.clone(), None));
     };
     let spec = range
         .strip_prefix("bytes=")
         .filter(|spec| !spec.contains(','))
-        .ok_or(OpenObjectError::InvalidRange)?;
-    let (start, end) = spec.split_once('-').ok_or(OpenObjectError::InvalidRange)?;
-    let length = data.len();
+        .ok_or_else(invalid_range)?;
+    let (start, end) = spec.split_once('-').ok_or_else(invalid_range)?;
     if length == 0 {
-        return Err(OpenObjectError::InvalidRange);
+        return Err(invalid_range());
     }
     let (start, end) = if start.is_empty() {
-        let suffix = end
-            .parse::<usize>()
-            .map_err(|_| OpenObjectError::InvalidRange)?;
+        let suffix = end.parse::<usize>().map_err(|_| invalid_range())?;
         if suffix == 0 {
-            return Err(OpenObjectError::InvalidRange);
+            return Err(invalid_range());
         }
         (length.saturating_sub(suffix), length - 1)
     } else {
-        let start = start
-            .parse::<usize>()
-            .map_err(|_| OpenObjectError::InvalidRange)?;
+        let start = start.parse::<usize>().map_err(|_| invalid_range())?;
         let end = if end.is_empty() {
             length - 1
         } else {
-            end.parse::<usize>()
-                .map_err(|_| OpenObjectError::InvalidRange)?
+            end.parse::<usize>().map_err(|_| invalid_range())?
         };
         if start >= length || start > end {
-            return Err(OpenObjectError::InvalidRange);
+            return Err(invalid_range());
         }
         (start, end.min(length - 1))
     };
@@ -1722,11 +1759,13 @@ async fn demo_read(
 }
 
 fn s3_xml_ok(xml: String) -> axum::response::Response {
-    axum::response::Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/xml")
-        .body(axum::body::Body::from(xml))
-        .unwrap()
+    let mut response = axum::response::Response::new(axum::body::Body::from(xml));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/xml".parse().expect("static content type"),
+    );
+    harden_object_response_headers(response.headers_mut());
+    response
 }
 
 fn wants_transformed_read(headers: &HeaderMap) -> bool {
@@ -1786,7 +1825,14 @@ impl CompatibilitySpoolUploader for PresignedSpoolUploader {
                         response.status()
                     ));
                 }
-                Err(error) => last_error = Some(error.to_string()),
+                Err(error) => {
+                    let failure = PresignedTransportFailure::from_reqwest(&error);
+                    warn!(
+                        category = failure.as_str(),
+                        "presigned destination transport failed"
+                    );
+                    last_error = Some("presigned destination request failed".to_string());
+                }
             }
         }
         Err(TransactionError::Spool(last_error.unwrap_or_else(|| {
@@ -3386,12 +3432,12 @@ fn transformed_response_headers(
             headers.append(name.clone(), value.clone());
         }
     }
-    headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
     if let Some(content_length) = content_length
         && let Ok(value) = content_length.to_string().parse()
     {
         headers.insert(header::CONTENT_LENGTH, value);
     }
+    harden_object_response_headers(&mut headers);
     headers
 }
 
@@ -3467,10 +3513,7 @@ fn transformed_source_matches_preflight(
             .is_some_and(|(left, right)| left == right)
 }
 
-fn conditional_read_response(
-    headers: &HeaderMap,
-    metadata: &ObjectMetadata,
-) -> Option<axum::response::Response> {
+fn conditional_read_status(headers: &HeaderMap, metadata: &ObjectMetadata) -> Option<StatusCode> {
     let etag = metadata.headers.get(header::ETAG)?.to_str().ok()?;
     let matches = |condition: &str| {
         condition
@@ -3478,7 +3521,7 @@ fn conditional_read_response(
             .map(str::trim)
             .any(|candidate| candidate == "*" || candidate == etag)
     };
-    let status = if let Some(condition) = headers
+    if let Some(condition) = headers
         .get(header::IF_MATCH)
         .and_then(|value| value.to_str().ok())
     {
@@ -3490,22 +3533,26 @@ fn conditional_read_response(
         matches(condition).then_some(StatusCode::NOT_MODIFIED)
     } else {
         None
-    }?;
-    let mut response = axum::response::Response::builder().status(status);
-    let response_headers = response
-        .headers_mut()
-        .expect("response builder has headers");
-    response_headers.insert(header::ETAG, metadata.headers[header::ETAG].clone());
-    if let Some(version_id) = &metadata.version_id
+    }
+}
+
+fn conditional_read_response(
+    mut object: OpenedObject,
+    status: StatusCode,
+) -> axum::response::Response {
+    let etag = object.metadata.headers[header::ETAG].clone();
+    let version_id = object.metadata.version_id.clone();
+    object.status = status;
+    object.metadata.headers.clear();
+    object.metadata.headers.insert(header::ETAG, etag);
+    if let Some(version_id) = version_id
         && let Ok(value) = version_id.parse()
     {
-        response_headers.insert("x-amz-version-id", value);
+        object.metadata.headers.insert("x-amz-version-id", value);
     }
-    Some(
-        response
-            .body(axum::body::Body::empty())
-            .expect("valid conditional response"),
-    )
+    object.cancellation.cancel();
+    object.body = axum::body::Body::empty();
+    object.into_response()
 }
 
 fn is_immutable_version_id(version_id: Option<&str>) -> bool {
@@ -4004,8 +4051,8 @@ async fn s3_get(
                 ),
             );
         }
-        if let Some(response) = conditional_read_response(&headers, &object.metadata) {
-            object.cancellation.cancel();
+        if let Some(status) = conditional_read_status(&headers, &object.metadata) {
+            let response = conditional_read_response(object, status);
             state
                 .control
                 .record(&auth.context, &bucket, RequestKind::Read, 0)
@@ -4030,8 +4077,8 @@ async fn s3_get(
             Ok(object) => object,
             Err(error) => return open_error_response(&key, error),
         };
-    if let Some(response) = conditional_read_response(&headers, &object.metadata) {
-        object.cancellation.cancel();
+    if let Some(status) = conditional_read_status(&headers, &object.metadata) {
+        let response = conditional_read_response(object, status);
         state
             .control
             .record(&auth.context, &bucket, RequestKind::Read, 0)
@@ -4478,19 +4525,17 @@ async fn s3_head(
     };
     match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, true).await {
         Ok(object) => {
-            if let Some(response) = conditional_read_response(&headers, &object.metadata) {
-                object.cancellation.cancel();
-                state
-                    .control
-                    .record(&auth.context, &bucket, RequestKind::Read, 0)
-                    .await;
-                return response;
-            }
+            let response = if let Some(status) = conditional_read_status(&headers, &object.metadata)
+            {
+                conditional_read_response(object, status)
+            } else {
+                object.into_response()
+            };
             state
                 .control
                 .record(&auth.context, &bucket, RequestKind::Read, 0)
                 .await;
-            object.into_response()
+            response
         }
         Err(error) => open_error_response(&key, error),
     }
@@ -4592,7 +4637,15 @@ async fn s3_delete(
                     &key,
                     &format!("presigned DELETE returned {}", response.status()),
                 ),
-                Err(error) => s3_error::internal_error(&key, &error.to_string()),
+                Err(error) => {
+                    let failure = PresignedTransportFailure::from_reqwest(&error);
+                    warn!(
+                        key,
+                        category = failure.as_str(),
+                        "presigned DELETE transport failed"
+                    );
+                    s3_error::internal_error(&key, "presigned backend request failed")
+                }
             }
         }
         ResolvedBackend::S3 { client, .. } => match client

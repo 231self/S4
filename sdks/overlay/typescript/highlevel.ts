@@ -82,7 +82,7 @@ export class S4Client {
   async attachPublicKey(publicKeyPem: string): Promise<void> {
     const resp = await fetch(`${this.endpoint}/dashboard/api/keys/public-key`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: { ...this.authHeaders(), "Content-Type": "application/json" },
       body: JSON.stringify({ key_id: this.accessKey, public_key_pem: publicKeyPem }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });

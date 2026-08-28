@@ -95,6 +95,7 @@ class S4Client:
         """
         resp = requests.put(
             f"{self.endpoint}/dashboard/api/keys/public-key",
+            headers=self._headers(),
             json={"key_id": self.access_key, "public_key_pem": public_key_pem},
             timeout=self.timeout,
         )

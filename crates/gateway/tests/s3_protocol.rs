@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use s4_gateway::s3_error;
 
 fn body_of(resp: axum::response::Response) -> String {
@@ -9,6 +9,16 @@ fn body_of(resp: axum::response::Response) -> String {
 
 fn status_of(resp: &axum::response::Response) -> StatusCode {
     resp.status()
+}
+
+fn xml_element_names(document: &str) -> Vec<String> {
+    xmlparser::Tokenizer::from(document)
+        .map(|token| token.expect("generated error must be well-formed XML"))
+        .filter_map(|token| match token {
+            xmlparser::Token::ElementStart { local, .. } => Some(local.as_str().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -82,12 +92,59 @@ fn s3_error_has_content_type_header() {
             .and_then(|v| v.to_str().ok()),
         Some("application/xml")
     );
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+    assert!(!resp.headers().contains_key(header::AGE));
+    assert!(!resp.headers().contains_key(header::EXPIRES));
+    assert_eq!(resp.headers()[header::CONTENT_DISPOSITION], "attachment");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(
+        resp.headers()["content-security-policy"],
+        "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'"
+    );
 }
 
 #[test]
 fn s3_error_contains_key_in_xml() {
     let body = body_of(s3_error::internal_error("key-name-123", "detail"));
     assert!(body.contains("<Key>key-name-123</Key>"));
+}
+
+#[test]
+fn adversarial_decoded_resource_and_message_cannot_inject_xml_nodes() {
+    let decoded_resource = "bucket/<Injected>resource</Injected>&\"'";
+    let body = body_of(s3_error::invalid_request(
+        decoded_resource,
+        "bad </Message><Injected>message</Injected> & value",
+    ));
+
+    assert_eq!(
+        xml_element_names(&body),
+        ["Error", "Code", "Message", "Key", "RequestId"]
+    );
+    assert!(!body.contains("<Injected>"));
+    assert!(body.contains("bucket/&lt;Injected&gt;resource&lt;/Injected&gt;&amp;&quot;&apos;"));
+    assert!(
+        body.contains("bad &lt;/Message&gt;&lt;Injected&gt;message&lt;/Injected&gt; &amp; value")
+    );
+}
+
+#[test]
+fn s3_invalid_range_is_hardened_xml_with_complete_length() {
+    let resp = s3_error::invalid_range("unsafe<range>&.txt", 10);
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes */10");
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+    let body = body_of(resp);
+    assert_eq!(
+        xml_element_names(&body),
+        ["Error", "Code", "Message", "Key", "RequestId"]
+    );
+    assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
+    assert!(
+        body.contains("<Key>unsafe&lt;range&gt;&amp;.txt</Key>"),
+        "{body}"
+    );
+    assert!(!body.contains("<range>"), "{body}");
 }
 
 #[test]

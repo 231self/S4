@@ -380,6 +380,29 @@ fn add_headers(req: Request<Body>, hdrs: &[(&'static str, String)]) -> Request<B
     Request::from_parts(parts, body)
 }
 
+fn assert_hardened_object_headers(headers: &axum::http::HeaderMap) {
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+    assert!(!headers.contains_key(header::AGE));
+    assert!(!headers.contains_key(header::EXPIRES));
+    assert_eq!(headers[header::CONTENT_DISPOSITION], "attachment");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(
+        headers["content-security-policy"],
+        "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'"
+    );
+}
+
+fn assert_s3_error_has_only_expected_xml_elements(document: &str) {
+    let elements: Vec<_> = xmlparser::Tokenizer::from(document)
+        .map(|token| token.expect("generated error must be well-formed XML"))
+        .filter_map(|token| match token {
+            xmlparser::Token::ElementStart { local, .. } => Some(local.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(elements, ["Error", "Code", "Message", "Key", "RequestId"]);
+}
+
 #[tokio::test]
 async fn global_admin_routes_only_mount_in_local_auth_disabled_mode() {
     let state = test_state().await;
@@ -762,6 +785,7 @@ async fn list_objects_returns_keys_and_prefixes() {
     );
     let resp = app.clone().oneshot(list).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_hardened_object_headers(resp.headers());
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1073,6 +1097,7 @@ async fn conditional_get_and_head_preserve_object_identity_without_a_body() {
     let response = app.clone().oneshot(not_modified).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(response.headers()[header::ETAG], etag);
+    assert_hardened_object_headers(response.headers());
     assert!(
         axum::body::to_bytes(response.into_body(), 1024)
             .await
@@ -1092,6 +1117,7 @@ async fn conditional_get_and_head_preserve_object_identity_without_a_body() {
     let response = app.oneshot(failed_match).await.unwrap();
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
     assert_eq!(response.headers()[header::ETAG], etag);
+    assert_hardened_object_headers(response.headers());
 }
 
 #[tokio::test]
@@ -1105,6 +1131,15 @@ async fn streaming_memory_get_preserves_range_and_head_metadata() {
         bytes::Bytes::from_static(b"0123456789"),
         "text/plain",
     );
+    state_mut.store.put(
+        "range",
+        "unsafe<name>&.txt",
+        bytes::Bytes::from_static(b"0123456789"),
+        "text/plain",
+    );
+    state_mut
+        .store
+        .put("range", "empty.txt", bytes::Bytes::new(), "text/plain");
     let (ak, sk) = make_key(&state).await;
     let headers = auth_headers(&ak, &sk);
     let app = build_router(state);
@@ -1123,12 +1158,76 @@ async fn streaming_memory_get_preserves_range_and_head_metadata() {
     assert_eq!(response.headers()[header::CONTENT_LENGTH], "4");
     assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
     assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_hardened_object_headers(response.headers());
     assert_eq!(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap(),
         "2345"
     );
+
+    let suffix = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/range/object.txt")
+            .header(header::RANGE, "bytes=-3")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(suffix).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "3");
+    assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 7-9/10");
+    assert_hardened_object_headers(response.headers());
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "789"
+    );
+
+    for (uri, range, object_length, escaped_key) in [
+        (
+            "/range/unsafe%3Cname%3E%26.txt",
+            "bytes=20-30",
+            10,
+            "unsafe&lt;name&gt;&amp;.txt",
+        ),
+        ("/range/object.txt", "not-a-byte-range", 10, "object.txt"),
+        ("/range/empty.txt", "bytes=0-0", 0, "empty.txt"),
+    ] {
+        let invalid = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::RANGE, range)
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(invalid).await.unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE],
+            format!("bytes */{object_length}")
+        );
+        assert_hardened_object_headers(response.headers());
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_s3_error_has_only_expected_xml_elements(&body);
+        assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
+        assert!(
+            body.contains(&format!("<Key>{escaped_key}</Key>")),
+            "{body}"
+        );
+        assert!(!body.contains("<name>"), "{body}");
+    }
 
     let head = add_headers(
         Request::builder()
@@ -1142,12 +1241,93 @@ async fn streaming_memory_get_preserves_range_and_head_metadata() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
     assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+    assert_hardened_object_headers(response.headers());
     assert!(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn object_get_forces_browser_safe_download_headers_for_html() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.store.put(
+        "download",
+        "attacker-name.html",
+        bytes::Bytes::from_static(b"<script>document.cookie='stolen=1'</script>"),
+        "text/html; charset=utf-8",
+    );
+    let (ak, sk) = make_key(&state).await;
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/download/attacker-name.html")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/html; charset=utf-8"
+    );
+    assert_hardened_object_headers(response.headers());
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "<script>document.cookie='stolen=1'</script>"
+    );
+}
+
+#[tokio::test]
+async fn percent_decoded_object_and_bucket_resources_cannot_inject_s3_error_xml() {
+    let (app, state) = router().await;
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let encoded = "%3CInjected%3Eresource%3C%2FInjected%3E%26%22%27";
+
+    for (method, uri, status) in [
+        ("GET", format!("/escape/{encoded}"), StatusCode::NOT_FOUND),
+        ("PUT", format!("/{encoded}"), StatusCode::FORBIDDEN),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(add_headers(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+                &headers,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_hardened_object_headers(response.headers());
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert_s3_error_has_only_expected_xml_elements(&body);
+        assert!(!body.contains("<Injected>"));
+        assert!(
+            body.contains("&lt;Injected&gt;resource&lt;/Injected&gt;&amp;&quot;&apos;"),
+            "escaped resource missing from {body}"
+        );
+    }
 }
 
 async fn spawn_presigned_upstream() -> (String, tokio::task::JoinHandle<()>) {
@@ -1169,17 +1349,53 @@ async fn spawn_presigned_upstream() -> (String, tokio::task::JoinHandle<()>) {
             .header(header::CONTENT_ENCODING, "identity")
             .header(
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=object.txt",
+                "inline; filename=attacker-controlled.html",
             )
+            .header("content-security-policy", "default-src * 'unsafe-inline'")
+            .header("x-content-type-options", "off")
             .header(header::CONTENT_LANGUAGE, "en")
-            .header(header::CACHE_CONTROL, "private, max-age=60")
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .header(header::AGE, "600")
+            .header(header::EXPIRES, "Wed, 19 Aug 2026 10:00:00 GMT")
             .header(header::ETAG, "\"upstream-etag\"")
             .header(header::LAST_MODIFIED, "Wed, 19 Aug 2026 09:00:00 GMT")
             .header("x-amz-checksum-sha256", "checksum")
+            .header("x-amz-meta-project", "safe-metadata")
             .header("x-amz-version-id", "version-7")
+            .header("x-goog-component-count", "2")
+            .header("x-goog-custom-time", "2026-08-19T09:00:00Z")
+            .header("x-goog-encryption-algorithm", "AES256")
+            .header("x-goog-encryption-key-sha256", "key-checksum")
+            .header("x-goog-expiration", "Wed, 19 Aug 2026 10:00:00 GMT")
+            .header("x-goog-generation", "123456")
+            .header("x-goog-hash", "crc32c=abcd")
+            .header("x-goog-meta-project", "safe-gcs-metadata")
+            .header("x-goog-metageneration", "9")
+            .header("x-goog-object-lock-mode", "GOVERNANCE")
+            .header(
+                "x-goog-object-lock-retain-until-date",
+                "2027-08-19T09:00:00Z",
+            )
+            .header("x-goog-storage-class", "STANDARD")
+            .header("x-goog-stored-content-encoding", "identity")
+            .header("x-goog-stored-content-length", "10")
+            .header(header::SET_COOKIE, "session=attacker; Secure")
+            .header("access-control-allow-origin", "https://attacker.example")
+            .header(header::LOCATION, "https://attacker.example/redirect")
+            .header("refresh", "0;url=https://attacker.example/redirect")
+            .header("report-to", r#"{"group":"attacker"}"#)
+            .header(
+                "reporting-endpoints",
+                "attacker=\"https://attacker.example\"",
+            )
+            .header(header::WWW_AUTHENTICATE, "Basic realm=attacker")
+            .header("authentication-info", "nextnonce=attacker")
             .header("connection", "x-upstream-private")
             .header("x-upstream-private", "remove-me")
             .header(header::ACCEPT_RANGES, "bytes");
+        if let Some(checksum_mode) = headers.get("x-amz-checksum-mode") {
+            response = response.header("x-amz-meta-request-checksum-mode", checksum_mode.clone());
+        }
         if let Some(content_range) = content_range {
             response = response.header(header::CONTENT_RANGE, content_range);
         }
@@ -1200,8 +1416,24 @@ async fn spawn_presigned_upstream() -> (String, tokio::task::JoinHandle<()>) {
             .unwrap()
     }
 
+    async fn html_error() -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "text/html")
+            .header(header::CONTENT_DISPOSITION, "inline; filename=error.html")
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .header(header::AGE, "600")
+            .header(header::EXPIRES, "Wed, 19 Aug 2026 10:00:00 GMT")
+            .header("content-security-policy", "default-src * 'unsafe-inline'")
+            .header("x-content-type-options", "off")
+            .header(header::SET_COOKIE, "error=attacker")
+            .body(Body::from("<script>attack()</script>"))
+            .unwrap()
+    }
+
     let app = axum::Router::new()
         .route("/object", axum::routing::get(object).head(object))
+        .route("/not-found", axum::routing::get(html_error))
         .route("/redirect", axum::routing::get(redirect));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -1212,7 +1444,71 @@ async fn spawn_presigned_upstream() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
-async fn real_router_streams_presigned_http_range_headers_and_rejects_redirects() {
+async fn presigned_transport_failure_never_discloses_signed_url_material() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.presigned_http_policy = PresignedHttpPolicy::new(
+        ["127.0.0.1".to_string()],
+        ["127.0.0.1".to_string()],
+        true,
+        Duration::ZERO,
+        Arc::new(TokioAddressResolver),
+    );
+    let (ak, sk) = make_key(&state).await;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let signed_url = format!(
+        "http://{address}/object?X-Amz-Credential=AKIA_TEST%2F20260828%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=DO_NOT_DISCLOSE&Expires={expires}"
+    );
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/proxy/transport-failure")
+                .header("x-s4-backend-url", &signed_url)
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_hardened_object_headers(response.headers());
+    let body = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("presigned backend request failed"), "{body}");
+    let address = address.to_string();
+    for sensitive in [
+        signed_url.as_str(),
+        "AKIA_TEST",
+        "X-Amz-Credential",
+        "X-Amz-Signature",
+        "DO_NOT_DISCLOSE",
+        address.as_str(),
+    ] {
+        assert!(
+            !body.contains(sensitive),
+            "response leaked {sensitive}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn presigned_http_responses_are_hardened_without_losing_object_semantics() {
     let (upstream, task) = spawn_presigned_upstream().await;
     let mut state = test_state().await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
@@ -1238,6 +1534,7 @@ async fn real_router_streams_presigned_http_range_headers_and_rejects_redirects(
             .method("GET")
             .uri("/proxy/object")
             .header(header::RANGE, "bytes=2-5")
+            .header("x-amz-checksum-mode", "ENABLED")
             .header(
                 "x-s4-backend-url",
                 format!("{upstream}/object?Expires={expires}"),
@@ -1254,15 +1551,57 @@ async fn real_router_streams_presigned_http_range_headers_and_rejects_redirects(
         (header::CONTENT_TYPE.as_str(), "text/plain"),
         (header::CONTENT_ENCODING.as_str(), "identity"),
         (header::CONTENT_LANGUAGE.as_str(), "en"),
-        (header::CACHE_CONTROL.as_str(), "private, max-age=60"),
         (header::ETAG.as_str(), "\"upstream-etag\""),
+        (
+            header::LAST_MODIFIED.as_str(),
+            "Wed, 19 Aug 2026 09:00:00 GMT",
+        ),
         ("x-amz-checksum-sha256", "checksum"),
+        ("x-amz-meta-project", "safe-metadata"),
+        ("x-amz-meta-request-checksum-mode", "ENABLED"),
         ("x-amz-version-id", "version-7"),
+        ("x-goog-component-count", "2"),
+        ("x-goog-custom-time", "2026-08-19T09:00:00Z"),
+        ("x-goog-encryption-algorithm", "AES256"),
+        ("x-goog-encryption-key-sha256", "key-checksum"),
+        ("x-goog-expiration", "Wed, 19 Aug 2026 10:00:00 GMT"),
+        ("x-goog-generation", "123456"),
+        ("x-goog-hash", "crc32c=abcd"),
+        ("x-goog-meta-project", "safe-gcs-metadata"),
+        ("x-goog-metageneration", "9"),
+        ("x-goog-object-lock-mode", "GOVERNANCE"),
+        (
+            "x-goog-object-lock-retain-until-date",
+            "2027-08-19T09:00:00Z",
+        ),
+        ("x-goog-storage-class", "STANDARD"),
+        ("x-goog-stored-content-encoding", "identity"),
+        ("x-goog-stored-content-length", "10"),
     ] {
         assert_eq!(response.headers()[name], expected, "header {name}");
     }
-    assert!(!response.headers().contains_key("connection"));
-    assert!(!response.headers().contains_key("x-upstream-private"));
+    assert_hardened_object_headers(response.headers());
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        "*",
+        "the gateway CORS policy must replace the untrusted upstream value"
+    );
+    for dropped in [
+        "set-cookie",
+        "location",
+        "refresh",
+        "report-to",
+        "reporting-endpoints",
+        "www-authenticate",
+        "authentication-info",
+        "connection",
+        "x-upstream-private",
+    ] {
+        assert!(
+            !response.headers().contains_key(dropped),
+            "untrusted upstream header {dropped} was forwarded"
+        );
+    }
     assert_eq!(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1286,11 +1625,58 @@ async fn real_router_streams_presigned_http_range_headers_and_rejects_redirects(
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
     assert_eq!(response.headers()[header::ETAG], "\"upstream-etag\"");
+    assert_hardened_object_headers(response.headers());
     assert!(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap()
             .is_empty()
+    );
+
+    let list = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/proxy?list-type=2")
+            .header(
+                "x-s4-backend-url",
+                format!("{upstream}/object?Expires={expires}"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(list).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_hardened_object_headers(response.headers());
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "0123456789"
+    );
+
+    let non_success = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/proxy/missing")
+            .header(
+                "x-s4-backend-url",
+                format!("{upstream}/not-found?Expires={expires}"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(non_success).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
+    assert_hardened_object_headers(response.headers());
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "<script>attack()</script>"
     );
 
     let redirect = add_headers(
@@ -2310,13 +2696,10 @@ async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers()[header::CACHE_CONTROL],
-        "private, no-store"
-    );
-    assert_eq!(
         response.headers()[header::CONTENT_TYPE],
         "text/plain; charset=utf-8"
     );
+    assert_hardened_object_headers(response.headers());
     assert!(!response.headers().contains_key(header::ETAG));
     assert!(!response.headers().contains_key(header::ACCEPT_RANGES));
     assert!(!response.headers().contains_key(header::CONTENT_RANGE));

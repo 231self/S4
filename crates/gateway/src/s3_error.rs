@@ -1,29 +1,63 @@
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderValue, StatusCode, header};
 use uuid::Uuid;
+
+use crate::object::harden_object_response_headers;
+
+fn push_xml_text(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            '\t'
+            | '\n'
+            | '\r'
+            | '\u{20}'..='\u{d7ff}'
+            | '\u{e000}'..='\u{fffd}'
+            | '\u{10000}'..='\u{10ffff}' => output.push(character),
+            _ => output.push('\u{fffd}'),
+        }
+    }
+}
+
+fn push_xml_element(output: &mut String, name: &'static str, value: &str) {
+    output.push_str("  <");
+    output.push_str(name);
+    output.push('>');
+    push_xml_text(output, value);
+    output.push_str("</");
+    output.push_str(name);
+    output.push_str(">\n");
+}
+
+fn s3_error_body(code: &str, message: &str, resource: &str, request_id: &str) -> String {
+    let mut body = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n");
+    push_xml_element(&mut body, "Code", code);
+    push_xml_element(&mut body, "Message", message);
+    push_xml_element(&mut body, "Key", resource);
+    push_xml_element(&mut body, "RequestId", request_id);
+    body.push_str("</Error>");
+    body
+}
 
 fn s3_error_xml(
     code: &str,
     message: &str,
-    key: &str,
+    resource: &str,
     status: StatusCode,
 ) -> axum::response::Response {
-    let request_id = Uuid::new_v4();
-    let body = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<Error>
-  <Code>{code}</Code>
-  <Message>{message}</Message>
-  <Key>{key}</Key>
-  <RequestId>{request_id}</RequestId>
-</Error>"#
+    let request_id = Uuid::new_v4().to_string();
+    let body = s3_error_body(code, message, resource, &request_id);
+    let mut response = axum::response::Response::new(axum::body::Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
     );
-    axum::response::Response::builder()
-        .status(status)
-        .header("Content-Type", "application/xml")
-        .body(axum::body::Body::from(body))
-        .unwrap()
-        .into_response()
+    harden_object_response_headers(response.headers_mut());
+    response
 }
 
 pub fn no_such_key(key: &str) -> axum::response::Response {
@@ -36,9 +70,11 @@ pub fn no_such_key(key: &str) -> axum::response::Response {
 }
 
 pub fn internal_error(key: &str, detail: &str) -> axum::response::Response {
+    let mut message = String::from("We encountered an internal error: ");
+    message.push_str(detail);
     s3_error_xml(
         "InternalError",
-        &format!("We encountered an internal error: {detail}"),
+        &message,
         key,
         StatusCode::INTERNAL_SERVER_ERROR,
     )
@@ -127,6 +163,19 @@ pub fn invalid_request(key: &str, detail: &str) -> axum::response::Response {
     s3_error_xml("InvalidRequest", detail, key, StatusCode::BAD_REQUEST)
 }
 
+pub fn invalid_range(key: &str, object_length: u64) -> axum::response::Response {
+    let mut response = s3_error_xml(
+        "InvalidRange",
+        "The requested range is not satisfiable.",
+        key,
+        StatusCode::RANGE_NOT_SATISFIABLE,
+    );
+    let value = HeaderValue::from_str(&format!("bytes */{object_length}"))
+        .expect("numeric object length is a valid Content-Range");
+    response.headers_mut().insert(header::CONTENT_RANGE, value);
+    response
+}
+
 pub fn slow_down(key: &str) -> axum::response::Response {
     s3_error_xml(
         "SlowDown",
@@ -152,4 +201,35 @@ pub fn bucket_not_allowed(bucket: &str) -> axum::response::Response {
         bucket,
         StatusCode::FORBIDDEN,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::s3_error_body;
+
+    #[test]
+    fn every_dynamic_error_field_is_xml_text_not_markup() {
+        let body = s3_error_body(
+            "Bad</Code><Injected code=\"1\">",
+            "message & </Message><Injected message='1'>",
+            "bucket/<Injected>resource</Injected>&\"'\u{1}",
+            "request</RequestId><Injected request=\"1\">",
+        );
+        let elements: Vec<_> = xmlparser::Tokenizer::from(body.as_str())
+            .map(|token| token.expect("generated error must be well-formed XML"))
+            .filter_map(|token| match token {
+                xmlparser::Token::ElementStart { local, .. } => Some(local.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(elements, ["Error", "Code", "Message", "Key", "RequestId"]);
+        assert!(!body.contains("<Injected"));
+        assert!(body.contains("Bad&lt;/Code&gt;&lt;Injected code=&quot;1&quot;&gt;"));
+        assert!(body.contains("message &amp; &lt;/Message&gt;"));
+        assert!(
+            body.contains("bucket/&lt;Injected&gt;resource&lt;/Injected&gt;&amp;&quot;&apos;�")
+        );
+        assert!(body.contains("request&lt;/RequestId&gt;&lt;Injected request=&quot;1&quot;&gt;"));
+    }
 }

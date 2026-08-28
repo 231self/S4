@@ -4305,6 +4305,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "x509-parser",
+ "xmlparser",
 ]
 
 [[package]]

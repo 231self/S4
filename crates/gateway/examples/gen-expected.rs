@@ -97,7 +97,9 @@ fn stream_process(
                 format: format.as_str().to_string(),
                 content_type: content_type.to_string(),
                 policy_version: 0,
-                ..Default::default()
+                public_key_pem: None,
+                stable_key: None,
+                stable_fields: None,
             };
             let cancellation = CancellationToken::new();
             let mut pipeline = snapshot

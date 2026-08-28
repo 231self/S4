@@ -160,6 +160,7 @@ pub struct PipelineSession {
 enum PipelineCommand {
     Process(Record, oneshot::Sender<Result<Option<Record>, S4Error>>),
     Finish(oneshot::Sender<Result<Vec<Record>, S4Error>>),
+    Cancel,
 }
 
 /// Async, backpressured handle to one object-scoped pipeline running on the
@@ -169,6 +170,8 @@ pub struct StreamingPipelineSession {
     sender: Option<mpsc::Sender<PipelineCommand>>,
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<(), S4Error>>>,
+    watchdog: Option<tokio::task::JoinHandle<()>>,
+    object_deadline: Instant,
 }
 
 impl Default for PluginRegistry {
@@ -397,6 +400,45 @@ impl PluginRegistry {
 }
 
 impl PipelineSnapshot {
+    /// Return a snapshot with endpoint-specific limits. Every field is merged
+    /// with `min`, so a caller can only tighten the registry configuration.
+    pub fn constrained(&self, constraints: PipelineLimits) -> Result<Self, S4Error> {
+        let constraints = constraints.validate()?;
+        let mut snapshot = self.clone();
+        snapshot.limits.max_intermediate_record_bytes = snapshot
+            .limits
+            .max_intermediate_record_bytes
+            .min(constraints.max_intermediate_record_bytes);
+        snapshot.limits.max_plugin_finish_bytes = snapshot
+            .limits
+            .max_plugin_finish_bytes
+            .min(constraints.max_plugin_finish_bytes);
+        snapshot.limits.max_input_bytes = snapshot
+            .limits
+            .max_input_bytes
+            .min(constraints.max_input_bytes);
+        snapshot.limits.max_output_bytes = snapshot
+            .limits
+            .max_output_bytes
+            .min(constraints.max_output_bytes);
+        snapshot.limits.max_expansion_factor = snapshot
+            .limits
+            .max_expansion_factor
+            .min(constraints.max_expansion_factor);
+        snapshot.limits.max_expansion_slack_bytes = snapshot
+            .limits
+            .max_expansion_slack_bytes
+            .min(constraints.max_expansion_slack_bytes);
+        snapshot.limits.max_plugins = snapshot.limits.max_plugins.min(constraints.max_plugins);
+        snapshot.limits.max_cumulative_fuel = snapshot
+            .limits
+            .max_cumulative_fuel
+            .min(constraints.max_cumulative_fuel);
+        snapshot.limits.max_wall_time =
+            snapshot.limits.max_wall_time.min(constraints.max_wall_time);
+        Ok(snapshot)
+    }
+
     pub fn plugin_infos(&self) -> Vec<PluginInfo> {
         self.plugins
             .iter()
@@ -436,6 +478,19 @@ impl PipelineSnapshot {
         session: &s4_wasm_runtime::Session,
         cancellation: CancellationToken,
     ) -> Result<PipelineSession, S4Error> {
+        self.start_session_with_deadline(
+            session,
+            cancellation,
+            Instant::now() + self.limits.max_wall_time,
+        )
+    }
+
+    pub fn start_session_with_deadline(
+        &self,
+        session: &s4_wasm_runtime::Session,
+        cancellation: CancellationToken,
+        requested_deadline: Instant,
+    ) -> Result<PipelineSession, S4Error> {
         if self.plugins.len() > self.limits.max_plugins {
             return Err(limit_error(
                 codes::LIMIT_PLUGIN_COUNT,
@@ -446,7 +501,7 @@ impl PipelineSnapshot {
         }
         let mut plugins = Vec::with_capacity(self.plugins.len());
         let mut fuel_consumed = 0u64;
-        let object_deadline = Instant::now() + self.limits.max_wall_time;
+        let object_deadline = requested_deadline.min(Instant::now() + self.limits.max_wall_time);
         for plugin in &self.plugins {
             let remaining_fuel = self.limits.max_cumulative_fuel - fuel_consumed;
             let filter = plugin
@@ -486,63 +541,111 @@ impl PipelineSnapshot {
         session: s4_wasm_runtime::Session,
         cancellation: CancellationToken,
     ) -> Result<StreamingPipelineSession, S4Error> {
+        let deadline = Instant::now() + self.limits.max_wall_time;
+        self.start_streaming_session_with_deadline(session, cancellation, deadline)
+            .await
+    }
+
+    pub async fn start_streaming_session_with_deadline(
+        self,
+        session: s4_wasm_runtime::Session,
+        cancellation: CancellationToken,
+        requested_deadline: Instant,
+    ) -> Result<StreamingPipelineSession, S4Error> {
+        let object_deadline = requested_deadline.min(Instant::now() + self.limits.max_wall_time);
         let reservation = self.guest_memory_reservation()?;
         let executor = Arc::clone(&self.executor);
         let task_cancellation = cancellation.clone();
+        let executor_cancellation = cancellation.clone();
         let (sender, mut receiver) = mpsc::channel(1);
         let (started_sender, started_receiver) = oneshot::channel();
         let task = tokio::task::spawn_blocking(move || {
-            executor.execute(reservation, &task_cancellation.clone(), move || {
-                let mut pipeline = match self.start_session(&session, task_cancellation) {
-                    Ok(pipeline) => {
-                        let _ = started_sender.send(Ok(()));
-                        pipeline
-                    }
-                    Err(error) => {
-                        let _ = started_sender.send(Err(error));
-                        return Ok(());
-                    }
-                };
-                while let Some(command) = receiver.blocking_recv() {
-                    match command {
-                        PipelineCommand::Process(record, response) => {
-                            match pipeline.process(record) {
-                                Ok(record) => {
-                                    let _ = response.send(Ok(record));
-                                }
-                                Err(error) => {
-                                    let _ = response.send(Err(error));
-                                    break;
+            executor.execute_until(
+                reservation,
+                &executor_cancellation,
+                object_deadline,
+                move || {
+                    let startup = self.start_session_with_deadline(
+                        &session,
+                        task_cancellation,
+                        object_deadline,
+                    );
+                    drop(session);
+                    let mut pipeline = match startup {
+                        Ok(pipeline) => {
+                            let _ = started_sender.send(Ok(()));
+                            pipeline
+                        }
+                        Err(error) => {
+                            let _ = started_sender.send(Err(error));
+                            return Ok(());
+                        }
+                    };
+                    while let Some(command) = receiver.blocking_recv() {
+                        match command {
+                            PipelineCommand::Process(record, response) => {
+                                match pipeline.process(record) {
+                                    Ok(record) => {
+                                        let _ = response.send(Ok(record));
+                                    }
+                                    Err(error) => {
+                                        let _ = response.send(Err(error));
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        PipelineCommand::Finish(response) => {
-                            let _ = response.send(pipeline.finish());
-                            break;
+                            PipelineCommand::Finish(response) => {
+                                let _ = response.send(pipeline.finish());
+                                break;
+                            }
+                            PipelineCommand::Cancel => break,
                         }
                     }
-                }
-                Ok(())
-            })?
+                    Ok(())
+                },
+            )?
         });
-        match started_receiver.await {
-            Ok(Ok(())) => Ok(StreamingPipelineSession {
-                sender: Some(sender),
-                cancellation,
-                task: Some(task),
-            }),
-            Ok(Err(error)) => {
+        let started = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(object_deadline),
+            started_receiver,
+        )
+        .await;
+        match started {
+            Ok(Ok(Ok(()))) => {
+                let watchdog =
+                    spawn_deadline_watchdog(&sender, cancellation.clone(), object_deadline);
+                Ok(StreamingPipelineSession {
+                    sender: Some(sender),
+                    cancellation,
+                    task: Some(task),
+                    watchdog: Some(watchdog),
+                    object_deadline,
+                })
+            }
+            Ok(Ok(Err(error))) => {
+                cancellation.cancel();
+                drop(sender);
                 let _ = task.await;
                 Err(error)
             }
-            Err(_) => match task.await {
-                Ok(Err(error)) => Err(error),
-                Ok(Ok(())) => Err(S4Error::new(
-                    codes::INTERNAL,
-                    "Wasm pipeline stopped before session startup",
-                )),
-                Err(error) => Err(S4Error::new(codes::INTERNAL, error.to_string())),
-            },
+            Err(_) => {
+                cancellation.cancel();
+                drop(sender);
+                let _ = task.await;
+                Err(deadline_error())
+            }
+            Ok(Err(_)) => {
+                cancellation.cancel();
+                drop(sender);
+                match task.await {
+                    Ok(Err(error)) => Err(error),
+                    Ok(Ok(())) => Err(S4Error::new(
+                        codes::INTERNAL,
+                        "Wasm pipeline stopped before session startup",
+                    )),
+                    Err(error) => Err(S4Error::new(codes::INTERNAL, error.to_string())),
+                }
+            }
         }
     }
 }
@@ -550,40 +653,104 @@ impl PipelineSnapshot {
 impl StreamingPipelineSession {
     pub async fn process(&mut self, record: Record) -> Result<Option<Record>, S4Error> {
         let (response_sender, response_receiver) = oneshot::channel();
-        self.sender
-            .as_ref()
-            .ok_or_else(pipeline_stopped)?
-            .send(PipelineCommand::Process(record, response_sender))
-            .await
-            .map_err(|_| pipeline_stopped())?;
-        response_receiver.await.map_err(|_| pipeline_stopped())?
+        let sender = self.sender.as_ref().ok_or_else(pipeline_stopped)?;
+        let deadline = tokio::time::Instant::from_std(self.object_deadline);
+        let send = tokio::time::timeout_at(
+            deadline,
+            sender.send(PipelineCommand::Process(record, response_sender)),
+        )
+        .await;
+        let send_error = match send {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some(pipeline_stopped()),
+            Err(_) => Some(deadline_error()),
+        };
+        if let Some(error) = send_error {
+            let _ = self.abort_and_wait().await;
+            return Err(error);
+        }
+        let result = match tokio::time::timeout_at(deadline, response_receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(pipeline_stopped()),
+            Err(_) => Err(deadline_error()),
+        };
+        if result.is_err() {
+            let _ = self.abort_and_wait().await;
+        }
+        result
     }
 
     pub async fn finish(mut self) -> Result<Vec<Record>, S4Error> {
         let (response_sender, response_receiver) = oneshot::channel();
-        let sender = self.sender.take().ok_or_else(pipeline_stopped)?;
-        sender
-            .send(PipelineCommand::Finish(response_sender))
-            .await
-            .map_err(|_| pipeline_stopped())?;
+        let Some(sender) = self.sender.take() else {
+            let _ = self.abort_and_wait().await;
+            return Err(pipeline_stopped());
+        };
+        let deadline = tokio::time::Instant::from_std(self.object_deadline);
+        let send = tokio::time::timeout_at(
+            deadline,
+            sender.send(PipelineCommand::Finish(response_sender)),
+        )
+        .await;
+        let send_error = match send {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some(pipeline_stopped()),
+            Err(_) => Some(deadline_error()),
+        };
+        if let Some(error) = send_error {
+            drop(sender);
+            let _ = self.abort_and_wait().await;
+            return Err(error);
+        }
         drop(sender);
-        let result = response_receiver.await.map_err(|_| pipeline_stopped())?;
-        self.wait().await?;
+        let result = match tokio::time::timeout_at(deadline, response_receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(pipeline_stopped()),
+            Err(_) => Err(deadline_error()),
+        };
+        if result.is_err() {
+            self.cancellation.cancel();
+        }
+        let wait = self.wait().await;
+        if result.is_ok() {
+            wait?;
+        }
         result
     }
 
     pub async fn cancel_and_wait(mut self) -> Result<(), S4Error> {
+        self.abort_and_wait().await
+    }
+
+    async fn abort_and_wait(&mut self) -> Result<(), S4Error> {
         self.cancellation.cancel();
         self.sender.take();
-        self.wait().await
+        self.stop_watchdog().await;
+        match self.wait_task().await {
+            Err(error) if error.code() == codes::WASM_CANCELLED => Ok(()),
+            result => result,
+        }
     }
 
     async fn wait(&mut self) -> Result<(), S4Error> {
+        let result = self.wait_task().await;
+        self.stop_watchdog().await;
+        result
+    }
+
+    async fn wait_task(&mut self) -> Result<(), S4Error> {
         match self.task.take() {
             Some(task) => task
                 .await
                 .map_err(|error| S4Error::new(codes::INTERNAL, error.to_string()))?,
             None => Ok(()),
+        }
+    }
+
+    async fn stop_watchdog(&mut self) {
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
+            let _ = watchdog.await;
         }
     }
 }
@@ -592,11 +759,33 @@ impl Drop for StreamingPipelineSession {
     fn drop(&mut self) {
         self.cancellation.cancel();
         self.sender.take();
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
+        }
     }
+}
+
+fn spawn_deadline_watchdog(
+    sender: &mpsc::Sender<PipelineCommand>,
+    cancellation: CancellationToken,
+    object_deadline: Instant,
+) -> tokio::task::JoinHandle<()> {
+    let sender = sender.downgrade();
+    tokio::spawn(async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(object_deadline)).await;
+        cancellation.cancel();
+        if let Some(sender) = sender.upgrade() {
+            let _ = sender.send(PipelineCommand::Cancel).await;
+        }
+    })
 }
 
 fn pipeline_stopped() -> S4Error {
     S4Error::new(codes::WASM_CANCELLED, "Wasm pipeline session stopped")
+}
+
+fn deadline_error() -> S4Error {
+    S4Error::new(codes::WASM_DEADLINE, "Wasm pipeline deadline exceeded")
 }
 
 impl PipelineSession {
@@ -825,7 +1014,9 @@ mod tests {
             format: "text".to_string(),
             content_type: "text/plain".to_string(),
             policy_version: 1,
-            ..Default::default()
+            public_key_pem: None,
+            stable_key: None,
+            stable_fields: None,
         }
     }
 
@@ -952,6 +1143,99 @@ mod tests {
             ["a", "b"]
         );
         assert!(registry.snapshot().plugin_infos().is_empty());
+    }
+
+    #[test]
+    fn constrained_snapshot_only_lowers_limits() {
+        let limits = PipelineLimits {
+            max_cumulative_fuel: 25,
+            max_wall_time: Duration::from_millis(25),
+            ..PipelineLimits::default()
+        };
+        let registry =
+            PluginRegistry::with_options(DEFAULT_PIPELINE_FUEL, limits, ExecutorConfig::default())
+                .unwrap();
+        let snapshot = registry.snapshot();
+
+        let unchanged = snapshot
+            .constrained(PipelineLimits {
+                max_cumulative_fuel: 50,
+                max_wall_time: Duration::from_millis(50),
+                ..PipelineLimits::default()
+            })
+            .unwrap();
+        assert_eq!(unchanged.limits.max_cumulative_fuel, 25);
+        assert_eq!(unchanged.limits.max_wall_time, Duration::from_millis(25));
+
+        let lowered = snapshot
+            .constrained(PipelineLimits {
+                max_intermediate_record_bytes: 64,
+                max_plugin_finish_bytes: 63,
+                max_input_bytes: 62,
+                max_output_bytes: 61,
+                max_expansion_factor: 8,
+                max_expansion_slack_bytes: 60,
+                max_plugins: 2,
+                max_cumulative_fuel: 10,
+                max_wall_time: Duration::from_millis(10),
+            })
+            .unwrap();
+        assert_eq!(lowered.limits.max_intermediate_record_bytes, 64);
+        assert_eq!(lowered.limits.max_plugin_finish_bytes, 63);
+        assert_eq!(lowered.limits.max_input_bytes, 62);
+        assert_eq!(lowered.limits.max_output_bytes, 61);
+        assert_eq!(lowered.limits.max_expansion_factor, 8);
+        assert_eq!(lowered.limits.max_expansion_slack_bytes, 60);
+        assert_eq!(lowered.limits.max_plugins, 2);
+        assert_eq!(lowered.limits.max_cumulative_fuel, 10);
+        assert_eq!(lowered.limits.max_wall_time, Duration::from_millis(10));
+        assert_eq!(
+            snapshot
+                .constrained(PipelineLimits {
+                    max_cumulative_fuel: 0,
+                    ..PipelineLimits::default()
+                })
+                .err()
+                .expect("zero fuel is invalid")
+                .code(),
+            codes::CONFIG_INVALID
+        );
+    }
+
+    #[test]
+    fn constrained_snapshot_enforces_fuel_and_wall_time() {
+        let registry = PluginRegistry::new();
+        registry.import("noop", &component()).unwrap();
+        let fuel_error = registry
+            .snapshot()
+            .constrained(PipelineLimits {
+                max_cumulative_fuel: 1,
+                max_wall_time: Duration::from_secs(1),
+                ..PipelineLimits::default()
+            })
+            .unwrap()
+            .start_session(&session(), CancellationToken::new())
+            .err()
+            .expect("one fuel unit cannot initialize the component");
+        assert_eq!(fuel_error.code(), codes::WASM_FUEL);
+
+        let registry = PluginRegistry::new();
+        let snapshot = registry
+            .snapshot()
+            .constrained(PipelineLimits {
+                max_cumulative_fuel: DEFAULT_PIPELINE_FUEL,
+                max_wall_time: Duration::from_millis(1),
+                ..PipelineLimits::default()
+            })
+            .unwrap();
+        let mut pipeline = snapshot
+            .start_session(&session(), CancellationToken::new())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            pipeline.process(Record::new("x", "")).unwrap_err().code(),
+            codes::WASM_DEADLINE
+        );
     }
 
     #[test]
@@ -1167,6 +1451,215 @@ mod tests {
             Ok(_) => panic!("admission must reject an over-budget pipeline"),
             Err(error) => assert_eq!(error.code(), codes::WASM_ADMISSION),
         }
+    }
+
+    #[tokio::test]
+    async fn queued_startup_deadline_cancels_without_leaking_executor_work() {
+        let registry = PluginRegistry::with_options(
+            DEFAULT_PIPELINE_FUEL,
+            PipelineLimits::default(),
+            ExecutorConfig {
+                workers: 1,
+                queue_capacity: 1,
+                guest_memory_budget_bytes: 2 * 64 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let test_component = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("target/test-components/test-filter.component.wasm"),
+        )
+        .expect("test-filter.component.wasm; run just build-filters");
+        registry.import("test-filter", &test_component).unwrap();
+        let snapshot = registry.snapshot();
+
+        let first_cancellation = CancellationToken::new();
+        let mut first = snapshot
+            .clone()
+            .start_streaming_session_with_deadline(
+                session(),
+                first_cancellation.clone(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let running = tokio::spawn(async move { first.process(Record::new("loop", "")).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let queued_cancellation = CancellationToken::new();
+        let error = snapshot
+            .clone()
+            .start_streaming_session_with_deadline(
+                session(),
+                queued_cancellation,
+                Instant::now() + Duration::from_millis(25),
+            )
+            .await
+            .err()
+            .expect("queued startup must time out");
+        assert_eq!(error.code(), codes::WASM_DEADLINE);
+        assert_eq!(registry.executor.admission().used(), 64 * 1024 * 1024);
+
+        first_cancellation.cancel();
+        let first_error = running
+            .await
+            .unwrap()
+            .expect_err("running guest must be cancelled");
+        assert_eq!(first_error.code(), codes::WASM_CANCELLED);
+        assert_eq!(registry.executor.admission().used(), 0);
+
+        let third = snapshot
+            .start_streaming_session_with_deadline(
+                session(),
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("executor worker remains available");
+        third.cancel_and_wait().await.unwrap();
+        assert_eq!(registry.executor.admission().used(), 0);
+    }
+
+    #[tokio::test]
+    async fn constrained_finish_cap_rejects_large_guest_output() {
+        let registry = PluginRegistry::new();
+        let test_component = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("target/test-components/test-filter.component.wasm"),
+        )
+        .expect("test-filter.component.wasm; run just build-filters");
+        registry.import("test-filter", &test_component).unwrap();
+        let snapshot = registry
+            .snapshot()
+            .constrained(PipelineLimits {
+                max_intermediate_record_bytes: 64 * 1024,
+                max_plugin_finish_bytes: 64 * 1024,
+                max_input_bytes: 64 * 1024,
+                max_output_bytes: 64 * 1024,
+                max_expansion_factor: 8,
+                max_expansion_slack_bytes: 1024,
+                max_plugins: 1,
+                max_cumulative_fuel: DEFAULT_PIPELINE_FUEL,
+                max_wall_time: Duration::from_secs(1),
+            })
+            .unwrap();
+        let mut configured = session();
+        configured.stable_fields = Some("finish-large".to_string());
+        let pipeline = snapshot
+            .start_streaming_session(configured, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            pipeline.finish().await.unwrap_err().code(),
+            codes::LIMIT_FINISH_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_timeout_before_enqueue_drops_sender_and_joins_worker() {
+        let cancellation = CancellationToken::new();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (queued_response, _queued_receiver) = oneshot::channel();
+        assert!(
+            sender
+                .try_send(PipelineCommand::Process(
+                    Record::new("queued", ""),
+                    queued_response,
+                ))
+                .is_ok()
+        );
+        let task = tokio::task::spawn_blocking(move || -> Result<(), S4Error> {
+            std::thread::sleep(Duration::from_millis(25));
+            while receiver.blocking_recv().is_some() {}
+            Ok(())
+        });
+        let pipeline = StreamingPipelineSession {
+            sender: Some(sender),
+            cancellation,
+            task: Some(task),
+            watchdog: None,
+            object_deadline: Instant::now() + Duration::from_millis(5),
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(1), pipeline.finish())
+            .await
+            .expect("finish cleanup must not retain the local sender")
+            .expect_err("full command queue must hit the finish deadline");
+        assert_eq!(error.code(), codes::WASM_DEADLINE);
+    }
+
+    #[tokio::test]
+    async fn idle_deadline_watchdog_releases_worker_and_admission() {
+        let registry = PluginRegistry::with_options(
+            DEFAULT_PIPELINE_FUEL,
+            PipelineLimits::default(),
+            ExecutorConfig {
+                workers: 1,
+                queue_capacity: 1,
+                guest_memory_budget_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        registry.import("noop", &component()).unwrap();
+        let pipeline = registry
+            .snapshot()
+            .start_streaming_session_with_deadline(
+                session(),
+                CancellationToken::new(),
+                Instant::now() + Duration::from_millis(250),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.executor.admission().used(), 64 * 1024 * 1024);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.executor.admission().used() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("idle deadline must release the executor reservation");
+        let error = pipeline
+            .cancel_and_wait()
+            .await
+            .expect_err("watchdog expiry must preserve the deadline result");
+        assert_eq!(error.code(), codes::WASM_DEADLINE);
+    }
+
+    #[tokio::test]
+    async fn watchdog_weak_sender_does_not_keep_dropped_session_alive() {
+        let registry = PluginRegistry::with_options(
+            DEFAULT_PIPELINE_FUEL,
+            PipelineLimits::default(),
+            ExecutorConfig {
+                workers: 1,
+                queue_capacity: 1,
+                guest_memory_budget_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        registry.import("noop", &component()).unwrap();
+        let pipeline = registry
+            .snapshot()
+            .start_streaming_session_with_deadline(
+                session(),
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.executor.admission().used(), 64 * 1024 * 1024);
+        drop(pipeline);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.executor.admission().used() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dropping the last strong sender must stop the idle worker");
     }
 
     #[test]

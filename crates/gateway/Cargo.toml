@@ -28,6 +28,7 @@ aws-smithy-types.workspace = true
 md-5.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
+zeroize.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true

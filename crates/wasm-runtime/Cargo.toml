@@ -11,6 +11,7 @@ wasmtime-wasi.workspace = true
 wit-bindgen.workspace = true
 anyhow = "1"
 rand.workspace = true
+zeroize.workspace = true
 
 [build-dependencies]
 wit-bindgen.workspace = true

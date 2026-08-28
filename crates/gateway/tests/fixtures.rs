@@ -39,7 +39,9 @@ fn session(format: &str, content_type: &str) -> s4_wasm_runtime::Session {
         format: format.to_string(),
         content_type: content_type.to_string(),
         policy_version: 1,
-        ..Default::default()
+        public_key_pem: None,
+        stable_key: None,
+        stable_fields: None,
     }
 }
 

@@ -2988,6 +2988,8 @@ async fn demo_redact_runs_pipeline() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -3001,6 +3003,250 @@ async fn demo_redact_runs_pipeline() {
         redacted.contains("[REDACTED_CARD]"),
         "card redacted: {redacted}"
     );
+}
+
+async fn post_demo_process(app: &Router, body: serde_json::Value) -> axum::response::Response {
+    post_demo_process_body(app, Body::from(body.to_string())).await
+}
+
+async fn post_demo_process_body(app: &Router, body: Body) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/demo/process")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+fn assert_demo_security_headers(response: &axum::response::Response) {
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+}
+
+fn assert_demo_response_headers(response: &axum::response::Response) {
+    assert_demo_security_headers(response);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+}
+
+async fn demo_response_json(response: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn demo_process_is_stateless_ordered_and_supports_safe_and_join_modes() {
+    let (app, state) = router().await;
+    assert!(state.store.list_keys().is_empty());
+    for plugin in state.plugins.list() {
+        state.plugins.set_enabled(&plugin.id, false);
+    }
+    let records = serde_json::json!([
+        {
+            "email": "alice@example.com",
+            "card": "4111111111111111",
+            "note": "first"
+        },
+        {
+            "email": "alice@example.com",
+            "card": "4111111111111111",
+            "note": "second"
+        },
+        {
+            "email": "bob@example.com",
+            "card": "4111111111111111",
+            "note": "third"
+        }
+    ]);
+
+    let safe = post_demo_process(
+        &app,
+        serde_json::json!({"records": records, "mode": "safe"}),
+    )
+    .await;
+    assert_eq!(safe.status(), StatusCode::OK);
+    assert_demo_response_headers(&safe);
+    let safe = demo_response_json(safe).await;
+    assert_eq!(safe["mode"], "safe");
+    assert_eq!(safe["records"][0]["record"], 1);
+    assert_eq!(safe["records"][1]["record"], 2);
+    assert_eq!(safe["records"][2]["record"], 3);
+    for (index, note) in ["first", "second", "third"].into_iter().enumerate() {
+        let body: serde_json::Value =
+            serde_json::from_str(safe["records"][index]["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["email"], "[REDACTED_EMAIL]");
+        assert_eq!(body["card"], "[REDACTED_CARD]");
+        assert_eq!(body["note"], note);
+    }
+
+    let join = post_demo_process(
+        &app,
+        serde_json::json!({"records": records, "mode": "join"}),
+    )
+    .await;
+    assert_eq!(join.status(), StatusCode::OK);
+    assert_demo_response_headers(&join);
+    let join = demo_response_json(join).await;
+    assert_eq!(join["mode"], "join");
+    let first: serde_json::Value =
+        serde_json::from_str(join["records"][0]["body"].as_str().unwrap()).unwrap();
+    let second: serde_json::Value =
+        serde_json::from_str(join["records"][1]["body"].as_str().unwrap()).unwrap();
+    let third: serde_json::Value =
+        serde_json::from_str(join["records"][2]["body"].as_str().unwrap()).unwrap();
+    assert_ne!(first["email"], "alice@example.com");
+    assert_eq!(first["email"], second["email"]);
+    assert_ne!(first["email"], third["email"]);
+    assert_eq!(first["note"], "first");
+    assert_eq!(second["note"], "second");
+    assert_eq!(third["note"], "third");
+    assert_eq!(first["card"], "[REDACTED_CARD]");
+
+    let next_request = post_demo_process(
+        &app,
+        serde_json::json!({
+            "records": [{"email": "alice@example.com"}],
+            "mode": "join"
+        }),
+    )
+    .await;
+    assert_eq!(next_request.status(), StatusCode::OK);
+    let next_request = demo_response_json(next_request).await;
+    let next_email: serde_json::Value =
+        serde_json::from_str(next_request["records"][0]["body"].as_str().unwrap()).unwrap();
+    assert_ne!(first["email"], next_email["email"]);
+    assert!(state.store.list_keys().is_empty());
+}
+
+#[tokio::test]
+async fn demo_process_rejects_raw_unknown_and_malformed_modes() {
+    let (app, _state) = router().await;
+    for mode in ["raw", "unknown", "SAFE"] {
+        let response = post_demo_process(
+            &app,
+            serde_json::json!({"records": [{"value": 1}], "mode": mode}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_demo_response_headers(&response);
+        let body = demo_response_json(response).await;
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["message"], "Invalid demo request");
+    }
+}
+
+#[tokio::test]
+async fn demo_process_enforces_record_and_canonical_input_limits() {
+    let (app, _state) = router().await;
+    for records in [
+        serde_json::json!([]),
+        serde_json::Value::Array(vec![serde_json::Value::Null; 11]),
+    ] {
+        let response = post_demo_process(
+            &app,
+            serde_json::json!({"records": records, "mode": "safe"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_demo_response_headers(&response);
+        assert_eq!(
+            demo_response_json(response).await["code"],
+            "invalid_record_count"
+        );
+    }
+
+    let response = post_demo_process(
+        &app,
+        serde_json::json!({
+            "records": ["x".repeat(64 * 1024)],
+            "mode": "safe"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_demo_response_headers(&response);
+    assert_eq!(
+        demo_response_json(response).await["code"],
+        "input_too_large"
+    );
+
+    let response = post_demo_process_body(&app, Body::from(vec![b' '; 512 * 1024 + 1])).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_demo_response_headers(&response);
+    assert_eq!(
+        demo_response_json(response).await["code"],
+        "input_too_large"
+    );
+}
+
+#[tokio::test]
+async fn demo_process_enforces_aggregate_output_limit() {
+    let state = test_state().await;
+    for plugin in state.plugins.list() {
+        state.plugins.set_enabled(&plugin.id, false);
+    }
+    let app = build_router(state);
+    let response = post_demo_process(
+        &app,
+        serde_json::json!({
+            "records": ["a@b.co ".repeat(7_000)],
+            "mode": "safe"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_demo_response_headers(&response);
+    let body = demo_response_json(response).await;
+    assert_eq!(body["code"], "output_too_large");
+    assert_eq!(body["message"], "Demo output exceeds 64 KiB");
+}
+
+#[tokio::test]
+async fn demo_process_enforces_serialized_json_response_limit() {
+    let (app, _state) = router().await;
+    let response = post_demo_process(
+        &app,
+        serde_json::json!({
+            "records": ["\\".repeat(30_000)],
+            "mode": "safe"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_demo_response_headers(&response);
+    assert_eq!(
+        demo_response_json(response).await["code"],
+        "output_too_large"
+    );
+}
+
+#[tokio::test]
+async fn malformed_demo_bodies_consume_the_global_start_allowance() {
+    let (app, _state) = router().await;
+    for _ in 0..30 {
+        let response = post_demo_process_body(&app, Body::from("{")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_demo_response_headers(&response);
+    }
+    let response = post_demo_process(
+        &app,
+        serde_json::json!({"records": [{"value": 1}], "mode": "safe"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_demo_response_headers(&response);
+    assert_eq!(demo_response_json(response).await["code"], "rate_limited");
 }
 
 #[tokio::test]
@@ -3521,6 +3767,7 @@ async fn demo_read_safe_and_join_modes() {
         .await
         .unwrap();
     assert_eq!(store.status(), StatusCode::OK);
+    assert_demo_response_headers(&store);
 
     // 2. Raw read keeps PII.
     let raw = app
@@ -3534,6 +3781,7 @@ async fn demo_read_safe_and_join_modes() {
         )
         .await
         .unwrap();
+    assert_demo_response_headers(&raw);
     let raw_body = axum::body::to_bytes(raw.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -3556,6 +3804,7 @@ async fn demo_read_safe_and_join_modes() {
         .await
         .unwrap();
     assert_eq!(safe.status(), StatusCode::OK);
+    assert_demo_response_headers(&safe);
     let safe_bytes = axum::body::to_bytes(safe.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -3581,6 +3830,7 @@ async fn demo_read_safe_and_join_modes() {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
+            assert_demo_response_headers(&resp);
             let text = String::from_utf8_lossy(
                 &axum::body::to_bytes(resp.into_body(), usize::MAX)
                     .await
@@ -3600,4 +3850,46 @@ async fn demo_read_safe_and_join_modes() {
         email1, email2,
         "join must produce identical ciphertext for the same email"
     );
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/dashboard/api/demo/read?id=99&mode=raw")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_demo_security_headers(&missing);
+
+    let unknown = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/dashboard/api/demo/read?id=1&mode=unknown")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    assert_demo_security_headers(&unknown);
+
+    let malformed_store = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/demo/store")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed_store.status(), StatusCode::BAD_REQUEST);
+    assert_demo_security_headers(&malformed_store);
 }

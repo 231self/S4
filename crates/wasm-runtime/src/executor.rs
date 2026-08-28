@@ -1,9 +1,9 @@
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use s4_error::{S4Error, codes};
 use wasmtime::Engine;
@@ -158,6 +158,33 @@ impl MemoryAdmission {
         })
     }
 
+    pub fn reserve_until(
+        &self,
+        bytes: usize,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<MemoryPermit, S4Error> {
+        self.validate_request(bytes)?;
+        let mut state = self.inner.state.lock().unwrap();
+        while state.used.saturating_add(bytes) > self.inner.capacity {
+            if let Some(error) = execution_control_error(cancellation, deadline) {
+                return Err(error);
+            }
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10));
+            state = self.inner.available.wait_timeout(state, wait).unwrap().0;
+        }
+        if let Some(error) = execution_control_error(cancellation, deadline) {
+            return Err(error);
+        }
+        state.used += bytes;
+        Ok(MemoryPermit {
+            admission: self.clone(),
+            bytes,
+        })
+    }
+
     fn validate_request(&self, bytes: usize) -> Result<(), S4Error> {
         if bytes > self.inner.capacity {
             return Err(admission_error(bytes, self.inner.capacity));
@@ -251,6 +278,47 @@ impl WasmExecutor {
         })?;
         receive_result(result_receiver)
     }
+
+    pub fn execute_until<R, F>(
+        &self,
+        guest_memory_bytes: usize,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+        task: F,
+    ) -> Result<R, S4Error>
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        let permit = self
+            .admission
+            .reserve_until(guest_memory_bytes, cancellation, deadline)?;
+        let pending = Arc::new(Mutex::new(Some((task, permit))));
+        let (result_sender, result_receiver) = sync_channel(1);
+        let mut job = make_cancellable_job(Arc::clone(&pending), result_sender);
+        loop {
+            match self.sender.try_send(job) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    job = returned;
+                    if let Some(error) = execution_control_error(cancellation, deadline) {
+                        cancellation.cancel();
+                        pending.lock().unwrap().take();
+                        return Err(error);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    pending.lock().unwrap().take();
+                    return Err(S4Error::new(
+                        codes::WASM_ADMISSION,
+                        "Wasm executor is not available",
+                    ));
+                }
+            }
+        }
+        receive_result_until(result_receiver, pending, cancellation, deadline)
+    }
 }
 
 fn make_job<R, F>(
@@ -272,6 +340,24 @@ where
     })
 }
 
+fn make_cancellable_job<R, F>(
+    pending: Arc<Mutex<Option<(F, MemoryPermit)>>>,
+    result_sender: SyncSender<Result<R, S4Error>>,
+) -> Job
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    Box::new(move || {
+        let Some((task, permit)) = pending.lock().unwrap().take() else {
+            return;
+        };
+        let result = catch_unwind(AssertUnwindSafe(task)).map_err(panic_error);
+        drop(permit);
+        let _ = result_sender.send(result);
+    })
+}
+
 fn receive_result<R>(receiver: Receiver<Result<R, S4Error>>) -> Result<R, S4Error> {
     receiver.recv().map_err(|_| {
         S4Error::new(
@@ -279,6 +365,58 @@ fn receive_result<R>(receiver: Receiver<Result<R, S4Error>>) -> Result<R, S4Erro
             "Wasm executor worker stopped before returning a result",
         )
     })?
+}
+
+fn receive_result_until<R, F>(
+    receiver: Receiver<Result<R, S4Error>>,
+    pending: Arc<Mutex<Option<(F, MemoryPermit)>>>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<R, S4Error> {
+    loop {
+        if let Some(error) = execution_control_error(cancellation, deadline) {
+            cancellation.cancel();
+            if pending.lock().unwrap().take().is_none() {
+                let _ = receiver.recv();
+            }
+            return Err(error);
+        }
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(10));
+        match receiver.recv_timeout(wait) {
+            Ok(result) => {
+                if let Some(error) = execution_control_error(cancellation, deadline) {
+                    cancellation.cancel();
+                    return Err(error);
+                }
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(S4Error::new(
+                    codes::INTERNAL,
+                    "Wasm executor worker stopped before returning a result",
+                ));
+            }
+        }
+    }
+}
+
+fn execution_control_error(cancellation: &CancellationToken, deadline: Instant) -> Option<S4Error> {
+    if Instant::now() >= deadline {
+        Some(S4Error::new(
+            codes::WASM_DEADLINE,
+            "Wasm execution deadline exceeded",
+        ))
+    } else if cancellation.is_cancelled() {
+        Some(S4Error::new(
+            codes::WASM_CANCELLED,
+            "Wasm execution was cancelled",
+        ))
+    } else {
+        None
+    }
 }
 
 fn panic_error(payload: Box<dyn Any + Send>) -> S4Error {
@@ -311,6 +449,8 @@ fn spawn_worker(index: usize, receiver: Arc<Mutex<Receiver<Job>>>) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     #[test]
@@ -360,5 +500,58 @@ mod tests {
             codes::WASM_CANCELLED
         );
         drop(permit);
+    }
+
+    #[test]
+    fn queued_deadline_drops_the_task_and_releases_admission() {
+        let executor = Arc::new(
+            WasmExecutor::new(ExecutorConfig {
+                workers: 1,
+                queue_capacity: 1,
+                guest_memory_budget_bytes: 2,
+            })
+            .unwrap(),
+        );
+        let release = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let blocker_executor = Arc::clone(&executor);
+        let blocker_release = Arc::clone(&release);
+        let blocker_started = Arc::clone(&started);
+        let blocker = std::thread::spawn(move || {
+            blocker_executor
+                .execute(1, &CancellationToken::new(), move || {
+                    blocker_started.store(true, Ordering::Release);
+                    while !blocker_release.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                })
+                .unwrap();
+        });
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let queued_ran = Arc::clone(&ran);
+        let cancellation = CancellationToken::new();
+        let error = executor
+            .execute_until(
+                1,
+                &cancellation,
+                Instant::now() + Duration::from_millis(25),
+                move || queued_ran.store(true, Ordering::Release),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), codes::WASM_DEADLINE);
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(executor.admission().used(), 1);
+
+        release.store(true, Ordering::Release);
+        blocker.join().unwrap();
+        executor
+            .execute(1, &CancellationToken::new(), || ())
+            .unwrap();
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(executor.admission().used(), 0);
     }
 }

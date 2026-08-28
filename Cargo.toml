@@ -29,6 +29,7 @@ thiserror = "2"
 hex = "0.4"
 uuid = { version = "1", features = ["v7", "v4"] }
 rand = "0.8"
+zeroize = "1"
 bytes = "1"
 csv-core = "0.1"
 http-body = "1"

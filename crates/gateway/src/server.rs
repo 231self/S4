@@ -6,10 +6,10 @@
 //! [`crate::control::NoopControlPlane`]; the private SaaS crate builds it with
 //! its own control-plane implementation.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -28,12 +28,14 @@ use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use md5::Md5;
 use rand::{RngCore, rngs::OsRng};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::backend::{BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation};
 use crate::control::{AuthenticatedRequestContext, ControlPlane, RequestKind, StreamingWriteMode};
@@ -55,7 +57,9 @@ use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, filter_presigned_response_headers,
     harden_object_response_headers,
 };
-use crate::plugin_registry::{PluginCapabilities, PluginRegistry, StreamingPipelineSession};
+use crate::plugin_registry::{
+    PipelineLimits, PipelineSnapshot, PluginCapabilities, PluginRegistry, StreamingPipelineSession,
+};
 use crate::read_spool::EncryptedReadSpool;
 use crate::s3_error;
 use crate::service_storage::{ServiceStorage, parse_service_backends};
@@ -105,6 +109,8 @@ pub struct AppState {
     pub transformed_read_spool_enabled: bool,
     pub dev_memory_max_object_bytes: usize,
     pub dev_memory_streaming_enabled: bool,
+    demo_pipelines: DemoPipelines,
+    demo_limiter: Arc<DemoLimiter>,
     multipart_staging: Option<Arc<MultipartStaging>>,
     multipart_mode: MultipartMode,
     continuation_token_key: [u8; 32],
@@ -224,6 +230,114 @@ struct MultipartStaging {
 }
 
 const LEGACY_MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
+const DEMO_MAX_RECORDS: usize = 10;
+const DEMO_MAX_INPUT_BYTES: usize = 64 * 1024;
+const DEMO_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const DEMO_MAX_RAW_BODY_BYTES: usize = 512 * 1024;
+const DEMO_MAX_CONCURRENCY: usize = 4;
+const DEMO_MAX_STARTS_PER_MINUTE: usize = 30;
+const DEMO_MAX_CUMULATIVE_FUEL: u64 = 50_000_000;
+const DEMO_MAX_WALL_TIME: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+struct DemoPipelines {
+    safe: PipelineSnapshot,
+    join: Option<PipelineSnapshot>,
+}
+
+/// The process's single `AppState` shares this anonymous admission policy across
+/// all router clones and both processing routes. A noisy anonymous client can
+/// exhaust the shared allowance; edge or identity-aware limiting is the
+/// follow-up availability control.
+struct DemoLimiter {
+    concurrency: Arc<tokio::sync::Semaphore>,
+    starts: Mutex<VecDeque<Instant>>,
+    max_starts: usize,
+    window: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoLimitError {
+    Concurrent,
+    Rate,
+}
+
+impl DemoLimiter {
+    fn new() -> Self {
+        Self::with_limits(
+            DEMO_MAX_CONCURRENCY,
+            DEMO_MAX_STARTS_PER_MINUTE,
+            Duration::from_secs(60),
+        )
+    }
+
+    fn with_limits(concurrency: usize, max_starts: usize, window: Duration) -> Self {
+        Self {
+            concurrency: Arc::new(tokio::sync::Semaphore::new(concurrency)),
+            starts: Mutex::new(VecDeque::with_capacity(max_starts)),
+            max_starts,
+            window,
+        }
+    }
+
+    fn try_start(&self) -> Result<tokio::sync::OwnedSemaphorePermit, DemoLimitError> {
+        let permit = self
+            .concurrency
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| DemoLimitError::Concurrent)?;
+        let now = Instant::now();
+        let mut starts = self.starts.lock().unwrap();
+        starts.retain(|started| now.saturating_duration_since(*started) < self.window);
+        if starts.len() >= self.max_starts {
+            return Err(DemoLimitError::Rate);
+        }
+        starts.push_back(now);
+        Ok(permit)
+    }
+}
+
+fn demo_pipeline_limits() -> PipelineLimits {
+    PipelineLimits {
+        max_intermediate_record_bytes: DEMO_MAX_OUTPUT_BYTES,
+        max_plugin_finish_bytes: DEMO_MAX_OUTPUT_BYTES,
+        max_input_bytes: DEMO_MAX_INPUT_BYTES as u64,
+        max_output_bytes: DEMO_MAX_OUTPUT_BYTES as u64,
+        max_expansion_factor: 8,
+        max_expansion_slack_bytes: 1024,
+        max_plugins: 2,
+        max_cumulative_fuel: DEMO_MAX_CUMULATIVE_FUEL,
+        max_wall_time: DEMO_MAX_WALL_TIME,
+    }
+}
+
+fn build_demo_pipelines(
+    pii_component: &[u8],
+    stable_component: Option<&[u8]>,
+    engine_fuel: u64,
+) -> anyhow::Result<DemoPipelines> {
+    let registry = PluginRegistry::with_fuel(engine_fuel);
+    let pii = registry.import("pii-default", pii_component)?;
+    let safe = registry.snapshot().constrained(demo_pipeline_limits())?;
+    let join = stable_component.and_then(|component| {
+        let stable = match registry.import("stable-encrypt", component) {
+            Ok(stable) => stable,
+            Err(error) => {
+                warn!("stable-encrypt unavailable for the stateless demo: {error}");
+                return None;
+            }
+        };
+        registry.reorder(vec![stable.id, pii.id.clone()]);
+        match registry.snapshot().constrained(demo_pipeline_limits()) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                warn!("join demo pipeline constraints are invalid: {error}");
+                None
+            }
+        }
+    });
+    Ok(DemoPipelines { safe, join })
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StreamingReadMode {
@@ -1571,40 +1685,341 @@ async fn get_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
 }
 
 /// Interactive demo: run the WASM PII pipeline over the submitted text and
-/// return the redacted output. Uses the demo-user identity (no storage write);
-/// rate limited in the client (5 trials).
+/// return the redacted output without writing request data to storage.
 #[derive(Deserialize, ToSchema)]
 struct DemoRedactRequest {
     text: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DemoMode {
+    Safe,
+    Join,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DemoProcessRequest {
+    records: Vec<serde_json::Value>,
+    mode: DemoMode,
+}
+
+#[derive(Serialize)]
+struct DemoProcessedRecord {
+    record: usize,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct DemoProcessResponse {
+    mode: DemoMode,
+    records: Vec<DemoProcessedRecord>,
+}
+
+#[derive(Serialize)]
+struct DemoErrorResponse {
+    code: &'static str,
+    message: &'static str,
+}
+
+fn harden_demo_response(mut response: axum::response::Response) -> axum::response::Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "private, no-store".parse().expect("static cache control"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        "nosniff".parse().expect("static content type option"),
+    );
+    response
+}
+
+async fn harden_legacy_demo_response(
+    response: axum::response::Response,
+) -> axum::response::Response {
+    harden_demo_response(response)
+}
+
+struct BoundedDemoJsonWriter {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl BoundedDemoJsonWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(DEMO_MAX_OUTPUT_BYTES),
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedDemoJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(buffer.len()) > DEMO_MAX_OUTPUT_BYTES {
+            self.exceeded = true;
+            return Err(std::io::Error::other("demo JSON response exceeds limit"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_demo_json<T: Serialize>(value: &T) -> axum::response::Response {
+    let mut writer = BoundedDemoJsonWriter::new();
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => {
+            let mut response = axum::response::Response::new(axum::body::Body::from(writer.bytes));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                "application/json".parse().expect("static content type"),
+            );
+            harden_demo_response(response)
+        }
+        Err(_) if writer.exceeded => demo_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "output_too_large",
+            "Demo output exceeds 64 KiB",
+        ),
+        Err(_) => demo_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pipeline_failed",
+            "Demo processing failed",
+        ),
+    }
+}
+
+fn demo_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> axum::response::Response {
+    harden_demo_response((status, Json(DemoErrorResponse { code, message })).into_response())
+}
+
+fn demo_limit_response(error: DemoLimitError) -> axum::response::Response {
+    match error {
+        DemoLimitError::Concurrent => demo_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "demo_busy",
+            "Too many demo operations are running",
+        ),
+        DemoLimitError::Rate => demo_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Demo rate limit exceeded",
+        ),
+    }
+}
+
+fn start_demo_operation(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, DemoLimitError> {
+    state.demo_limiter.try_start()
+}
+
+fn pipeline_snapshot(state: &AppState) -> Result<PipelineSnapshot, s4_error::S4Error> {
+    state.gateway.pipeline_snapshot().ok_or_else(|| {
+        s4_error::S4Error::new(
+            s4_error::codes::INTERNAL,
+            "demo pipeline requires a plugin registry",
+        )
+    })
+}
+
+fn demo_pipeline(state: &AppState, mode: DemoMode) -> Option<PipelineSnapshot> {
+    match mode {
+        DemoMode::Safe => Some(state.demo_pipelines.safe.clone()),
+        DemoMode::Join => state.demo_pipelines.join.clone(),
+    }
+}
+
+fn demo_request_stable_key() -> Zeroizing<Vec<u8>> {
+    let mut key = Zeroizing::new(vec![0u8; 64]);
+    OsRng.fill_bytes(key.as_mut_slice());
+    key
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoBodyError {
+    Invalid,
+    TooLarge,
+    Deadline,
+}
+
+fn demo_body_error(error: DemoBodyError) -> axum::response::Response {
+    match error {
+        DemoBodyError::Invalid => demo_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Invalid demo request",
+        ),
+        DemoBodyError::TooLarge => demo_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "input_too_large",
+            "Demo request body is too large",
+        ),
+        DemoBodyError::Deadline => demo_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "demo_timeout",
+            "Demo operation timed out",
+        ),
+    }
+}
+
+async fn decode_demo_json<T: DeserializeOwned>(
+    request: Request,
+    deadline: Instant,
+) -> Result<T, DemoBodyError> {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|value| value == "application/json" || value.ends_with("+json"));
+    if content_type.is_none() {
+        return Err(DemoBodyError::Invalid);
+    }
+
+    let mut body = request.into_body();
+    let mut bytes = Vec::new();
+    loop {
+        let frame = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), body.frame())
+            .await
+            .map_err(|_| DemoBodyError::Deadline)?;
+        let Some(frame) = frame else {
+            break;
+        };
+        let frame = frame.map_err(|_| DemoBodyError::Invalid)?;
+        if let Some(data) = frame.data_ref() {
+            if bytes.len().saturating_add(data.len()) > DEMO_MAX_RAW_BODY_BYTES {
+                return Err(DemoBodyError::TooLarge);
+            }
+            bytes.extend_from_slice(data);
+        }
+    }
+    let decoded = serde_json::from_slice(&bytes).map_err(|_| DemoBodyError::Invalid)?;
+    if Instant::now() >= deadline {
+        return Err(DemoBodyError::Deadline);
+    }
+    Ok(decoded)
+}
+
+fn demo_pipeline_error(error: &s4_error::S4Error) -> axum::response::Response {
+    match error.code() {
+        s4_error::codes::LIMIT_INPUT_BYTES | s4_error::codes::RECORD_TOO_LARGE => demo_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "input_too_large",
+            "Demo input exceeds 64 KiB",
+        ),
+        s4_error::codes::LIMIT_OUTPUT_BYTES
+        | s4_error::codes::LIMIT_EXPANSION
+        | s4_error::codes::LIMIT_INTERMEDIATE_BYTES
+        | s4_error::codes::LIMIT_FINISH_BYTES => demo_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "output_too_large",
+            "Demo output exceeds 64 KiB",
+        ),
+        s4_error::codes::WASM_DEADLINE | s4_error::codes::WASM_CANCELLED => demo_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "demo_timeout",
+            "Demo operation timed out",
+        ),
+        _ => demo_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pipeline_failed",
+            "Demo processing failed",
+        ),
+    }
+}
+
+fn demo_deadline_error() -> s4_error::S4Error {
+    s4_error::S4Error::new(
+        s4_error::codes::WASM_DEADLINE,
+        "demo operation deadline exceeded",
+    )
+}
+
+async fn execute_demo_records(
+    snapshot: PipelineSnapshot,
+    session: s4_wasm_runtime::Session,
+    records: Vec<crate::record::Record>,
+    deadline: Instant,
+) -> Result<(Vec<crate::record::Record>, Vec<crate::record::Record>), s4_error::S4Error> {
+    let cancellation = s4_wasm_runtime::CancellationToken::new();
+    let mut pipeline = snapshot
+        .start_streaming_session_with_deadline(session, cancellation, deadline)
+        .await?;
+    let mut output = Vec::with_capacity(records.len());
+    for record in records {
+        if Instant::now() >= deadline {
+            let _ = pipeline.cancel_and_wait().await;
+            return Err(demo_deadline_error());
+        }
+        match pipeline.process(record).await {
+            Ok(Some(record)) => output.push(record),
+            Ok(None) => {
+                let _ = pipeline.cancel_and_wait().await;
+                return Err(s4_error::S4Error::new(
+                    s4_error::codes::WASM_REJECT,
+                    "demo pipeline dropped a record",
+                ));
+            }
+            Err(error) => {
+                let _ = pipeline.cancel_and_wait().await;
+                return Err(error);
+            }
+        }
+    }
+    let trailing = pipeline.finish().await?;
+    Ok((output, trailing))
+}
+
+fn append_demo_output(
+    output: &mut Vec<u8>,
+    record: crate::record::Record,
+    max_output_bytes: Option<usize>,
+) -> Result<(), s4_error::S4Error> {
+    let added = record.payload.len().saturating_add(record.separator.len());
+    if max_output_bytes.is_some_and(|limit| output.len().saturating_add(added) > limit) {
+        return Err(s4_error::S4Error::new(
+            s4_error::codes::LIMIT_OUTPUT_BYTES,
+            "demo output exceeds limit",
+        ));
+    }
+    output.extend_from_slice(&record.payload);
+    output.extend_from_slice(&record.separator);
+    Ok(())
 }
 
 /// Run a bounded in-memory input through the streaming record decoder and
 /// persistent pipeline session. Kept small on purpose: demo endpoints cap the
 /// input so this never becomes a whole-object buffer.
 async fn run_demo_streaming(
-    state: &AppState,
+    snapshot: PipelineSnapshot,
     input: &[u8],
     format: Format,
     content_type: &str,
-    public_key_pem: Option<&str>,
     stable_key: Option<&[u8]>,
     stable_fields: Option<&str>,
+    max_output_bytes: Option<usize>,
 ) -> Result<(Vec<u8>, usize), s4_error::S4Error> {
     let session = s4_wasm_runtime::Session {
         format: format.as_str().to_string(),
         content_type: content_type.to_string(),
         policy_version: 0,
-        public_key_pem: public_key_pem.map(str::to_string),
+        public_key_pem: None,
         stable_key: stable_key.map(<[u8]>::to_vec),
         stable_fields: stable_fields.map(str::to_string),
     };
     let cancellation = s4_wasm_runtime::CancellationToken::new();
-    let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
-        s4_error::S4Error::new(
-            s4_error::codes::INTERNAL,
-            "demo pipeline requires a plugin registry",
-        )
-    })?;
     let mut pipeline = snapshot
         .start_streaming_session(session, cancellation)
         .await?;
@@ -1617,8 +2032,7 @@ async fn run_demo_streaming(
         while let Some(record) = decoder.next_record()? {
             records += 1;
             if let Some(record) = pipeline.process(record).await? {
-                output.extend_from_slice(&record.payload);
-                output.extend_from_slice(&record.separator);
+                append_demo_output(&mut output, record, max_output_bytes)?;
             }
         }
     }
@@ -1626,51 +2040,224 @@ async fn run_demo_streaming(
     while let Some(record) = decoder.next_record()? {
         records += 1;
         if let Some(record) = pipeline.process(record).await? {
-            output.extend_from_slice(&record.payload);
-            output.extend_from_slice(&record.separator);
+            append_demo_output(&mut output, record, max_output_bytes)?;
         }
     }
     for record in pipeline.finish().await? {
-        output.extend_from_slice(&record.payload);
-        output.extend_from_slice(&record.separator);
+        append_demo_output(&mut output, record, max_output_bytes)?;
     }
     Ok((output, records))
 }
 
 async fn demo_redact(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<DemoRedactRequest>,
-) -> impl IntoResponse {
-    if body.text.len() > 64 * 1024 {
-        return (StatusCode::BAD_REQUEST, "demo input must be <= 64KB").into_response();
+    request: Request,
+) -> axum::response::Response {
+    let _permit = match start_demo_operation(&state) {
+        Ok(permit) => permit,
+        Err(error) => return demo_limit_response(error),
+    };
+    let deadline = Instant::now() + DEMO_MAX_WALL_TIME;
+    let body: DemoRedactRequest = match decode_demo_json(request, deadline).await {
+        Ok(body) => body,
+        Err(error) => return demo_body_error(error),
+    };
+    if body.text.len() > DEMO_MAX_INPUT_BYTES {
+        return demo_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "input_too_large",
+            "Demo input exceeds 64 KiB",
+        );
     }
-    // Run the engine's default pipeline (PII redaction). No public key, no
-    // stable key: this is the pure "detect + redact" path.
-    match run_demo_streaming(
-        &state,
-        body.text.as_bytes(),
-        Format::Text,
-        "text/plain",
-        None,
-        None,
-        None,
+    let limits = crate::record::DecoderLimits::default();
+    let mut decoder = match crate::record::RecordDecoder::new(Format::Text, limits) {
+        Ok(decoder) => decoder,
+        Err(error) => return demo_pipeline_error(&error),
+    };
+    if let Err(error) = decoder.push(body.text.as_bytes()) {
+        return demo_pipeline_error(&error);
+    }
+    let mut records = Vec::new();
+    loop {
+        match decoder.next_record() {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => break,
+            Err(error) => return demo_pipeline_error(&error),
+        }
+    }
+    if let Err(error) = decoder.finish() {
+        return demo_pipeline_error(&error);
+    }
+    loop {
+        match decoder.next_record() {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => break,
+            Err(error) => return demo_pipeline_error(&error),
+        }
+    }
+    let records_processed = records.len();
+    let session = s4_wasm_runtime::Session {
+        format: Format::Text.as_str().to_string(),
+        content_type: "text/plain".to_string(),
+        policy_version: 0,
+        public_key_pem: None,
+        stable_key: None,
+        stable_fields: None,
+    };
+    match execute_demo_records(
+        state.demo_pipelines.safe.clone(),
+        session,
+        records,
+        deadline,
     )
     .await
     {
-        Ok((bytes, records_processed)) => Json(serde_json::json!({
-            "redacted": String::from_utf8_lossy(&bytes),
-            "records_processed": records_processed,
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("pipeline error: {e}"),
-        )
-            .into_response(),
+        Ok((records, trailing)) => {
+            let mut bytes = Vec::new();
+            for record in records.into_iter().chain(trailing) {
+                if let Err(error) =
+                    append_demo_output(&mut bytes, record, Some(DEMO_MAX_OUTPUT_BYTES))
+                {
+                    return demo_pipeline_error(&error);
+                }
+            }
+            if Instant::now() >= deadline {
+                return demo_pipeline_error(&demo_deadline_error());
+            }
+            bounded_demo_json(&serde_json::json!({
+                "redacted": String::from_utf8_lossy(&bytes),
+                "records_processed": records_processed,
+            }))
+        }
+        Err(error) => demo_pipeline_error(&error),
     }
 }
 
-/// Demo store: persist a batch of demo records (shared join keys allowed) in
+async fn demo_process(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> axum::response::Response {
+    let _permit = match start_demo_operation(&state) {
+        Ok(permit) => permit,
+        Err(error) => return demo_limit_response(error),
+    };
+    let deadline = Instant::now() + DEMO_MAX_WALL_TIME;
+    let DemoProcessRequest { records, mode } = match decode_demo_json(request, deadline).await {
+        Ok(body) => body,
+        Err(error) => return demo_body_error(error),
+    };
+    if records.is_empty() || records.len() > DEMO_MAX_RECORDS {
+        return demo_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_record_count",
+            "Demo requests require 1-10 records",
+        );
+    }
+
+    let mut canonical_records = Vec::with_capacity(records.len());
+    let mut input_bytes = 0usize;
+    for record in &records {
+        if Instant::now() >= deadline {
+            return demo_pipeline_error(&demo_deadline_error());
+        }
+        let canonical = match serde_json::to_vec(record) {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                return demo_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Invalid demo request",
+                );
+            }
+        };
+        input_bytes = input_bytes.saturating_add(canonical.len());
+        if input_bytes > DEMO_MAX_INPUT_BYTES {
+            return demo_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "input_too_large",
+                "Demo input exceeds 64 KiB",
+            );
+        }
+        canonical_records.push(crate::record::Record::new(canonical, bytes::Bytes::new()));
+    }
+
+    let snapshot = match demo_pipeline(&state, mode) {
+        Some(snapshot) => snapshot,
+        None => {
+            return demo_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "join_unavailable",
+                "Join demo mode is unavailable",
+            );
+        }
+    };
+    let stable_key = match mode {
+        DemoMode::Safe => None,
+        DemoMode::Join => Some(demo_request_stable_key()),
+    };
+    let session = s4_wasm_runtime::Session {
+        format: Format::Json.as_str().to_string(),
+        content_type: "application/json".to_string(),
+        policy_version: 0,
+        public_key_pem: None,
+        stable_key: stable_key.as_ref().map(|key| key.as_slice().to_vec()),
+        stable_fields: matches!(mode, DemoMode::Join).then(|| "email".to_string()),
+    };
+    let (output, trailing) =
+        match execute_demo_records(snapshot, session, canonical_records, deadline).await {
+            Ok(output) => output,
+            Err(error) => return demo_pipeline_error(&error),
+        };
+    if !trailing.is_empty() {
+        return demo_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pipeline_failed",
+            "Demo processing failed",
+        );
+    }
+    let mut output_bytes = 0usize;
+    let mut processed = Vec::with_capacity(output.len());
+    for (index, record) in output.into_iter().enumerate() {
+        if !record.separator.is_empty() {
+            return demo_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "pipeline_failed",
+                "Demo processing failed",
+            );
+        }
+        output_bytes = output_bytes.saturating_add(record.payload.len());
+        if output_bytes > DEMO_MAX_OUTPUT_BYTES {
+            return demo_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "output_too_large",
+                "Demo output exceeds 64 KiB",
+            );
+        }
+        let body = match String::from_utf8(record.payload.to_vec()) {
+            Ok(body) => body,
+            Err(_) => {
+                return demo_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "pipeline_failed",
+                    "Demo processing failed",
+                );
+            }
+        };
+        processed.push(DemoProcessedRecord {
+            record: index + 1,
+            body,
+        });
+    }
+    if Instant::now() >= deadline {
+        return demo_pipeline_error(&demo_deadline_error());
+    }
+    bounded_demo_json(&DemoProcessResponse {
+        mode,
+        records: processed,
+    })
+}
+
+/// Deprecated demo store: persist a batch of demo records (shared join keys allowed) in
 /// the in-memory store under a fixed demo namespace. No auth — this is the
 /// landing-page "store raw data" step. The store is in-memory, so it resets on
 /// gateway restart.
@@ -1679,6 +2266,7 @@ struct DemoStoreRequest {
     records: Vec<serde_json::Value>,
 }
 
+#[deprecated(note = "use the stateless /dashboard/api/demo/process endpoint")]
 async fn demo_store(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DemoStoreRequest>,
@@ -1698,7 +2286,7 @@ async fn demo_store(
     Json(serde_json::json!({ "stored": body.records.len(), "namespace": "__demo" })).into_response()
 }
 
-/// Demo read: fetch a stored demo record and run the requested disclosure mode.
+/// Deprecated demo read: fetch a stored demo record and run the requested disclosure mode.
 /// `mode` is `raw` (bytes at rest), `safe` (PII redacted), or `join` (`email`
 /// stable-encrypted so records stay joinable without exposing plaintext).
 #[derive(Deserialize, ToSchema)]
@@ -1707,6 +2295,7 @@ struct DemoReadQuery {
     mode: Option<String>, // raw | safe | join
 }
 
+#[deprecated(note = "use the stateless /dashboard/api/demo/process endpoint")]
 async fn demo_read(
     State(state): State<Arc<AppState>>,
     Query(q): Query<DemoReadQuery>,
@@ -1725,14 +2314,24 @@ async fn demo_read(
                 None
             };
             let stable_fields: Option<&str> = if mode == "join" { Some("email") } else { None };
+            let snapshot = match pipeline_snapshot(&state) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("pipeline error: {error}"),
+                    )
+                        .into_response();
+                }
+            };
             match run_demo_streaming(
-                &state,
+                snapshot,
                 &obj.data,
                 Format::Json,
                 "application/json",
-                None,
                 stable_key.as_deref(),
                 stable_fields,
+                None,
             )
             .await
             {
@@ -4433,7 +5032,10 @@ mod tests {
                 s4_wasm_runtime::Session {
                     format: "text".to_string(),
                     content_type: "text/plain".to_string(),
-                    ..Default::default()
+                    policy_version: 0,
+                    public_key_pem: None,
+                    stable_key: None,
+                    stable_fields: None,
                 },
                 s4_wasm_runtime::CancellationToken::new(),
             )
@@ -6083,6 +6685,27 @@ fn component_path() -> PathBuf {
         })
 }
 
+fn bundled_stable_component() -> Option<Vec<u8>> {
+    let directory = match std::env::var("S4_PLUGINS_DIR") {
+        Ok(directory) => PathBuf::from(directory),
+        Err(_) => {
+            warn!("join demo disabled because S4_PLUGINS_DIR is not configured");
+            return None;
+        }
+    };
+    let path = directory.join("stable-encrypt.component.wasm");
+    match std::fs::read(&path) {
+        Ok(component) => Some(component),
+        Err(error) => {
+            warn!(
+                "join demo disabled because {} is unavailable: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// Build the engine state from environment variables, injecting the given
 /// control plane and key-wrapping backend. This is the shared construction
 /// path for both the OSS self-host binary (`NoopControlPlane` +
@@ -6123,6 +6746,13 @@ pub async fn build_state(
             plugins.load_from_dir_with_capabilities(dir, &prefix_safe_hashes)?;
         }
     }
+
+    let stable_demo_component = bundled_stable_component();
+    let demo_pipelines = build_demo_pipelines(
+        &component_bytes,
+        stable_demo_component.as_deref(),
+        pipeline_fuel,
+    )?;
 
     let gateway = Gateway::with_registry(engine, plugins.clone());
 
@@ -6470,6 +7100,8 @@ pub async fn build_state(
         transformed_read_spool_enabled: transformed_read_spool_enabled(),
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
+        demo_pipelines,
+        demo_limiter: Arc::new(DemoLimiter::new()),
         multipart_staging,
         multipart_mode,
         continuation_token_key,
@@ -6563,6 +7195,7 @@ pub async fn build_state(
 
 /// Build the axum router for the engine. The SaaS crate merges its own
 /// control-plane routes (workspaces, billing, dashboard) onto this.
+#[allow(deprecated)]
 pub fn build_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
@@ -6576,8 +7209,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/dashboard/api/mcp-tokens", delete(delete_mcp_token))
         .route("/dashboard/api/me", get(get_me))
         .route("/dashboard/api/demo/redact", post(demo_redact))
-        .route("/dashboard/api/demo/store", post(demo_store))
-        .route("/dashboard/api/demo/read", get(demo_read))
+        .route("/dashboard/api/demo/process", post(demo_process))
+        .route(
+            "/dashboard/api/demo/store",
+            post(demo_store).layer(axum::middleware::map_response(harden_legacy_demo_response)),
+        )
+        .route(
+            "/dashboard/api/demo/read",
+            get(demo_read).layer(axum::middleware::map_response(harden_legacy_demo_response)),
+        )
         .route("/dashboard/api/backend", get(get_backend))
         .route("/dashboard/api/backend", put(put_backend))
         .route("/{bucket}", get(s3_list_objects))
@@ -6631,6 +7271,95 @@ mod auth_tests {
                 .expect("valid Supabase token");
 
         assert_eq!(decoded.claims["sub"], "user-123");
+    }
+}
+
+#[cfg(test)]
+mod demo_limiter_tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::{ApiDoc, DemoLimitError, DemoLimiter, build_demo_pipelines};
+    use utoipa::OpenApi;
+
+    #[test]
+    fn rejects_a_fifth_concurrent_operation_without_counting_it_as_a_start() {
+        let limiter = DemoLimiter::with_limits(4, 5, Duration::from_secs(60));
+        let permits: Vec<_> = (0..4)
+            .map(|_| limiter.try_start().expect("first four operations start"))
+            .collect();
+        assert!(matches!(
+            limiter.try_start(),
+            Err(DemoLimitError::Concurrent)
+        ));
+
+        drop(permits);
+        assert!(limiter.try_start().is_ok());
+    }
+
+    #[test]
+    fn rejects_more_than_thirty_starts_in_the_window() {
+        let limiter = DemoLimiter::with_limits(4, 30, Duration::from_secs(60));
+        for _ in 0..30 {
+            drop(limiter.try_start().expect("operation starts within limit"));
+        }
+        assert!(matches!(limiter.try_start(), Err(DemoLimitError::Rate)));
+    }
+
+    #[test]
+    fn dedicated_demo_snapshots_are_ordered_and_join_fails_closed() {
+        let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
+        let pii = std::fs::read(components.join("pii-default.component.wasm"))
+            .expect("pii-default.component.wasm; run just build-filters");
+        let stable = std::fs::read(components.join("stable-encrypt.component.wasm"))
+            .expect("stable-encrypt.component.wasm; run just build-filters");
+
+        let unavailable = build_demo_pipelines(&pii, None, 1_000_000_000).unwrap();
+        assert!(unavailable.join.is_none());
+        assert_eq!(
+            unavailable
+                .safe
+                .plugin_infos()
+                .into_iter()
+                .map(|plugin| plugin.name)
+                .collect::<Vec<_>>(),
+            ["pii-default"]
+        );
+
+        let malformed = build_demo_pipelines(&pii, Some(b"not a component"), 1_000_000_000)
+            .expect("safe demo remains available when stable-encrypt is malformed");
+        assert!(malformed.join.is_none());
+
+        let available = build_demo_pipelines(&pii, Some(&stable), 1_000_000_000).unwrap();
+        assert_eq!(
+            available
+                .join
+                .expect("valid bundled stable component enables join")
+                .plugin_infos()
+                .into_iter()
+                .map(|plugin| plugin.name)
+                .collect::<Vec<_>>(),
+            ["stable-encrypt", "pii-default"]
+        );
+    }
+
+    #[test]
+    fn stateless_demo_process_is_not_published_in_openapi() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert!(
+            document["paths"]
+                .get("/dashboard/api/demo/process")
+                .is_none()
+        );
+        for schema in [
+            "DemoMode",
+            "DemoProcessRequest",
+            "DemoProcessedRecord",
+            "DemoProcessResponse",
+            "DemoErrorResponse",
+        ] {
+            assert!(document["components"]["schemas"].get(schema).is_none());
+        }
     }
 }
 

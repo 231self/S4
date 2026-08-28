@@ -23,7 +23,7 @@ pub struct StoredObject {
     pub etag: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKey {
     pub key_id: String,
     pub secret_hash: String,
@@ -38,7 +38,7 @@ pub struct ApiKey {
 
 /// MCP bearer token (`s4m_...`). The full token is the credential; only its
 /// SHA-256 hash is stored.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct McpToken {
     pub token_hash: String,
     pub user_id: String,
@@ -198,7 +198,12 @@ pub trait KeyRepository: Send + Sync {
         public_key_pem: Option<String>,
     ) -> anyhow::Result<(String, String)>;
 
-    async fn set_public_key(&self, key_id: &str, user_id: &str, public_key_pem: &str) -> bool;
+    async fn set_public_key(
+        &self,
+        key_id: &str,
+        user_id: &str,
+        public_key_pem: &str,
+    ) -> anyhow::Result<bool>;
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey>;
 
@@ -470,8 +475,18 @@ impl KeyRepository for KeyStore {
         Ok((key_id, secret))
     }
 
-    async fn set_public_key(&self, key_id: &str, user_id: &str, public_key_pem: &str) -> bool {
-        set_public_key_in(&self.keys, key_id, user_id, public_key_pem)
+    async fn set_public_key(
+        &self,
+        key_id: &str,
+        user_id: &str,
+        public_key_pem: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(set_public_key_in(
+            &self.keys,
+            key_id,
+            user_id,
+            public_key_pem,
+        ))
     }
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
@@ -577,10 +592,19 @@ impl KeyRepository for KeyStore {
 pub struct FileKeyStore {
     keys: RwLock<HashMap<String, ApiKey>>,
     mcp_tokens: RwLock<HashMap<String, McpToken>>,
-    // Keep v1 replacement and disk commit atomic from concurrent readers' view.
-    rewrap_lock: Mutex<()>,
+    // Every state mutation shares one snapshot file and must commit in order.
+    mutation_lock: Mutex<()>,
+    #[cfg(test)]
+    persist_hook: Mutex<Option<PersistTestHook>>,
     path: PathBuf,
     cipher: Option<Arc<SecretCipher>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PersistTestHook {
+    entered: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl FileKeyStore {
@@ -589,7 +613,9 @@ impl FileKeyStore {
         Self {
             keys: RwLock::new(keys),
             mcp_tokens: RwLock::new(mcp_tokens),
-            rewrap_lock: Mutex::new(()),
+            mutation_lock: Mutex::new(()),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
             path,
             cipher: None,
         }
@@ -600,7 +626,9 @@ impl FileKeyStore {
         Self {
             keys: RwLock::new(keys),
             mcp_tokens: RwLock::new(mcp_tokens),
-            rewrap_lock: Mutex::new(()),
+            mutation_lock: Mutex::new(()),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
             path,
             cipher: Some(cipher),
         }
@@ -616,6 +644,11 @@ impl FileKeyStore {
 
     /// Atomically write the current key set to disk (0600 on unix).
     fn persist(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.persist_hook.lock().unwrap().take() {
+            hook.entered.send(()).unwrap();
+            hook.resume.recv().unwrap();
+        }
         #[derive(serde::Serialize)]
         struct Persisted {
             keys: HashMap<String, ApiKey>,
@@ -667,7 +700,12 @@ impl KeyRepository for FileKeyStore {
             public_key_pem,
             self.cipher.as_deref(),
         )?;
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore mutation lock poisoned"))?;
         let key_id = api_key.key_id.clone();
+        let inserted = api_key.clone();
         let previous = self
             .keys
             .write()
@@ -679,23 +717,56 @@ impl KeyRepository for FileKeyStore {
                     "FileKeyStore persist failed and API key rollback lock was poisoned: {error}"
                 )
             })?;
-            if let Some(previous) = previous {
-                keys.insert(key_id, previous);
-            } else {
-                keys.remove(&key_id);
+            if keys.get(&key_id) == Some(&inserted) {
+                if let Some(previous) = previous {
+                    keys.insert(key_id, previous);
+                } else {
+                    keys.remove(&key_id);
+                }
             }
             return Err(error.context("FileKeyStore persist failed"));
         }
         Ok((key_id, secret))
     }
 
-    async fn set_public_key(&self, key_id: &str, user_id: &str, public_key_pem: &str) -> bool {
-        let ok = set_public_key_in(&self.keys, key_id, user_id, public_key_pem);
-        if ok {
-            self.persist()
-                .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
+    async fn set_public_key(
+        &self,
+        key_id: &str,
+        user_id: &str,
+        public_key_pem: &str,
+    ) -> anyhow::Result<bool> {
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore mutation lock poisoned"))?;
+        let previous = {
+            let mut keys = self
+                .keys
+                .write()
+                .map_err(|_| anyhow::anyhow!("FileKeyStore API key lock poisoned"))?;
+            let Some(key) = keys.get_mut(key_id) else {
+                return Ok(false);
+            };
+            if key.user_id != user_id {
+                return Ok(false);
+            }
+            key.public_key_pem.replace(public_key_pem.to_string())
+        };
+        if let Err(error) = self.persist() {
+            let mut keys = self.keys.write().map_err(|_| {
+                anyhow::anyhow!(
+                    "FileKeyStore public key persist failed and rollback lock was poisoned: {error}"
+                )
+            })?;
+            if let Some(key) = keys.get_mut(key_id)
+                && key.user_id == user_id
+                && key.public_key_pem.as_deref() == Some(public_key_pem)
+            {
+                key.public_key_pem = previous;
+            }
+            return Err(error.context("FileKeyStore public key persist failed"));
         }
-        ok
+        Ok(true)
     }
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
@@ -711,7 +782,7 @@ impl KeyRepository for FileKeyStore {
         };
         let (secret, rewrapped) = decrypt_verified_secret(cipher, key_id, &secret_hash, &blob)?;
         if let Some(rewrapped) = rewrapped {
-            let _rewrap_guard = self.rewrap_lock.lock().ok()?;
+            let _mutation_guard = self.mutation_lock.lock().ok()?;
             match replace_or_accept_rewrapped_envelope(
                 &self.keys,
                 cipher,
@@ -722,12 +793,9 @@ impl KeyRepository for FileKeyStore {
                 rewrapped.clone(),
             )? {
                 EnvelopeUpdate::Replaced => {
-                    if let Err(error) = self.persist() {
+                    if self.persist().is_err() {
                         let _ = compare_and_swap_envelope(&self.keys, key_id, &rewrapped, blob);
-                        tracing::warn!(
-                            key_id = key_id,
-                            "FileKeyStore legacy secret rewrap persist failed: {error}"
-                        );
+                        tracing::warn!("FileKeyStore legacy secret rewrap persist failed");
                         return None;
                     }
                 }
@@ -750,12 +818,30 @@ impl KeyRepository for FileKeyStore {
     }
 
     async fn delete_key(&self, key_id: &str, user_id: &str) -> bool {
-        let ok = delete_key_in(&self.keys, key_id, user_id);
-        if ok {
-            self.persist()
-                .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
+        let Ok(_mutation_guard) = self.mutation_lock.lock() else {
+            tracing::warn!("FileKeyStore mutation lock poisoned");
+            return false;
+        };
+        let removed = {
+            let mut keys = self.keys.write().unwrap();
+            let Some(key) = keys.get(key_id) else {
+                return false;
+            };
+            if key.user_id != user_id {
+                return false;
+            }
+            keys.remove(key_id).expect("key existence checked")
+        };
+        if self.persist().is_err() {
+            self.keys
+                .write()
+                .unwrap()
+                .entry(key_id.to_string())
+                .or_insert(removed);
+            tracing::warn!("FileKeyStore key deletion persist failed");
+            return false;
         }
-        ok
+        true
     }
 
     async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String {
@@ -773,9 +859,27 @@ impl KeyRepository for FileKeyStore {
                 None
             },
         };
-        self.mcp_tokens.write().unwrap().insert(token_hash, mcp);
-        self.persist()
-            .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
+        let Ok(_mutation_guard) = self.mutation_lock.lock() else {
+            tracing::warn!("FileKeyStore mutation lock poisoned");
+            return token;
+        };
+        let inserted = mcp.clone();
+        let previous = self
+            .mcp_tokens
+            .write()
+            .unwrap()
+            .insert(token_hash.clone(), mcp);
+        if self.persist().is_err() {
+            let mut tokens = self.mcp_tokens.write().unwrap();
+            if tokens.get(&token_hash) == Some(&inserted) {
+                if let Some(previous) = previous {
+                    tokens.insert(token_hash, previous);
+                } else {
+                    tokens.remove(&token_hash);
+                }
+            }
+            tracing::warn!("FileKeyStore MCP token creation persist failed");
+        }
         token
     }
 
@@ -800,16 +904,30 @@ impl KeyRepository for FileKeyStore {
     }
 
     async fn delete_mcp_token(&self, token_hash: &str, user_id: &str) -> bool {
-        let mut tokens = self.mcp_tokens.write().unwrap();
-        if let Some(t) = tokens.get(token_hash)
-            && t.user_id == user_id
-        {
-            tokens.remove(token_hash);
-            self.persist()
-                .unwrap_or_else(|e| tracing::warn!("FileKeyStore persist failed: {e}"));
-            return true;
+        let Ok(_mutation_guard) = self.mutation_lock.lock() else {
+            tracing::warn!("FileKeyStore mutation lock poisoned");
+            return false;
+        };
+        let removed = {
+            let mut tokens = self.mcp_tokens.write().unwrap();
+            let Some(token) = tokens.get(token_hash) else {
+                return false;
+            };
+            if token.user_id != user_id {
+                return false;
+            }
+            tokens.remove(token_hash).expect("token existence checked")
+        };
+        if self.persist().is_err() {
+            self.mcp_tokens
+                .write()
+                .unwrap()
+                .entry(token_hash.to_string())
+                .or_insert(removed);
+            tracing::warn!("FileKeyStore MCP token deletion persist failed");
+            return false;
         }
-        false
+        true
     }
 }
 
@@ -871,7 +989,12 @@ impl KeyRepository for PostgresKeyStore {
         Ok((api_key.key_id, secret))
     }
 
-    async fn set_public_key(&self, key_id: &str, user_id: &str, public_key_pem: &str) -> bool {
+    async fn set_public_key(
+        &self,
+        key_id: &str,
+        user_id: &str,
+        public_key_pem: &str,
+    ) -> anyhow::Result<bool> {
         let result = api_key::Entity::update_many()
             .col_expr(
                 api_key::Column::PublicKeyPem,
@@ -880,8 +1003,9 @@ impl KeyRepository for PostgresKeyStore {
             .filter(api_key::Column::KeyId.eq(key_id.to_string()))
             .filter(api_key::Column::UserId.eq(user_id.to_string()))
             .exec(&self.db)
-            .await;
-        matches!(result, Ok(r) if r.rows_affected == 1)
+            .await
+            .context("Postgres public key update failed")?;
+        Ok(result.rows_affected == 1)
     }
 
     async fn get_key(&self, key_id: &str) -> Option<ApiKey> {
@@ -1367,8 +1491,8 @@ mod tests {
     async fn in_memory_public_key_and_delete() {
         let store = KeyStore::new();
         let (key_id, _secret) = store.create_key("u1", "enc", 0, None).await.unwrap();
-        assert!(store.set_public_key(&key_id, "u1", "pem").await);
-        assert!(!store.set_public_key(&key_id, "u2", "pem").await);
+        assert!(store.set_public_key(&key_id, "u1", "pem").await.unwrap());
+        assert!(!store.set_public_key(&key_id, "u2", "pem").await.unwrap());
         let key = store.get_key(&key_id).await.expect("key exists");
         assert_eq!(key.public_key_pem.as_deref(), Some("pem"));
         let keys = store.list_for_user("u1").await;
@@ -1423,6 +1547,289 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_key_store_rolls_back_public_key_when_persist_fails_and_restart_keeps_old_value() {
+        let parent = std::env::temp_dir().join(format!("s4-file-keys-{}", Uuid::new_v4()));
+        let durable_parent = parent.with_extension("durable");
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("keys.json");
+        let store = FileKeyStore::new(path.clone());
+        let (key_id, _) = store
+            .create_key("u1", "persisted-public-key", 0, Some("old-pem".to_string()))
+            .await
+            .unwrap();
+        std::fs::rename(&parent, &durable_parent).unwrap();
+        std::fs::write(&parent, "not a directory").unwrap();
+
+        let error = store
+            .set_public_key(&key_id, "u1", "new-pem")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("public key persist failed"));
+        assert_eq!(
+            store
+                .get_key(&key_id)
+                .await
+                .unwrap()
+                .public_key_pem
+                .as_deref(),
+            Some("old-pem")
+        );
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::rename(&durable_parent, &parent).unwrap();
+        drop(store);
+
+        let restarted = FileKeyStore::new(path);
+        assert_eq!(
+            restarted
+                .get_key(&key_id)
+                .await
+                .unwrap()
+                .public_key_pem
+                .as_deref(),
+            Some("old-pem")
+        );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_key_store_rolls_back_key_delete_when_persist_fails() {
+        let parent = std::env::temp_dir().join(format!("s4-file-keys-{}", Uuid::new_v4()));
+        let durable_parent = parent.with_extension("durable");
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("keys.json");
+        let store = FileKeyStore::new(path.clone());
+        let (key_id, secret) = store.create_key("u1", "delete", 0, None).await.unwrap();
+        std::fs::rename(&parent, &durable_parent).unwrap();
+        std::fs::write(&parent, "not a directory").unwrap();
+
+        assert!(!store.delete_key(&key_id, "u1").await);
+        assert!(store.resolve_credentials(&key_id, &secret).await.is_some());
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::rename(&durable_parent, &parent).unwrap();
+        drop(store);
+
+        let restarted = FileKeyStore::new(path);
+        assert!(
+            restarted
+                .resolve_credentials(&key_id, &secret)
+                .await
+                .is_some(),
+            "failed revocation must not be acknowledged only in memory"
+        );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_key_store_rolls_back_mcp_mutations_when_persist_fails() {
+        let parent = std::env::temp_dir().join(format!("s4-file-keys-{}", Uuid::new_v4()));
+        let durable_parent = parent.with_extension("durable");
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("keys.json");
+        let store = FileKeyStore::new(path.clone());
+        let persisted_token = store.create_mcp_token("u1", "persisted", 0).await;
+        let persisted_hash = sha256_hash(&persisted_token);
+        std::fs::rename(&parent, &durable_parent).unwrap();
+        std::fs::write(&parent, "not a directory").unwrap();
+
+        let rejected_token = store.create_mcp_token("u1", "rejected", 0).await;
+        assert!(store.resolve_mcp_token(&rejected_token).await.is_none());
+        assert!(!store.delete_mcp_token(&persisted_hash, "u1").await);
+        assert_eq!(
+            store.resolve_mcp_token(&persisted_token).await.as_deref(),
+            Some("u1")
+        );
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::rename(&durable_parent, &parent).unwrap();
+        drop(store);
+
+        let restarted = FileKeyStore::new(path);
+        assert_eq!(
+            restarted
+                .resolve_mcp_token(&persisted_token)
+                .await
+                .as_deref(),
+            Some("u1")
+        );
+        assert!(restarted.resolve_mcp_token(&rejected_token).await.is_none());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_key_store_serializes_public_key_set_before_successful_delete() {
+        let path = temp_keys_file();
+        let store = Arc::new(FileKeyStore::new(path.clone()));
+        let (key_id, secret) = store.create_key("u1", "race", 0, None).await.unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        *store.persist_hook.lock().unwrap() = Some(PersistTestHook {
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+
+        let set_store = store.clone();
+        let set_key = key_id.clone();
+        let set_task = tokio::spawn(async move {
+            set_store
+                .set_public_key(&set_key, "u1", "concurrent-pem")
+                .await
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let delete_store = store.clone();
+        let delete_key = key_id.clone();
+        let delete_task =
+            tokio::spawn(async move { delete_store.delete_key(&delete_key, "u1").await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !delete_task.is_finished(),
+            "delete must wait for the in-flight snapshot"
+        );
+
+        resume_tx.send(()).unwrap();
+        assert!(set_task.await.unwrap().unwrap());
+        assert!(delete_task.await.unwrap());
+        assert!(store.resolve_credentials(&key_id, &secret).await.is_none());
+        drop(store);
+
+        let restarted = FileKeyStore::new(path.clone());
+        assert!(
+            restarted
+                .resolve_credentials(&key_id, &secret)
+                .await
+                .is_none(),
+            "a successfully revoked key must never reappear after restart"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_key_store_serializes_api_key_and_mcp_creation_snapshots() {
+        let path = temp_keys_file();
+        let store = Arc::new(FileKeyStore::new(path.clone()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        *store.persist_hook.lock().unwrap() = Some(PersistTestHook {
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+
+        let key_store = store.clone();
+        let key_task =
+            tokio::spawn(async move { key_store.create_key("u1", "concurrent", 0, None).await });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let mcp_store = store.clone();
+        let mcp_task = tokio::spawn(async move {
+            mcp_store
+                .create_mcp_token("u1", "concurrent-token", 0)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !mcp_task.is_finished(),
+            "MCP creation must wait for the API key snapshot"
+        );
+
+        resume_tx.send(()).unwrap();
+        let (key_id, secret) = key_task.await.unwrap().unwrap();
+        let token = mcp_task.await.unwrap();
+        drop(store);
+
+        let restarted = FileKeyStore::new(path.clone());
+        assert!(
+            restarted
+                .resolve_credentials(&key_id, &secret)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            restarted.resolve_mcp_token(&token).await.as_deref(),
+            Some("u1")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_key_store_serializes_secret_rewrap_and_mcp_creation() {
+        let path = temp_keys_file();
+        let cipher = test_cipher();
+        let store = Arc::new(FileKeyStore::with_cipher(path.clone(), cipher.clone()));
+        let (key_id, secret) = store.create_key("u1", "legacy", 0, None).await.unwrap();
+        let legacy = cipher.encrypt_v1(&secret).unwrap();
+        store
+            .keys
+            .write()
+            .unwrap()
+            .get_mut(&key_id)
+            .unwrap()
+            .secret_encrypted = Some(legacy);
+        store.persist().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        *store.persist_hook.lock().unwrap() = Some(PersistTestHook {
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+
+        let rewrap_store = store.clone();
+        let rewrap_key = key_id.clone();
+        let rewrap_task =
+            tokio::spawn(async move { rewrap_store.decrypt_secret(&rewrap_key).await });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let mcp_store = store.clone();
+        let mcp_task =
+            tokio::spawn(async move { mcp_store.create_mcp_token("u1", "after-rewrap", 0).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !mcp_task.is_finished(),
+            "MCP creation must wait for the rewrap snapshot"
+        );
+
+        resume_tx.send(()).unwrap();
+        assert_eq!(rewrap_task.await.unwrap().as_deref(), Some(secret.as_str()));
+        let token = mcp_task.await.unwrap();
+        drop(store);
+
+        let restarted = FileKeyStore::with_cipher(path.clone(), cipher);
+        assert_eq!(
+            restarted.decrypt_secret(&key_id).await.as_deref(),
+            Some(secret.as_str())
+        );
+        assert_eq!(
+            restarted.resolve_mcp_token(&token).await.as_deref(),
+            Some("u1")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_key_store_mcp_delete_does_not_self_deadlock_and_persists() {
+        let path = temp_keys_file();
+        let store = FileKeyStore::new(path.clone());
+        let token = store.create_mcp_token("u1", "delete", 0).await;
+        let token_hash = sha256_hash(&token);
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                store.delete_mcp_token(&token_hash, "u1")
+            )
+            .await
+            .expect("MCP delete must not deadlock")
+        );
+        drop(store);
+
+        let restarted = FileKeyStore::new(path.clone());
+        assert!(restarted.resolve_mcp_token(&token).await.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn configured_cipher_failure_does_not_create_or_persist_file_key() {
         let path = temp_keys_file();
         let store = FileKeyStore::with_cipher(path.clone(), failing_cipher());
@@ -1454,6 +1861,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_set_public_key_propagates_update_error() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/s4")
+            .unwrap();
+        let store = PostgresKeyStore::new(pool);
+
+        let error = store
+            .set_public_key("missing-key", "u1", "pem")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Postgres public key update failed")
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_configured_cipher_failure_prevents_insert() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(50))
@@ -1474,8 +1901,8 @@ mod tests {
         let path = temp_keys_file();
         let store = FileKeyStore::new(path.clone());
         let (key_id, _secret) = store.create_key("u1", "enc", 3600, None).await.unwrap();
-        assert!(store.set_public_key(&key_id, "u1", "pem").await);
-        assert!(!store.set_public_key(&key_id, "u2", "pem").await);
+        assert!(store.set_public_key(&key_id, "u1", "pem").await.unwrap());
+        assert!(!store.set_public_key(&key_id, "u2", "pem").await.unwrap());
         drop(store);
 
         let reloaded = FileKeyStore::new(path);

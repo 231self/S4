@@ -18,7 +18,7 @@ use s4_gateway::key_cipher::default_wrapping;
 use s4_gateway::object::BodyLimits;
 use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
 use s4_gateway::sigv4::SigV4Policy;
-use s4_gateway::store::FileKeyStore;
+use s4_gateway::store::{FileKeyStore, KeyRepository};
 use s4_gateway::transaction::SpoolQuota;
 use s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
 use std::collections::VecDeque;
@@ -305,12 +305,110 @@ async fn create_key_persistence_failure_returns_internal_error_without_secret() 
     std::fs::remove_file(blocking_parent).unwrap();
 }
 
+#[tokio::test]
+async fn public_key_persistence_failure_returns_generic_500_and_rolls_back() {
+    let mut state = test_state().await;
+    let parent =
+        std::env::temp_dir().join(format!("s4-public-key-handler-{}", uuid::Uuid::new_v4()));
+    let durable_parent = parent.with_extension("durable");
+    std::fs::create_dir_all(&parent).unwrap();
+    let path = parent.join("keys.json");
+    let file_store = Arc::new(FileKeyStore::new(path.clone()));
+    let (key_id, secret_key) = file_store
+        .create_key("test-user", "persist-failure", 0, None)
+        .await
+        .unwrap();
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .keys = file_store.clone();
+    let app = build_router(state);
+    std::fs::rename(&parent, &durable_parent).unwrap();
+    std::fs::write(&parent, "not a directory").unwrap();
+
+    let request = add_headers(
+        public_key_request(&key_id, "must-not-persist"),
+        &auth_headers(&key_id, &secret_key),
+    );
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty(), "persistence failure body must be generic");
+    assert!(!String::from_utf8_lossy(&body).contains("must-not-persist"));
+    assert!(!String::from_utf8_lossy(&body).contains(&secret_key));
+    assert!(
+        file_store
+            .get_key(&key_id)
+            .await
+            .unwrap()
+            .public_key_pem
+            .is_none(),
+        "failed persistence must roll back the in-memory value"
+    );
+    std::fs::remove_file(&parent).unwrap();
+    std::fs::rename(&durable_parent, &parent).unwrap();
+    drop(file_store);
+
+    let restarted = FileKeyStore::new(path);
+    assert!(
+        restarted
+            .get_key(&key_id)
+            .await
+            .unwrap()
+            .public_key_pem
+            .is_none(),
+        "failed persistence must not appear after restart"
+    );
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
 async fn make_key(state: &Arc<AppState>) -> (String, String) {
+    make_key_for(state, "test-user").await
+}
+
+async fn make_key_for(state: &Arc<AppState>, user_id: &str) -> (String, String) {
     state
         .keys
-        .create_key("test-user", "sigv4-test", 0, None)
+        .create_key(user_id, "sigv4-test", 0, None)
         .await
         .expect("create test API key")
+}
+
+fn configure_dashboard_jwt(state: &mut Arc<AppState>, user_id: &str) -> String {
+    let secret = b"public-key-dashboard-secret";
+    let issuer = "https://example.supabase.co/auth/v1";
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &serde_json::json!({
+            "sub": user_id,
+            "iss": issuer,
+            "aud": "authenticated",
+            "exp": u64::MAX,
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(secret),
+    )
+    .unwrap();
+    let state_mut = Arc::get_mut(state).expect("test state is uniquely owned");
+    state_mut.supabase_url = "https://example.supabase.co".to_string();
+    state_mut.jwt_decoder = Some(Arc::new(jsonwebtoken::DecodingKey::from_secret(secret)));
+    token
+}
+
+fn public_key_request(key_id: &str, public_key_pem: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri("/dashboard/api/keys/public-key")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "key_id": key_id,
+                "public_key_pem": public_key_pem,
+            })
+            .to_string(),
+        ))
+        .unwrap()
 }
 
 fn test_filter_component() -> Vec<u8> {
@@ -380,6 +478,14 @@ fn add_headers(req: Request<Body>, hdrs: &[(&'static str, String)]) -> Request<B
     Request::from_parts(parts, body)
 }
 
+fn append_headers(req: Request<Body>, hdrs: &[(&'static str, String)]) -> Request<Body> {
+    let (mut parts, body) = req.into_parts();
+    for (name, value) in hdrs {
+        parts.headers.append(*name, value.parse().unwrap());
+    }
+    Request::from_parts(parts, body)
+}
+
 fn assert_hardened_object_headers(headers: &axum::http::HeaderMap) {
     assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
     assert!(!headers.contains_key(header::AGE));
@@ -401,6 +507,460 @@ fn assert_s3_error_has_only_expected_xml_elements(document: &str) {
         })
         .collect();
     assert_eq!(elements, ["Error", "Code", "Message", "Key", "RequestId"]);
+}
+
+#[tokio::test]
+async fn public_key_mutation_rejects_unauthenticated_requests_in_production_and_local_mode() {
+    for auth_disabled in [false, true] {
+        let mut state = test_state().await;
+        let (key_id, _) = make_key(&state).await;
+        Arc::get_mut(&mut state)
+            .expect("test state is uniquely owned")
+            .auth_disabled = auth_disabled;
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(public_key_request(&key_id, "rejected-pem"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            state
+                .keys
+                .get_key(&key_id)
+                .await
+                .unwrap()
+                .public_key_pem
+                .is_none(),
+            "rejected request must not mutate the key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_key_mutation_rejects_incomplete_or_invalid_api_key_credentials() {
+    let state = test_state().await;
+    let (key_id, secret_key) = make_key(&state).await;
+    let app = build_router(state.clone());
+    let requests = [
+        add_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[("x-s4-access-key", key_id.clone())],
+        ),
+        add_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[("x-s4-secret-key", secret_key.clone())],
+        ),
+        add_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &auth_headers(&key_id, "wrong-secret"),
+        ),
+        add_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[("authorization", format!("Bearer {key_id}:wrong-secret"))],
+        ),
+    ];
+
+    for request in requests {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            state
+                .keys
+                .get_key(&key_id)
+                .await
+                .unwrap()
+                .public_key_pem
+                .is_none(),
+            "rejected credentials must not mutate the key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_key_mutation_rejects_duplicate_security_headers_without_mutation() {
+    let state = test_state().await;
+    let (key_id, secret_key) = make_key(&state).await;
+    let mcp_token = state
+        .keys
+        .create_mcp_token("test-user", "duplicate-test", 0)
+        .await;
+    let app = build_router(state.clone());
+    let bearer = format!("Bearer {key_id}:{secret_key}");
+    let requests = [
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[
+                ("authorization", bearer.clone()),
+                ("authorization", bearer.clone()),
+            ],
+        ),
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[
+                ("x-s4-access-key", key_id.clone()),
+                ("x-s4-access-key", key_id.clone()),
+                ("x-s4-secret-key", secret_key.clone()),
+            ],
+        ),
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[
+                ("x-s4-access-key", key_id.clone()),
+                ("x-s4-secret-key", secret_key.clone()),
+                ("x-s4-secret-key", secret_key.clone()),
+            ],
+        ),
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[
+                ("x-s4-mcp-token", mcp_token.clone()),
+                ("x-s4-mcp-token", mcp_token.clone()),
+            ],
+        ),
+    ];
+
+    for request in requests {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            state
+                .keys
+                .get_key(&key_id)
+                .await
+                .unwrap()
+                .public_key_pem
+                .is_none(),
+            "duplicate credential headers must not mutate the key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_key_mutation_rejects_mixed_credential_classes_without_mutation() {
+    let mut state = test_state().await;
+    let (key_id, secret_key) = make_key(&state).await;
+    let mcp_token = state
+        .keys
+        .create_mcp_token("test-user", "mixed-test", 0)
+        .await;
+    let jwt = configure_dashboard_jwt(&mut state, "test-user");
+    let app = build_router(state.clone());
+    let api_bearer = format!("Bearer {key_id}:{secret_key}");
+    let requests = [
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[
+                ("x-s4-access-key", key_id.clone()),
+                ("x-s4-secret-key", secret_key.clone()),
+                ("authorization", api_bearer.clone()),
+            ],
+        ),
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[
+                ("x-s4-access-key", key_id.clone()),
+                ("x-s4-secret-key", secret_key.clone()),
+                ("authorization", format!("Bearer {jwt}")),
+            ],
+        ),
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[
+                ("x-s4-mcp-token", mcp_token.clone()),
+                ("x-s4-access-key", key_id.clone()),
+                ("x-s4-secret-key", secret_key.clone()),
+            ],
+        ),
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[
+                ("x-s4-mcp-token", mcp_token.clone()),
+                ("authorization", format!("Bearer {jwt}")),
+            ],
+        ),
+        append_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[("x-s4-mcp-token", mcp_token), ("authorization", api_bearer)],
+        ),
+    ];
+
+    for request in requests {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            state
+                .keys
+                .get_key(&key_id)
+                .await
+                .unwrap()
+                .public_key_pem
+                .is_none(),
+            "mixed credential classes must not mutate the key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
+    let state = test_state().await;
+    let (header_key, header_secret) = make_key(&state).await;
+    let (bearer_key, bearer_secret) = make_key(&state).await;
+    let app = build_router(state.clone());
+
+    let header_request = add_headers(
+        public_key_request(&header_key, "header-pem"),
+        &auth_headers(&header_key, &header_secret),
+    );
+    assert_eq!(
+        app.clone().oneshot(header_request).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let bearer_request = add_headers(
+        public_key_request(&bearer_key, "bearer-pem"),
+        &[(
+            "authorization",
+            format!("Bearer {bearer_key}:{bearer_secret}"),
+        )],
+    );
+    assert_eq!(
+        app.oneshot(bearer_request).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        state
+            .keys
+            .get_key(&header_key)
+            .await
+            .unwrap()
+            .public_key_pem
+            .as_deref(),
+        Some("header-pem")
+    );
+    assert_eq!(
+        state
+            .keys
+            .get_key(&bearer_key)
+            .await
+            .unwrap()
+            .public_key_pem
+            .as_deref(),
+        Some("bearer-pem")
+    );
+}
+
+#[tokio::test]
+async fn local_public_key_mutation_accepts_real_target_credentials() {
+    let mut state = test_state().await;
+    let (key_id, secret_key) = make_key(&state).await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .auth_disabled = true;
+    let app = build_router(state.clone());
+    let request = add_headers(
+        public_key_request(&key_id, "local-authenticated-pem"),
+        &auth_headers(&key_id, &secret_key),
+    );
+
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .keys
+            .get_key(&key_id)
+            .await
+            .unwrap()
+            .public_key_pem
+            .as_deref(),
+        Some("local-authenticated-pem")
+    );
+}
+
+#[tokio::test]
+async fn api_key_public_key_mutation_hides_and_rejects_sibling_and_foreign_keys() {
+    let state = test_state().await;
+    let (credential_key, credential_secret) = make_key_for(&state, "owner-a").await;
+    let (sibling_key, _) = make_key_for(&state, "owner-a").await;
+    let (foreign_key, _) = make_key_for(&state, "owner-b").await;
+    let app = build_router(state.clone());
+    let mut rejection_bodies = Vec::new();
+
+    for target in [&sibling_key, &foreign_key] {
+        let request = add_headers(
+            public_key_request(target, "rejected-pem"),
+            &auth_headers(&credential_key, &credential_secret),
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        rejection_bodies.push(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(rejection_bodies[0], rejection_bodies[1]);
+    assert_eq!(rejection_bodies[0].as_ref(), b"key not found");
+    for key_id in [&credential_key, &sibling_key, &foreign_key] {
+        assert!(
+            state
+                .keys
+                .get_key(key_id)
+                .await
+                .unwrap()
+                .public_key_pem
+                .is_none(),
+            "rejected cross-key request must not mutate any key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
+    let mut state = test_state().await;
+    let (owned_key, _) = make_key_for(&state, "dashboard-user").await;
+    let (second_owned_key, _) = make_key_for(&state, "dashboard-user").await;
+    let (foreign_key, _) = make_key_for(&state, "another-user").await;
+    let token = configure_dashboard_jwt(&mut state, "dashboard-user");
+    let app = build_router(state.clone());
+
+    for (key_id, pem) in [(&owned_key, "first-pem"), (&second_owned_key, "second-pem")] {
+        let request = add_headers(
+            public_key_request(key_id, pem),
+            &[("authorization", format!("Bearer {token}"))],
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    let foreign_request = add_headers(
+        public_key_request(&foreign_key, "rejected-pem"),
+        &[("authorization", format!("Bearer {token}"))],
+    );
+    assert_eq!(
+        app.oneshot(foreign_request).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+
+    assert_eq!(
+        state
+            .keys
+            .get_key(&owned_key)
+            .await
+            .unwrap()
+            .public_key_pem
+            .as_deref(),
+        Some("first-pem")
+    );
+    assert_eq!(
+        state
+            .keys
+            .get_key(&second_owned_key)
+            .await
+            .unwrap()
+            .public_key_pem
+            .as_deref(),
+        Some("second-pem")
+    );
+    assert!(
+        state
+            .keys
+            .get_key(&foreign_key)
+            .await
+            .unwrap()
+            .public_key_pem
+            .is_none(),
+        "wrong-owner JWT must not mutate the target"
+    );
+}
+
+#[tokio::test]
+async fn mcp_tokens_cannot_mutate_public_keys() {
+    let state = test_state().await;
+    let (key_id, _) = make_key_for(&state, "mcp-user").await;
+    let token = state
+        .keys
+        .create_mcp_token("mcp-user", "mutation-test", 0)
+        .await;
+    let app = build_router(state.clone());
+    let requests = [
+        add_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[("authorization", format!("Bearer {token}"))],
+        ),
+        add_headers(
+            public_key_request(&key_id, "rejected-pem"),
+            &[("x-s4-mcp-token", token)],
+        ),
+    ];
+
+    for request in requests {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            state
+                .keys
+                .get_key(&key_id)
+                .await
+                .unwrap()
+                .public_key_pem
+                .is_none(),
+            "MCP rejection must leave the target unchanged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_key_still_accepts_an_initial_public_key() {
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .auth_disabled = true;
+    let app = build_router(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/dashboard/api/keys")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "label": "created-with-public-key",
+                "public_key_pem": "creation-pem",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let key_id = body["key_id"].as_str().unwrap();
+    assert_eq!(body["public_key_pem"], "creation-pem");
+    assert_eq!(
+        state
+            .keys
+            .get_key(key_id)
+            .await
+            .unwrap()
+            .public_key_pem
+            .as_deref(),
+        Some("creation-pem")
+    );
 }
 
 #[tokio::test]

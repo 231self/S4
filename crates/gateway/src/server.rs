@@ -20,7 +20,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header},
     response::{Html, IntoResponse},
-    routing::{delete, get, head, post, put},
+    routing::{any, delete, get, head, post, put},
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
@@ -1735,12 +1735,6 @@ fn harden_demo_response(mut response: axum::response::Response) -> axum::respons
     response
 }
 
-async fn harden_legacy_demo_response(
-    response: axum::response::Response,
-) -> axum::response::Response {
-    harden_demo_response(response)
-}
-
 struct BoundedDemoJsonWriter {
     bytes: Vec<u8>,
     exceeded: bool,
@@ -1821,15 +1815,6 @@ fn start_demo_operation(
     state: &AppState,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, DemoLimitError> {
     state.demo_limiter.try_start()
-}
-
-fn pipeline_snapshot(state: &AppState) -> Result<PipelineSnapshot, s4_error::S4Error> {
-    state.gateway.pipeline_snapshot().ok_or_else(|| {
-        s4_error::S4Error::new(
-            s4_error::codes::INTERNAL,
-            "demo pipeline requires a plugin registry",
-        )
-    })
 }
 
 fn demo_pipeline(state: &AppState, mode: DemoMode) -> Option<PipelineSnapshot> {
@@ -1997,56 +1982,6 @@ fn append_demo_output(
     output.extend_from_slice(&record.payload);
     output.extend_from_slice(&record.separator);
     Ok(())
-}
-
-/// Run a bounded in-memory input through the streaming record decoder and
-/// persistent pipeline session. Kept small on purpose: demo endpoints cap the
-/// input so this never becomes a whole-object buffer.
-async fn run_demo_streaming(
-    snapshot: PipelineSnapshot,
-    input: &[u8],
-    format: Format,
-    content_type: &str,
-    stable_key: Option<&[u8]>,
-    stable_fields: Option<&str>,
-    max_output_bytes: Option<usize>,
-) -> Result<(Vec<u8>, usize), s4_error::S4Error> {
-    let session = s4_wasm_runtime::Session {
-        format: format.as_str().to_string(),
-        content_type: content_type.to_string(),
-        policy_version: 0,
-        public_key_pem: None,
-        stable_key: stable_key.map(<[u8]>::to_vec),
-        stable_fields: stable_fields.map(str::to_string),
-    };
-    let cancellation = s4_wasm_runtime::CancellationToken::new();
-    let mut pipeline = snapshot
-        .start_streaming_session(session, cancellation)
-        .await?;
-    let limits = crate::record::DecoderLimits::default();
-    let mut decoder = crate::record::RecordDecoder::new(format, limits)?;
-    let mut output = Vec::new();
-    let mut records = 0usize;
-    for chunk in input.chunks(limits.max_source_frame_bytes) {
-        decoder.push(chunk)?;
-        while let Some(record) = decoder.next_record()? {
-            records += 1;
-            if let Some(record) = pipeline.process(record).await? {
-                append_demo_output(&mut output, record, max_output_bytes)?;
-            }
-        }
-    }
-    decoder.finish()?;
-    while let Some(record) = decoder.next_record()? {
-        records += 1;
-        if let Some(record) = pipeline.process(record).await? {
-            append_demo_output(&mut output, record, max_output_bytes)?;
-        }
-    }
-    for record in pipeline.finish().await? {
-        append_demo_output(&mut output, record, max_output_bytes)?;
-    }
-    Ok((output, records))
 }
 
 async fn demo_redact(
@@ -2257,104 +2192,8 @@ async fn demo_process(
     })
 }
 
-/// Deprecated demo store: persist a batch of demo records (shared join keys allowed) in
-/// the in-memory store under a fixed demo namespace. No auth — this is the
-/// landing-page "store raw data" step. The store is in-memory, so it resets on
-/// gateway restart.
-#[derive(Deserialize, ToSchema)]
-struct DemoStoreRequest {
-    records: Vec<serde_json::Value>,
-}
-
-#[deprecated(note = "use the stateless /dashboard/api/demo/process endpoint")]
-async fn demo_store(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<DemoStoreRequest>,
-) -> impl IntoResponse {
-    if body.records.is_empty() || body.records.len() > 10 {
-        return (StatusCode::BAD_REQUEST, "store 1-10 records").into_response();
-    }
-    for (i, record) in body.records.iter().enumerate() {
-        let data = serde_json::to_vec(record).unwrap_or_default();
-        state.store.put(
-            "__demo",
-            &format!("record-{}.json", i + 1),
-            data,
-            "application/json",
-        );
-    }
-    Json(serde_json::json!({ "stored": body.records.len(), "namespace": "__demo" })).into_response()
-}
-
-/// Deprecated demo read: fetch a stored demo record and run the requested disclosure mode.
-/// `mode` is `raw` (bytes at rest), `safe` (PII redacted), or `join` (`email`
-/// stable-encrypted so records stay joinable without exposing plaintext).
-#[derive(Deserialize, ToSchema)]
-struct DemoReadQuery {
-    id: Option<u32>,      // 1-based record number; default 1
-    mode: Option<String>, // raw | safe | join
-}
-
-#[deprecated(note = "use the stateless /dashboard/api/demo/process endpoint")]
-async fn demo_read(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<DemoReadQuery>,
-) -> impl IntoResponse {
-    let id = q.id.unwrap_or(1);
-    let mode = q.mode.as_deref().unwrap_or("raw");
-    let Some(obj) = state.store.get("__demo", &format!("record-{id}.json")) else {
-        return (StatusCode::NOT_FOUND, "no demo record stored yet").into_response();
-    };
-    let body = match mode {
-        "raw" => String::from_utf8_lossy(&obj.data).into_owned(),
-        "safe" | "join" => {
-            let stable_key: Option<Vec<u8>> = if mode == "join" {
-                Some(derive_stable_key("s4-demo"))
-            } else {
-                None
-            };
-            let stable_fields: Option<&str> = if mode == "join" { Some("email") } else { None };
-            let snapshot = match pipeline_snapshot(&state) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!("pipeline error: {error}"),
-                    )
-                        .into_response();
-                }
-            };
-            match run_demo_streaming(
-                snapshot,
-                &obj.data,
-                Format::Json,
-                "application/json",
-                stable_key.as_deref(),
-                stable_fields,
-                None,
-            )
-            .await
-            {
-                Ok((bytes, _)) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(error) => {
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!("pipeline error: {error}"),
-                    )
-                        .into_response();
-                }
-            }
-        }
-        other => {
-            return (StatusCode::BAD_REQUEST, format!("unknown mode: {other}")).into_response();
-        }
-    };
-    Json(serde_json::json!({
-        "mode": mode,
-        "record": id,
-        "body": body,
-    }))
-    .into_response()
+async fn legacy_demo_gone() -> axum::response::Response {
+    harden_demo_response(StatusCode::GONE.into_response())
 }
 
 fn s3_xml_ok(xml: String) -> axum::response::Response {
@@ -7195,7 +7034,6 @@ pub async fn build_state(
 
 /// Build the axum router for the engine. The SaaS crate merges its own
 /// control-plane routes (workspaces, billing, dashboard) onto this.
-#[allow(deprecated)]
 pub fn build_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
@@ -7210,14 +7048,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/dashboard/api/me", get(get_me))
         .route("/dashboard/api/demo/redact", post(demo_redact))
         .route("/dashboard/api/demo/process", post(demo_process))
-        .route(
-            "/dashboard/api/demo/store",
-            post(demo_store).layer(axum::middleware::map_response(harden_legacy_demo_response)),
-        )
-        .route(
-            "/dashboard/api/demo/read",
-            get(demo_read).layer(axum::middleware::map_response(harden_legacy_demo_response)),
-        )
         .route("/dashboard/api/backend", get(get_backend))
         .route("/dashboard/api/backend", put(put_backend))
         .route("/{bucket}", get(s3_list_objects))
@@ -7237,8 +7067,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             .route("/dashboard/api/plugins/{id}", delete(delete_plugin))
             .route("/dashboard/api/objects", get(list_objects));
     }
+    let router = router.layer(CorsLayer::permissive());
     router
-        .layer(CorsLayer::permissive())
+        // Remove at the next major release. Registration after CORS lets OPTIONS return 410.
+        .route("/dashboard/api/demo/store", any(legacy_demo_gone))
+        .route("/dashboard/api/demo/read", any(legacy_demo_gone))
         .with_state(state)
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
 }

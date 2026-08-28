@@ -1089,8 +1089,14 @@ fn postgres_public_key_binding() {
             store
                 .set_public_key(&key_id, &user, "-----BEGIN PUBLIC KEY-----\npem")
                 .await
+                .unwrap()
         );
-        assert!(!store.set_public_key(&key_id, "someone-else", "pem2").await);
+        assert!(
+            !store
+                .set_public_key(&key_id, "someone-else", "pem2")
+                .await
+                .unwrap()
+        );
 
         let (uid, pk) = store
             .resolve_credentials(&key_id, &secret)

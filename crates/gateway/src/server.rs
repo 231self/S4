@@ -5857,20 +5857,118 @@ struct SetPublicKeyRequest {
     public_key_pem: String,
 }
 
+enum PublicKeyMutationActor {
+    ApiKey { access_key: String, user_id: String },
+    DashboardUser(String),
+}
+
+fn unique_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, StatusCode> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next();
+    if values.next().is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    value
+        .map(|value| value.to_str().map_err(|_| StatusCode::UNAUTHORIZED))
+        .transpose()
+}
+
+async fn authenticate_public_key_mutation(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<PublicKeyMutationActor, StatusCode> {
+    let authorization = unique_header(headers, "authorization")?;
+    let access_key = unique_header(headers, "x-s4-access-key")?;
+    let secret_key = unique_header(headers, "x-s4-secret-key")?;
+    let mcp_token = unique_header(headers, "x-s4-mcp-token")?;
+    let api_headers_supplied = access_key.is_some() || secret_key.is_some();
+    if (api_headers_supplied && authorization.is_some())
+        || (mcp_token.is_some() && (api_headers_supplied || authorization.is_some()))
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if mcp_token.is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    if access_key.is_some() || secret_key.is_some() {
+        let access_key = access_key
+            .filter(|value| !value.is_empty())
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let secret_key = secret_key
+            .filter(|value| !value.is_empty())
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let (user_id, _) = state
+            .keys
+            .resolve_credentials(access_key, secret_key)
+            .await
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        return Ok(PublicKeyMutationActor::ApiKey {
+            access_key: access_key.to_string(),
+            user_id,
+        });
+    }
+
+    let token = authorization
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if let Some((access_key, secret_key)) = token.split_once(':') {
+        if access_key.is_empty() || secret_key.is_empty() {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let (user_id, _) = state
+            .keys
+            .resolve_credentials(access_key, secret_key)
+            .await
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        return Ok(PublicKeyMutationActor::ApiKey {
+            access_key: access_key.to_string(),
+            user_id,
+        });
+    }
+
+    if state.auth_disabled || token.starts_with("s4m_") {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    require_user_id(headers, state)
+        .await
+        .map(PublicKeyMutationActor::DashboardUser)
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
 async fn set_public_key(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<SetPublicKeyRequest>,
 ) -> impl IntoResponse {
-    let uid = get_user_id(&headers, &state);
-    if state
+    let actor = match authenticate_public_key_mutation(&state, &headers).await {
+        Ok(actor) => actor,
+        Err(status) => return status.into_response(),
+    };
+    let uid = match actor {
+        PublicKeyMutationActor::ApiKey {
+            access_key,
+            user_id,
+        } => {
+            if body.key_id != access_key {
+                return (StatusCode::NOT_FOUND, "key not found").into_response();
+            }
+            user_id
+        }
+        PublicKeyMutationActor::DashboardUser(user_id) => user_id,
+    };
+    match state
         .keys
         .set_public_key(&body.key_id, &uid, &body.public_key_pem)
         .await
     {
-        StatusCode::OK.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "key not found or not owned by user").into_response()
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "key not found").into_response(),
+        Err(_) => {
+            tracing::error!(user_id = uid, "public key persistence failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

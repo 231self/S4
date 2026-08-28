@@ -3745,10 +3745,10 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
 }
 
 #[tokio::test]
-async fn demo_read_safe_and_join_modes() {
-    let (app, _state) = router().await;
+async fn legacy_demo_paths_are_gone_without_storage_or_plaintext() {
+    let (app, state) = router().await;
+    let plaintext = "legacy-user@example.com";
 
-    // 1. Store two records sharing an email.
     let store = app
         .clone()
         .oneshot(
@@ -3756,21 +3756,22 @@ async fn demo_read_safe_and_join_modes() {
                 .method("POST")
                 .uri("/dashboard/api/demo/store")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"records":[
-                    {"email":"alice@example.com","card":"4111111111111111","note":"first"},
-                    {"email":"alice@example.com","card":"4111111111111111","note":"second"}
-                ]}"#,
-                ))
+                .body(Body::from(format!(
+                    r#"{{"records":[{{"email":"{plaintext}"}}]}}"#
+                )))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(store.status(), StatusCode::OK);
-    assert_demo_response_headers(&store);
+    assert_eq!(store.status(), StatusCode::GONE);
+    assert_demo_security_headers(&store);
+    let body = axum::body::to_bytes(store.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains(plaintext));
+    assert!(state.store.list_keys().is_empty());
 
-    // 2. Raw read keeps PII.
-    let raw = app
+    let read = app
         .clone()
         .oneshot(
             Request::builder()
@@ -3781,115 +3782,101 @@ async fn demo_read_safe_and_join_modes() {
         )
         .await
         .unwrap();
-    assert_demo_response_headers(&raw);
-    let raw_body = axum::body::to_bytes(raw.into_body(), usize::MAX)
+    assert_eq!(read.status(), StatusCode::GONE);
+    assert_demo_security_headers(&read);
+    let body = axum::body::to_bytes(read.into_body(), usize::MAX)
         .await
         .unwrap();
-    let raw_text = String::from_utf8_lossy(&raw_body);
-    assert!(
-        raw_text.contains("alice@example.com"),
-        "raw keeps PII: {raw_text}"
-    );
+    assert!(!String::from_utf8_lossy(&body).contains(plaintext));
+    assert!(state.store.list_keys().is_empty());
 
-    // 3. Safe read runs the PII pipeline (detect + redact).
-    let safe = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/dashboard/api/demo/read?id=1&mode=safe")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(safe.status(), StatusCode::OK);
-    assert_demo_response_headers(&safe);
-    let safe_bytes = axum::body::to_bytes(safe.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let safe_text = String::from_utf8_lossy(&safe_bytes);
-    assert!(
-        safe_text.contains("REDACTED_EMAIL") && !safe_text.contains("alice@example.com"),
-        "safe must redact PII: {safe_text}"
-    );
+    let process = post_demo_process(
+        &app,
+        serde_json::json!({
+            "records": [{"email": plaintext}],
+            "mode": "safe"
+        }),
+    )
+    .await;
+    assert_eq!(process.status(), StatusCode::OK);
+    assert_demo_response_headers(&process);
+    let process = demo_response_json(process).await;
+    let processed: serde_json::Value =
+        serde_json::from_str(process["records"][0]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(processed["email"], "[REDACTED_EMAIL]");
+    assert!(state.store.list_keys().is_empty());
+}
 
-    // 4. Join read stable-encrypts `email`; the same email yields identical
-    //    ciphertext across records (joinable without plaintext).
-    let read_join = |id: u32| {
-        let app = app.clone();
-        async move {
-            let resp = app
-                .oneshot(
-                    Request::builder()
-                        .method("GET")
-                        .uri(format!("/dashboard/api/demo/read?id={id}&mode=join"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+#[tokio::test]
+async fn legacy_demo_tombstones_handle_every_method_before_cors_and_s3() {
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let plaintext = "must-not-be-stored@example.com";
+
+    for base_path in ["/dashboard/api/demo/store", "/dashboard/api/demo/read"] {
+        for (method, query) in [
+            ("CONNECT", "transport=legacy"),
+            ("DELETE", "versionId=legacy"),
+            ("GET", "id=1&mode=raw"),
+            ("HEAD", "id=1&mode=raw"),
+            ("OPTIONS", "preflight=legacy"),
+            ("PATCH", "mode=raw"),
+            ("POST", "uploads"),
+            ("PUT", "overwrite=true"),
+            ("TRACE", "mode=raw"),
+        ] {
+            let path = format!("{base_path}?{query}");
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path.as_str())
+                .header(header::CONTENT_TYPE, "text/plain");
+            if method == "OPTIONS" {
+                request = request
+                    .header(header::ORIGIN, "https://example.test")
+                    .header("access-control-request-method", "POST");
+            }
+            let response = app
+                .clone()
+                .oneshot(add_headers(
+                    request.body(Body::from(plaintext)).unwrap(),
+                    &auth_headers(&access_key, &secret_key),
+                ))
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            assert_demo_response_headers(&resp);
-            let text = String::from_utf8_lossy(
-                &axum::body::to_bytes(resp.into_body(), usize::MAX)
-                    .await
-                    .unwrap(),
-            )
-            .to_string();
-            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            let body: serde_json::Value =
-                serde_json::from_str(value["body"].as_str().unwrap()).unwrap();
-            body["email"].as_str().unwrap().to_string()
+            assert_eq!(
+                response.status(),
+                StatusCode::GONE,
+                "method: {method}, path: {path}"
+            );
+            assert_demo_security_headers(&response);
+            if method == "OPTIONS" {
+                assert!(
+                    !response
+                        .headers()
+                        .contains_key("access-control-allow-origin")
+                );
+            }
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.is_empty(), "method: {method}, path: {path}");
+            assert!(!String::from_utf8_lossy(&body).contains(plaintext));
+            assert!(state.store.list_keys().is_empty());
         }
-    };
-    let email1 = read_join(1).await;
-    let email2 = read_join(2).await;
-    assert_ne!(email1, "alice@example.com", "join leaks plaintext email");
-    assert_eq!(
-        email1, email2,
-        "join must produce identical ciphertext for the same email"
-    );
+    }
 
-    let missing = app
-        .clone()
+    let cors = app
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri("/dashboard/api/demo/read?id=99&mode=raw")
+                .method("OPTIONS")
+                .uri("/dashboard/api/demo/process")
+                .header(header::ORIGIN, "https://example.test")
+                .header("access-control-request-method", "POST")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    assert_demo_security_headers(&missing);
-
-    let unknown = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/dashboard/api/demo/read?id=1&mode=unknown")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
-    assert_demo_security_headers(&unknown);
-
-    let malformed_store = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/dashboard/api/demo/store")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from("{"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(malformed_store.status(), StatusCode::BAD_REQUEST);
-    assert_demo_security_headers(&malformed_store);
+    assert_eq!(cors.status(), StatusCode::OK);
+    assert_eq!(cors.headers()["access-control-allow-origin"], "*");
 }

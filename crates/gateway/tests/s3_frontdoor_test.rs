@@ -18,7 +18,10 @@ use s4_gateway::key_cipher::default_wrapping;
 use s4_gateway::object::BodyLimits;
 use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
 use s4_gateway::sigv4::SigV4Policy;
-use s4_gateway::store::{FileKeyStore, KeyRepository};
+use s4_gateway::store::{
+    FileKeyStore, KeyRepository, MAX_CREDENTIAL_LABEL_BYTES, MAX_CREDENTIAL_TTL_SECONDS,
+    MAX_PUBLIC_KEY_PEM_BYTES,
+};
 use s4_gateway::transaction::SpoolQuota;
 use s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
 use std::collections::VecDeque;
@@ -32,6 +35,9 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 use tower::ServiceExt;
+
+const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/pub.pem");
+const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
 
 struct PollTrackingBody {
     polls: Arc<AtomicUsize>,
@@ -329,7 +335,7 @@ async fn public_key_persistence_failure_returns_generic_500_and_rolls_back() {
     std::fs::write(&parent, "not a directory").unwrap();
 
     let request = add_headers(
-        public_key_request(&key_id, "must-not-persist"),
+        public_key_request(&key_id, TEST_PUBLIC_KEY_PEM),
         &auth_headers(&key_id, &secret_key),
     );
     let response = app.oneshot(request).await.unwrap();
@@ -339,7 +345,7 @@ async fn public_key_persistence_failure_returns_generic_500_and_rolls_back() {
         .await
         .unwrap();
     assert!(body.is_empty(), "persistence failure body must be generic");
-    assert!(!String::from_utf8_lossy(&body).contains("must-not-persist"));
+    assert!(!String::from_utf8_lossy(&body).contains("BEGIN PUBLIC KEY"));
     assert!(!String::from_utf8_lossy(&body).contains(&secret_key));
     assert!(
         file_store
@@ -590,7 +596,9 @@ async fn public_key_mutation_rejects_duplicate_security_headers_without_mutation
     let mcp_token = state
         .keys
         .create_mcp_token("test-user", "duplicate-test", 0)
-        .await;
+        .await
+        .unwrap()
+        .0;
     let app = build_router(state.clone());
     let bearer = format!("Bearer {key_id}:{secret_key}");
     let requests = [
@@ -651,7 +659,9 @@ async fn public_key_mutation_rejects_mixed_credential_classes_without_mutation()
     let mcp_token = state
         .keys
         .create_mcp_token("test-user", "mixed-test", 0)
-        .await;
+        .await
+        .unwrap()
+        .0;
     let jwt = configure_dashboard_jwt(&mut state, "test-user");
     let app = build_router(state.clone());
     let api_bearer = format!("Bearer {key_id}:{secret_key}");
@@ -719,7 +729,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
     let app = build_router(state.clone());
 
     let header_request = add_headers(
-        public_key_request(&header_key, "header-pem"),
+        public_key_request(&header_key, TEST_PUBLIC_KEY_PEM),
         &auth_headers(&header_key, &header_secret),
     );
     assert_eq!(
@@ -728,7 +738,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
     );
 
     let bearer_request = add_headers(
-        public_key_request(&bearer_key, "bearer-pem"),
+        public_key_request(&bearer_key, TEST_CERTIFICATE_PEM),
         &[(
             "authorization",
             format!("Bearer {bearer_key}:{bearer_secret}"),
@@ -747,7 +757,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some("header-pem")
+        Some(TEST_PUBLIC_KEY_PEM.trim())
     );
     assert_eq!(
         state
@@ -757,7 +767,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some("bearer-pem")
+        Some(TEST_CERTIFICATE_PEM.trim())
     );
 }
 
@@ -770,7 +780,7 @@ async fn local_public_key_mutation_accepts_real_target_credentials() {
         .auth_disabled = true;
     let app = build_router(state.clone());
     let request = add_headers(
-        public_key_request(&key_id, "local-authenticated-pem"),
+        public_key_request(&key_id, TEST_PUBLIC_KEY_PEM),
         &auth_headers(&key_id, &secret_key),
     );
 
@@ -783,7 +793,37 @@ async fn local_public_key_mutation_accepts_real_target_credentials() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some("local-authenticated-pem")
+        Some(TEST_PUBLIC_KEY_PEM.trim())
+    );
+}
+
+#[tokio::test]
+async fn public_key_mutation_rejects_invalid_pem_before_persistence() {
+    let state = test_state().await;
+    let (key_id, secret_key) = make_key(&state).await;
+    let app = build_router(state.clone());
+
+    for public_key_pem in [
+        "not an RSA public key".to_string(),
+        "x".repeat(MAX_PUBLIC_KEY_PEM_BYTES + 1),
+    ] {
+        let request = add_headers(
+            public_key_request(&key_id, &public_key_pem),
+            &auth_headers(&key_id, &secret_key),
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert!(
+        state
+            .keys
+            .get_key(&key_id)
+            .await
+            .unwrap()
+            .public_key_pem
+            .is_none()
     );
 }
 
@@ -834,7 +874,10 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
     let token = configure_dashboard_jwt(&mut state, "dashboard-user");
     let app = build_router(state.clone());
 
-    for (key_id, pem) in [(&owned_key, "first-pem"), (&second_owned_key, "second-pem")] {
+    for (key_id, pem) in [
+        (&owned_key, TEST_PUBLIC_KEY_PEM),
+        (&second_owned_key, TEST_CERTIFICATE_PEM),
+    ] {
         let request = add_headers(
             public_key_request(key_id, pem),
             &[("authorization", format!("Bearer {token}"))],
@@ -846,7 +889,7 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
     }
 
     let foreign_request = add_headers(
-        public_key_request(&foreign_key, "rejected-pem"),
+        public_key_request(&foreign_key, TEST_PUBLIC_KEY_PEM),
         &[("authorization", format!("Bearer {token}"))],
     );
     assert_eq!(
@@ -862,7 +905,7 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some("first-pem")
+        Some(TEST_PUBLIC_KEY_PEM.trim())
     );
     assert_eq!(
         state
@@ -872,7 +915,7 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some("second-pem")
+        Some(TEST_CERTIFICATE_PEM.trim())
     );
     assert!(
         state
@@ -893,7 +936,9 @@ async fn mcp_tokens_cannot_mutate_public_keys() {
     let token = state
         .keys
         .create_mcp_token("mcp-user", "mutation-test", 0)
-        .await;
+        .await
+        .unwrap()
+        .0;
     let app = build_router(state.clone());
     let requests = [
         add_headers(
@@ -938,7 +983,7 @@ async fn create_key_still_accepts_an_initial_public_key() {
         .body(Body::from(
             serde_json::json!({
                 "label": "created-with-public-key",
-                "public_key_pem": "creation-pem",
+                "public_key_pem": TEST_CERTIFICATE_PEM,
             })
             .to_string(),
         ))
@@ -953,7 +998,7 @@ async fn create_key_still_accepts_an_initial_public_key() {
     )
     .unwrap();
     let key_id = body["key_id"].as_str().unwrap();
-    assert_eq!(body["public_key_pem"], "creation-pem");
+    assert_eq!(body["public_key_pem"], TEST_CERTIFICATE_PEM.trim());
     assert_eq!(
         state
             .keys
@@ -962,8 +1007,135 @@ async fn create_key_still_accepts_an_initial_public_key() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some("creation-pem")
+        Some(TEST_CERTIFICATE_PEM.trim())
     );
+}
+
+#[tokio::test]
+async fn credential_mutation_endpoints_enforce_input_and_body_boundaries() {
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .auth_disabled = true;
+    let app = build_router(state);
+
+    for (label, expected) in [
+        ("a".repeat(MAX_CREDENTIAL_LABEL_BYTES), StatusCode::OK),
+        (
+            "a".repeat(MAX_CREDENTIAL_LABEL_BYTES + 1),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("control\nlabel".to_string(), StatusCode::BAD_REQUEST),
+        ("   ".to_string(), StatusCode::BAD_REQUEST),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/dashboard/api/keys")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "label": label }).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            expected
+        );
+    }
+
+    for (expires_in, expected) in [
+        (MAX_CREDENTIAL_TTL_SECONDS, StatusCode::OK),
+        (MAX_CREDENTIAL_TTL_SECONDS + 1, StatusCode::BAD_REQUEST),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/dashboard/api/keys")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "label": "ttl", "expires_in": expires_in }).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(body["expires_at"].as_str().is_some());
+        }
+    }
+
+    for public_key_pem in [
+        "not a PEM".to_string(),
+        "x".repeat(MAX_PUBLIC_KEY_PEM_BYTES + 1),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/dashboard/api/keys")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "label": "invalid pem",
+                    "public_key_pem": public_key_pem,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    for (expires_in, expected) in [
+        (MAX_CREDENTIAL_TTL_SECONDS, StatusCode::OK),
+        (MAX_CREDENTIAL_TTL_SECONDS + 1, StatusCode::BAD_REQUEST),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/dashboard/api/mcp-tokens")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "label": "agent", "expires_in": expires_in }).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(body["expires_at"].as_str().is_some());
+        }
+    }
+
+    for (method, uri, body) in [
+        ("POST", "/dashboard/api/keys", "x".repeat(20 * 1024)),
+        (
+            "PUT",
+            "/dashboard/api/keys/public-key",
+            "x".repeat(20 * 1024),
+        ),
+        ("DELETE", "/dashboard/api/keys", "x".repeat(2048)),
+        ("POST", "/dashboard/api/mcp-tokens", "x".repeat(2048)),
+        ("DELETE", "/dashboard/api/mcp-tokens", "x".repeat(2048)),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
 }
 
 #[tokio::test]
@@ -3340,7 +3512,12 @@ async fn mcp_token_roundtrip_and_auth() {
     let (app, state) = router().await;
 
     // Create an MCP token.
-    let token = state.keys.create_mcp_token("mcp-user", "agent", 0).await;
+    let token = state
+        .keys
+        .create_mcp_token("mcp-user", "agent", 0)
+        .await
+        .unwrap()
+        .0;
     assert!(token.starts_with("s4m_"), "token prefix: {token}");
 
     // Use it as a Bearer token to write.
@@ -3395,8 +3572,18 @@ async fn mcp_token_roundtrip_and_auth() {
 #[tokio::test]
 async fn mcp_token_identity_is_per_user() {
     let (app, state) = router().await;
-    let t1 = state.keys.create_mcp_token("user-a", "agent", 0).await;
-    let t2 = state.keys.create_mcp_token("user-b", "agent", 0).await;
+    let t1 = state
+        .keys
+        .create_mcp_token("user-a", "agent", 0)
+        .await
+        .unwrap()
+        .0;
+    let t2 = state
+        .keys
+        .create_mcp_token("user-b", "agent", 0)
+        .await
+        .unwrap()
+        .0;
 
     // user-a can write; user-b's token cannot read user-a's in-memory object
     // under a different identity via the dashboard key list (identity binding).

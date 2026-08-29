@@ -37,7 +37,10 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::backend::{BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation};
+use crate::backend::{
+    BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation,
+    WorkspaceEndpointPolicy,
+};
 use crate::control::{AuthenticatedRequestContext, ControlPlane, RequestKind, StreamingWriteMode};
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
@@ -62,6 +65,7 @@ use crate::plugin_registry::{
 };
 use crate::read_spool::EncryptedReadSpool;
 use crate::s3_error;
+use crate::s3_safety::{S3Failure, record_s3_failure, s3_retry_config, s3_timeout_config};
 use crate::service_storage::{ServiceStorage, parse_service_backends};
 use crate::sigv4::{RequestAuthorization, SigV4Error, SigV4Policy, SigningKeyCache};
 use crate::store::{
@@ -76,7 +80,8 @@ use crate::transaction::{
     SpoolQuota, StoredObjectMeta, TransactionError, VersioningCapability,
 };
 use crate::workspace_storage::{
-    BackendConfigRequest, BackendConfigResponse, WorkspaceStorageError, WorkspaceStorageRepository,
+    BackendConfigRequest, BackendConfigResponse, BackendType, WorkspaceId, WorkspaceStorageError,
+    WorkspaceStorageRepository,
 };
 use crate::{Format, Gateway};
 
@@ -92,6 +97,8 @@ pub struct AppState {
     pub supabase_url: String,
     pub jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     pub auth_disabled: bool,
+    pub explicit_single_tenant: bool,
+    pub workspace_endpoint_policy: WorkspaceEndpointPolicy,
     pub control: Arc<dyn ControlPlane>,
     pub legacy_max_object_bytes: usize,
     pub streaming_read_mode: StreamingReadMode,
@@ -649,6 +656,8 @@ fn backend_resolver(state: &AppState) -> BackendResolver {
         state.service_storage.clone(),
         state.s3_client.clone(),
         state.store.clone(),
+        state.explicit_single_tenant,
+        state.workspace_endpoint_policy.clone(),
     )
 }
 
@@ -663,12 +672,18 @@ async fn resolve_backend(
         .await
 }
 
+fn backend_resolution_error_response(key: &str) -> axum::response::Response {
+    warn!(key, "workspace backend resolution failed");
+    s3_error::service_unavailable(key, "workspace storage is unavailable")
+}
+
 #[derive(Debug)]
 enum OpenObjectError {
     NotFound,
     InvalidRange { object_length: u64 },
     Rejected(String),
     Backend(String),
+    S3(S3Failure),
     PresignedTransport(PresignedTransportFailure),
 }
 
@@ -713,6 +728,7 @@ fn open_error_response(key: &str, error: OpenObjectError) -> axum::response::Res
             warn!("backend read failed for {key}: {detail}");
             s3_error::internal_error(key, &detail)
         }
+        OpenObjectError::S3(failure) => s3_error::internal_error(key, failure.client_message()),
         OpenObjectError::PresignedTransport(failure) => {
             warn!(
                 key,
@@ -734,6 +750,15 @@ fn insert_number<T: ToString>(metadata: &mut ObjectMetadata, name: &'static str,
     if let Some(value) = value {
         metadata.insert(HeaderName::from_static(name), value.to_string());
     }
+}
+
+fn s3_response_body(
+    body: aws_sdk_s3::primitives::ByteStream,
+    operation: &'static str,
+) -> axum::body::Body {
+    axum::body::Body::new(body.into_inner().map_err(move |_| {
+        std::io::Error::other(crate::s3_safety::record_s3_body_failure(operation))
+    }))
 }
 
 fn s3_get_metadata(output: &aws_sdk_s3::operation::get_object::GetObjectOutput) -> ObjectMetadata {
@@ -1066,7 +1091,7 @@ async fn open_backend_object(
                     {
                         OpenObjectError::NotFound
                     } else {
-                        OpenObjectError::Backend(error.to_string())
+                        OpenObjectError::S3(record_s3_failure("head_object", &error))
                     }
                 })?;
                 return Ok(OpenedObject::new(
@@ -1090,7 +1115,7 @@ async fn open_backend_object(
                 {
                     OpenObjectError::NotFound
                 } else {
-                    OpenObjectError::Backend(error.to_string())
+                    OpenObjectError::S3(record_s3_failure("get_object", &error))
                 }
             })?;
             let status = if output.content_range.is_some() {
@@ -1099,7 +1124,7 @@ async fn open_backend_object(
                 StatusCode::OK
             };
             let metadata = s3_get_metadata(&output);
-            let body = axum::body::Body::new(output.body.into_inner());
+            let body = s3_response_body(output.body, "get_object_body");
             Ok(OpenedObject::new(
                 status,
                 metadata,
@@ -1158,7 +1183,7 @@ async fn open_backend_object(
                 StatusCode::OK
             };
             let metadata = s3_get_metadata(&output);
-            let body = axum::body::Body::new(output.body.into_inner());
+            let body = s3_response_body(output.body, "managed_get_object_body");
             Ok(OpenedObject::new(
                 status,
                 metadata,
@@ -3490,7 +3515,7 @@ async fn s3_upload_part(
     .await
     {
         Ok(backend) => backend,
-        Err(_) => return s3_error::internal_error(&key, "multipart backend resolution failed"),
+        Err(_) => return backend_resolution_error_response(&key),
     };
     let identity = multipart_identity(&authentication.auth, &bucket, &key, &upload_id);
     let upload = match staging.repository.get_authorized(&identity).await {
@@ -3731,7 +3756,7 @@ async fn s3_put(
     let effective_write_mode = state.streaming_write_mode.min(tenant_write_mode);
     let backend = match resolve_backend(&state, auth, &parts.headers, StorageOperation::Put).await {
         Ok(backend) => backend,
-        Err(error) => return s3_error::internal_error(&key, &error),
+        Err(_) => return backend_resolution_error_response(&key),
     };
     if let ResolvedBackend::Managed(storage) = &backend {
         match storage.managed_mode() {
@@ -4376,12 +4401,11 @@ async fn s3_get(
         return s3_error::transformed_read_not_supported(&key);
     }
     if params.upload_id.is_some() {
-        let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart)
-            .await
-        {
-            Ok(backend) => backend,
-            Err(_) => return s3_error::internal_error(&key, "multipart backend resolution failed"),
-        };
+        let backend =
+            match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
+                Ok(backend) => backend,
+                Err(_) => return backend_resolution_error_response(&key),
+            };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
@@ -4434,7 +4458,7 @@ async fn s3_get(
     }
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Get).await {
         Ok(backend) => backend,
-        Err(error) => return s3_error::internal_error(&key, &error),
+        Err(_) => return backend_resolution_error_response(&key),
     };
     // A transformed representation must be admitted from authoritative object
     // metadata before a source GET can start delivering bytes. Passthrough keeps
@@ -4590,6 +4614,106 @@ mod tests {
                 bytes,
             });
         }
+    }
+
+    struct PrivateAddressResolver;
+
+    #[async_trait::async_trait]
+    impl crate::backend::AddressResolver for PrivateAddressResolver {
+        async fn resolve(
+            &self,
+            _host: &str,
+            port: u16,
+        ) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            Ok(vec![std::net::SocketAddr::new(
+                "127.0.0.1".parse().unwrap(),
+                port,
+            )])
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWorkspaceStorageRepository {
+        put_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceStorageRepository for CountingWorkspaceStorageRepository {
+        async fn resolve_workspace(
+            &self,
+            user_id: &str,
+        ) -> Result<WorkspaceId, WorkspaceStorageError> {
+            WorkspaceId::new(user_id)
+        }
+
+        async fn get_runtime_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<Option<crate::workspace_storage::RuntimeBackendConfig>, WorkspaceStorageError>
+        {
+            Ok(None)
+        }
+
+        async fn get_public_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<BackendConfigResponse, WorkspaceStorageError> {
+            Ok(BackendConfigResponse::unconfigured())
+        }
+
+        async fn put_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+            _request: BackendConfigRequest,
+        ) -> Result<BackendConfigResponse, WorkspaceStorageError> {
+            self.put_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(BackendConfigResponse::unconfigured())
+        }
+    }
+
+    #[test]
+    fn startup_storage_boundary_requires_explicit_single_tenant_or_managed_storage() {
+        assert!(explicit_single_tenant_mode(true, false));
+        assert!(explicit_single_tenant_mode(false, true));
+        assert!(!explicit_single_tenant_mode(false, false));
+
+        assert!(validate_storage_boundary_startup(false, true, true).is_err());
+        assert!(validate_storage_boundary_startup(false, false, false).is_err());
+        assert!(validate_storage_boundary_startup(false, false, true).is_ok());
+        assert!(validate_storage_boundary_startup(true, true, false).is_ok());
+        assert!(validate_storage_boundary_startup(true, false, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dashboard_rejects_workspace_endpoint_before_persistence() {
+        let repository = CountingWorkspaceStorageRepository::default();
+        let policy = WorkspaceEndpointPolicy::new(
+            false,
+            ["objects.example".to_string()],
+            Vec::<String>::new(),
+            Arc::new(PrivateAddressResolver),
+        )
+        .unwrap();
+        let result = validate_and_put_workspace_backend(
+            &repository,
+            &policy,
+            &WorkspaceId::new("workspace").unwrap(),
+            BackendConfigRequest {
+                backend_type: BackendType::S3Compatible,
+                endpoint: "https://objects.example".to_string(),
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                region: "us-east-1".to_string(),
+                role_arn: String::new(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceStorageError::InvalidConfig(_))
+        ));
+        assert_eq!(repository.put_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4962,7 +5086,7 @@ async fn s3_head(
 
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Head).await {
         Ok(backend) => backend,
-        Err(error) => return s3_error::internal_error(&key, &error),
+        Err(_) => return backend_resolution_error_response(&key),
     };
     match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, true).await {
         Ok(object) => {
@@ -5007,9 +5131,7 @@ async fn s3_delete(
         let backend =
             match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
                 Ok(backend) => backend,
-                Err(_) => {
-                    return s3_error::internal_error(&key, "multipart backend resolution failed");
-                }
+                Err(_) => return backend_resolution_error_response(&key),
             };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
@@ -5058,11 +5180,15 @@ async fn s3_delete(
 
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Delete).await {
         Ok(backend) => backend,
-        Err(error) => return s3_error::internal_error(&key, &error),
+        Err(_) => return backend_resolution_error_response(&key),
     };
     match backend {
         ResolvedBackend::PresignedHttp(url) => {
-            let client = match state.presigned_http_policy.client_for(&url).await {
+            let client = match state
+                .presigned_http_policy
+                .client_for_destination(&url, Duration::from_secs(30))
+                .await
+            {
                 Ok(client) => client,
                 Err(error) => return open_error_response(&key, OpenObjectError::Rejected(error)),
             };
@@ -5103,7 +5229,10 @@ async fn s3_delete(
                     .await;
                 StatusCode::NO_CONTENT.into_response()
             }
-            Err(e) => s3_error::internal_error(&key, &e.to_string()),
+            Err(error) => {
+                let failure = record_s3_failure("delete_object", &error);
+                s3_error::internal_error(&key, failure.client_message())
+            }
         },
         ResolvedBackend::Managed(storage) => {
             let result = match storage.managed_mode() {
@@ -5212,7 +5341,7 @@ async fn s3_post(
             match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
             {
                 Ok(backend) => backend,
-                Err(error) => return s3_error::internal_error(&key, &error),
+                Err(_) => return backend_resolution_error_response(&key),
             };
         if let ResolvedBackend::Managed(storage) = &backend {
             let Some(epoch) = upload.namespace_epoch else {
@@ -5346,7 +5475,7 @@ async fn s3_post(
             match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
             {
                 Ok(backend) => backend,
-                Err(error) => return s3_error::internal_error(&key, &error),
+                Err(_) => return backend_resolution_error_response(&key),
             };
         if let ResolvedBackend::Managed(storage) = &backend
             && let Err(error) = storage
@@ -5458,15 +5587,12 @@ async fn s3_list_objects(
 
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
         Ok(backend) => backend,
-        Err(error) => return s3_error::internal_error(&bucket, &error),
+        Err(_) => return backend_resolution_error_response(&bucket),
     };
     match backend {
         ResolvedBackend::S3 { client, .. } => match list_from_s3(&client, &bucket, &params).await {
             Ok(xml) => s3_xml_ok(xml),
-            Err(e) => {
-                warn!("list from S3 backend failed for {bucket}: {e}");
-                s3_error::internal_error(&bucket, &e.to_string())
-            }
+            Err(failure) => s3_error::internal_error(&bucket, failure.client_message()),
         },
         ResolvedBackend::Memory(store) => {
             match list_from_memory(&store, &bucket, &params, &state.continuation_token_key) {
@@ -5488,7 +5614,7 @@ async fn s3_list_objects(
 }
 
 /// Forward a ListObjectsV2 request to an S3 backend.
-async fn list_from_s3(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Result<String> {
+async fn list_from_s3(s3: &Client, bucket: &str, params: &S3Query) -> Result<String, S3Failure> {
     if params.list_type.as_deref() != Some("2") {
         return list_from_s3_v1(s3, bucket, params).await;
     }
@@ -5508,7 +5634,10 @@ async fn list_from_s3(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Re
     if let Some(m) = params.max_keys {
         req = req.max_keys(m.min(1000) as i32);
     }
-    let out = req.send().await?;
+    let out = req
+        .send()
+        .await
+        .map_err(|error| record_s3_failure("list_objects_v2", &error))?;
 
     let encoding = params.encoding_type.as_deref() == Some("url");
     let mut xml = String::from(
@@ -5582,7 +5711,7 @@ async fn list_from_s3(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Re
     Ok(xml)
 }
 
-async fn list_from_s3_v1(s3: &Client, bucket: &str, params: &S3Query) -> anyhow::Result<String> {
+async fn list_from_s3_v1(s3: &Client, bucket: &str, params: &S3Query) -> Result<String, S3Failure> {
     let mut request = s3.list_objects().bucket(bucket);
     if let Some(prefix) = params.prefix.as_deref() {
         request = request.prefix(prefix);
@@ -5596,7 +5725,10 @@ async fn list_from_s3_v1(s3: &Client, bucket: &str, params: &S3Query) -> anyhow:
     if let Some(max_keys) = params.max_keys {
         request = request.max_keys(max_keys.min(1000) as i32);
     }
-    let output = request.send().await?;
+    let output = request
+        .send()
+        .await
+        .map_err(|error| record_s3_failure("list_objects_v1", &error))?;
     let encoding = params.encoding_type.as_deref() == Some("url");
     let display = |value: &str| {
         if encoding {
@@ -5894,7 +6026,7 @@ async fn root(
     };
     match list_buckets(&state, &auth, &headers).await {
         Ok(xml) => s3_xml_ok(xml).into_response(),
-        Err(e) => s3_error::internal_error("", &e.to_string()).into_response(),
+        Err(_) => backend_resolution_error_response(""),
     }
 }
 
@@ -5909,7 +6041,11 @@ async fn list_buckets(
         .map_err(anyhow::Error::msg)?
     {
         ResolvedBackend::S3 { client, .. } => {
-            let out = client.list_buckets().send().await?;
+            let out = client
+                .list_buckets()
+                .send()
+                .await
+                .map_err(|error| record_s3_failure("list_buckets", &error))?;
             for bucket in out.buckets() {
                 if let Some(name) = bucket.name() {
                     names.push(name.to_string());
@@ -6256,6 +6392,21 @@ fn workspace_storage_error_response(error: WorkspaceStorageError) -> axum::respo
         .into_response()
 }
 
+async fn validate_and_put_workspace_backend(
+    repository: &dyn WorkspaceStorageRepository,
+    endpoint_policy: &WorkspaceEndpointPolicy,
+    workspace: &WorkspaceId,
+    config: BackendConfigRequest,
+) -> Result<BackendConfigResponse, WorkspaceStorageError> {
+    if config.backend_type == BackendType::S3Compatible {
+        endpoint_policy
+            .validate(&config.endpoint)
+            .await
+            .map_err(WorkspaceStorageError::InvalidConfig)?;
+    }
+    repository.put_config(workspace, config).await
+}
+
 #[utoipa::path(
     put,
     path = "/dashboard/api/backend",
@@ -6282,7 +6433,14 @@ async fn put_backend(
         Ok(workspace) => workspace,
         Err(error) => return workspace_storage_error_response(error),
     };
-    match state.workspace_storage.put_config(&workspace, config).await {
+    match validate_and_put_workspace_backend(
+        state.workspace_storage.as_ref(),
+        &state.workspace_endpoint_policy,
+        &workspace,
+        config,
+    )
+    .await
+    {
         Ok(config) => Json(config).into_response(),
         Err(error) => workspace_storage_error_response(error),
     }
@@ -6545,6 +6703,28 @@ fn bundled_stable_component() -> Option<Vec<u8>> {
     }
 }
 
+fn enabled_env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn explicit_single_tenant_mode(auth_disabled: bool, configured_single_tenant: bool) -> bool {
+    auth_disabled || configured_single_tenant
+}
+
+fn validate_storage_boundary_startup(
+    explicit_single_tenant: bool,
+    has_global_s3_endpoint: bool,
+    has_service_backends: bool,
+) -> anyhow::Result<()> {
+    if !explicit_single_tenant && has_global_s3_endpoint {
+        anyhow::bail!("S3_ENDPOINT is forbidden in multi-tenant mode");
+    }
+    if !explicit_single_tenant && !has_service_backends {
+        anyhow::bail!("multi-tenant mode requires a non-empty S4_SERVICE_BUCKETS");
+    }
+    Ok(())
+}
+
 /// Build the engine state from environment variables, injecting the given
 /// control plane and key-wrapping backend. This is the shared construction
 /// path for both the OSS self-host binary (`NoopControlPlane` +
@@ -6556,6 +6736,22 @@ pub async fn build_state(
     workspace_storage: Arc<dyn WorkspaceStorageRepository>,
 ) -> anyhow::Result<Arc<AppState>> {
     let s3_endpoint = std::env::var("S3_ENDPOINT").ok();
+    let auth_disabled = enabled_env_flag("AUTH_DISABLED");
+    let explicit_single_tenant =
+        explicit_single_tenant_mode(auth_disabled, enabled_env_flag("S4_SINGLE_TENANT"));
+    let service_backends = std::env::var("S4_SERVICE_BUCKETS")
+        .ok()
+        .map(|value| parse_service_backends(&value))
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_default();
+    validate_storage_boundary_startup(
+        explicit_single_tenant,
+        s3_endpoint.is_some(),
+        !service_backends.is_empty(),
+    )?;
+    let workspace_endpoint_policy =
+        WorkspaceEndpointPolicy::from_env(explicit_single_tenant).map_err(anyhow::Error::msg)?;
 
     let component_bytes = std::fs::read(component_path())?;
     let pipeline_fuel = std::env::var("S4_WASM_FUEL")
@@ -6619,6 +6815,8 @@ pub async fn build_state(
                         .region(Region::new(region))
                         .endpoint_url(endpoint)
                         .credentials_provider(creds)
+                        .retry_config(s3_retry_config())
+                        .timeout_config(s3_timeout_config())
                         .load()
                         .await;
                     let s3_config = aws_sdk_s3::config::Builder::from(&config)
@@ -6644,15 +6842,6 @@ pub async fn build_state(
     let jwt_decoder = supabase_jwt_secret
         .map(|secret| Arc::new(jsonwebtoken::DecodingKey::from_secret(secret.as_bytes())));
 
-    // Local mode: skip all auth UI and allow unauthenticated S3 access.
-    let auth_disabled = std::env::var("AUTH_DISABLED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    let service_backends = std::env::var("S4_SERVICE_BUCKETS")
-        .ok()
-        .map(|v| parse_service_backends(&v))
-        .unwrap_or_default();
     let managed_mode_value = std::env::var("S4_MANAGED_STREAMING_MODE").ok();
     let managed_mode = ManagedStreamingMode::from_value(managed_mode_value.as_deref())?;
     let managed_placement_version = std::env::var("S4_MANAGED_PLACEMENT_VERSION")
@@ -6729,7 +6918,7 @@ pub async fn build_state(
         .filter(|value| *value > 0)
         .unwrap_or(LEGACY_MAX_OBJECT_BYTES)
         .min(64 * 1024 * 1024);
-    let dev_memory_streaming_enabled = auth_disabled
+    let dev_memory_streaming_enabled = explicit_single_tenant
         || std::env::var("S4_DEV_MEMORY_STREAMING")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
 
@@ -6802,6 +6991,8 @@ pub async fn build_state(
                             None,
                             "multipart-staging",
                         ))
+                        .retry_config(s3_retry_config())
+                        .timeout_config(s3_timeout_config())
                         .load()
                         .await;
                     Some(Arc::new(MultipartStaging {
@@ -6923,12 +7114,14 @@ pub async fn build_state(
         supabase_url,
         jwt_decoder,
         auth_disabled,
+        explicit_single_tenant,
+        workspace_endpoint_policy,
         control,
         legacy_max_object_bytes: legacy_max_object_bytes(),
         streaming_read_mode: StreamingReadMode::from_env(),
         streaming_write_mode,
         source_body_limits,
-        presigned_http_policy: PresignedHttpPolicy::from_env(),
+        presigned_http_policy: PresignedHttpPolicy::from_env().map_err(anyhow::Error::msg)?,
         sigv4_cache: Arc::new(SigningKeyCache::standard()),
         sigv4_policy: SigV4Policy::from_env(),
         operation_journal,

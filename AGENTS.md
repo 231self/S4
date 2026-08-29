@@ -79,16 +79,26 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### Storage (Object Data)
 
-- **Three-tier storage model** with fallback priority:
-  1. Per-object presigned URL (`x-s4-backend-url` header) — zero-trust, no credential storage
-  2. Per-user backend config (`/dashboard/api/backend`) — IAM Role or S3-compatible creds
-  3. S4 Service Storage — managed multi-cloud buckets with consistent hashing
-  4. Global `S3_ENDPOINT` env var — single shared backend
-  5. In-memory `MemoryStore` — local dev default (HashMap by bucket/key)
+- **Storage resolution order**: explicit `x-s4-storage-mode: managed`, per-object
+  presigned URL (`x-s4-backend-url`), per-workspace configuration, then configured
+  S4 service storage. Only explicit single-tenant mode may continue to global
+  `S3_ENDPOINT` and then in-memory storage.
 
 - **Presigned URL proxy**: User generates a presigned PUT/GET URL for their bucket with their own SDK. Sends it as `x-s4-backend-url` header. S4 validates S4 API key, filters PII, HTTP-forwards to the presigned URL. No credentials stored in S4. Platform-agnostic (works with S3, R2, B2, MinIO).
 
-- **Per-user backend (IAM Role model)**: Follows Fivetran/Airbyte pattern. User creates an IAM Role in their AWS account with trust policy allowing S4 to assume it, protected by a unique External ID (prevents confused deputy attacks). User pastes Role ARN into dashboard. S4 calls `sts:AssumeRole` for temp credentials. For non-AWS backends (R2, B2, MinIO): user provides endpoint + token via dashboard. Backend config stored in `BackendRegistry` (in-memory, per-user `BackendConfig`).
+- **Per-workspace backend**: `WorkspaceStorageRepository` maps authenticated users
+  to canonical, unchanged `WorkspaceId` values and returns either `managed` or
+  `s3_compatible` configuration with static credentials. `aws_role` is not
+  implemented and is rejected; there is no per-user `BackendRegistry` contract.
+
+- **Tenant storage boundary**: Multi-tenant startup requires non-empty
+  `S4_SERVICE_BUCKETS` and rejects `S3_ENDPOINT`. Missing workspace configuration
+  defaults to managed storage; repository or required-managed failures fail closed.
+  Persisted workspace endpoints require an operator-trusted provider allowlist;
+  the SDK resolves DNS again, so tenants must not control allowed provider DNS.
+  Per-workspace and presigned clients disable proxies. Presigned HTTP is opt-in
+  only for source `GET`; presigned `PUT`/`DELETE` stay HTTPS-only. AWS SDK clients
+  make one attempt; transaction layers own their bounded retries.
 
 - **S4 Service Storage**: "Just works" mode. Users write PII-cleansed data without configuring any backend. S4 manages dedicated buckets across multiple cloud providers. Objects distributed via consistent hashing (150 virtual nodes per backend). Dual-write to primary + replica for cross-cloud resilience. Read falls back to replica on primary miss. Configured via `S4_SERVICE_BUCKETS` env var: `provider|endpoint|region|bucket|access_key|secret_key;...`. Implementation in `crates/gateway/src/service_storage.rs`.
 
@@ -112,7 +122,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 ### CLI (s4ctl)
 
 - Binary crate at `crates/s4ctl/`. Full-featured CLI for S4 operations.
-- Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`.
+- Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`. The legacy `set-aws` command submits unsupported `aws_role` configuration and is rejected by the gateway.
 - Auth from: `~/.config/s4/config.json` (login saved), `S4_ACCESS_KEY`/`S4_SECRET_KEY` env vars, or demo mode (empty keys fall through to gateway demo bypass).
 - Key expiry support: `--expiry never|30d|90d|1y` (or raw seconds).
 - Backend presign: generates presigned URLs via local AWS CLI for use with S4 proxy.

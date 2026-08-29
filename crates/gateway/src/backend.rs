@@ -6,9 +6,14 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
+use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, ConnectorBuilder};
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use axum::http::HeaderMap;
 use reqwest::Url;
 
+use crate::s3_safety::{s3_retry_config, s3_timeout_config};
 use crate::service_storage::ServiceStorage;
 use crate::store::MemoryStore;
 use crate::workspace_storage::{RuntimeBackendConfig, WorkspaceId, WorkspaceStorageRepository};
@@ -51,12 +56,27 @@ impl ResolvedBackend {
     }
 }
 
+fn workspace_s3_http_client() -> SharedHttpClient {
+    SmithyHttpClientBuilder::new().build_with_connector_fn(|settings, runtime_components| {
+        let mut connector =
+            ConnectorBuilder::default().tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc));
+        connector.set_connector_settings(settings.cloned());
+        if let Some(components) = runtime_components {
+            connector.set_sleep_impl(components.sleep_impl());
+        }
+        connector.set_proxy_config(Some(ProxyConfig::disabled()));
+        connector.build()
+    })
+}
+
 #[derive(Clone)]
 pub struct BackendResolver {
     workspace_storage: Arc<dyn WorkspaceStorageRepository>,
     managed: Arc<ServiceStorage>,
     global_s3: Option<Client>,
     memory: Arc<MemoryStore>,
+    explicit_single_tenant: bool,
+    workspace_endpoint_policy: WorkspaceEndpointPolicy,
 }
 
 impl BackendResolver {
@@ -65,12 +85,16 @@ impl BackendResolver {
         managed: Arc<ServiceStorage>,
         global_s3: Option<Client>,
         memory: Arc<MemoryStore>,
+        explicit_single_tenant: bool,
+        workspace_endpoint_policy: WorkspaceEndpointPolicy,
     ) -> Self {
         Self {
             workspace_storage,
             managed,
             global_s3,
             memory,
+            explicit_single_tenant,
+            workspace_endpoint_policy,
         }
     }
 
@@ -108,7 +132,7 @@ impl BackendResolver {
             .workspace_storage
             .get_runtime_config(workspace_id)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|_| "workspace storage is unavailable".to_string())?
         {
             Some(RuntimeBackendConfig::Managed) => {
                 if self.managed.is_empty() {
@@ -125,12 +149,24 @@ impl BackendResolver {
                 secret_key,
                 region,
             }) => {
+                let endpoint = self
+                    .workspace_endpoint_policy
+                    .validate(&endpoint)
+                    .await
+                    .map_err(|_| "workspace storage is unavailable".to_string())?;
                 let credentials =
                     Credentials::new(access_key, secret_key, None, None, "s4-backend");
+                // Tenant-selected destinations must never inherit process proxy
+                // settings. DNS is intentionally resolved again by the SDK: in
+                // multi-tenant mode the hostname belongs to an operator-trusted
+                // provider, so a tenant cannot control it after this validation.
                 let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
                     .region(Region::new(region))
-                    .endpoint_url(endpoint)
+                    .endpoint_url(endpoint.as_str())
                     .credentials_provider(credentials)
+                    .retry_config(s3_retry_config())
+                    .timeout_config(s3_timeout_config())
+                    .http_client(workspace_s3_http_client())
                     .load()
                     .await;
                 let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
@@ -147,6 +183,9 @@ impl BackendResolver {
         if !self.managed.is_empty() {
             return Ok(ResolvedBackend::Managed(self.managed.clone()));
         }
+        if !self.explicit_single_tenant {
+            return Err("workspace storage is unavailable".to_string());
+        }
         if let Some(client) = &self.global_s3 {
             return Ok(ResolvedBackend::S3 {
                 kind: BackendKind::GlobalS3,
@@ -155,6 +194,250 @@ impl BackendResolver {
         }
         Ok(ResolvedBackend::Memory(self.memory.clone()))
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TrustedHostPattern {
+    Exact(String),
+    Suffix(String),
+}
+
+impl TrustedHostPattern {
+    fn parse(value: String) -> Result<Self, String> {
+        let value = value.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return Err("workspace endpoint allowlist contains an empty entry".to_string());
+        }
+        if let Some(suffix) = value.strip_prefix("*.") {
+            if suffix.contains('*') || psl::domain_str(suffix).is_none() {
+                return Err("workspace endpoint allowlist contains a broad wildcard".to_string());
+            }
+            validate_dns_name(suffix)?;
+            return Ok(Self::Suffix(suffix.to_string()));
+        }
+        if value.contains('*') {
+            return Err("workspace endpoint allowlist contains an invalid wildcard".to_string());
+        }
+        validate_dns_name(&value)?;
+        Ok(Self::Exact(value))
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        match self {
+            Self::Exact(allowed) => host == allowed,
+            Self::Suffix(suffix) => host
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.')),
+        }
+    }
+}
+
+/// Policy for persisted S3-compatible workspace endpoints.
+///
+/// This is deliberately separate from [`PresignedHttpPolicy`]: persisted
+/// credentials and presigned, expiring URLs have different trust boundaries.
+#[derive(Clone)]
+pub struct WorkspaceEndpointPolicy {
+    explicit_single_tenant: bool,
+    trusted_hosts: Vec<TrustedHostPattern>,
+    private_allowed_hosts: HashSet<String>,
+    resolver: Arc<dyn AddressResolver>,
+}
+
+impl WorkspaceEndpointPolicy {
+    pub fn new(
+        explicit_single_tenant: bool,
+        trusted_hosts: impl IntoIterator<Item = String>,
+        private_allowed_hosts: impl IntoIterator<Item = String>,
+        resolver: Arc<dyn AddressResolver>,
+    ) -> Result<Self, String> {
+        let trusted_hosts = trusted_hosts
+            .into_iter()
+            .map(TrustedHostPattern::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        let private_allowed_hosts = private_allowed_hosts
+            .into_iter()
+            .map(normalize_private_allowlist_host)
+            .collect::<Result<HashSet<_>, _>>()?;
+        if !explicit_single_tenant && !private_allowed_hosts.is_empty() {
+            return Err(
+                "S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST requires explicit single-tenant mode"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            explicit_single_tenant,
+            trusted_hosts,
+            private_allowed_hosts,
+            resolver,
+        })
+    }
+
+    pub fn from_env(explicit_single_tenant: bool) -> Result<Self, String> {
+        let trusted_hosts = parse_allowlist_env("S4_WORKSPACE_ENDPOINT_ALLOWLIST")?;
+        let private_allowed_hosts = parse_allowlist_env("S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST")?;
+        Self::new(
+            explicit_single_tenant,
+            trusted_hosts,
+            private_allowed_hosts,
+            Arc::new(TokioAddressResolver),
+        )
+    }
+
+    pub async fn validate(&self, endpoint: &str) -> Result<Url, String> {
+        if !endpoint.is_ascii() {
+            return Err("workspace endpoint must use an ASCII hostname".to_string());
+        }
+        let url = Url::parse(endpoint)
+            .map_err(|_| "workspace endpoint must be an absolute HTTP(S) URL".to_string())?;
+        match url.scheme() {
+            "https" => {}
+            "http" if self.explicit_single_tenant => {}
+            "http" => return Err("workspace endpoints require HTTPS".to_string()),
+            _ => return Err("workspace endpoint URL scheme is not supported".to_string()),
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(
+                "workspace endpoint userinfo, query strings, and fragments are forbidden"
+                    .to_string(),
+            );
+        }
+
+        let host = normalize_endpoint_host(
+            url.host_str()
+                .ok_or_else(|| "workspace endpoint must have a host".to_string())?,
+        )?;
+        let literal_ip = host.parse::<IpAddr>().ok();
+        if literal_ip.is_none() {
+            validate_dns_name(&host)?;
+        }
+        if !self.explicit_single_tenant {
+            if literal_ip.is_some() {
+                return Err(
+                    "multi-tenant workspace endpoints require a trusted provider hostname"
+                        .to_string(),
+                );
+            }
+            if !self
+                .trusted_hosts
+                .iter()
+                .any(|allowed| allowed.matches(&host))
+            {
+                return Err(
+                    "workspace endpoint host is not in S4_WORKSPACE_ENDPOINT_ALLOWLIST".to_string(),
+                );
+            }
+        }
+
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| "workspace endpoint has no usable port".to_string())?;
+        let addresses = self
+            .resolver
+            .resolve(&host, port)
+            .await
+            .map_err(|_| "workspace endpoint DNS resolution failed".to_string())?;
+        if addresses.is_empty() {
+            return Err("workspace endpoint DNS resolution returned no addresses".to_string());
+        }
+        if addresses.iter().any(|address| is_ipv4_mapped(address.ip())) {
+            return Err("workspace endpoint uses a forbidden IPv4-mapped IPv6 address".to_string());
+        }
+        if addresses
+            .iter()
+            .any(|address| is_forbidden_endpoint_ip(address.ip()))
+            && (!self.explicit_single_tenant || !self.private_allowed_hosts.contains(&host))
+        {
+            return Err("workspace endpoint resolves to a forbidden address range".to_string());
+        }
+        Ok(url)
+    }
+}
+
+fn parse_allowlist_env(name: &str) -> Result<Vec<String>, String> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                Err(format!("{name} contains an empty entry"))
+            } else {
+                Ok(entry.to_string())
+            }
+        })
+        .collect()
+}
+
+fn normalize_endpoint_host(host: &str) -> Result<String, String> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    if host.ends_with('.') {
+        return Err("workspace endpoint host must not have a trailing dot".to_string());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_ipv4_mapped(ip) {
+            return Err("workspace endpoint uses a forbidden IPv4-mapped IPv6 address".to_string());
+        }
+        return Ok(ip.to_string());
+    }
+    Ok(host)
+}
+
+fn normalize_private_allowlist_host(value: String) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("workspace private endpoint allowlist contains an empty entry".to_string());
+    }
+    if value.contains('*')
+        || value.contains('/')
+        || value.contains('@')
+        || value.contains('?')
+        || value.contains('#')
+    {
+        return Err("workspace private endpoint allowlist entries must be exact hosts".to_string());
+    }
+    let host = normalize_endpoint_host(value)?;
+    if host.parse::<IpAddr>().is_err() {
+        validate_dns_name(&host)?;
+    }
+    Ok(host)
+}
+
+fn validate_dns_name(host: &str) -> Result<(), String> {
+    if host.is_empty()
+        || host.len() > 253
+        || !host.is_ascii()
+        || host.parse::<IpAddr>().is_ok()
+        || host.ends_with('.')
+    {
+        return Err("workspace endpoint allowlist contains an invalid hostname".to_string());
+    }
+    for label in host.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("workspace endpoint allowlist contains an invalid hostname".to_string());
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -174,7 +457,7 @@ impl AddressResolver for TokioAddressResolver {
 
 #[derive(Clone)]
 pub struct PresignedHttpPolicy {
-    allowed_hosts: HashSet<String>,
+    allowed_hosts: Vec<TrustedHostPattern>,
     private_allowed_hosts: HashSet<String>,
     allow_http: bool,
     minimum_validity: Duration,
@@ -188,12 +471,12 @@ impl PresignedHttpPolicy {
         allow_http: bool,
         minimum_validity: Duration,
         resolver: Arc<dyn AddressResolver>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        Ok(Self {
             allowed_hosts: allowed_hosts
                 .into_iter()
-                .map(|host| host.to_ascii_lowercase())
-                .collect(),
+                .map(TrustedHostPattern::parse)
+                .collect::<Result<Vec<_>, _>>()?,
             private_allowed_hosts: private_allowed_hosts
                 .into_iter()
                 .map(|host| host.to_ascii_lowercase())
@@ -201,17 +484,11 @@ impl PresignedHttpPolicy {
             allow_http,
             minimum_validity,
             resolver,
-        }
+        })
     }
 
-    pub fn from_env() -> Self {
-        let allowed_hosts: Vec<String> = std::env::var("S4_PRESIGNED_HTTP_ALLOWLIST")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|host| !host.is_empty())
-            .map(|host| host.to_ascii_lowercase())
-            .collect();
+    pub fn from_env() -> Result<Self, String> {
+        let allowed_hosts = parse_allowlist_env("S4_PRESIGNED_HTTP_ALLOWLIST")?;
         let allow_http = std::env::var("S4_PRESIGNED_HTTP_ALLOW_HTTP")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         let minimum_validity = std::env::var("S4_PRESIGNED_HTTP_MIN_VALIDITY_SECS")
@@ -249,6 +526,7 @@ impl PresignedHttpPolicy {
             Duration::ZERO,
             resolver,
         )
+        .unwrap()
     }
 
     pub async fn client_for(&self, url: &Url) -> Result<reqwest::Client, String> {
@@ -303,7 +581,12 @@ impl PresignedHttpPolicy {
         }
 
         let private_exception = self.private_allowed_hosts.contains(&host);
-        if !private_exception && addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        if addresses.iter().any(|address| is_ipv4_mapped(address.ip()))
+            || (!private_exception
+                && addresses
+                    .iter()
+                    .any(|address| is_forbidden_endpoint_ip(address.ip())))
+        {
             return Err("presigned URL resolves to a forbidden address range".to_string());
         }
         let pinned = addresses[0];
@@ -316,12 +599,11 @@ impl PresignedHttpPolicy {
     }
 
     fn host_allowed(&self, host: &str) -> bool {
-        self.allowed_hosts.contains(host)
-            || self.allowed_hosts.iter().any(|allowed| {
-                allowed
-                    .strip_prefix("*.")
-                    .is_some_and(|suffix| host.ends_with(&format!(".{suffix}")))
-            })
+        self.private_allowed_hosts.contains(host)
+            || self
+                .allowed_hosts
+                .iter()
+                .any(|allowed| allowed.matches(host))
     }
 }
 
@@ -409,45 +691,102 @@ fn parse_amz_timestamp(value: &str) -> Option<SystemTime> {
     (seconds >= 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds as u64))
 }
 
-fn is_public_ip(ip: IpAddr) -> bool {
+fn is_ipv4_mapped(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some())
+}
+
+const IPV4_FORBIDDEN_RANGES: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(0, 0, 0, 0), 8),
+    (Ipv4Addr::new(10, 0, 0, 0), 8),
+    (Ipv4Addr::new(100, 64, 0, 0), 10),
+    (Ipv4Addr::new(127, 0, 0, 0), 8),
+    (Ipv4Addr::new(169, 254, 0, 0), 16),
+    (Ipv4Addr::new(172, 16, 0, 0), 12),
+    (Ipv4Addr::new(192, 0, 0, 0), 24),
+    (Ipv4Addr::new(192, 0, 2, 0), 24),
+    (Ipv4Addr::new(192, 88, 99, 2), 32),
+    (Ipv4Addr::new(192, 168, 0, 0), 16),
+    (Ipv4Addr::new(198, 18, 0, 0), 15),
+    (Ipv4Addr::new(198, 51, 100, 0), 24),
+    (Ipv4Addr::new(203, 0, 113, 0), 24),
+    (Ipv4Addr::new(224, 0, 0, 0), 4),
+    (Ipv4Addr::new(240, 0, 0, 0), 4),
+];
+
+const IPV4_PUBLIC_EXCEPTIONS: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(192, 0, 0, 9), 32),
+    (Ipv4Addr::new(192, 0, 0, 10), 32),
+];
+
+const IPV6_FORBIDDEN_RANGES: &[(Ipv6Addr, u8)] = &[
+    // Current IANA reserved address-space allocations.
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 8),
+    (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 8),
+    (Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0), 7),
+    (Ipv6Addr::new(0x0400, 0, 0, 0, 0, 0, 0, 0), 6),
+    (Ipv6Addr::new(0x0800, 0, 0, 0, 0, 0, 0, 0), 5),
+    (Ipv6Addr::new(0x1000, 0, 0, 0, 0, 0, 0, 0), 4),
+    (Ipv6Addr::new(0x4000, 0, 0, 0, 0, 0, 0, 0), 3),
+    (Ipv6Addr::new(0x6000, 0, 0, 0, 0, 0, 0, 0), 3),
+    (Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0), 3),
+    (Ipv6Addr::new(0xa000, 0, 0, 0, 0, 0, 0, 0), 3),
+    (Ipv6Addr::new(0xc000, 0, 0, 0, 0, 0, 0, 0), 3),
+    (Ipv6Addr::new(0xe000, 0, 0, 0, 0, 0, 0, 0), 4),
+    (Ipv6Addr::new(0xf000, 0, 0, 0, 0, 0, 0, 0), 5),
+    (Ipv6Addr::new(0xf800, 0, 0, 0, 0, 0, 0, 0), 6),
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+    (Ipv6Addr::new(0xfe00, 0, 0, 0, 0, 0, 0, 0), 9),
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+    // Non-global entries in the current IANA special-purpose registry.
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0), 96),
+    (Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64),
+    (Ipv6Addr::new(0x0100, 0, 0, 1, 0, 0, 0, 0), 64),
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
+    (Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
+];
+
+const IPV6_PUBLIC_EXCEPTIONS: &[(Ipv6Addr, u8)] = &[
+    (Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96),
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1), 128),
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2), 128),
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3), 128),
+    (Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x2001, 4, 0x0112, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0), 28),
+    (Ipv6Addr::new(0x2001, 0x0030, 0, 0, 0, 0, 0, 0), 28),
+];
+
+fn is_forbidden_endpoint_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => is_public_ipv4(ip),
-        IpAddr::V6(ip) => is_public_ipv6(ip),
+        IpAddr::V4(ip) => {
+            in_ipv4_ranges(ip, IPV4_FORBIDDEN_RANGES) && !in_ipv4_ranges(ip, IPV4_PUBLIC_EXCEPTIONS)
+        }
+        IpAddr::V6(ip) => {
+            in_ipv6_ranges(ip, IPV6_FORBIDDEN_RANGES) && !in_ipv6_ranges(ip, IPV6_PUBLIC_EXCEPTIONS)
+        }
     }
 }
 
-fn is_public_ipv4(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    !matches!(
-        octets,
-        [0, ..]
-            | [10, ..]
-            | [100, 64..=127, ..]
-            | [127, ..]
-            | [169, 254, ..]
-            | [172, 16..=31, ..]
-            | [192, 0, 0, ..]
-            | [192, 0, 2, ..]
-            | [192, 88, 99, ..]
-            | [192, 168, ..]
-            | [198, 18..=19, ..]
-            | [198, 51, 100, ..]
-            | [203, 0, 113, ..]
-            | [224..=255, ..]
-    )
+fn in_ipv4_ranges(ip: Ipv4Addr, ranges: &[(Ipv4Addr, u8)]) -> bool {
+    let bits = u32::from(ip);
+    ranges.iter().any(|(network, prefix)| {
+        let shift = Ipv4Addr::BITS - u32::from(*prefix);
+        bits >> shift == u32::from(*network) >> shift
+    })
 }
 
-fn is_public_ipv6(ip: Ipv6Addr) -> bool {
-    if let Some(ipv4) = ip.to_ipv4_mapped() {
-        return is_public_ipv4(ipv4);
-    }
-    let segments = ip.segments();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || segments[0] & 0xfe00 == 0xfc00
-        || segments[0] & 0xffc0 == 0xfe80
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+fn in_ipv6_ranges(ip: Ipv6Addr, ranges: &[(Ipv6Addr, u8)]) -> bool {
+    let bits = u128::from(ip);
+    ranges.iter().any(|(network, prefix)| {
+        let shift = Ipv6Addr::BITS - u32::from(*prefix);
+        bits >> shift == u128::from(*network) >> shift
+    })
 }
 
 #[cfg(test)]
@@ -473,11 +812,69 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct FailingResolver;
+
     #[async_trait]
     impl AddressResolver for StaticResolver {
         async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.addresses.clone())
+        }
+    }
+
+    #[async_trait]
+    impl AddressResolver for FailingResolver {
+        async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            Err(std::io::Error::other("test DNS failure"))
+        }
+    }
+
+    struct FailingWorkspaceStorageRepository;
+
+    #[async_trait]
+    impl WorkspaceStorageRepository for FailingWorkspaceStorageRepository {
+        async fn resolve_workspace(
+            &self,
+            _user_id: &str,
+        ) -> Result<WorkspaceId, crate::workspace_storage::WorkspaceStorageError> {
+            Err(crate::workspace_storage::WorkspaceStorageError::Repository(
+                "database details must not escape".to_string(),
+            ))
+        }
+
+        async fn get_runtime_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<Option<RuntimeBackendConfig>, crate::workspace_storage::WorkspaceStorageError>
+        {
+            Err(crate::workspace_storage::WorkspaceStorageError::Repository(
+                "database details must not escape".to_string(),
+            ))
+        }
+
+        async fn get_public_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<
+            crate::workspace_storage::BackendConfigResponse,
+            crate::workspace_storage::WorkspaceStorageError,
+        > {
+            Err(crate::workspace_storage::WorkspaceStorageError::Repository(
+                "database details must not escape".to_string(),
+            ))
+        }
+
+        async fn put_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+            _request: crate::workspace_storage::BackendConfigRequest,
+        ) -> Result<
+            crate::workspace_storage::BackendConfigResponse,
+            crate::workspace_storage::WorkspaceStorageError,
+        > {
+            Err(crate::workspace_storage::WorkspaceStorageError::Repository(
+                "database details must not escape".to_string(),
+            ))
         }
     }
 
@@ -488,6 +885,40 @@ mod tests {
             .as_secs()
             + 3600;
         Url::parse(&format!("https://{host}/object?Expires={expires}")).unwrap()
+    }
+
+    fn workspace_policy(explicit_single_tenant: bool) -> WorkspaceEndpointPolicy {
+        WorkspaceEndpointPolicy::new(
+            explicit_single_tenant,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            Arc::new(StaticResolver {
+                addresses: vec!["93.184.216.34:443".parse().unwrap()],
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap()
+    }
+
+    fn workspace_policy_with(
+        explicit_single_tenant: bool,
+        trusted_hosts: &[&str],
+        private_allowed_hosts: &[&str],
+        addresses: &[&str],
+    ) -> WorkspaceEndpointPolicy {
+        WorkspaceEndpointPolicy::new(
+            explicit_single_tenant,
+            trusted_hosts.iter().map(|host| (*host).to_string()),
+            private_allowed_hosts.iter().map(|host| (*host).to_string()),
+            Arc::new(StaticResolver {
+                addresses: addresses
+                    .iter()
+                    .map(|address| address.parse().unwrap())
+                    .collect(),
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -550,6 +981,8 @@ mod tests {
             empty_managed.clone(),
             None,
             memory.clone(),
+            true,
+            workspace_policy(true),
         );
         assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::Memory).await;
 
@@ -559,6 +992,8 @@ mod tests {
             empty_managed,
             Some(global.clone()),
             memory.clone(),
+            true,
+            workspace_policy(true),
         );
         assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::GlobalS3).await;
 
@@ -575,6 +1010,8 @@ mod tests {
             managed.clone(),
             Some(global.clone()),
             memory.clone(),
+            true,
+            workspace_policy(true),
         );
         assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::Managed).await;
 
@@ -593,7 +1030,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let resolver = BackendResolver::new(repository, managed, Some(global), memory.clone());
+        let resolver = BackendResolver::new(
+            repository,
+            managed,
+            Some(global),
+            memory.clone(),
+            true,
+            workspace_policy(true),
+        );
         assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::PerUserS3).await;
 
         // S7a: x-s4-storage-mode: managed forces managed storage even for a
@@ -611,6 +1055,8 @@ mod tests {
             Arc::new(ServiceStorage::new(Vec::new())),
             None,
             memory.clone(),
+            true,
+            workspace_policy(true),
         );
         assert!(
             no_managed
@@ -659,6 +1105,8 @@ mod tests {
             Arc::new(ServiceStorage::new(Vec::new())),
             Some(global),
             memory.clone(),
+            false,
+            workspace_policy(false),
         );
         for operation in [
             StorageOperation::Get,
@@ -685,32 +1133,31 @@ mod tests {
             access_key: "key".to_string(),
             secret_key: "secret".to_string(),
         }]));
-        let available = BackendResolver::new(repository, managed, None, memory);
+        let available = BackendResolver::new(
+            repository,
+            managed,
+            None,
+            memory,
+            false,
+            workspace_policy(false),
+        );
         assert_operations_resolve_to(&available, &HeaderMap::new(), BackendKind::Managed).await;
     }
 
     #[tokio::test]
-    async fn byo_s3_custom_endpoint_uses_path_style_addressing() {
+    async fn multi_tenant_workspace_never_falls_through_to_global_or_memory_storage() {
         use crate::workspace_storage::{
             BackendConfigRequest, BackendType, InMemoryWorkspaceStorageRepository,
         };
 
-        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let app = Router::new()
-            .fallback(any(capture_request_path))
-            .with_state(paths.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let workspace = WorkspaceId::new("workspace").unwrap();
         let repository = Arc::new(InMemoryWorkspaceStorageRepository::new());
+        let configured = WorkspaceId::new("configured-workspace").unwrap();
         repository
             .put_config(
-                &workspace,
+                &configured,
                 BackendConfigRequest {
                     backend_type: BackendType::S3Compatible,
-                    endpoint,
+                    endpoint: "https://tenant.storage.example".to_string(),
                     access_key: "key".to_string(),
                     secret_key: "secret".to_string(),
                     region: "us-east-1".to_string(),
@@ -722,25 +1169,506 @@ mod tests {
         let resolver = BackendResolver::new(
             repository,
             Arc::new(ServiceStorage::new(Vec::new())),
-            None,
+            Some(test_s3_client().await),
             Arc::new(MemoryStore::new()),
+            false,
+            workspace_policy_with(false, &["*.storage.example"], &[], &["93.184.216.34:443"]),
         );
-        let ResolvedBackend::S3 { client, .. } = resolver
-            .resolve(&workspace, &HeaderMap::new(), StorageOperation::Head)
-            .await
-            .unwrap()
-        else {
-            panic!("expected BYO S3 backend");
-        };
-        client
-            .head_bucket()
-            .bucket("bucket.with.dots")
-            .send()
-            .await
-            .unwrap();
 
-        assert_eq!(paths.lock().unwrap().as_slice(), ["/bucket.with.dots/"]);
-        server.abort();
+        assert_eq!(
+            resolver
+                .resolve(&configured, &HeaderMap::new(), StorageOperation::Get)
+                .await
+                .unwrap()
+                .kind(),
+            BackendKind::PerUserS3
+        );
+        let unconfigured = WorkspaceId::new("other-workspace").unwrap();
+        let Err(error) = resolver
+            .resolve(&unconfigured, &HeaderMap::new(), StorageOperation::Get)
+            .await
+        else {
+            panic!("unconfigured tenant must not reach process-global storage");
+        };
+        assert_eq!(error, "workspace storage is unavailable");
+    }
+
+    #[tokio::test]
+    async fn multi_tenant_unconfigured_workspace_defaults_to_managed_storage() {
+        use crate::service_storage::ServiceBackend;
+        use crate::workspace_storage::InMemoryWorkspaceStorageRepository;
+
+        let managed = Arc::new(ServiceStorage::new(vec![ServiceBackend {
+            provider: "test".to_string(),
+            endpoint: "https://managed.example".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "managed".to_string(),
+            access_key: "key".to_string(),
+            secret_key: "secret".to_string(),
+        }]));
+        let resolver = BackendResolver::new(
+            Arc::new(InMemoryWorkspaceStorageRepository::new()),
+            managed,
+            Some(test_s3_client().await),
+            Arc::new(MemoryStore::new()),
+            false,
+            workspace_policy(false),
+        );
+
+        assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::Managed).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_single_tenant_mode_preserves_global_and_memory_fallbacks() {
+        use crate::workspace_storage::InMemoryWorkspaceStorageRepository;
+
+        let repository = Arc::new(InMemoryWorkspaceStorageRepository::new());
+        let memory = Arc::new(MemoryStore::new());
+        let global = BackendResolver::new(
+            repository.clone(),
+            Arc::new(ServiceStorage::new(Vec::new())),
+            Some(test_s3_client().await),
+            memory.clone(),
+            true,
+            workspace_policy(true),
+        );
+        assert_operations_resolve_to(&global, &HeaderMap::new(), BackendKind::GlobalS3).await;
+
+        let local = BackendResolver::new(
+            repository,
+            Arc::new(ServiceStorage::new(Vec::new())),
+            None,
+            memory,
+            true,
+            workspace_policy(true),
+        );
+        assert_operations_resolve_to(&local, &HeaderMap::new(), BackendKind::Memory).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_repository_failure_is_bounded_and_fail_closed() {
+        let resolver = BackendResolver::new(
+            Arc::new(FailingWorkspaceStorageRepository),
+            Arc::new(ServiceStorage::new(Vec::new())),
+            Some(test_s3_client().await),
+            Arc::new(MemoryStore::new()),
+            false,
+            workspace_policy(false),
+        );
+        let workspace = WorkspaceId::new("workspace").unwrap();
+        let Err(error) = resolver
+            .resolve(&workspace, &HeaderMap::new(), StorageOperation::Get)
+            .await
+        else {
+            panic!("repository failure must not use a fallback backend");
+        };
+        assert_eq!(error, "workspace storage is unavailable");
+    }
+
+    #[test]
+    fn byo_s3_custom_endpoint_uses_path_style_and_ignores_environment_proxies() {
+        const CHILD_ENV: &str = "S4_TEST_WORKSPACE_S3_NO_PROXY_CHILD";
+        const TEST_NAME: &str = "backend::tests::byo_s3_custom_endpoint_uses_path_style_and_ignores_environment_proxies";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let poison_proxy = "http://127.0.0.1:1";
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("HTTP_PROXY", poison_proxy)
+                .env("http_proxy", poison_proxy)
+                .env("HTTPS_PROXY", poison_proxy)
+                .env("https_proxy", poison_proxy)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .status()
+                .unwrap();
+            assert!(status.success(), "proxy-poisoned child test failed");
+            return;
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use crate::workspace_storage::{
+                BackendConfigRequest, BackendType, InMemoryWorkspaceStorageRepository,
+            };
+
+            let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let app = Router::new()
+                .fallback(any(capture_request_path))
+                .with_state(paths.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let workspace = WorkspaceId::new("workspace").unwrap();
+            let repository = Arc::new(InMemoryWorkspaceStorageRepository::new());
+            repository
+                .put_config(
+                    &workspace,
+                    BackendConfigRequest {
+                        backend_type: BackendType::S3Compatible,
+                        endpoint,
+                        access_key: "key".to_string(),
+                        secret_key: "secret".to_string(),
+                        region: "us-east-1".to_string(),
+                        role_arn: String::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            let resolver = BackendResolver::new(
+                repository,
+                Arc::new(ServiceStorage::new(Vec::new())),
+                None,
+                Arc::new(MemoryStore::new()),
+                true,
+                WorkspaceEndpointPolicy::new(
+                    true,
+                    Vec::<String>::new(),
+                    ["127.0.0.1".to_string()],
+                    Arc::new(TokioAddressResolver),
+                )
+                .unwrap(),
+            );
+            let ResolvedBackend::S3 { client, .. } = resolver
+                .resolve(&workspace, &HeaderMap::new(), StorageOperation::Head)
+                .await
+                .unwrap()
+            else {
+                panic!("expected BYO S3 backend");
+            };
+            client
+                .head_bucket()
+                .bucket("bucket.with.dots")
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(paths.lock().unwrap().as_slice(), ["/bucket.with.dots/"]);
+            server.abort();
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("https://{}", listener.local_addr().unwrap());
+            let direct_connection = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(stream);
+            });
+            let workspace = WorkspaceId::new("https-workspace").unwrap();
+            let repository = Arc::new(InMemoryWorkspaceStorageRepository::new());
+            repository
+                .put_config(
+                    &workspace,
+                    BackendConfigRequest {
+                        backend_type: BackendType::S3Compatible,
+                        endpoint,
+                        access_key: "key".to_string(),
+                        secret_key: "secret".to_string(),
+                        region: "us-east-1".to_string(),
+                        role_arn: String::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            let resolver = BackendResolver::new(
+                repository,
+                Arc::new(ServiceStorage::new(Vec::new())),
+                None,
+                Arc::new(MemoryStore::new()),
+                true,
+                WorkspaceEndpointPolicy::new(
+                    true,
+                    Vec::<String>::new(),
+                    ["127.0.0.1".to_string()],
+                    Arc::new(TokioAddressResolver),
+                )
+                .unwrap(),
+            );
+            let ResolvedBackend::S3 { client, .. } = resolver
+                .resolve(&workspace, &HeaderMap::new(), StorageOperation::Head)
+                .await
+                .unwrap()
+            else {
+                panic!("expected BYO S3 backend");
+            };
+            assert!(client.head_bucket().bucket("bucket").send().await.is_err());
+            tokio::time::timeout(Duration::from_secs(1), direct_connection)
+                .await
+                .expect("HTTPS request used the poisoned proxy instead of the endpoint")
+                .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn workspace_policy_uses_exact_and_dot_boundary_suffix_matching() {
+        let policy = workspace_policy_with(
+            false,
+            &["objects.example", "*.storage.example", "*.backblazeb2.com"],
+            &[],
+            &["93.184.216.34:443"],
+        );
+        for endpoint in [
+            "https://objects.example",
+            "https://tenant.storage.example",
+            "https://s3.us-east-005.backblazeb2.com",
+        ] {
+            assert!(policy.validate(endpoint).await.is_ok(), "{endpoint}");
+        }
+        for endpoint in [
+            "https://other.objects.example",
+            "https://evilstorage.example",
+            "https://storage.example",
+        ] {
+            assert!(policy.validate(endpoint).await.is_err(), "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_tenant_workspace_policy_requires_https_and_clean_urls() {
+        let policy =
+            workspace_policy_with(false, &["objects.example"], &[], &["93.184.216.34:443"]);
+        for endpoint in [
+            "http://objects.example",
+            "https://user@objects.example",
+            "https://objects.example?token=secret",
+            "https://objects.example#fragment",
+        ] {
+            assert!(policy.validate(endpoint).await.is_err(), "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_policy_requires_successful_public_dns_resolution() {
+        let empty = workspace_policy_with(false, &["objects.example"], &[], &[]);
+        assert!(empty.validate("https://objects.example").await.is_err());
+
+        let failed = WorkspaceEndpointPolicy::new(
+            false,
+            ["objects.example".to_string()],
+            Vec::<String>::new(),
+            Arc::new(FailingResolver),
+        )
+        .unwrap();
+        assert!(failed.validate("https://objects.example").await.is_err());
+
+        let private = workspace_policy_with(false, &["objects.example"], &[], &["10.0.0.1:443"]);
+        assert!(private.validate("https://objects.example").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn private_and_http_workspace_endpoints_require_explicit_single_tenant_operator_trust() {
+        let public_http = workspace_policy_with(true, &[], &[], &["93.184.216.34:80"]);
+        assert!(public_http.validate("http://objects.example").await.is_ok());
+
+        let private_denied = workspace_policy_with(true, &[], &[], &["127.0.0.1:9000"]);
+        assert!(
+            private_denied
+                .validate("http://minio.internal:9000")
+                .await
+                .is_err()
+        );
+        let private_allowed =
+            workspace_policy_with(true, &[], &["minio.internal"], &["127.0.0.1:9000"]);
+        assert!(
+            private_allowed
+                .validate("http://minio.internal:9000")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_policy_rejects_dns_rebinding_and_mapped_ipv6() {
+        let rebound = workspace_policy_with(
+            false,
+            &["objects.example"],
+            &[],
+            &["93.184.216.34:443", "169.254.169.254:443"],
+        );
+        assert!(rebound.validate("https://objects.example").await.is_err());
+
+        let mapped = workspace_policy_with(
+            true,
+            &[],
+            &["objects.internal"],
+            &["[::ffff:127.0.0.1]:443"],
+        );
+        assert!(mapped.validate("https://objects.internal").await.is_err());
+        assert!(mapped.validate("https://[::ffff:127.0.0.1]").await.is_err());
+    }
+
+    #[test]
+    fn workspace_policy_rejects_empty_broad_and_ip_allowlist_entries() {
+        for entry in [
+            "",
+            "*",
+            "*.com",
+            "*.co.uk",
+            "*.storage.example.",
+            "storage.example.",
+            "b\u{fc}cket.example",
+            "127.0.0.1",
+            "::1",
+            "foo..example",
+            "foo_example.com",
+            "https://storage.example",
+        ] {
+            assert!(
+                WorkspaceEndpointPolicy::new(
+                    false,
+                    [entry.to_string()],
+                    Vec::<String>::new(),
+                    Arc::new(TokioAddressResolver),
+                )
+                .is_err(),
+                "workspace pattern {entry:?}",
+            );
+            assert!(
+                PresignedHttpPolicy::new(
+                    [entry.to_string()],
+                    Vec::<String>::new(),
+                    false,
+                    Duration::ZERO,
+                    Arc::new(TokioAddressResolver),
+                )
+                .is_err(),
+                "presigned pattern {entry:?}",
+            );
+        }
+        assert!(
+            WorkspaceEndpointPolicy::new(
+                true,
+                Vec::<String>::new(),
+                ["*.internal".to_string()],
+                Arc::new(TokioAddressResolver),
+            )
+            .is_err()
+        );
+        assert!(
+            WorkspaceEndpointPolicy::new(
+                false,
+                ["objects.example".to_string()],
+                ["objects.example".to_string()],
+                Arc::new(TokioAddressResolver),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn trusted_host_patterns_normalize_and_keep_strict_dns_boundaries() {
+        let exact = TrustedHostPattern::parse(" Objects.Example ".to_string()).unwrap();
+        assert!(exact.matches("objects.example"));
+        assert!(!exact.matches("other.objects.example"));
+
+        let provider = TrustedHostPattern::parse("*.BackblazeB2.com".to_string()).unwrap();
+        assert!(provider.matches("s3.us-east-005.backblazeb2.com"));
+        assert!(!provider.matches("backblazeb2.com"));
+        assert!(!provider.matches("evilbackblazeb2.com"));
+        assert!(!provider.matches("backblazeb2.com.evil.example"));
+
+        let presigned = PresignedHttpPolicy::new(
+            ["*.BackblazeB2.com".to_string()],
+            Vec::<String>::new(),
+            false,
+            Duration::ZERO,
+            Arc::new(TokioAddressResolver),
+        )
+        .unwrap();
+        assert!(presigned.host_allowed("s3.us-east-005.backblazeb2.com"));
+        assert!(!presigned.host_allowed("backblazeb2.com"));
+    }
+
+    #[test]
+    fn every_forbidden_ip_prefix_boundary_is_classified() {
+        for (network, prefix) in IPV4_FORBIDDEN_RANGES {
+            let host_bits = Ipv4Addr::BITS - u32::from(*prefix);
+            let host_mask = u32::MAX.checked_shr(u32::from(*prefix)).unwrap_or(0);
+            let last = Ipv4Addr::from(u32::from(*network) | host_mask);
+            assert!(
+                is_forbidden_endpoint_ip(IpAddr::V4(*network)),
+                "{network}/{prefix} network"
+            );
+            assert!(
+                is_forbidden_endpoint_ip(IpAddr::V4(last)),
+                "{network}/{prefix} last address ({host_bits} host bits)"
+            );
+        }
+
+        for (network, prefix) in IPV6_FORBIDDEN_RANGES {
+            let host_bits = Ipv6Addr::BITS - u32::from(*prefix);
+            let host_mask = u128::MAX.checked_shr(u32::from(*prefix)).unwrap_or(0);
+            let last = Ipv6Addr::from(u128::from(*network) | host_mask);
+            assert!(
+                is_forbidden_endpoint_ip(IpAddr::V6(*network)),
+                "{network}/{prefix} network"
+            );
+            assert!(
+                is_forbidden_endpoint_ip(IpAddr::V6(last)),
+                "{network}/{prefix} last address ({host_bits} host bits)"
+            );
+        }
+    }
+
+    #[test]
+    fn current_special_purpose_examples_are_forbidden() {
+        for (address, purpose) in [
+            ("0.0.0.0", "this network"),
+            ("10.0.0.1", "private"),
+            ("100.64.0.1", "shared"),
+            ("127.0.0.1", "loopback"),
+            ("169.254.169.254", "link local"),
+            ("192.0.2.1", "documentation"),
+            ("198.18.0.1", "benchmarking"),
+            ("224.0.0.1", "multicast"),
+            ("240.0.0.1", "reserved"),
+            ("::", "unspecified"),
+            ("::1", "loopback"),
+            ("::ffff:8.8.8.8", "IPv4-mapped IPv6"),
+            ("64:ff9b:1::1", "non-global translation"),
+            ("100::1", "discard"),
+            ("100:0:0:1::1", "dummy"),
+            ("2001:2::1", "benchmarking"),
+            ("2001:db8::1", "documentation"),
+            ("2002::1", "6to4"),
+            ("3fff:fff::1", "documentation"),
+            ("5f00::1", "segment routing"),
+            ("fc00::1", "unique local"),
+            ("fe80::1", "link local"),
+            ("ff02::1", "multicast"),
+        ] {
+            assert!(
+                is_forbidden_endpoint_ip(address.parse().unwrap()),
+                "{purpose}: {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn globally_reachable_controls_remain_public() {
+        for (address, purpose) in [
+            ("8.8.8.8", "ordinary IPv4"),
+            ("93.184.216.34", "ordinary IPv4"),
+            ("192.0.0.9", "PCP anycast"),
+            ("192.0.0.10", "TURN anycast"),
+            ("192.31.196.1", "AS112-v4"),
+            ("192.52.193.1", "AMT-v4"),
+            ("192.175.48.1", "direct AS112-v4"),
+            ("64:ff9b::808:808", "global translation"),
+            ("2001:1::1", "PCP anycast"),
+            ("2001:1::2", "TURN anycast"),
+            ("2001:1::3", "DNS-SD anycast"),
+            ("2001:3::1", "AMT-v6"),
+            ("2001:4:112::1", "AS112-v6"),
+            ("2001:20::1", "ORCHIDv2"),
+            ("2001:30::1", "DETs"),
+            ("2606:4700:4700::1111", "ordinary IPv6"),
+            ("2620:4f:8000::1", "direct AS112-v6"),
+            ("3fff:1000::1", "outside documentation prefix"),
+        ] {
+            assert!(
+                !is_forbidden_endpoint_ip(address.parse().unwrap()),
+                "{purpose}: {address}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -778,11 +1706,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn presigned_http_get_requires_the_operator_flag() {
+        let url = Url::parse("http://objects.example/object?Expires=9999999999").unwrap();
+        let resolver = Arc::new(StaticResolver {
+            addresses: vec!["93.184.216.34:80".parse().unwrap()],
+            calls: AtomicUsize::new(0),
+        });
+        let denied =
+            PresignedHttpPolicy::for_test(["objects.example".to_string()], false, resolver.clone());
+        assert!(denied.client_for(&url).await.is_err());
+
+        let allowed =
+            PresignedHttpPolicy::for_test(["objects.example".to_string()], true, resolver);
+        assert!(allowed.client_for(&url).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn presigned_http_put_and_delete_are_always_rejected() {
+        let url = Url::parse("http://objects.example/object?Expires=9999999999").unwrap();
+        let policy = PresignedHttpPolicy::for_test(
+            ["objects.example".to_string()],
+            true,
+            Arc::new(StaticResolver {
+                addresses: vec!["93.184.216.34:80".parse().unwrap()],
+                calls: AtomicUsize::new(0),
+            }),
+        );
+
+        for method in ["PUT", "DELETE"] {
+            assert!(
+                policy
+                    .client_for_destination(&url, Duration::ZERO)
+                    .await
+                    .is_err(),
+                "HTTP {method} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn private_and_metadata_addresses_need_exact_admin_exception() {
         for address in ["127.0.0.1:443", "10.0.0.1:443", "169.254.169.254:443"] {
-            assert!(!is_public_ip(address.parse::<SocketAddr>().unwrap().ip()));
+            assert!(is_forbidden_endpoint_ip(
+                address.parse::<SocketAddr>().unwrap().ip()
+            ));
         }
-        assert!(is_public_ip("93.184.216.34".parse().unwrap()));
+        assert!(!is_forbidden_endpoint_ip("93.184.216.34".parse().unwrap()));
 
         let resolver = Arc::new(StaticResolver {
             addresses: vec!["127.0.0.1:443".parse().unwrap()],
@@ -793,6 +1762,24 @@ mod tests {
 
         let allowed = PresignedHttpPolicy::for_test(["localhost".to_string()], false, resolver);
         assert!(allowed.client_for(&future_url("localhost")).await.is_ok());
+
+        let mapped = PresignedHttpPolicy::new(
+            Vec::<String>::new(),
+            ["objects.internal".to_string()],
+            false,
+            Duration::ZERO,
+            Arc::new(StaticResolver {
+                addresses: vec!["[::ffff:127.0.0.1]:443".parse().unwrap()],
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap();
+        assert!(
+            mapped
+                .client_for(&future_url("objects.internal"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -820,15 +1807,16 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let policy = PresignedHttpPolicy::new(
-            ["*.example".to_string()],
+            ["*.storage.example.com".to_string()],
             Vec::<String>::new(),
             false,
             Duration::ZERO,
             resolver,
-        );
+        )
+        .unwrap();
         assert!(
             policy
-                .client_for(&future_url("objects.example"))
+                .client_for(&future_url("objects.storage.example.com"))
                 .await
                 .is_err()
         );

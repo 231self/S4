@@ -117,6 +117,9 @@ async fn test_state() -> Arc<AppState> {
     // values so concurrent runs stay deterministic.
     unsafe {
         std::env::set_var("AUTH_DISABLED", "0");
+        std::env::set_var("S4_SINGLE_TENANT", "1");
+        std::env::set_var("S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST", "127.0.0.1");
+        std::env::remove_var("S4_WORKSPACE_ENDPOINT_ALLOWLIST");
         std::env::remove_var("DATABASE_URL");
         std::env::remove_var("S4_KEYS_FILE");
         std::env::remove_var("S3_ENDPOINT");
@@ -188,7 +191,7 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
         .uri("/dashboard/api/backend")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
-            r#"{"backend_type":"s3_compatible","endpoint":"https://objects.example","access_key":"access","secret_key":"secret","region":"us-east-1"}"#,
+            r#"{"backend_type":"s3_compatible","endpoint":"http://127.0.0.1:9000","access_key":"access","secret_key":"secret","region":"us-east-1"}"#,
         ))
         .unwrap();
     assert_eq!(
@@ -216,7 +219,7 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
-            r#"{"backend_type":"s3_compatible","endpoint":"https://objects.example","access_key":"access","secret_key":"secret","region":"us-east-1"}"#,
+            r#"{"backend_type":"s3_compatible","endpoint":"http://127.0.0.1:9000","access_key":"access","secret_key":"secret","region":"us-east-1"}"#,
         ))
         .unwrap();
     let response = app.clone().oneshot(configured).await.unwrap();
@@ -242,7 +245,7 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
         .await
         .unwrap();
     let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(response_json["endpoint"], "https://objects.example");
+    assert_eq!(response_json["endpoint"], "http://127.0.0.1:9000");
     assert_eq!(response_json["access_key_configured"], true);
     assert_eq!(response_json["secret_key_configured"], true);
     assert!(!String::from_utf8_lossy(&body).contains("\"access_key\":"));
@@ -2013,12 +2016,13 @@ async fn presigned_transport_failure_never_discloses_signed_url_material() {
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.presigned_http_policy = PresignedHttpPolicy::new(
-        ["127.0.0.1".to_string()],
+        Vec::<String>::new(),
         ["127.0.0.1".to_string()],
         true,
         Duration::ZERO,
         Arc::new(TokioAddressResolver),
-    );
+    )
+    .unwrap();
     let (ak, sk) = make_key(&state).await;
     let expires = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -2074,12 +2078,13 @@ async fn presigned_http_responses_are_hardened_without_losing_object_semantics()
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.presigned_http_policy = PresignedHttpPolicy::new(
-        ["127.0.0.1".to_string()],
+        Vec::<String>::new(),
         ["127.0.0.1".to_string()],
         true,
         Duration::ZERO,
         Arc::new(TokioAddressResolver),
-    );
+    )
+    .unwrap();
     let (ak, sk) = make_key(&state).await;
     let headers = auth_headers(&ak, &sk);
     let app = build_router(state);

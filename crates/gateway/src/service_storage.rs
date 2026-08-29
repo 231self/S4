@@ -1,4 +1,3 @@
-use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use bytes::Bytes;
@@ -16,6 +15,9 @@ use crate::managed::{
     NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget,
     PhysicalWriteIntent, Placement, RepairKind, RepairRecord, RepairTargetRole,
     generation_physical_key, rendezvous_placement,
+};
+use crate::s3_safety::{
+    record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, DirectS3Sink, ExpectedObject,
@@ -57,7 +59,8 @@ impl ServiceBackend {
             .region(Region::new(region))
             .endpoint_url(&endpoint)
             .credentials_provider(creds)
-            .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .retry_config(s3_retry_config())
+            .timeout_config(s3_timeout_config())
             .load()
             .await;
         Some(Client::from_conf(
@@ -348,10 +351,7 @@ impl ServiceStorage {
                 .raw_response()
                 .is_some_and(|response| response.status().as_u16() == 404)
         {
-            return Err(format!(
-                "deleting managed physical version from {} failed: {error}",
-                target.backend_id
-            ));
+            return Err(record_s3_failure("managed_delete_version", &error).to_string());
         }
 
         let mut head = client
@@ -369,10 +369,7 @@ impl ServiceStorage {
             {
                 Ok(())
             }
-            Err(error) => Err(format!(
-                "verifying managed physical version absence from {} failed: {error}",
-                target.backend_id
-            )),
+            Err(error) => Err(record_s3_failure("managed_verify_delete", &error).to_string()),
             Ok(_) => Err(format!(
                 "managed physical version on {} is still present after deletion",
                 target.backend_id
@@ -457,7 +454,10 @@ impl ServiceStorage {
                 None => BackendVersioningMode::Unversioned,
                 Some(_) => BackendVersioningMode::Unknown,
             },
-            Err(_) => BackendVersioningMode::Unknown,
+            Err(error) => {
+                record_s3_failure("managed_get_bucket_versioning", &error);
+                BackendVersioningMode::Unknown
+            }
         }
     }
 
@@ -658,7 +658,18 @@ impl ServiceStorage {
             if let Some(range) = range {
                 request = request.range(range);
             }
-            request.send().await.ok()
+            match request.send().await {
+                Ok(output) => Some(output),
+                Err(error) => {
+                    if !error
+                        .as_service_error()
+                        .is_some_and(|service| service.is_no_such_key())
+                    {
+                        record_s3_failure("managed_get_object", &error);
+                    }
+                    None
+                }
+            }
         };
 
         if let Some(output) = try_get(primary).await {
@@ -677,22 +688,26 @@ impl ServiceStorage {
             .client_for(primary)
             .await
             .ok_or_else(|| anyhow::anyhow!("No client for primary"))?;
-        let _ = primary_client
+        if let Err(error) = primary_client
             .delete_object()
             .bucket(&self.backends[primary].bucket)
             .key(key)
             .send()
-            .await;
+            .await
+        {
+            record_s3_failure("managed_delete_object", &error);
+        }
 
         if let Some(ri) = replica_opt
             && let Some(rc) = self.client_for(ri).await
-        {
-            let _ = rc
+            && let Err(error) = rc
                 .delete_object()
                 .bucket(&self.backends[ri].bucket)
                 .key(key)
                 .send()
-                .await;
+                .await
+        {
+            record_s3_failure("managed_delete_replica", &error);
         }
         Ok(())
     }
@@ -701,13 +716,24 @@ impl ServiceStorage {
         let (primary, replica_opt) = self.get_backend_ids(key);
         let try_head = |index: usize| async move {
             let client = self.client_for(index).await?;
-            let resp = client
+            let resp = match client
                 .head_object()
                 .bucket(&self.backends[index].bucket)
                 .key(key)
                 .send()
                 .await
-                .ok()?;
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if !error
+                        .as_service_error()
+                        .is_some_and(|service| service.is_not_found())
+                    {
+                        record_s3_failure("managed_head_object", &error);
+                    }
+                    return None;
+                }
+            };
             let size = resp.content_length.map(|s| s as u64).unwrap_or(0);
             let etag = resp.e_tag.unwrap_or_default();
             Some((size, etag))
@@ -729,13 +755,24 @@ impl ServiceStorage {
         let (primary, replica_opt) = self.get_backend_ids(key);
         let try_head = |index: usize| async move {
             let client = self.client_for(index).await?;
-            client
+            match client
                 .head_object()
                 .bucket(&self.backends[index].bucket)
                 .key(key)
                 .send()
                 .await
-                .ok()
+            {
+                Ok(output) => Some(output),
+                Err(error) => {
+                    if !error
+                        .as_service_error()
+                        .is_some_and(|service| service.is_not_found())
+                    {
+                        record_s3_failure("managed_head_output", &error);
+                    }
+                    None
+                }
+            }
         };
         if let Some(output) = try_head(primary).await {
             return Some(output);
@@ -854,7 +891,18 @@ impl ServiceStorage {
         if let Some(range) = range {
             request = request.range(range);
         }
-        let output = request.send().await.ok()?;
+        let output = match request.send().await {
+            Ok(output) => output,
+            Err(error) => {
+                if !error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_no_such_key())
+                {
+                    record_s3_failure("managed_authoritative_get", &error);
+                }
+                return None;
+            }
+        };
         Self::metadata_matches(
             output.metadata(),
             output.content_length(),
@@ -930,13 +978,24 @@ impl ServiceStorage {
     ) -> Option<aws_sdk_s3::operation::head_object::HeadObjectOutput> {
         let index = self.index_for_id(backend_id)?;
         let client = self.client_for(index).await?;
-        let output = client
+        let output = match client
             .head_object()
             .bucket(&self.backends[index].bucket)
             .key(physical_key)
             .send()
             .await
-            .ok()?;
+        {
+            Ok(output) => output,
+            Err(error) => {
+                if !error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_not_found())
+                {
+                    record_s3_failure("managed_authoritative_head", &error);
+                }
+                return None;
+            }
+        };
         Self::metadata_matches(output.metadata(), output.content_length(), authority, false)
             .then_some(output)
     }
@@ -1294,7 +1353,7 @@ impl ServiceStorage {
             .key(&repair.physical_key)
             .send()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| record_s3_failure("managed_repair_get", &error).to_string())?;
         let authority = ObjectAuthority {
             logical: repair.logical.clone(),
             generation: repair.generation,
@@ -1333,7 +1392,11 @@ impl ServiceStorage {
             .await
             .map_err(|error| error.to_string())?;
         let mut body = output.body;
-        while let Some(chunk) = body.try_next().await.map_err(|error| error.to_string())? {
+        while let Some(chunk) = body
+            .try_next()
+            .await
+            .map_err(|_| record_s3_body_failure("managed_repair_get_body").to_string())?
+        {
             target
                 .write(chunk)
                 .await
@@ -1732,26 +1795,82 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
     }
 }
 
-pub fn parse_service_backends(env_value: &str) -> Vec<ServiceBackend> {
-    env_value
-        .split(';')
-        .filter(|s| !s.is_empty())
-        .filter_map(|def| {
-            let parts: Vec<&str> = def.split('|').collect();
-            if parts.len() >= 6 {
-                Some(ServiceBackend {
-                    provider: parts[0].to_string(),
-                    endpoint: parts[1].to_string(),
-                    region: parts[2].to_string(),
-                    bucket: parts[3].to_string(),
-                    access_key: parts[4].to_string(),
-                    secret_key: parts[5].to_string(),
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
+pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, String> {
+    fn valid_identifier(value: &str, max_len: usize) -> bool {
+        (1..=max_len).contains(&value.len())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }
+
+    fn valid_credential(value: &str) -> bool {
+        value.len() <= 4096 && value.bytes().all(|byte| byte.is_ascii_graphic())
+    }
+
+    let mut backends = Vec::new();
+    for (index, definition) in env_value.split(';').enumerate() {
+        let entry = index + 1;
+        let parts: Vec<&str> = definition.split('|').collect();
+        let [provider, endpoint, region, bucket, access_key, secret_key] = parts.as_slice() else {
+            return Err(format!(
+                "invalid S4_SERVICE_BUCKETS entry {entry}: expected exactly six fields"
+            ));
+        };
+        if parts.iter().any(|part| part.trim().is_empty()) {
+            return Err(format!(
+                "invalid S4_SERVICE_BUCKETS entry {entry}: fields must be non-empty"
+            ));
+        }
+        if !valid_identifier(provider, 128) {
+            return Err(format!(
+                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed provider"
+            ));
+        }
+        let endpoint_url = reqwest::Url::parse(endpoint)
+            .map_err(|_| format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint"))?;
+        if endpoint.len() > 2048
+            || !endpoint.bytes().all(|byte| byte.is_ascii_graphic())
+            || !matches!(endpoint_url.scheme(), "http" | "https")
+            || endpoint_url.host_str().is_none()
+            || !endpoint_url.username().is_empty()
+            || endpoint_url.password().is_some()
+            || endpoint_url.query().is_some()
+            || endpoint_url.fragment().is_some()
+        {
+            return Err(format!(
+                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint"
+            ));
+        }
+        if !valid_identifier(region, 128) {
+            return Err(format!(
+                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed region"
+            ));
+        }
+        if !valid_identifier(bucket, 255) {
+            return Err(format!(
+                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed bucket"
+            ));
+        }
+        if !valid_credential(access_key) {
+            return Err(format!(
+                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed access key"
+            ));
+        }
+        if !valid_credential(secret_key) {
+            return Err(format!(
+                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed secret key"
+            ));
+        }
+        backends.push(ServiceBackend {
+            provider: (*provider).to_string(),
+            endpoint: (*endpoint).to_string(),
+            region: (*region).to_string(),
+            bucket: (*bucket).to_string(),
+            access_key: (*access_key).to_string(),
+            secret_key: (*secret_key).to_string(),
+        });
+    }
+    Ok(backends)
 }
 
 #[cfg(test)]
@@ -1767,6 +1886,67 @@ mod tests {
     use axum::routing::any;
 
     type ProviderRequests = Arc<Mutex<Vec<(Method, String)>>>;
+
+    #[test]
+    fn service_backend_parser_accepts_exact_valid_entries() {
+        let backends = parse_service_backends(
+            "aws|https://s3.us-east-1.amazonaws.com|us-east-1|bucket.one|AKIA123|secret+/=;r2|https://account.r2.cloudflarestorage.com|auto|bucket-two|key|secret",
+        )
+        .unwrap();
+
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].provider, "aws");
+        assert_eq!(backends[1].bucket, "bucket-two");
+    }
+
+    #[test]
+    fn service_backend_parser_rejects_missing_extra_and_empty_fields() {
+        for value in [
+            "aws|https://s3.example|us-east-1|bucket|access",
+            "aws|https://s3.example|us-east-1|bucket|access|secret|extra",
+            "aws|https://s3.example|us-east-1|bucket|access|secret;",
+            "",
+        ] {
+            assert!(parse_service_backends(value).is_err(), "accepted {value:?}");
+        }
+
+        for empty_field in 0..6 {
+            let mut fields = [
+                "aws",
+                "https://s3.example",
+                "us-east-1",
+                "bucket",
+                "access",
+                "secret",
+            ];
+            fields[empty_field] = " ";
+            assert!(
+                parse_service_backends(&fields.join("|")).is_err(),
+                "accepted empty field {empty_field}",
+            );
+        }
+    }
+
+    #[test]
+    fn service_backend_parser_rejects_malformed_fields_without_echoing_values() {
+        let malformed = [
+            "aws/provider|https://s3.example|us-east-1|bucket|access|secret",
+            "aws|not-a-url|us-east-1|bucket|access|secret",
+            "aws|https://user@s3.example|us-east-1|bucket|access|secret",
+            "aws|https://s3.example?credential=secret|us-east-1|bucket|access|secret",
+            "aws|https://s3.example|us/east/1|bucket|access|secret",
+            "aws|https://s3.example|us-east-1|bucket/name|access|secret",
+            "aws|https://s3.example|us-east-1|bucket|ACCESS KEY VALUE|secret",
+            "aws|https://s3.example|us-east-1|bucket|access|secret\nvalue",
+        ];
+        for value in malformed {
+            let error = parse_service_backends(value).unwrap_err();
+            assert!(!error.contains(value));
+            assert!(!error.contains("credential=secret"));
+            assert!(!error.contains("ACCESS KEY VALUE"));
+            assert!(!error.contains("secret\nvalue"));
+        }
+    }
 
     async fn purge_provider_mock(
         State(requests): State<ProviderRequests>,

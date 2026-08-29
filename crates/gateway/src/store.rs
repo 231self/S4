@@ -1,6 +1,9 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
+use rsa::RsaPublicKey;
+use rsa::pkcs8::DecodePublicKey;
+use rsa::traits::PublicKeyParts;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
@@ -15,6 +18,12 @@ use uuid::Uuid;
 use crate::entity::api_key;
 use crate::entity::mcp_token;
 use crate::key_cipher::SecretCipher;
+
+pub const MAX_CREDENTIAL_LABEL_BYTES: usize = 128;
+pub const MAX_CREDENTIAL_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
+pub const MAX_PUBLIC_KEY_PEM_BYTES: usize = 16 * 1024;
+const MIN_RSA_PUBLIC_KEY_BITS: usize = 2048;
+const MAX_RSA_PUBLIC_KEY_BITS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct StoredObject {
@@ -226,7 +235,12 @@ pub trait KeyRepository: Send + Sync {
 
     /// Create an MCP bearer token (`s4m_...`) and return the plaintext token
     /// (shown once). Only its SHA-256 hash is stored.
-    async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String;
+    async fn create_mcp_token(
+        &self,
+        user_id: &str,
+        label: &str,
+        expires_in: u64,
+    ) -> anyhow::Result<(String, McpToken)>;
 
     /// Validate an MCP bearer token and return the owning user id.
     async fn resolve_mcp_token(&self, token: &str) -> Option<String>;
@@ -235,6 +249,63 @@ pub trait KeyRepository: Send + Sync {
     async fn list_mcp_tokens(&self, user_id: &str) -> Vec<McpToken>;
 
     async fn delete_mcp_token(&self, token_hash: &str, user_id: &str) -> bool;
+}
+
+pub fn canonicalize_credential_label(label: &str) -> anyhow::Result<String> {
+    if label.chars().any(char::is_control) {
+        anyhow::bail!("credential label must not contain control characters");
+    }
+    let label = label.trim();
+    if label.is_empty() {
+        anyhow::bail!("credential label must not be empty");
+    }
+    if label.len() > MAX_CREDENTIAL_LABEL_BYTES {
+        anyhow::bail!("credential label must not exceed {MAX_CREDENTIAL_LABEL_BYTES} UTF-8 bytes");
+    }
+    Ok(label.to_string())
+}
+
+pub fn validate_credential_ttl(expires_in: u64) -> anyhow::Result<()> {
+    if expires_in > MAX_CREDENTIAL_TTL_SECONDS {
+        anyhow::bail!(
+            "credential expiry must be 0 or at most {MAX_CREDENTIAL_TTL_SECONDS} seconds"
+        );
+    }
+    Ok(())
+}
+
+pub fn canonicalize_public_key_pem(public_key_pem: &str) -> anyhow::Result<String> {
+    if public_key_pem.len() > MAX_PUBLIC_KEY_PEM_BYTES {
+        anyhow::bail!("public key PEM must not exceed {MAX_PUBLIC_KEY_PEM_BYTES} bytes");
+    }
+    let public_key_pem = public_key_pem.trim();
+    if public_key_pem.is_empty() {
+        anyhow::bail!("public key PEM must not be empty");
+    }
+
+    let key = match RsaPublicKey::from_public_key_pem(public_key_pem) {
+        Ok(key) => key,
+        Err(_) => {
+            let (_, pem) =
+                x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes()).map_err(|_| {
+                    anyhow::anyhow!(
+                        "public key PEM must contain an RSA public key or X.509 certificate"
+                    )
+                })?;
+            let certificate = pem.parse_x509().map_err(|_| {
+                anyhow::anyhow!("public key PEM must contain a valid X.509 certificate")
+            })?;
+            RsaPublicKey::from_public_key_der(certificate.public_key().raw)
+                .map_err(|_| anyhow::anyhow!("X.509 certificate must contain an RSA public key"))?
+        }
+    };
+    let bits = key.n().bits();
+    if !(MIN_RSA_PUBLIC_KEY_BITS..=MAX_RSA_PUBLIC_KEY_BITS).contains(&bits) {
+        anyhow::bail!(
+            "RSA public key must be between {MIN_RSA_PUBLIC_KEY_BITS} and {MAX_RSA_PUBLIC_KEY_BITS} bits"
+        );
+    }
+    Ok(public_key_pem.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -267,6 +338,12 @@ fn generate_api_key(
     public_key_pem: Option<String>,
     cipher: Option<&SecretCipher>,
 ) -> anyhow::Result<(ApiKey, String)> {
+    let label = canonicalize_credential_label(label)?;
+    validate_credential_ttl(expires_in)?;
+    let public_key_pem = public_key_pem
+        .as_deref()
+        .map(canonicalize_public_key_pem)
+        .transpose()?;
     let key_id = format!("s4_{}", Uuid::new_v4().to_string().replace('-', ""));
     let secret = format!("s4s_{}", Uuid::new_v4().to_string().replace('-', ""));
     let secret_hash = sha256_hash(&secret);
@@ -285,14 +362,18 @@ fn generate_api_key(
     };
     let now = chrono_now().parse::<u64>().unwrap_or(0);
     let expires_at = if expires_in > 0 {
-        Some(format!("{}", now + expires_in))
+        Some(
+            now.checked_add(expires_in)
+                .context("API key expiry overflow")?
+                .to_string(),
+        )
     } else {
         None
     };
     let api_key = build_api_key(
         &key_id,
         user_id,
-        label,
+        &label,
         secret_hash,
         secret_encrypted,
         chrono_now(),
@@ -300,6 +381,36 @@ fn generate_api_key(
         public_key_pem,
     );
     Ok((api_key, secret))
+}
+
+fn generate_mcp_token(
+    user_id: &str,
+    label: &str,
+    expires_in: u64,
+) -> anyhow::Result<(McpToken, String)> {
+    let label = canonicalize_credential_label(label)?;
+    validate_credential_ttl(expires_in)?;
+    let token = format!("s4m_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let now = chrono_now().parse::<u64>().unwrap_or(0);
+    let expires_at = if expires_in > 0 {
+        Some(
+            now.checked_add(expires_in)
+                .context("MCP token expiry overflow")?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    Ok((
+        McpToken {
+            token_hash: sha256_hash(&token),
+            user_id: user_id.to_string(),
+            label,
+            created_at: chrono_now(),
+            expires_at,
+        },
+        token,
+    ))
 }
 
 fn decrypt_verified_secret(
@@ -481,11 +592,12 @@ impl KeyRepository for KeyStore {
         user_id: &str,
         public_key_pem: &str,
     ) -> anyhow::Result<bool> {
+        let public_key_pem = canonicalize_public_key_pem(public_key_pem)?;
         Ok(set_public_key_in(
             &self.keys,
             key_id,
             user_id,
-            public_key_pem,
+            &public_key_pem,
         ))
     }
 
@@ -531,23 +643,18 @@ impl KeyRepository for KeyStore {
         delete_key_in(&self.keys, key_id, user_id)
     }
 
-    async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String {
-        let token = format!("s4m_{}", Uuid::new_v4().to_string().replace('-', ""));
-        let now = chrono_now().parse::<u64>().unwrap_or(0);
-        let token_hash = sha256_hash(&token);
-        let mcp = McpToken {
-            token_hash: token_hash.clone(),
-            user_id: user_id.to_string(),
-            label: label.to_string(),
-            created_at: chrono_now(),
-            expires_at: if expires_in > 0 {
-                Some(format!("{}", now + expires_in))
-            } else {
-                None
-            },
-        };
-        self.mcp_tokens.write().unwrap().insert(token_hash, mcp);
-        token
+    async fn create_mcp_token(
+        &self,
+        user_id: &str,
+        label: &str,
+        expires_in: u64,
+    ) -> anyhow::Result<(String, McpToken)> {
+        let (mcp, token) = generate_mcp_token(user_id, label, expires_in)?;
+        self.mcp_tokens
+            .write()
+            .map_err(|_| anyhow::anyhow!("KeyStore MCP token lock poisoned"))?
+            .insert(mcp.token_hash.clone(), mcp.clone());
+        Ok((token, mcp))
     }
 
     async fn resolve_mcp_token(&self, token: &str) -> Option<String> {
@@ -735,6 +842,7 @@ impl KeyRepository for FileKeyStore {
         user_id: &str,
         public_key_pem: &str,
     ) -> anyhow::Result<bool> {
+        let public_key_pem = canonicalize_public_key_pem(public_key_pem)?;
         let _mutation_guard = self
             .mutation_lock
             .lock()
@@ -750,7 +858,7 @@ impl KeyRepository for FileKeyStore {
             if key.user_id != user_id {
                 return Ok(false);
             }
-            key.public_key_pem.replace(public_key_pem.to_string())
+            key.public_key_pem.replace(public_key_pem.clone())
         };
         if let Err(error) = self.persist() {
             let mut keys = self.keys.write().map_err(|_| {
@@ -760,7 +868,7 @@ impl KeyRepository for FileKeyStore {
             })?;
             if let Some(key) = keys.get_mut(key_id)
                 && key.user_id == user_id
-                && key.public_key_pem.as_deref() == Some(public_key_pem)
+                && key.public_key_pem.as_deref() == Some(public_key_pem.as_str())
             {
                 key.public_key_pem = previous;
             }
@@ -844,33 +952,30 @@ impl KeyRepository for FileKeyStore {
         true
     }
 
-    async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String {
-        let token = format!("s4m_{}", Uuid::new_v4().to_string().replace('-', ""));
-        let now = chrono_now().parse::<u64>().unwrap_or(0);
-        let token_hash = sha256_hash(&token);
-        let mcp = McpToken {
-            token_hash: token_hash.clone(),
-            user_id: user_id.to_string(),
-            label: label.to_string(),
-            created_at: chrono_now(),
-            expires_at: if expires_in > 0 {
-                Some(format!("{}", now + expires_in))
-            } else {
-                None
-            },
-        };
-        let Ok(_mutation_guard) = self.mutation_lock.lock() else {
-            tracing::warn!("FileKeyStore mutation lock poisoned");
-            return token;
-        };
+    async fn create_mcp_token(
+        &self,
+        user_id: &str,
+        label: &str,
+        expires_in: u64,
+    ) -> anyhow::Result<(String, McpToken)> {
+        let (mcp, token) = generate_mcp_token(user_id, label, expires_in)?;
+        let token_hash = mcp.token_hash.clone();
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore mutation lock poisoned"))?;
         let inserted = mcp.clone();
         let previous = self
             .mcp_tokens
             .write()
-            .unwrap()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore MCP token lock poisoned"))?
             .insert(token_hash.clone(), mcp);
-        if self.persist().is_err() {
-            let mut tokens = self.mcp_tokens.write().unwrap();
+        if let Err(error) = self.persist() {
+            let mut tokens = self.mcp_tokens.write().map_err(|_| {
+                anyhow::anyhow!(
+                    "FileKeyStore MCP token persist failed and rollback lock was poisoned: {error}"
+                )
+            })?;
             if tokens.get(&token_hash) == Some(&inserted) {
                 if let Some(previous) = previous {
                     tokens.insert(token_hash, previous);
@@ -878,9 +983,9 @@ impl KeyRepository for FileKeyStore {
                     tokens.remove(&token_hash);
                 }
             }
-            tracing::warn!("FileKeyStore MCP token creation persist failed");
+            return Err(error.context("FileKeyStore MCP token creation persist failed"));
         }
-        token
+        Ok((token, inserted))
     }
 
     async fn resolve_mcp_token(&self, token: &str) -> Option<String> {
@@ -972,13 +1077,19 @@ impl KeyRepository for PostgresKeyStore {
             public_key_pem,
             self.cipher.as_deref(),
         )?;
+        let expires_at = api_key
+            .expires_at
+            .as_deref()
+            .map(str::parse::<i64>)
+            .transpose()
+            .context("API key expiry is outside the Postgres timestamp range")?;
         let model = api_key::ActiveModel {
             user_id: Set(api_key.user_id.clone()),
             key_id: Set(api_key.key_id.clone()),
             secret_hash: Set(api_key.secret_hash.clone()),
             secret_encrypted: Set(api_key.secret_encrypted.clone()),
             label: Set(api_key.label.clone()),
-            expires_at: Set(api_key.expires_at.as_ref().and_then(|e| e.parse().ok())),
+            expires_at: Set(expires_at),
             public_key_pem: Set(api_key.public_key_pem.clone()),
             ..Default::default()
         };
@@ -995,10 +1106,11 @@ impl KeyRepository for PostgresKeyStore {
         user_id: &str,
         public_key_pem: &str,
     ) -> anyhow::Result<bool> {
+        let public_key_pem = canonicalize_public_key_pem(public_key_pem)?;
         let result = api_key::Entity::update_many()
             .col_expr(
                 api_key::Column::PublicKeyPem,
-                Expr::value(Some(public_key_pem.to_string())),
+                Expr::value(Some(public_key_pem)),
             )
             .filter(api_key::Column::KeyId.eq(key_id.to_string()))
             .filter(api_key::Column::UserId.eq(user_id.to_string()))
@@ -1104,23 +1216,40 @@ impl KeyRepository for PostgresKeyStore {
         matches!(result, Ok(r) if r.rows_affected == 1)
     }
 
-    async fn create_mcp_token(&self, user_id: &str, label: &str, expires_in: u64) -> String {
-        let token = format!("s4m_{}", Uuid::new_v4().to_string().replace('-', ""));
-        let now = chrono_now().parse::<u64>().unwrap_or(0);
-        let token_hash = sha256_hash(&token);
+    async fn create_mcp_token(
+        &self,
+        user_id: &str,
+        label: &str,
+        expires_in: u64,
+    ) -> anyhow::Result<(String, McpToken)> {
+        let (mcp, token) = generate_mcp_token(user_id, label, expires_in)?;
+        let expires_at = mcp
+            .expires_at
+            .as_deref()
+            .map(str::parse::<i64>)
+            .transpose()
+            .context("MCP token expiry is outside the Postgres timestamp range")?;
         let model = mcp_token::ActiveModel {
-            user_id: Set(user_id.to_string()),
-            token_hash: Set(token_hash),
-            label: Set(label.to_string()),
-            expires_at: Set(if expires_in > 0 {
-                Some((now + expires_in) as i64)
-            } else {
-                None
-            }),
+            user_id: Set(mcp.user_id.clone()),
+            token_hash: Set(mcp.token_hash.clone()),
+            label: Set(mcp.label.clone()),
+            expires_at: Set(expires_at),
             ..Default::default()
         };
-        let _ = model.insert(&self.db).await;
-        token
+        let inserted = model
+            .insert(&self.db)
+            .await
+            .context("Postgres MCP token insert failed")?;
+        Ok((
+            token,
+            McpToken {
+                token_hash: inserted.token_hash,
+                user_id: inserted.user_id,
+                label: inserted.label,
+                created_at: inserted.created_at.to_string(),
+                expires_at: inserted.expires_at.map(|value| value.to_string()),
+            },
+        ))
     }
 
     async fn resolve_mcp_token(&self, token: &str) -> Option<String> {
@@ -1196,9 +1325,7 @@ fn load_file_store(path: &PathBuf) -> (HashMap<String, ApiKey>, HashMap<String, 
 fn is_expired(expires_at: Option<&str>) -> bool {
     if let Some(exp) = expires_at {
         let now = chrono_now().parse::<u64>().unwrap_or(0);
-        if exp.parse::<u64>().is_ok_and(|ts| now >= ts) {
-            return true;
-        }
+        return exp.parse::<u64>().map_or(true, |ts| now >= ts);
     }
     false
 }
@@ -1229,6 +1356,11 @@ fn chrono_now() -> String {
 mod tests {
     use super::*;
     use crate::key_cipher::{KeyWrapping, LocalKeyWrapping};
+    use rand::rngs::OsRng;
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+
+    const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/pub.pem");
+    const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
 
     #[derive(Debug)]
     struct FailingKeyWrapping;
@@ -1251,6 +1383,101 @@ mod tests {
 
     fn failing_cipher() -> Arc<SecretCipher> {
         Arc::new(SecretCipher::new(Arc::new(FailingKeyWrapping)))
+    }
+
+    fn generated_public_key_pem(bits: usize) -> String {
+        rsa::RsaPrivateKey::new(&mut OsRng, bits)
+            .unwrap()
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap()
+    }
+
+    #[test]
+    fn credential_labels_and_ttls_are_canonical_and_bounded() {
+        assert_eq!(
+            canonicalize_credential_label("  production key  ").unwrap(),
+            "production key"
+        );
+        assert_eq!(
+            canonicalize_credential_label(&"a".repeat(MAX_CREDENTIAL_LABEL_BYTES)).unwrap(),
+            "a".repeat(MAX_CREDENTIAL_LABEL_BYTES)
+        );
+        for invalid in [
+            " ".to_string(),
+            "control\nlabel".to_string(),
+            "a".repeat(MAX_CREDENTIAL_LABEL_BYTES + 1),
+            "é".repeat((MAX_CREDENTIAL_LABEL_BYTES / 2) + 1),
+        ] {
+            assert!(canonicalize_credential_label(&invalid).is_err());
+        }
+        assert!(validate_credential_ttl(0).is_ok());
+        assert!(validate_credential_ttl(MAX_CREDENTIAL_TTL_SECONDS).is_ok());
+        assert!(validate_credential_ttl(MAX_CREDENTIAL_TTL_SECONDS + 1).is_err());
+    }
+
+    #[test]
+    fn public_key_validation_matches_filter_formats_and_bounds() {
+        assert_eq!(
+            canonicalize_public_key_pem(TEST_PUBLIC_KEY_PEM).unwrap(),
+            TEST_PUBLIC_KEY_PEM.trim()
+        );
+        assert_eq!(
+            canonicalize_public_key_pem(TEST_CERTIFICATE_PEM).unwrap(),
+            TEST_CERTIFICATE_PEM.trim()
+        );
+        assert!(canonicalize_public_key_pem("not a PEM").is_err());
+        assert!(canonicalize_public_key_pem(&generated_public_key_pem(1024)).is_err());
+        assert!(canonicalize_public_key_pem(&generated_public_key_pem(4096)).is_ok());
+        assert!(canonicalize_public_key_pem(&"x".repeat(MAX_PUBLIC_KEY_PEM_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn malformed_expiry_fails_closed() {
+        assert!(is_expired(Some("-1")));
+        assert!(is_expired(Some("not-a-timestamp")));
+    }
+
+    #[tokio::test]
+    async fn api_key_creation_enforces_input_boundaries() {
+        let store = KeyStore::new();
+        assert!(
+            store
+                .create_key(
+                    "u1",
+                    "  bounded  ",
+                    MAX_CREDENTIAL_TTL_SECONDS,
+                    Some(TEST_CERTIFICATE_PEM.to_string()),
+                )
+                .await
+                .is_ok()
+        );
+        let stored = store.list_for_user("u1").await;
+        assert_eq!(stored[0].label, "bounded");
+        assert_eq!(
+            stored[0].public_key_pem.as_deref(),
+            Some(TEST_CERTIFICATE_PEM.trim())
+        );
+        assert!(
+            store
+                .create_key("u1", "too long", MAX_CREDENTIAL_TTL_SECONDS + 1, None)
+                .await
+                .is_err()
+        );
+
+        let (token, mcp) = store
+            .create_mcp_token("u1", "  agent  ", MAX_CREDENTIAL_TTL_SECONDS)
+            .await
+            .unwrap();
+        assert!(token.starts_with("s4m_"));
+        assert_eq!(mcp.label, "agent");
+        assert!(mcp.expires_at.is_some());
+        assert!(
+            store
+                .create_mcp_token("u1", "agent", MAX_CREDENTIAL_TTL_SECONDS + 1)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1491,10 +1718,23 @@ mod tests {
     async fn in_memory_public_key_and_delete() {
         let store = KeyStore::new();
         let (key_id, _secret) = store.create_key("u1", "enc", 0, None).await.unwrap();
-        assert!(store.set_public_key(&key_id, "u1", "pem").await.unwrap());
-        assert!(!store.set_public_key(&key_id, "u2", "pem").await.unwrap());
+        assert!(
+            store
+                .set_public_key(&key_id, "u1", TEST_PUBLIC_KEY_PEM)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_public_key(&key_id, "u2", TEST_CERTIFICATE_PEM)
+                .await
+                .unwrap()
+        );
         let key = store.get_key(&key_id).await.expect("key exists");
-        assert_eq!(key.public_key_pem.as_deref(), Some("pem"));
+        assert_eq!(
+            key.public_key_pem.as_deref(),
+            Some(TEST_PUBLIC_KEY_PEM.trim())
+        );
         let keys = store.list_for_user("u1").await;
         assert_eq!(keys.len(), 1);
         assert!(keys[0].secret_hash.is_empty());
@@ -1554,14 +1794,19 @@ mod tests {
         let path = parent.join("keys.json");
         let store = FileKeyStore::new(path.clone());
         let (key_id, _) = store
-            .create_key("u1", "persisted-public-key", 0, Some("old-pem".to_string()))
+            .create_key(
+                "u1",
+                "persisted-public-key",
+                0,
+                Some(TEST_PUBLIC_KEY_PEM.to_string()),
+            )
             .await
             .unwrap();
         std::fs::rename(&parent, &durable_parent).unwrap();
         std::fs::write(&parent, "not a directory").unwrap();
 
         let error = store
-            .set_public_key(&key_id, "u1", "new-pem")
+            .set_public_key(&key_id, "u1", TEST_CERTIFICATE_PEM)
             .await
             .unwrap_err();
 
@@ -1573,7 +1818,7 @@ mod tests {
                 .unwrap()
                 .public_key_pem
                 .as_deref(),
-            Some("old-pem")
+            Some(TEST_PUBLIC_KEY_PEM.trim())
         );
         std::fs::remove_file(&parent).unwrap();
         std::fs::rename(&durable_parent, &parent).unwrap();
@@ -1587,7 +1832,7 @@ mod tests {
                 .unwrap()
                 .public_key_pem
                 .as_deref(),
-            Some("old-pem")
+            Some(TEST_PUBLIC_KEY_PEM.trim())
         );
         std::fs::remove_dir_all(parent).unwrap();
     }
@@ -1627,13 +1872,16 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("keys.json");
         let store = FileKeyStore::new(path.clone());
-        let persisted_token = store.create_mcp_token("u1", "persisted", 0).await;
+        let persisted_token = store
+            .create_mcp_token("u1", "persisted", 0)
+            .await
+            .unwrap()
+            .0;
         let persisted_hash = sha256_hash(&persisted_token);
         std::fs::rename(&parent, &durable_parent).unwrap();
         std::fs::write(&parent, "not a directory").unwrap();
 
-        let rejected_token = store.create_mcp_token("u1", "rejected", 0).await;
-        assert!(store.resolve_mcp_token(&rejected_token).await.is_none());
+        assert!(store.create_mcp_token("u1", "rejected", 0).await.is_err());
         assert!(!store.delete_mcp_token(&persisted_hash, "u1").await);
         assert_eq!(
             store.resolve_mcp_token(&persisted_token).await.as_deref(),
@@ -1651,7 +1899,7 @@ mod tests {
                 .as_deref(),
             Some("u1")
         );
-        assert!(restarted.resolve_mcp_token(&rejected_token).await.is_none());
+        assert_eq!(restarted.list_mcp_tokens("u1").await.len(), 1);
         std::fs::remove_dir_all(parent).unwrap();
     }
 
@@ -1671,7 +1919,7 @@ mod tests {
         let set_key = key_id.clone();
         let set_task = tokio::spawn(async move {
             set_store
-                .set_public_key(&set_key, "u1", "concurrent-pem")
+                .set_public_key(&set_key, "u1", TEST_PUBLIC_KEY_PEM)
                 .await
         });
         entered_rx
@@ -1735,7 +1983,7 @@ mod tests {
 
         resume_tx.send(()).unwrap();
         let (key_id, secret) = key_task.await.unwrap().unwrap();
-        let token = mcp_task.await.unwrap();
+        let token = mcp_task.await.unwrap().unwrap().0;
         drop(store);
 
         let restarted = FileKeyStore::new(path.clone());
@@ -1792,7 +2040,7 @@ mod tests {
 
         resume_tx.send(()).unwrap();
         assert_eq!(rewrap_task.await.unwrap().as_deref(), Some(secret.as_str()));
-        let token = mcp_task.await.unwrap();
+        let token = mcp_task.await.unwrap().unwrap().0;
         drop(store);
 
         let restarted = FileKeyStore::with_cipher(path.clone(), cipher);
@@ -1811,7 +2059,7 @@ mod tests {
     async fn file_key_store_mcp_delete_does_not_self_deadlock_and_persists() {
         let path = temp_keys_file();
         let store = FileKeyStore::new(path.clone());
-        let token = store.create_mcp_token("u1", "delete", 0).await;
+        let token = store.create_mcp_token("u1", "delete", 0).await.unwrap().0;
         let token_hash = sha256_hash(&token);
 
         assert!(
@@ -1858,6 +2106,16 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("Postgres API key insert failed"));
+
+        let error = store
+            .create_mcp_token("u1", "database-error", 0)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Postgres MCP token insert failed")
+        );
     }
 
     #[tokio::test]
@@ -1869,7 +2127,7 @@ mod tests {
         let store = PostgresKeyStore::new(pool);
 
         let error = store
-            .set_public_key("missing-key", "u1", "pem")
+            .set_public_key("missing-key", "u1", TEST_PUBLIC_KEY_PEM)
             .await
             .unwrap_err();
 
@@ -1901,13 +2159,26 @@ mod tests {
         let path = temp_keys_file();
         let store = FileKeyStore::new(path.clone());
         let (key_id, _secret) = store.create_key("u1", "enc", 3600, None).await.unwrap();
-        assert!(store.set_public_key(&key_id, "u1", "pem").await.unwrap());
-        assert!(!store.set_public_key(&key_id, "u2", "pem").await.unwrap());
+        assert!(
+            store
+                .set_public_key(&key_id, "u1", TEST_PUBLIC_KEY_PEM)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_public_key(&key_id, "u2", TEST_CERTIFICATE_PEM)
+                .await
+                .unwrap()
+        );
         drop(store);
 
         let reloaded = FileKeyStore::new(path);
         let key = reloaded.get_key(&key_id).await.expect("key exists");
-        assert_eq!(key.public_key_pem.as_deref(), Some("pem"));
+        assert_eq!(
+            key.public_key_pem.as_deref(),
+            Some(TEST_PUBLIC_KEY_PEM.trim())
+        );
         assert!(key.expires_at.is_some());
     }
 

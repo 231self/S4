@@ -48,6 +48,8 @@ use s4_gateway::server::{build_router, build_state};
 use tower::ServiceExt;
 
 const TEST_KEK: [u8; 32] = [7; 32];
+const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/pub.pem");
+const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
 static DB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn unix_time_ms() -> i64 {
@@ -1087,13 +1089,13 @@ fn postgres_public_key_binding() {
             .expect("create Postgres API key");
         assert!(
             store
-                .set_public_key(&key_id, &user, "-----BEGIN PUBLIC KEY-----\npem")
+                .set_public_key(&key_id, &user, TEST_PUBLIC_KEY_PEM)
                 .await
                 .unwrap()
         );
         assert!(
             !store
-                .set_public_key(&key_id, "someone-else", "pem2")
+                .set_public_key(&key_id, "someone-else", TEST_CERTIFICATE_PEM)
                 .await
                 .unwrap()
         );
@@ -1103,7 +1105,7 @@ fn postgres_public_key_binding() {
             .await
             .expect("resolve after binding");
         assert_eq!(uid, user);
-        assert_eq!(pk.as_deref(), Some("-----BEGIN PUBLIC KEY-----\npem"));
+        assert_eq!(pk.as_deref(), Some(TEST_PUBLIC_KEY_PEM.trim()));
         delete_api_key(&db, &key_id).await;
     });
 }
@@ -1124,6 +1126,30 @@ fn postgres_expired_key_rejected() {
             "expired key must be rejected"
         );
         delete_api_key(&db, &key_id).await;
+    });
+}
+
+#[test]
+fn postgres_mcp_creation_returns_persisted_metadata() {
+    with_pool(|pool| async move {
+        let store = PostgresKeyStore::new(pool);
+        let user = format!("unit-{}", uuid::Uuid::new_v4());
+        let (token, created) = store
+            .create_mcp_token(&user, "  agent  ", 3600)
+            .await
+            .expect("create Postgres MCP token");
+        let listed = store
+            .list_mcp_tokens(&user)
+            .await
+            .into_iter()
+            .find(|candidate| candidate.token_hash == created.token_hash)
+            .expect("persisted MCP token is listed");
+
+        assert!(token.starts_with("s4m_"));
+        assert_eq!(created, listed);
+        assert_eq!(created.label, "agent");
+        assert!(created.expires_at.is_some());
+        assert!(store.delete_mcp_token(&created.token_hash, &user).await);
     });
 }
 

@@ -17,7 +17,7 @@ use aws_sdk_s3::types::ChecksumMode;
 use aws_smithy_types::date_time::Format as DateTimeFormat;
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header},
     response::{Html, IntoResponse},
     routing::{any, delete, get, head, post, put},
@@ -69,7 +69,9 @@ use crate::s3_safety::{S3Failure, record_s3_failure, s3_retry_config, s3_timeout
 use crate::service_storage::{ServiceStorage, parse_service_backends};
 use crate::sigv4::{RequestAuthorization, SigV4Error, SigV4Policy, SigningKeyCache};
 use crate::store::{
-    FileKeyStore, KeyRepository, KeyStore, MemoryStore, PostgresKeyStore, sha256_hash,
+    FileKeyStore, KeyRepository, KeyStore, MAX_PUBLIC_KEY_PEM_BYTES, MemoryStore, PostgresKeyStore,
+    canonicalize_credential_label, canonicalize_public_key_pem, sha256_hash,
+    validate_credential_ttl,
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, CompatibilitySpoolConfig,
@@ -245,6 +247,9 @@ const DEMO_MAX_CONCURRENCY: usize = 4;
 const DEMO_MAX_STARTS_PER_MINUTE: usize = 30;
 const DEMO_MAX_CUMULATIVE_FUEL: u64 = 50_000_000;
 const DEMO_MAX_WALL_TIME: Duration = Duration::from_secs(2);
+const SIMPLE_CREDENTIAL_MUTATION_BODY_BYTES: usize = 1024;
+const CREATE_KEY_BODY_BYTES: usize = MAX_PUBLIC_KEY_PEM_BYTES + 1024;
+const SET_PUBLIC_KEY_BODY_BYTES: usize = MAX_PUBLIC_KEY_PEM_BYTES + 512;
 
 #[derive(Clone)]
 struct DemoPipelines {
@@ -6149,6 +6154,10 @@ async fn health() -> impl IntoResponse {
     "ok"
 }
 
+fn invalid_credential_mutation_response() -> axum::response::Response {
+    (StatusCode::BAD_REQUEST, "invalid credential mutation").into_response()
+}
+
 /// List API keys for the authenticated user
 #[utoipa::path(
     get,
@@ -6193,9 +6202,25 @@ async fn create_key(
     let Some(uid) = require_user_id(&headers, &state).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let label = match canonicalize_credential_label(&body.label) {
+        Ok(label) => label,
+        Err(_) => return invalid_credential_mutation_response(),
+    };
+    if validate_credential_ttl(body.expires_in).is_err() {
+        return invalid_credential_mutation_response();
+    }
+    let public_key_pem = match body
+        .public_key_pem
+        .as_deref()
+        .map(canonicalize_public_key_pem)
+        .transpose()
+    {
+        Ok(public_key_pem) => public_key_pem,
+        Err(_) => return invalid_credential_mutation_response(),
+    };
     let result = state
         .keys
-        .create_key(&uid, &body.label, body.expires_in, body.public_key_pem)
+        .create_key(&uid, &label, body.expires_in, public_key_pem)
         .await;
     let (key_id, secret) = match result {
         Ok(created) => created,
@@ -6223,7 +6248,7 @@ async fn create_key(
     Json(ApiKeyResponse {
         key_id,
         secret,
-        label: body.label,
+        label,
         created_at,
         expires_at,
         public_key_pem,
@@ -6298,24 +6323,29 @@ async fn create_mcp_token(
     let Some(uid) = require_user_id(&headers, &state).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let token = state
+    let label = match canonicalize_credential_label(&body.label) {
+        Ok(label) => label,
+        Err(_) => return invalid_credential_mutation_response(),
+    };
+    if validate_credential_ttl(body.expires_in).is_err() {
+        return invalid_credential_mutation_response();
+    }
+    let (token, created) = match state
         .keys
-        .create_mcp_token(&uid, &body.label, body.expires_in)
-        .await;
-    let hash = sha256_hash(&token);
-    let created_at = state
-        .keys
-        .list_mcp_tokens(&uid)
+        .create_mcp_token(&uid, &label, body.expires_in)
         .await
-        .into_iter()
-        .find(|t| t.token_hash == hash)
-        .map(|t| t.created_at)
-        .unwrap_or_default();
+    {
+        Ok(created) => created,
+        Err(_) => {
+            tracing::error!(user_id = uid, "MCP token creation persistence failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     Json(McpTokenCreatedResponse {
         token,
-        label: body.label,
-        created_at,
-        expires_at: None,
+        label,
+        created_at: created.created_at,
+        expires_at: created.expires_at,
     })
     .into_response()
 }
@@ -6557,9 +6587,13 @@ async fn set_public_key(
         }
         PublicKeyMutationActor::DashboardUser(user_id) => user_id,
     };
+    let public_key_pem = match canonicalize_public_key_pem(&body.public_key_pem) {
+        Ok(public_key_pem) => public_key_pem,
+        Err(_) => return invalid_credential_mutation_response(),
+    };
     match state
         .keys
-        .set_public_key(&body.key_id, &uid, &body.public_key_pem)
+        .set_public_key(&body.key_id, &uid, &public_key_pem)
         .await
     {
         Ok(true) => StatusCode::OK.into_response(),
@@ -7232,12 +7266,29 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/", get(root))
         .route("/dashboard/api/keys", get(get_keys))
-        .route("/dashboard/api/keys", post(create_key))
-        .route("/dashboard/api/keys", delete(delete_key))
-        .route("/dashboard/api/keys/public-key", put(set_public_key))
+        .route(
+            "/dashboard/api/keys",
+            post(create_key).layer(DefaultBodyLimit::max(CREATE_KEY_BODY_BYTES)),
+        )
+        .route(
+            "/dashboard/api/keys",
+            delete(delete_key).layer(DefaultBodyLimit::max(SIMPLE_CREDENTIAL_MUTATION_BODY_BYTES)),
+        )
+        .route(
+            "/dashboard/api/keys/public-key",
+            put(set_public_key).layer(DefaultBodyLimit::max(SET_PUBLIC_KEY_BODY_BYTES)),
+        )
         .route("/dashboard/api/mcp-tokens", get(get_mcp_tokens))
-        .route("/dashboard/api/mcp-tokens", post(create_mcp_token))
-        .route("/dashboard/api/mcp-tokens", delete(delete_mcp_token))
+        .route(
+            "/dashboard/api/mcp-tokens",
+            post(create_mcp_token)
+                .layer(DefaultBodyLimit::max(SIMPLE_CREDENTIAL_MUTATION_BODY_BYTES)),
+        )
+        .route(
+            "/dashboard/api/mcp-tokens",
+            delete(delete_mcp_token)
+                .layer(DefaultBodyLimit::max(SIMPLE_CREDENTIAL_MUTATION_BODY_BYTES)),
+        )
         .route("/dashboard/api/me", get(get_me))
         .route("/dashboard/api/demo/redact", post(demo_redact))
         .route("/dashboard/api/demo/process", post(demo_process))

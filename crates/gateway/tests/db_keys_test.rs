@@ -1335,6 +1335,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         // these values concurrently.
         unsafe {
             std::env::set_var("AUTH_DISABLED", "0");
+            std::env::set_var("S4_SINGLE_TENANT", "1");
             std::env::remove_var("S4_KEYS_FILE");
             std::env::remove_var("S3_ENDPOINT");
             std::env::remove_var("S4_SERVICE_BUCKETS");

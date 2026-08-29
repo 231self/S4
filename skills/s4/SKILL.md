@@ -34,10 +34,18 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
   `FileKeyStore` (`S4_KEYS_FILE`, default in local mode), `PostgresKeyStore`
   (`DATABASE_URL`). Secrets stored SHA-256-hashed. `AUTH_DISABLED=true` = demo
   bypass.
-- **Storage** — tiered: presigned-URL proxy (`x-s4-backend-url`), per-user
-  backend config (`BackendRegistry`), service storage (`S4_SERVICE_BUCKETS`,
-  consistent-hash ring + dual-write + read fail-over), global `S3_ENDPOINT`,
-  in-memory `MemoryStore` (local default).
+- **Storage** — resolution is explicit managed override, presigned URL, repository-
+  backed per-workspace config, then configured service storage
+  (`S4_SERVICE_BUCKETS`, consistent-hash ring + dual-write + read fail-over).
+  Workspace config supports `managed` and static-credential `s3_compatible`;
+  `aws_role` is unsupported. Global `S3_ENDPOINT` and `MemoryStore` fallback are
+  explicit-single-tenant only; multi-tenant mode requires managed storage and
+  fails closed.
+- **Tenant endpoint safety** — canonical workspace IDs scope storage. Persisted
+  endpoints require an operator-trusted provider allowlist because the proxy-free
+  AWS SDK client resolves DNS after validation. Presigned clients also disable
+  proxies; opt-in HTTP is source-`GET` only, while `PUT`/`DELETE` require HTTPS.
+  AWS SDK calls use one attempt; transactional writes own bounded retries.
 
 ## Commands
 

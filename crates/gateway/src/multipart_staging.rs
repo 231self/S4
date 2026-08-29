@@ -33,6 +33,7 @@ use crate::entity::{
     multipart_cleanup_audit, multipart_part_attempt, multipart_staging_quota, multipart_upload,
 };
 use crate::key_cipher::KeyWrapping;
+use crate::s3_safety::{record_s3_body_failure, record_s3_failure};
 
 pub const MAX_ACTIVE_UPLOADS: usize = 16;
 pub const MAX_PARTS: u32 = 10_000;
@@ -2326,7 +2327,9 @@ impl StagingArtifactStore for S3StagingArtifactStore {
             .body(body)
             .send()
             .await
-            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+            .map_err(|error| {
+                StagingError::Persistence(record_s3_failure("staging_put", &error).to_string())
+            })?;
         Ok(())
     }
     async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError> {
@@ -2337,7 +2340,9 @@ impl StagingArtifactStore for S3StagingArtifactStore {
             .send()
             .await
             .map(|output| output.body)
-            .map_err(|error| StagingError::Persistence(error.to_string()))
+            .map_err(|error| {
+                StagingError::Persistence(record_s3_failure("staging_get", &error).to_string())
+            })
     }
     async fn delete(&self, key: &str) -> Result<(), StagingError> {
         self.client
@@ -2346,7 +2351,9 @@ impl StagingArtifactStore for S3StagingArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+            .map_err(|error| {
+                StagingError::Persistence(record_s3_failure("staging_delete", &error).to_string())
+            })?;
         Ok(())
     }
     async fn list(&self, prefix: &str) -> Result<Vec<StagedArtifact>, StagingError> {
@@ -2361,7 +2368,9 @@ impl StagingArtifactStore for S3StagingArtifactStore {
                 .set_continuation_token(token)
                 .send()
                 .await
-                .map_err(|error| StagingError::Persistence(error.to_string()))?;
+                .map_err(|error| {
+                    StagingError::Persistence(record_s3_failure("staging_list", &error).to_string())
+                })?;
             artifacts.extend(response.contents().iter().filter_map(|object| {
                 Some(StagedArtifact {
                     key: object.key()?.to_string(),
@@ -2749,8 +2758,8 @@ fn artifact_aad(header: &ArtifactHeader, chunk: u64) -> Vec<u8> {
     )
     .into_bytes()
 }
-fn io_error(error: std::io::Error) -> StagingError {
-    StagingError::Persistence(error.to_string())
+fn io_error(_: std::io::Error) -> StagingError {
+    StagingError::Persistence(record_s3_body_failure("staging_get_body").to_string())
 }
 pub fn now_ms() -> i64 {
     SystemTime::now()

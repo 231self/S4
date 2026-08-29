@@ -11,9 +11,13 @@ pub struct WorkspaceId(String);
 impl WorkspaceId {
     pub fn new(value: impl Into<String>) -> Result<Self, WorkspaceStorageError> {
         let value = value.into();
-        if value.is_empty() {
+        if !(1..=128).contains(&value.len())
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
             return Err(WorkspaceStorageError::InvalidConfig(
-                "workspace id must not be empty".to_string(),
+                "workspace id must be 1-128 ASCII characters from [A-Za-z0-9._-]".to_string(),
             ));
         }
         Ok(Self(value))
@@ -279,6 +283,60 @@ impl WorkspaceStorageRepository for InMemoryWorkspaceStorageRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_ids_are_bounded_canonical_ascii() {
+        let maximum = "a".repeat(128);
+        for valid in ["a", "Workspace_01.prod", maximum.as_str()] {
+            assert_eq!(WorkspaceId::new(valid).unwrap().as_str(), valid);
+        }
+        let too_long = "a".repeat(129);
+        for invalid in [
+            "",
+            "workspace/child",
+            "workspace\\child",
+            "workspace child",
+            "workspace\nchild",
+            "workspace\0child",
+            "w\u{f6}rkspace",
+            too_long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    WorkspaceId::new(invalid),
+                    Err(WorkspaceStorageError::InvalidConfig(_))
+                ),
+                "accepted invalid workspace id {invalid:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_canonical_workspace_ids_do_not_collide() {
+        let repository = InMemoryWorkspaceStorageRepository::new();
+        let dotted = WorkspaceId::new("tenant.prod").unwrap();
+        let dashed = WorkspaceId::new("tenant-prod").unwrap();
+        repository
+            .put_config(&dotted, valid_request())
+            .await
+            .unwrap();
+
+        assert!(
+            repository
+                .get_runtime_config(&dotted)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repository
+                .get_runtime_config(&dashed)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(WorkspaceId::new("tenant/prod").is_err());
+    }
 
     fn valid_request() -> BackendConfigRequest {
         BackendConfigRequest {

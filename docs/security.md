@@ -159,10 +159,14 @@ signatures — regenerate them if you need native S3 tools.
   AES-256-GCM) keeps the decryption key solely with the client. `stable-encrypt`
   (AES-SIV) is opt-in for JOIN keys and derives from the API key secret, never
   the raw secret.
-- Tenant separation is enforced at the identity and quota boundaries: every
-  object session is isolated, multipart staging identities are tenant-scoped
-  (`tenant_id`, `credential_policy_id`), managed placement is hashed by tenant,
-  and per-tenant staging quotas are enforced in the database.
+- Every authenticated request resolves its user through the
+  `WorkspaceStorageRepository` to a canonical `WorkspaceId`. Workspace IDs are
+  opaque, used unchanged, and limited to 1–128 ASCII characters from
+  `[A-Za-z0-9._-]`; a repository may map multiple users to one workspace.
+  Resolution failure fails closed.
+- The canonical workspace ID, not the user ID, scopes backend configuration,
+  managed placement, multipart identities and quotas, and usage metering.
+  Object sessions remain isolated per invocation.
 
 ## 5. Transformed reads — fail-closed disclosure rules
 
@@ -214,13 +218,24 @@ deliberately strict:
   URL with their own cloud SDK; S4 filters and forwards. **No backend
   credential is stored.** The gateway applies SSRF controls before any request
   is made (see §10).
-- **Per-user backend config** — IAM role (trusted by a unique External ID) or
-  endpoint+token for non-AWS (R2/B2/MinIO). Credentials are kept in the
-  in-memory `BackendRegistry`, never persisted.
+- **Per-workspace backend config** — `managed`, or `s3_compatible` with an
+  endpoint, region, and static access credentials. `aws_role` remains
+  unsupported and is rejected. Runtime S3-compatible endpoints are governed by
+  `WorkspaceEndpointPolicy` (see §10), and dashboard reads return only a
+  redacted configuration.
 - **Service storage** — S4-managed multi-cloud buckets (`S4_SERVICE_BUCKETS`),
-  optionally with authoritative placement metadata (see §9).
-- **Global `S3_ENDPOINT`** — shared backend; credentials come from
-  environment variables, never hardcoded.
+  tenant-namespaced by workspace and optionally backed by authoritative
+  placement metadata (see §9).
+- **Resolution contract** — an explicit `x-s4-storage-mode: managed` request is
+  resolved first, followed by a presigned URL, a per-workspace configuration,
+  and configured service storage as the default. Only explicit single-tenant
+  mode (`AUTH_DISABLED=true` or `S4_SINGLE_TENANT=true`) may continue to the
+  global `S3_ENDPOINT` and then in-memory storage.
+- **Multi-tenant fail-closed boundary** — startup rejects `S3_ENDPOINT` and
+  requires non-empty `S4_SERVICE_BUCKETS`. An unconfigured workspace therefore
+  uses managed storage; workspace repository failures and unavailable explicit
+  or workspace-managed selections never fall through to a process-global
+  backend.
 
 Multipart uploads are **not** buffered in gateway memory: parts are staged
 durably and encrypted before any downstream processing (see §7).
@@ -318,8 +333,9 @@ single byte is fetched or sent:
 
 - **Host allowlist** — the URL host must be in `S4_PRESIGNED_HTTP_ALLOWLIST`
   (supports `*.suffix` wildcards).
-- **Scheme** — HTTPS is required; HTTP sources are allowed only with
-  `S4_PRESIGNED_HTTP_ALLOW_HTTP=true`, and **destinations are always HTTPS**.
+- **Scheme** — HTTPS is required. `S4_PRESIGNED_HTTP_ALLOW_HTTP=true` permits
+  HTTP only for an explicit presigned source `GET`; presigned `PUT` and
+  `DELETE` destinations remain HTTPS-only.
 - **No userinfo or fragments**, and the scheme must be supported.
 - **Expiry validation** — the URL must carry an explicit expiry
   (`X-Amz-Date`+`X-Amz-Expires` or `Expires`) with at least
@@ -330,6 +346,31 @@ single byte is fetched or sent:
   client (no re-resolution) and proxying is disabled.
 - **No redirects** — redirects are disabled at the client and redirect
   responses are rejected outright on reads.
+
+Persisted S3-compatible workspace endpoints use a separate
+`WorkspaceEndpointPolicy`; presigned URL policy and expiry rules are not reused:
+
+- In multi-tenant mode HTTPS is mandatory, URLs cannot contain userinfo, query,
+  or fragment components, and the host must exactly match or be a strict
+  dot-boundary `*.suffix` entry in `S4_WORKSPACE_ENDPOINT_ALLOWLIST`.
+- DNS is revalidated before every per-workspace AWS SDK client is constructed.
+  Empty answers, private/reserved addresses, mixed public/private answers,
+  IP-literal allowlist bypasses, and IPv4-mapped private IPv6 are rejected.
+- The per-workspace AWS SDK connector explicitly disables proxies and does not
+  use browser-style redirect following. It performs its own DNS lookup after
+  validation rather than using the validated addresses, so the multi-tenant
+  allowlist is a trusted-provider boundary: operators must allow only provider
+  domains whose DNS tenants cannot control or rebind.
+- Every gateway AWS SDK S3 client is configured for one SDK attempt. Journaled
+  and spooled write transactions retain their own explicit bounded retry budget
+  (currently three attempts), so retries remain visible to transaction evidence,
+  fencing, and reconciliation rather than occurring inside the SDK.
+- HTTP or private addresses are accepted only in explicit single-tenant mode.
+  Private destinations additionally require an exact operator entry in
+  `S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST`; wildcard private exceptions are
+  invalid.
+- Public builds provide no common-provider allowlist defaults. Deployments must
+  choose the provider domains they trust.
 
 ## 11. Cancellation and cleanup
 
@@ -369,6 +410,8 @@ The gateway must never log:
   object content),
 - **Staging keys or DEKs** (wrapped or unwrapped),
 - **Credentials** — API key secrets, backend access keys, KEKs, or tokens,
+- **Backend endpoint URLs containing query data** (these are rejected before
+  persistence or client construction),
 - **Signed URLs** (presigned URLs are bearer credentials),
 - **Staging artifact ciphertext or key material**.
 

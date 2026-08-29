@@ -10,6 +10,7 @@ pub mod plugin_registry;
 pub mod read_spool;
 pub mod record;
 pub mod s3_error;
+mod s3_safety;
 pub mod server;
 pub mod service_storage;
 pub mod sigv4;

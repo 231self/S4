@@ -8,6 +8,8 @@ use bytes::{Buf, Bytes, BytesMut};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::s3_safety::record_s3_failure;
+
 use super::{
     AbortSignal, BackendCapabilities, BackendError, CompletionProbe, DIRECT_PART_BYTES,
     DiscoveredUpload, EvidenceRecord, ObjectDestination, ObjectSinkTransaction, OperationJournal,
@@ -53,7 +55,7 @@ impl AwsS3TransactionBackend {
             .set_metadata(Some(object_metadata(operation)))
             .send()
             .await
-            .map_err(ambiguous)?;
+            .map_err(|error| ambiguous("rewrite_create_multipart", &error))?;
         let upload_id = upload.upload_id().ok_or_else(|| {
             BackendError::ambiguous("metadata rewrite create-multipart response omitted upload ID")
         })?;
@@ -86,7 +88,7 @@ impl AwsS3TransactionBackend {
                     .copy_source_range(format!("bytes={start}-{end}"))
                     .send()
                     .await
-                    .map_err(ambiguous)?;
+                    .map_err(|error| ambiguous("rewrite_upload_part_copy", &error))?;
                 let etag = output
                     .copy_part_result()
                     .and_then(|result| result.e_tag())
@@ -115,7 +117,7 @@ impl AwsS3TransactionBackend {
                 )
                 .send()
                 .await
-                .map_err(ambiguous)?;
+                .map_err(|error| ambiguous("rewrite_complete_multipart", &error))?;
             Ok(StoredObjectMeta {
                 etag: output.e_tag().map(ToOwned::to_owned),
                 version_id: output.version_id().map(ToOwned::to_owned),
@@ -124,15 +126,17 @@ impl AwsS3TransactionBackend {
             })
         }
         .await;
-        if result.is_err() {
-            let _ = self
+        if result.is_err()
+            && let Err(error) = self
                 .client
                 .abort_multipart_upload()
                 .bucket(&operation.destination.bucket)
                 .key(&operation.destination.physical_key)
                 .upload_id(upload_id)
                 .send()
-                .await;
+                .await
+        {
+            record_s3_failure("rewrite_abort_multipart", &error);
         }
         result
     }
@@ -182,7 +186,7 @@ impl AwsS3TransactionBackend {
             {
                 Ok(CompletionProbe::ProvenAbsent)
             }
-            Err(error) => Err(ambiguous(error)),
+            Err(error) => Err(ambiguous("probe_head_object", &error)),
         }
     }
 }
@@ -237,8 +241,11 @@ fn copy_source(operation: &OperationRecord) -> String {
     source
 }
 
-fn ambiguous(error: impl std::fmt::Display) -> BackendError {
-    BackendError::ambiguous(error.to_string())
+fn ambiguous<E, R>(
+    operation: &'static str,
+    error: &aws_smithy_runtime_api::client::result::SdkError<E, R>,
+) -> BackendError {
+    BackendError::ambiguous(record_s3_failure(operation, error).to_string())
 }
 
 #[async_trait]
@@ -262,7 +269,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .body(ByteStream::from(body))
             .send()
             .await
-            .map_err(ambiguous)?;
+            .map_err(|error| ambiguous("put_object", &error))?;
         Ok(StoredObjectMeta {
             etag: output.e_tag().map(ToOwned::to_owned),
             version_id: output.version_id().map(ToOwned::to_owned),
@@ -281,7 +288,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .set_metadata(Some(object_metadata(operation)))
             .send()
             .await
-            .map_err(ambiguous)?;
+            .map_err(|error| ambiguous("create_multipart", &error))?;
         output
             .upload_id()
             .map(ToOwned::to_owned)
@@ -305,7 +312,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .body(ByteStream::from(body))
             .send()
             .await
-            .map_err(ambiguous)?;
+            .map_err(|error| ambiguous("upload_part", &error))?;
         output
             .e_tag()
             .map(ToOwned::to_owned)
@@ -343,7 +350,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .multipart_upload(completed)
             .send()
             .await
-            .map_err(ambiguous)?;
+            .map_err(|error| ambiguous("complete_multipart", &error))?;
         let mut rewritten = self.rewrite_completed_multipart_metadata(operation).await?;
         if let Some(version_id) = first.version_id()
             && rewritten.version_id.as_deref() != Some(version_id)
@@ -367,7 +374,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
             .upload_id(upload_id)
             .send()
             .await
-            .map_err(ambiguous)?;
+            .map_err(|error| ambiguous("abort_multipart", &error))?;
         Ok(())
     }
 
@@ -388,7 +395,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
                 .set_upload_id_marker(upload_id_marker)
                 .send()
                 .await
-                .map_err(ambiguous)?;
+                .map_err(|error| ambiguous("list_multipart_uploads", &error))?;
             for upload in output.uploads() {
                 let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
                     continue;

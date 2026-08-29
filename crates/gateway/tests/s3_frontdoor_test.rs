@@ -2316,6 +2316,7 @@ fn signed_request(
     method: &str,
     uri: &str,
     body: &[u8],
+    headers: &[(&'static str, &str)],
 ) -> Request<Body> {
     use aws_credential_types::Credentials;
     use aws_sigv4::http_request::{
@@ -2342,16 +2343,24 @@ fn signed_request(
         .unwrap()
         .into();
 
-    let signable =
-        SignableRequest::new(method, uri, std::iter::empty(), SignableBody::Bytes(body)).unwrap();
-    let output = sign(signable, &params).unwrap();
-    let instructions = output.into_parts().0;
-
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .body(Body::from(body.to_vec()))
         .unwrap();
+    for &(name, value) in headers {
+        req.headers_mut().append(name, value.parse().unwrap());
+    }
+    let signable = SignableRequest::new(
+        method,
+        uri,
+        req.headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.to_str().unwrap())),
+        SignableBody::Bytes(body),
+    )
+    .unwrap();
+    let instructions = sign(signable, &params).unwrap().into_parts().0;
     instructions.apply_to_request_http1x(&mut req);
     // The signer covered `host`; the outgoing request must carry it too.
     let authority = req
@@ -2364,14 +2373,66 @@ fn signed_request(
     req
 }
 
-/// Streaming PUT requires an explicit Content-Type (it is not part of the
-/// SigV4 SignedHeaders, so injecting it after signing is safe).
-fn with_content_type(request: Request<Body>, content_type: &str) -> Request<Body> {
-    let (mut parts, body) = request.into_parts();
-    parts
-        .headers
-        .insert(header::CONTENT_TYPE, content_type.parse().unwrap());
-    Request::from_parts(parts, body)
+fn presigned_request(
+    access_key: &str,
+    secret: &str,
+    method: &str,
+    uri: &str,
+    headers: &[(&'static str, &str)],
+) -> Request<Body> {
+    use aws_credential_types::Credentials;
+    use aws_sigv4::http_request::{
+        PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation, SigningParams,
+        SigningSettings, UriPathNormalizationMode, sign,
+    };
+    use aws_sigv4::sign::v4;
+    use std::time::SystemTime;
+
+    let mut settings = SigningSettings::default();
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    settings.signature_location = SignatureLocation::QueryParams;
+    settings.expires_in = Some(Duration::from_secs(300));
+
+    let identity: aws_smithy_runtime_api::client::identity::Identity =
+        Credentials::new(access_key, secret, None, None, "test").into();
+    let params: SigningParams = v4::SigningParams::builder()
+        .identity(&identity)
+        .region("us-east-1")
+        .name("s3")
+        .time(SystemTime::now())
+        .settings(settings)
+        .build()
+        .unwrap()
+        .into();
+
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    for &(name, value) in headers {
+        req.headers_mut().append(name, value.parse().unwrap());
+    }
+    let signable = SignableRequest::new(
+        method,
+        uri,
+        req.headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.to_str().unwrap())),
+        SignableBody::UnsignedPayload,
+    )
+    .unwrap();
+    let instructions = sign(signable, &params).unwrap().into_parts().0;
+    instructions.apply_to_request_http1x(&mut req);
+    let authority = req
+        .uri()
+        .authority()
+        .expect("absolute uri")
+        .as_str()
+        .to_string();
+    req.headers_mut().insert("host", authority.parse().unwrap());
+    req
 }
 
 #[tokio::test]
@@ -2381,9 +2442,13 @@ async fn sigv4_signed_request_accepted_and_rejected() {
     let uri = "http://s4.local/demo/signed.txt";
 
     // Correct signature → 200.
-    let req = with_content_type(
-        signed_request(&ak, &sk, "PUT", uri, b"hello world"),
-        "text/plain",
+    let req = signed_request(
+        &ak,
+        &sk,
+        "PUT",
+        uri,
+        b"hello world",
+        &[("content-type", "text/plain")],
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
@@ -2396,7 +2461,7 @@ async fn sigv4_signed_request_accepted_and_rejected() {
     assert_eq!(status, StatusCode::OK, "valid SigV4 should pass");
 
     // Wrong secret → 403.
-    let req = signed_request(&ak, "not-the-secret", "PUT", uri, b"hello world");
+    let req = signed_request(&ak, "not-the-secret", "PUT", uri, b"hello world", &[]);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
@@ -2405,13 +2470,372 @@ async fn sigv4_signed_request_accepted_and_rejected() {
     );
 
     // Unknown access key → 403.
-    let req = signed_request("s4_unknown", &sk, "PUT", uri, b"hello world");
+    let req = signed_request("s4_unknown", &sk, "PUT", uri, b"hello world", &[]);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
         "unknown key must fail"
     );
+}
+
+#[tokio::test]
+async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
+    enum HeaderChange {
+        None,
+        Replace(&'static str, &'static str),
+        Remove(&'static str),
+    }
+
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    for (index, (name, change, expected)) in [
+        ("unchanged", HeaderChange::None, StatusCode::OK),
+        (
+            "mutated content type",
+            HeaderChange::Replace("content-type", "application/json"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "removed content type",
+            HeaderChange::Remove("content-type"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "mutated dynamic metadata",
+            HeaderChange::Replace("x-amz-meta-dynamic-name", "two"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "removed S4 semantic header",
+            HeaderChange::Remove("x-s4-process"),
+            StatusCode::FORBIDDEN,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let uri = format!("http://s4.local/semantic/signed-{index}.txt");
+        let request = signed_request(
+            &access_key,
+            &secret_key,
+            "PUT",
+            &uri,
+            b"semantic body",
+            &[
+                ("content-type", "text/plain"),
+                ("x-s4-process", "write"),
+                ("x-amz-meta-dynamic-name", "one"),
+            ],
+        );
+        let (mut parts, body) = request.into_parts();
+        match change {
+            HeaderChange::None => {}
+            HeaderChange::Replace(header, value) => {
+                parts.headers.insert(header, value.parse().unwrap());
+            }
+            HeaderChange::Remove(header) => {
+                parts.headers.remove(header);
+            }
+        }
+        let response = app
+            .clone()
+            .oneshot(Request::from_parts(parts, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{name}");
+        if expected == StatusCode::FORBIDDEN {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("<Code>SignatureDoesNotMatch</Code>"),
+                "{name}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sigv4_rejects_ambiguous_or_noncanonical_integrity_headers_before_body_polling() {
+    enum HeaderShape {
+        Raw(&'static str),
+        Duplicate {
+            signed: &'static str,
+            first: &'static str,
+            second: &'static str,
+        },
+    }
+
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    for (index, (name, shape)) in [
+        (
+            "x-s4-stable-fields",
+            HeaderShape::Duplicate {
+                signed: "email,account_id",
+                first: "email",
+                second: "account_id",
+            },
+        ),
+        (
+            "x-s4-backend-url",
+            HeaderShape::Duplicate {
+                signed: "https://storage.example/one,https://storage.example/two",
+                first: "https://storage.example/one",
+                second: "https://storage.example/two",
+            },
+        ),
+        (
+            "content-type",
+            HeaderShape::Duplicate {
+                signed: "text/plain;charset=utf-8",
+                first: "text/plain",
+                second: "charset=utf-8",
+            },
+        ),
+        (
+            "x-amz-meta-project",
+            HeaderShape::Duplicate {
+                signed: "one,two",
+                first: "one",
+                second: "two",
+            },
+        ),
+        ("x-s4-stable-fields", HeaderShape::Raw(" email, account_id")),
+        ("x-s4-stable-fields", HeaderShape::Raw("email, account_id ")),
+        (
+            "x-s4-backend-url",
+            HeaderShape::Raw("\thttps://storage.example/object"),
+        ),
+        (
+            "content-type",
+            HeaderShape::Raw("text/plain;  charset=utf-8"),
+        ),
+        (
+            "content-md5",
+            HeaderShape::Raw("CY9rzUYh03PK3k6DJie09g==\t"),
+        ),
+        ("x-amz-tagging", HeaderShape::Raw(" project=one&owner=two")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let signed_value = match &shape {
+            HeaderShape::Raw(value) => *value,
+            HeaderShape::Duplicate { signed, .. } => *signed,
+        };
+        let mut signed_headers = Vec::with_capacity(2);
+        if name != "content-type" {
+            signed_headers.push(("content-type", "text/plain"));
+        }
+        signed_headers.push((name, signed_value));
+        let uri = format!("http://s4.local/semantic/shape-{index}.txt");
+        let request = signed_request(
+            &access_key,
+            &secret_key,
+            "PUT",
+            &uri,
+            b"must not be polled",
+            &signed_headers,
+        );
+        let (mut parts, _) = request.into_parts();
+        if let HeaderShape::Duplicate { first, second, .. } = shape {
+            parts.headers.remove(name);
+            parts.headers.append(name, first.parse().unwrap());
+            parts.headers.append(name, second.parse().unwrap());
+        }
+        let polls = Arc::new(AtomicUsize::new(0));
+        let request = Request::from_parts(
+            parts,
+            Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not be polled")),
+            }),
+        );
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "{name}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("<Code>SignatureDoesNotMatch</Code>"),
+            "{name}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn sigv4_rejects_unsigned_integrity_header_injection_before_polling_the_body() {
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    for (index, (name, value)) in [
+        ("x-s4-storage-mode", "managed"),
+        ("x-s4-backend-url", "https://storage.example/object"),
+        ("x-s4-process", "read"),
+        ("x-s4-stable-fields", "email"),
+        ("content-type", "text/plain"),
+        ("content-encoding", "gzip"),
+        ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
+        ("x-amz-meta-dynamic-name", "metadata"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let uri = format!("http://s4.local/semantic/unsigned-{index}.txt");
+        let request = signed_request(
+            &access_key,
+            &secret_key,
+            "PUT",
+            &uri,
+            b"must not be polled",
+            &[],
+        );
+        let (mut parts, _) = request.into_parts();
+        parts.headers.insert(name, value.parse().unwrap());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let request = Request::from_parts(
+            parts,
+            Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not be polled")),
+            }),
+        );
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "{name}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("<Code>SignatureDoesNotMatch</Code>"),
+            "{name}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains(
+                "The request signature we calculated does not match the signature you provided."
+            ),
+            "{name} must use the generic 403 message"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains(name),
+            "{name} must not be disclosed by the generic rejection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn presigned_host_only_get_accepts_but_appended_protected_headers_are_rejected() {
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    state.store.put(
+        "presigned",
+        "object.txt",
+        Bytes::from_static(b"presigned body"),
+        "text/plain",
+    );
+    let uri = "https://s4.local/presigned/object.txt";
+
+    let response = app
+        .clone()
+        .oneshot(presigned_request(&access_key, &secret_key, "GET", uri, &[]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "presigned body"
+    );
+
+    for (name, value) in [
+        ("x-amz-user-agent", "unsigned-agent"),
+        ("x-amz-checksum-mode", "ENABLED"),
+    ] {
+        let request = presigned_request(&access_key, &secret_key, "GET", uri, &[]);
+        let (mut parts, body) = request.into_parts();
+        parts.headers.insert(name, value.parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(Request::from_parts(parts, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "unsigned signer exclusion {name}"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(presigned_request(
+            &access_key,
+            &secret_key,
+            "GET",
+            uri,
+            &[("x-amz-meta-dynamic-name", "signed")],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for (name, value) in [
+        ("x-s4-process", "read"),
+        ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+        ("x-amz-meta-dynamic-name", "appended"),
+        ("x-amz-tagging", "project=appended"),
+    ] {
+        let request = presigned_request(&access_key, &secret_key, "GET", uri, &[]);
+        let (mut parts, body) = request.into_parts();
+        parts.headers.insert(name, value.parse().unwrap());
+        let response = app
+            .clone()
+            .oneshot(Request::from_parts(parts, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{name}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("<Code>SignatureDoesNotMatch</Code>"),
+            "{name}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_sigv4_api_key_auth_keeps_raw_semantic_header_behavior() {
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let request = append_headers(
+        add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/semantic/api-key.txt")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header("x-amz-meta-dynamic-name", "metadata")
+                .body(Body::from("API key body"))
+                .unwrap(),
+            &auth_headers(&access_key, &secret_key),
+        ),
+        &[
+            ("x-s4-process", " write ".to_string()),
+            ("x-s4-process", "read".to_string()),
+        ],
+    );
+
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert!(state.store.get("semantic", "api-key.txt").is_some());
 }
 
 #[tokio::test]
@@ -2425,11 +2849,15 @@ async fn streaming_sigv4_hash_is_checked_before_atomic_commit() {
     let uri = "http://s4.local/stream/signed-stream.txt";
     let input = b"contact a@b.com now\n";
 
-    let request = signed_request(&access_key, &secret_key, "PUT", uri, input);
-    let (mut parts, _) = request.into_parts();
-    parts
-        .headers
-        .insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+    let request = signed_request(
+        &access_key,
+        &secret_key,
+        "PUT",
+        uri,
+        input,
+        &[("content-type", "text/plain")],
+    );
+    let (parts, _) = request.into_parts();
     let request = Request::from_parts(
         parts,
         Body::new(FrameSequenceBody::data([
@@ -2451,11 +2879,15 @@ async fn streaming_sigv4_hash_is_checked_before_atomic_commit() {
     );
 
     let bad_uri = "http://s4.local/stream/tampered-stream.txt";
-    let request = signed_request(&access_key, &secret_key, "PUT", bad_uri, input);
-    let (mut parts, _) = request.into_parts();
-    parts
-        .headers
-        .insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+    let request = signed_request(
+        &access_key,
+        &secret_key,
+        "PUT",
+        bad_uri,
+        input,
+        &[("content-type", "text/plain")],
+    );
+    let (parts, _) = request.into_parts();
     let request = Request::from_parts(parts, Body::from("tampered body\n"));
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -2469,15 +2901,19 @@ async fn sigv4_get_object_roundtrip() {
 
     // PUT via SigV4.
     let uri = "http://s4.local/bkt/signed.txt";
-    let req = with_content_type(
-        signed_request(&ak, &sk, "PUT", uri, b"content a@b.com"),
-        "text/plain",
+    let req = signed_request(
+        &ak,
+        &sk,
+        "PUT",
+        uri,
+        b"content a@b.com",
+        &[("content-type", "text/plain")],
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // GET via SigV4 returns the filtered object.
-    let req = signed_request(&ak, &sk, "GET", uri, b"");
+    let req = signed_request(&ak, &sk, "GET", uri, b"", &[]);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -2638,11 +3074,15 @@ async fn sigv4_tampered_body_rejected() {
     let uri = "http://s4.local/bkt/tamper.txt";
 
     // Sign body A, then send body B with the A-signature -> 403.
-    let req = with_content_type(signed_request(&ak, &sk, "PUT", uri, b"AAAA"), "text/plain");
-    let (mut parts, _old_body) = req.into_parts();
-    parts
-        .headers
-        .insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+    let req = signed_request(
+        &ak,
+        &sk,
+        "PUT",
+        uri,
+        b"AAAA",
+        &[("content-type", "text/plain")],
+    );
+    let (parts, _old_body) = req.into_parts();
     let req = Request::from_parts(parts, Body::from("BBBB"));
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
@@ -2657,7 +3097,7 @@ async fn invalid_sigv4_headers_are_rejected_without_polling_put_body() {
     let (app, state) = router().await;
     let (ak, _sk) = make_key(&state).await;
     let uri = "http://s4.local/bkt/unpolled.txt";
-    let signed = signed_request(&ak, "wrong-secret", "PUT", uri, b"sensitive body");
+    let signed = signed_request(&ak, "wrong-secret", "PUT", uri, b"sensitive body", &[]);
     let (parts, _) = signed.into_parts();
     let polls = Arc::new(AtomicUsize::new(0));
     let request = Request::from_parts(
@@ -2678,9 +3118,13 @@ async fn valid_sigv4_seed_polls_then_rejects_payload_hash_mismatch() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
     let uri = "http://s4.local/bkt/hash-mismatch.txt";
-    let signed = with_content_type(
-        signed_request(&ak, &sk, "PUT", uri, b"claimed body"),
-        "text/plain",
+    let signed = signed_request(
+        &ak,
+        &sk,
+        "PUT",
+        uri,
+        b"claimed body",
+        &[("content-type", "text/plain")],
     );
     let (parts, _) = signed.into_parts();
     let polls = Arc::new(AtomicUsize::new(0));

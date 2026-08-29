@@ -76,6 +76,23 @@ signature verification all complete before a request body is polled.
 - **Query auth (presigned)** — `X-Amz-*` query parameters; presigned requests
   without an explicit `x-amz-content-sha256` header default to
   `UNSIGNED-PAYLOAD`, which is only accepted over trusted TLS.
+- **Signed-header integrity** — `host` is always signed, and header auth also
+  requires signed `x-amz-date` and `x-amz-content-sha256`. In every SigV4 mode,
+  every present `x-amz-*` header except `x-amz-user-agent` and
+  `x-amz-checksum-mode`, plus each present request-semantic header
+  (`x-s4-storage-mode`, `x-s4-backend-url`, `x-s4-process`,
+  `x-s4-stable-fields`, `content-type`, `content-encoding`, and `content-md5`),
+  must appear in `SignedHeaders`, occur exactly once, contain valid UTF-8, and
+  already equal AWS SigV4 TrimAll form: no leading or trailing SP/HTAB and every
+  internal SP/HTAB run collapsed to one ASCII space. The gateway rejects rather
+  than rewrites noncanonical values, including comma-equivalent duplicates, so
+  metadata and tagging consumers observe the same sole canonical value that was
+  signed. The two exact exceptions are also exempt from duplicate and canonical
+  value enforcement because the pinned `aws-sigv4` presigner excludes them.
+  `x-amz-checksum-mode` is read-only response-integrity negotiation, not a
+  storage-selection or processing semantic. Optional headers may be absent, so
+  a normal host-only presigned GET remains valid; violations receive the generic
+  signature-mismatch response before the request body is read.
 - **Scope validation** — region (`S4_SIGV4_REGION`, default `us-east-1`),
   service (`s3`), and terminator (`aws4_request`) are enforced; the request
   timestamp must fall within the clock-skew window (15 minutes) and presigned

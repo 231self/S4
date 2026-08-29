@@ -21,6 +21,16 @@ use crate::integrity::{BodyVerifier, IntegrityError, StreamingSigning};
 
 const DEFAULT_REGION: &str = "us-east-1";
 const MAX_PRESIGN_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const SEMANTIC_HEADERS: &[&str] = &[
+    "x-s4-storage-mode",
+    "x-s4-backend-url",
+    "x-s4-process",
+    "x-s4-stable-fields",
+    "content-type",
+    "content-encoding",
+    "content-md5",
+];
+const X_AMZ_SIGNER_EXCLUSIONS: &[&str] = &["x-amz-user-agent", "x-amz-checksum-mode"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SigV4Error {
@@ -472,6 +482,7 @@ fn validate_signed_headers(
     {
         return Err(SigV4Error::InvalidSignedHeaders);
     }
+    validate_integrity_header_values(headers)?;
     for name in signed {
         if headers.get(name).is_none() {
             return Err(SigV4Error::MissingHeader("signed header"));
@@ -479,14 +490,46 @@ fn validate_signed_headers(
     }
     for name in headers.keys() {
         let name = name.as_str();
-        if name.starts_with("x-amz-")
-            && name != "x-amz-content-sha256"
-            && !signed.iter().any(|signed| signed == name)
-        {
+        if requires_signed_header_integrity(name) && !signed.iter().any(|signed| signed == name) {
             return Err(SigV4Error::InvalidSignedHeaders);
         }
     }
     Ok(())
+}
+
+fn requires_signed_header_integrity(name: &str) -> bool {
+    SEMANTIC_HEADERS.contains(&name)
+        || (name.starts_with("x-amz-") && !X_AMZ_SIGNER_EXCLUSIONS.contains(&name))
+}
+
+fn validate_integrity_header_values(headers: &HeaderMap) -> Result<(), SigV4Error> {
+    for name in headers.keys() {
+        let name = name.as_str();
+        if !requires_signed_header_integrity(name) {
+            continue;
+        }
+        let mut values = headers.get_all(name).iter();
+        let Some(value) = values.next() else {
+            continue;
+        };
+        if values.next().is_some() {
+            return Err(SigV4Error::InvalidSignedHeaders);
+        }
+        let value =
+            std::str::from_utf8(value.as_bytes()).map_err(|_| SigV4Error::InvalidSignedHeaders)?;
+        if !is_trim_all_canonical(value) {
+            return Err(SigV4Error::InvalidSignedHeaders);
+        }
+    }
+    Ok(())
+}
+
+fn is_trim_all_canonical(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.contains(&b'\t')
+        && !bytes.first().is_some_and(|byte| *byte == b' ')
+        && !bytes.last().is_some_and(|byte| *byte == b' ')
+        && !bytes.windows(2).any(|pair| pair == b"  ")
 }
 
 fn collect_signed_header_values(
@@ -765,7 +808,11 @@ mod tests {
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
     const DATE: &str = "20260819T120000Z";
 
-    fn signed_request(uri: &str, region: &str) -> (Uri, HeaderMap, SystemTime) {
+    fn signed_request(
+        uri: &str,
+        region: &str,
+        extra_headers: &[(&'static str, &str)],
+    ) -> (Uri, HeaderMap, SystemTime) {
         let time = parse_timestamp(DATE).unwrap();
         let mut settings = SigningSettings::default();
         settings.percent_encoding_mode = PercentEncodingMode::Single;
@@ -785,7 +832,7 @@ mod tests {
         let request = SignableRequest::new(
             Method::PUT.as_str(),
             uri,
-            std::iter::empty(),
+            extra_headers.iter().copied(),
             SignableBody::Bytes(b"payload"),
         )
         .unwrap();
@@ -796,6 +843,11 @@ mod tests {
             .uri(uri.clone())
             .body(())
             .unwrap();
+        for &(name, value) in extra_headers {
+            request
+                .headers_mut()
+                .append(name, HeaderValue::from_str(value).unwrap());
+        }
         instructions.apply_to_request_http1x(&mut request);
         request.headers_mut().insert(
             "host",
@@ -804,7 +856,10 @@ mod tests {
         (uri, request.into_parts().0.headers, time)
     }
 
-    fn presigned_request(uri: &str) -> (Uri, HeaderMap, SystemTime) {
+    fn presigned_request(
+        uri: &str,
+        extra_headers: &[(&'static str, &str)],
+    ) -> (Uri, HeaderMap, SystemTime) {
         let time = parse_timestamp(DATE).unwrap();
         let mut settings = SigningSettings::default();
         settings.percent_encoding_mode = PercentEncodingMode::Single;
@@ -825,7 +880,7 @@ mod tests {
         let request = SignableRequest::new(
             Method::GET.as_str(),
             uri,
-            std::iter::empty(),
+            extra_headers.iter().copied(),
             SignableBody::UnsignedPayload,
         )
         .unwrap();
@@ -835,6 +890,11 @@ mod tests {
             .uri(uri)
             .body(())
             .unwrap();
+        for &(name, value) in extra_headers {
+            request
+                .headers_mut()
+                .append(name, HeaderValue::from_str(value).unwrap());
+        }
         instructions.apply_to_request_http1x(&mut request);
         let authority = request.uri().authority().unwrap().as_str().to_string();
         request
@@ -864,7 +924,7 @@ mod tests {
             "http://s4.local/bucket/a%20b//c?z=last&a=first",
             "http://s4.local/bucket/%E2%98%83?empty=&repeat=b&repeat=a",
         ] {
-            let (uri, headers, time) = signed_request(uri, "us-east-1");
+            let (uri, headers, time) = signed_request(uri, "us-east-1", &[]);
             let auth = RequestAuthorization::parse(&uri, &headers)
                 .unwrap()
                 .unwrap();
@@ -883,7 +943,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_scope_skew_and_duplicate_or_unsorted_headers() {
-        let (uri, headers, time) = signed_request("http://s4.local/bucket/key", "eu-west-1");
+        let (uri, headers, time) = signed_request("http://s4.local/bucket/key", "eu-west-1", &[]);
         let auth = RequestAuthorization::parse(&uri, &headers)
             .unwrap()
             .unwrap();
@@ -902,7 +962,7 @@ mod tests {
             SigV4Error::InvalidScope
         );
 
-        let (uri, headers, time) = signed_request("http://s4.local/bucket/key", "us-east-1");
+        let (uri, headers, time) = signed_request("http://s4.local/bucket/key", "us-east-1", &[]);
         let auth = RequestAuthorization::parse(&uri, &headers)
             .unwrap()
             .unwrap();
@@ -928,6 +988,383 @@ mod tests {
             parse_signed_headers("x-amz-date;host"),
             Err(SigV4Error::InvalidSignedHeaders)
         );
+    }
+
+    #[test]
+    fn requires_every_present_semantic_and_amz_header_to_be_signed() {
+        let protected_headers = [
+            ("x-s4-storage-mode", "managed"),
+            ("x-s4-backend-url", "https://storage.example/object"),
+            ("x-s4-process", "read"),
+            ("x-s4-stable-fields", "email"),
+            ("content-type", "text/plain"),
+            ("content-encoding", "identity"),
+            ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
+            ("x-amz-meta-dynamic-name", "metadata"),
+        ];
+
+        for location in [
+            Location::Header,
+            Location::Query {
+                expires: Duration::ZERO,
+            },
+        ] {
+            let mut baseline_headers = HeaderMap::new();
+            baseline_headers.insert("host", HeaderValue::from_static("s4.local"));
+            let mut baseline_signed = vec!["host".to_string()];
+            if location == Location::Header {
+                baseline_headers.insert("x-amz-date", HeaderValue::from_static(DATE));
+                baseline_headers.insert(
+                    "x-amz-content-sha256",
+                    HeaderValue::from_static(
+                        "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+                    ),
+                );
+                baseline_signed
+                    .extend(["x-amz-content-sha256".to_string(), "x-amz-date".to_string()]);
+            }
+            assert_eq!(
+                validate_signed_headers(&baseline_signed, location, &baseline_headers),
+                Ok(()),
+                "absent optional headers remain valid for {location:?}"
+            );
+
+            for (name, value) in protected_headers {
+                let mut headers = baseline_headers.clone();
+                headers.insert(name, HeaderValue::from_static(value));
+                assert_eq!(
+                    validate_signed_headers(&baseline_signed, location, &headers),
+                    Err(SigV4Error::InvalidSignedHeaders),
+                    "unsigned {name} must be rejected for {location:?}"
+                );
+
+                let mut signed = baseline_signed.clone();
+                signed.push(name.to_string());
+                signed.sort_unstable();
+                assert_eq!(
+                    validate_signed_headers(&signed, location, &headers),
+                    Ok(()),
+                    "signed {name} must be accepted for {location:?}"
+                );
+            }
+        }
+
+        let mut query_headers = HeaderMap::new();
+        query_headers.insert("host", HeaderValue::from_static("s4.local"));
+        query_headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+        );
+        assert_eq!(
+            validate_signed_headers(
+                &["host".to_string()],
+                Location::Query {
+                    expires: Duration::ZERO,
+                },
+                &query_headers,
+            ),
+            Err(SigV4Error::InvalidSignedHeaders)
+        );
+    }
+
+    #[test]
+    fn integrity_header_values_must_be_unique_utf8_and_trim_all_canonical() {
+        let canonical_values = [
+            ("x-s4-storage-mode", "managed"),
+            ("x-s4-backend-url", "https://storage.example/object"),
+            ("x-s4-process", "read"),
+            ("x-s4-stable-fields", "email, account_id"),
+            ("content-type", "text/plain; charset=utf-8"),
+            ("content-encoding", "aws-chunked"),
+            ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
+            ("x-amz-meta-project", "project one"),
+            ("x-amz-tagging", "project=one&owner=two"),
+            ("x-amz-checksum-sha256", "checksum"),
+            ("x-amz-trailer", "x-amz-checksum-sha256"),
+            ("x-amz-decoded-content-length", "123"),
+            ("x-amz-security-token", "token"),
+            (
+                "x-amz-content-sha256",
+                "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+            ),
+            ("x-amz-date", DATE),
+            ("x-amz-future-semantics", "future value"),
+        ];
+        for (name, value) in canonical_values {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", HeaderValue::from_static("s4.local"));
+            headers.insert("x-amz-date", HeaderValue::from_static(DATE));
+            headers.insert(
+                "x-amz-content-sha256",
+                HeaderValue::from_static(
+                    "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+                ),
+            );
+            headers.insert(name, HeaderValue::from_static(value));
+            let mut signed = vec![
+                "host".to_string(),
+                "x-amz-content-sha256".to_string(),
+                "x-amz-date".to_string(),
+            ];
+            if !signed.iter().any(|signed| signed == name) {
+                signed.push(name.to_string());
+            }
+            signed.sort_unstable();
+            assert_eq!(
+                validate_signed_headers(&signed, Location::Header, &headers),
+                Ok(()),
+                "canonical {name} must remain accepted"
+            );
+
+            headers.append(name, HeaderValue::from_static(value));
+            assert_eq!(
+                validate_signed_headers(&signed, Location::Header, &headers),
+                Err(SigV4Error::InvalidSignedHeaders),
+                "duplicate {name} must be rejected"
+            );
+        }
+
+        let mut invalid_utf8 = HeaderMap::new();
+        invalid_utf8.insert("host", HeaderValue::from_static("s4.local"));
+        invalid_utf8.insert(
+            "x-amz-meta-project",
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert_eq!(
+            validate_signed_headers(
+                &["host".to_string(), "x-amz-meta-project".to_string()],
+                Location::Query {
+                    expires: Duration::ZERO,
+                },
+                &invalid_utf8,
+            ),
+            Err(SigV4Error::InvalidSignedHeaders)
+        );
+
+        let mut excluded_amz = HeaderMap::new();
+        excluded_amz.insert("host", HeaderValue::from_static("s4.local"));
+        excluded_amz.append("x-amz-user-agent", HeaderValue::from_static(" agent "));
+        excluded_amz.append("x-amz-user-agent", HeaderValue::from_static("second"));
+        excluded_amz.append("x-amz-checksum-mode", HeaderValue::from_static(" ENABLED "));
+        excluded_amz.append("x-amz-checksum-mode", HeaderValue::from_static("second"));
+        assert_eq!(
+            validate_signed_headers(
+                &["host".to_string()],
+                Location::Query {
+                    expires: Duration::ZERO,
+                },
+                &excluded_amz,
+            ),
+            Ok(()),
+            "the pinned signer exclusions remain unsigned and value-unconstrained"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_integrity_headers_even_when_joined_value_matches_the_signature() {
+        for (name, combined, first, second) in [
+            (
+                "x-s4-stable-fields",
+                "email,account_id",
+                "email",
+                "account_id",
+            ),
+            (
+                "x-s4-backend-url",
+                "https://storage.example/one,https://storage.example/two",
+                "https://storage.example/one",
+                "https://storage.example/two",
+            ),
+            (
+                "content-type",
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "charset=utf-8",
+            ),
+            ("x-amz-meta-project", "one,two", "one", "two"),
+        ] {
+            let (uri, headers, time) = signed_request(
+                "http://s4.local/bucket/duplicate",
+                "us-east-1",
+                &[(name, combined)],
+            );
+            let authorization = RequestAuthorization::parse(&uri, &headers)
+                .unwrap()
+                .unwrap();
+            authorization
+                .authorize(
+                    "PUT",
+                    &uri,
+                    &headers,
+                    SECRET,
+                    &SigningKeyCache::standard(),
+                    &SigV4Policy::new("us-east-1", false),
+                    time,
+                )
+                .unwrap();
+
+            let mut duplicated = headers.clone();
+            duplicated.remove(name);
+            duplicated.append(name, HeaderValue::from_static(first));
+            duplicated.append(name, HeaderValue::from_static(second));
+            assert_eq!(
+                authorization
+                    .authorize(
+                        "PUT",
+                        &uri,
+                        &duplicated,
+                        SECRET,
+                        &SigningKeyCache::standard(),
+                        &SigV4Policy::new("us-east-1", false),
+                        time,
+                    )
+                    .err()
+                    .unwrap(),
+                SigV4Error::InvalidSignedHeaders,
+                "comma-equivalent duplicate {name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_signed_trim_all_variants_and_accepts_canonical_single_spaces() {
+        for (name, raw) in [
+            ("x-s4-stable-fields", " email"),
+            ("x-s4-stable-fields", "email "),
+            ("x-s4-backend-url", "\thttps://storage.example/object"),
+            ("content-type", "text/plain;  charset=utf-8"),
+            ("content-md5", "CY9rzUYh03PK3k6DJie09g==\t"),
+            ("x-amz-tagging", " project=one&owner=two"),
+        ] {
+            let (uri, headers, time) = signed_request(
+                "http://s4.local/bucket/noncanonical",
+                "us-east-1",
+                &[(name, raw)],
+            );
+            let authorization = RequestAuthorization::parse(&uri, &headers)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                authorization
+                    .authorize(
+                        "PUT",
+                        &uri,
+                        &headers,
+                        SECRET,
+                        &SigningKeyCache::standard(),
+                        &SigV4Policy::new("us-east-1", false),
+                        time,
+                    )
+                    .err()
+                    .unwrap(),
+                SigV4Error::InvalidSignedHeaders,
+                "noncanonical {name} value {raw:?} must be rejected"
+            );
+        }
+
+        for (name, canonical) in [
+            ("x-s4-stable-fields", "email, account_id"),
+            ("x-s4-backend-url", "https://storage.example/object"),
+            ("content-type", "text/plain; charset=utf-8"),
+            ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
+            ("x-amz-meta-project", "project one"),
+        ] {
+            let (uri, headers, time) = signed_request(
+                "http://s4.local/bucket/canonical",
+                "us-east-1",
+                &[(name, canonical)],
+            );
+            RequestAuthorization::parse(&uri, &headers)
+                .unwrap()
+                .unwrap()
+                .authorize(
+                    "PUT",
+                    &uri,
+                    &headers,
+                    SECRET,
+                    &SigningKeyCache::standard(),
+                    &SigV4Policy::new("us-east-1", false),
+                    time,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn signed_integrity_values_are_cryptographically_bound_and_required() {
+        for (name, value, mutation) in [
+            (
+                "x-s4-backend-url",
+                "https://one.example/object",
+                "https://two.example/object",
+            ),
+            ("x-s4-stable-fields", "email", "account_id"),
+            ("content-type", "text/plain", "application/json"),
+            (
+                "content-md5",
+                "CY9rzUYh03PK3k6DJie09g==",
+                "AAAAAAAAAAAAAAAAAAAAAA==",
+            ),
+            ("x-amz-meta-dynamic-name", "one", "two"),
+        ] {
+            let (uri, headers, time) = signed_request(
+                "http://s4.local/bucket/semantic",
+                "us-east-1",
+                &[(name, value)],
+            );
+            let authorization = RequestAuthorization::parse(&uri, &headers)
+                .unwrap()
+                .unwrap();
+            authorization
+                .authorize(
+                    "PUT",
+                    &uri,
+                    &headers,
+                    SECRET,
+                    &SigningKeyCache::standard(),
+                    &SigV4Policy::new("us-east-1", false),
+                    time,
+                )
+                .unwrap();
+
+            let mut mutated = headers.clone();
+            mutated.insert(name, HeaderValue::from_static(mutation));
+            assert_eq!(
+                authorization
+                    .authorize(
+                        "PUT",
+                        &uri,
+                        &mutated,
+                        SECRET,
+                        &SigningKeyCache::standard(),
+                        &SigV4Policy::new("us-east-1", false),
+                        time,
+                    )
+                    .err()
+                    .unwrap(),
+                SigV4Error::SignatureMismatch,
+                "mutated {name} must fail signature verification"
+            );
+
+            let mut removed = headers.clone();
+            removed.remove(name);
+            assert_eq!(
+                authorization
+                    .authorize(
+                        "PUT",
+                        &uri,
+                        &removed,
+                        SECRET,
+                        &SigningKeyCache::standard(),
+                        &SigV4Policy::new("us-east-1", false),
+                        time,
+                    )
+                    .err()
+                    .unwrap(),
+                SigV4Error::MissingHeader("signed header"),
+                "removed {name} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -959,10 +1396,12 @@ mod tests {
 
     #[test]
     fn accepts_sdk_generated_presign_and_rejects_expiry_replay() {
-        let (uri, headers, time) = presigned_request("https://s4.local/bucket/a%20b?versionId=one");
+        let (uri, headers, time) =
+            presigned_request("https://s4.local/bucket/a%20b?versionId=one", &[]);
         let authorization = RequestAuthorization::parse(&uri, &headers)
             .unwrap()
             .unwrap();
+        assert_eq!(authorization.signed_headers, vec!["host".to_string()]);
         authorization
             .authorize(
                 "GET",
@@ -991,6 +1430,38 @@ mod tests {
                 .unwrap(),
             SigV4Error::Expired
         );
+    }
+
+    #[test]
+    fn presign_rejects_headers_appended_after_host_only_signing() {
+        let (uri, headers, time) = presigned_request("https://s4.local/bucket/object", &[]);
+        let authorization = RequestAuthorization::parse(&uri, &headers)
+            .unwrap()
+            .unwrap();
+        for (name, value) in [
+            ("x-s4-process", "read"),
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("x-amz-meta-dynamic-name", "metadata"),
+        ] {
+            let mut appended = headers.clone();
+            appended.insert(name, HeaderValue::from_static(value));
+            assert_eq!(
+                authorization
+                    .authorize(
+                        "GET",
+                        &uri,
+                        &appended,
+                        SECRET,
+                        &SigningKeyCache::standard(),
+                        &SigV4Policy::new("us-east-1", false),
+                        time,
+                    )
+                    .err()
+                    .unwrap(),
+                SigV4Error::InvalidSignedHeaders,
+                "appended {name} must be rejected"
+            );
+        }
     }
 
     #[test]

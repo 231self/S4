@@ -131,6 +131,14 @@ The plaintext secret exists only in the create-key HTTP response and,
 transiently, in memory during SigV4 verification. It is never logged or
 persisted.
 
+Credential mutations are bounded before persistence. API-key and MCP labels are
+trimmed, non-empty, free of control characters, and at most 128 UTF-8 bytes.
+Non-zero API-key and MCP lifetimes are at most one year (`0` means no expiry).
+Encryption public keys are at most 16 KiB and must be an SPKI public-key PEM or
+X.509 certificate carrying an RSA key between 2048 and 4096 bits, matching the
+formats consumed by the envelope-encryption filter. Credential JSON endpoints
+also have route-specific body limits; oversized requests receive `413`.
+
 ### Key-wrapping providers
 
 | Provider | Durability | When to use |

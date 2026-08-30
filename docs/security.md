@@ -139,6 +139,22 @@ X.509 certificate carrying an RSA key between 2048 and 4096 bits, matching the
 formats consumed by the envelope-encryption filter. Credential JSON endpoints
 also have route-specific body limits; oversized requests receive `413`.
 
+Credential creation returns plaintext only after the repository has committed
+the new credential. File-backed mutations remain hidden from concurrent readers
+until snapshot persistence succeeds, and failed mutations restore the prior
+state before readers resume. Repository failures are reported as service
+unavailable; they are never treated as a missing credential, an empty list, or
+an authentication denial.
+
+The file-backed repository writes and synchronizes a permission-restricted
+temporary snapshot, then atomically renames it as the mutation commit boundary.
+It attempts to synchronize the parent directory after rename; failure is warned
+but cannot make the already-published snapshot uncommitted. This provides
+committed atomic visibility, not an absolute power-loss durability guarantee.
+Missing snapshots start empty; unreadable or invalid snapshots stop startup
+instead of being replaced. This repository is a single gateway-instance
+abstraction and does not provide multi-process locking.
+
 ### Key-wrapping providers
 
 | Provider | Durability | When to use |
@@ -153,6 +169,11 @@ a KMS/Vault-backed wrapper can be supplied by an embedding deployment without
 changing the engine. `is_durable()` is the load-bearing flag: **durable staging
 fails closed when the active wrapping is not durable** (see §7), because a lost
 DEK would permanently strand staged tenant data.
+
+`SecretCipher::decrypt` retains its public compatibility behavior and collapses
+invalid data or wrapping failures to `None`. Credential repositories use
+`decrypt_result` instead, allowing operational KMS/Vault failures to become a
+generic service-unavailable response rather than an authentication denial.
 
 > **Non-local deployments must use a durable KMS/Vault-backed wrapping.**
 > Running with auth enabled while the active wrapping is the local KEK or an

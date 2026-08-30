@@ -73,6 +73,13 @@ s4ctl plugin reorder pii-default my-filter
 
 Full guide: [docs/plugins.md](docs/plugins.md).
 
+Typed binary codecs use a separate schema-aware reductor contract, not the
+byte-oriented plugin pipeline. See [docs/binary-adapters.md](docs/binary-adapters.md)
+when adding a custom logical-type adapter.
+
+The in-progress Avro OCF boundary and its supported subset are documented in
+[docs/avro.md](docs/avro.md).
+
 ## Usage examples
 
 Everything below is copy-paste runnable.

@@ -1,6 +1,6 @@
 # S4 Plugins — create and consume your own
 
-Plugins are how S4 transforms data. A plugin is a WebAssembly component that receives
+Plugins are how S4 transforms text data. A plugin is a WebAssembly component that receives
 each object's payload, optionally transforms it, and returns a decision. Plugins run in
 a pipeline — the output of one is the input of the next — so you compose transforms:
 filter, then encrypt, then convert.
@@ -104,6 +104,10 @@ The default local setup preloads `pii-default` via `S4_FILTER_COMPONENT`.
 
 - Plugins are pure byte-in/byte-out. The gateway handles transport (S3 API), auth, and
   storage.
+- Plugins do not declare an output schema, so they cannot be used directly for Avro,
+  Parquet, or another typed binary format. Binary codecs use schema-aware transforms and
+  optional `s4:binary-reductor` components instead; see
+  [Binary adapters](binary-adapters.md).
 - Filters shipped in-tree: `noop` (pass-through baseline), `pii-default`,
   `email-detect`, `ssn-detect`, `card-detect`, `envelope-encrypt`, `stable-encrypt`.
 - The original WIT design is recorded in `docs/adr/0001-component-model-wit.md`.

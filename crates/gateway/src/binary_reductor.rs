@@ -5,8 +5,14 @@
 
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use s4_error::{S4Error, codes};
+use s4_wasm_runtime::{
+    BinaryReductorEngine as WasmBinaryReductorEngine,
+    BinaryReductorPathSegment as WasmBinaryReductorPathSegment,
+    BinaryReductorSession as WasmBinaryReductorSession, CancellationToken,
+};
 use sha2::{Digest, Sha256};
 
 use crate::binary_ir::{
@@ -311,6 +317,303 @@ impl BinaryReductor for CommonTypeBinaryReductor {
     }
 }
 
+/// Adapter from the bounded `s4:binary-reductor` runtime world to the typed
+/// gateway contract used by binary codecs.
+///
+/// The runtime bounds byte-oriented guest calls. This adapter is responsible
+/// for parsing canonical IR, binding plans to the component digest, and making
+/// sure a guest changes schema only at paths it explicitly owns.
+pub struct WasmBinaryReductor {
+    session: WasmBinaryReductorSession,
+    owner: ReductorOwner,
+    limits: BinaryIrLimits,
+}
+
+impl WasmBinaryReductor {
+    pub fn start(
+        engine: &WasmBinaryReductorEngine,
+        limits: BinaryIrLimits,
+    ) -> Result<Self, S4Error> {
+        Self::start_with_cancellation(engine, limits, CancellationToken::new())
+    }
+
+    pub fn start_with_cancellation(
+        engine: &WasmBinaryReductorEngine,
+        limits: BinaryIrLimits,
+        cancellation: CancellationToken,
+    ) -> Result<Self, S4Error> {
+        let session = engine.start_session_with_cancellation(cancellation)?;
+        Ok(Self {
+            session,
+            owner: ReductorOwner(Arc::from(engine.component_digest())),
+            limits,
+        })
+    }
+
+    pub fn start_with_control(
+        engine: &WasmBinaryReductorEngine,
+        limits: BinaryIrLimits,
+        cancellation: CancellationToken,
+        object_deadline: Instant,
+    ) -> Result<Self, S4Error> {
+        let session = engine.start_session_with_control(cancellation, object_deadline)?;
+        Ok(Self {
+            session,
+            owner: ReductorOwner(Arc::from(engine.component_digest())),
+            limits,
+        })
+    }
+
+    pub fn component_digest(&self) -> &str {
+        self.owner
+            .component_digest()
+            .expect("Wasm reductors always have a component digest")
+    }
+
+    pub fn fuel_consumed(&self) -> u64 {
+        self.session.fuel_consumed()
+    }
+}
+
+impl BinaryReductor for WasmBinaryReductor {
+    fn plan(&mut self, source_schema: &SchemaIr) -> Result<BinaryReductionPlan, S4Error> {
+        source_schema.validate(self.limits)?;
+        let source_encoded = source_schema.to_canonical_json(self.limits)?;
+        let planned = self.session.plan(&source_encoded)?;
+        let claims = canonicalize_claims(convert_wasm_claims(planned.claims))?;
+        validate_claims_against_schema(source_schema, &claims)?;
+        let reduced_schema =
+            SchemaIr::from_canonical_json(&planned.reduced_schema_ir, self.limits)?;
+        ensure_schema_changes_are_claimed(source_schema, &reduced_schema, &claims)?;
+
+        BinaryReductionPlan::new(
+            self.owner.clone(),
+            source_schema.clone(),
+            reduced_schema,
+            claims.clone(),
+            claims,
+            planned.plan,
+            self.limits,
+        )
+    }
+
+    fn plan_restore(
+        &mut self,
+        plan: &BinaryReductionPlan,
+        transformed_reduced_schema: &SchemaIr,
+    ) -> Result<BinaryRestorePlan, S4Error> {
+        ensure_owner(plan, &self.owner)?;
+        transformed_reduced_schema.validate(self.limits)?;
+        let source_encoded = plan.source_schema().to_canonical_json(self.limits)?;
+        let transformed_encoded = transformed_reduced_schema.to_canonical_json(self.limits)?;
+        let planned =
+            self.session
+                .plan_restore(&source_encoded, &transformed_encoded, plan.opaque_plan())?;
+        let output_schema = SchemaIr::from_canonical_json(&planned.output_schema_ir, self.limits)?;
+        ensure_schema_changes_are_claimed(
+            transformed_reduced_schema,
+            &output_schema,
+            plan.claims(),
+        )?;
+
+        BinaryRestorePlan::new(
+            plan,
+            transformed_reduced_schema.clone(),
+            output_schema,
+            planned.restore_plan,
+            self.limits,
+        )
+    }
+
+    fn reduce(
+        &mut self,
+        plan: &BinaryReductionPlan,
+        source_value: &ValueIr,
+    ) -> Result<ValueIr, S4Error> {
+        ensure_owner(plan, &self.owner)?;
+        source_value.validate(plan.source_schema(), self.limits)?;
+        let source_encoded = source_value.to_canonical_json(plan.source_schema(), self.limits)?;
+        let reduced_encoded = self.session.reduce(plan.opaque_plan(), &source_encoded)?;
+        ValueIr::from_canonical_json(&reduced_encoded, plan.reduced_schema(), self.limits)
+    }
+
+    fn restore(
+        &mut self,
+        plan: &BinaryRestorePlan,
+        transformed_value: &ValueIr,
+    ) -> Result<ValueIr, S4Error> {
+        ensure_owner(&plan.reduction, &self.owner)?;
+        transformed_value.validate(plan.transformed_reduced_schema(), self.limits)?;
+        let transformed_encoded =
+            transformed_value.to_canonical_json(plan.transformed_reduced_schema(), self.limits)?;
+        let restored_encoded = self
+            .session
+            .restore(plan.opaque_restore_plan(), &transformed_encoded)?;
+        ValueIr::from_canonical_json(&restored_encoded, plan.output_schema(), self.limits)
+    }
+}
+
+fn convert_wasm_claims(
+    claims: Vec<s4_wasm_runtime::BinaryReductorClaim>,
+) -> Vec<BinaryReductorClaim> {
+    claims
+        .into_iter()
+        .map(|claim| {
+            BinaryReductorClaim::new(
+                SchemaPath(
+                    claim
+                        .path
+                        .into_iter()
+                        .map(|segment| match segment {
+                            WasmBinaryReductorPathSegment::Field(name) => {
+                                SchemaPathSegment::Field(name)
+                            }
+                            WasmBinaryReductorPathSegment::ArrayElement => {
+                                SchemaPathSegment::ArrayElement
+                            }
+                            WasmBinaryReductorPathSegment::MapValue => SchemaPathSegment::MapValue,
+                            WasmBinaryReductorPathSegment::LogicalValue => {
+                                SchemaPathSegment::LogicalValue
+                            }
+                        })
+                        .collect(),
+                ),
+                claim.type_id,
+            )
+        })
+        .collect()
+}
+
+fn validate_claims_against_schema(
+    schema: &SchemaIr,
+    claims: &[BinaryReductorClaim],
+) -> Result<(), S4Error> {
+    for claim in claims {
+        let node = schema.node_at_path(claim.path()).ok_or_else(|| {
+            claim_error(format!(
+                "reductor claimed nonexistent schema path {}",
+                claim.path()
+            ))
+        })?;
+        match &node.kind {
+            SchemaKind::Custom { type_id, .. } if type_id == claim.type_id() => {}
+            SchemaKind::Custom { type_id, .. } => {
+                return Err(claim_error(format!(
+                    "reductor claimed type {:?} at {}, but the schema declares {:?}",
+                    claim.type_id(),
+                    claim.path(),
+                    type_id
+                )));
+            }
+            SchemaKind::Record { .. } => {}
+            _ => {
+                return Err(claim_error(format!(
+                    "reductor claim at {} must target a custom logical value or record",
+                    claim.path()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_schema_changes_are_claimed(
+    source: &SchemaIr,
+    transformed: &SchemaIr,
+    claims: &[BinaryReductorClaim],
+) -> Result<(), S4Error> {
+    let mut path = SchemaPath::root();
+    ensure_node_changes_are_claimed(&source.root, &transformed.root, claims, &mut path)
+}
+
+fn ensure_node_changes_are_claimed(
+    source: &crate::binary_ir::SchemaNode,
+    transformed: &crate::binary_ir::SchemaNode,
+    claims: &[BinaryReductorClaim],
+    path: &mut SchemaPath,
+) -> Result<(), S4Error> {
+    if claims
+        .iter()
+        .any(|claim| path_is_prefix(claim.path(), path))
+    {
+        return Ok(());
+    }
+    if source.nullable != transformed.nullable {
+        return Err(unclaimed_schema_change(path));
+    }
+    match (&source.kind, &transformed.kind) {
+        (SchemaKind::Array { items: source }, SchemaKind::Array { items: transformed }) => {
+            path.0.push(SchemaPathSegment::ArrayElement);
+            let result = ensure_node_changes_are_claimed(source, transformed, claims, path);
+            path.0.pop();
+            result
+        }
+        (
+            SchemaKind::Map { values: source },
+            SchemaKind::Map {
+                values: transformed,
+            },
+        ) => {
+            path.0.push(SchemaPathSegment::MapValue);
+            let result = ensure_node_changes_are_claimed(source, transformed, claims, path);
+            path.0.pop();
+            result
+        }
+        (
+            SchemaKind::Record {
+                fields: source_fields,
+            },
+            SchemaKind::Record {
+                fields: transformed_fields,
+            },
+        ) => {
+            if source_fields.len() != transformed_fields.len() {
+                return Err(unclaimed_schema_change(path));
+            }
+            for (source_field, transformed_field) in source_fields.iter().zip(transformed_fields) {
+                if source_field.name != transformed_field.name {
+                    return Err(unclaimed_schema_change(path));
+                }
+                path.0
+                    .push(SchemaPathSegment::Field(source_field.name.clone()));
+                let result = ensure_node_changes_are_claimed(
+                    &source_field.schema,
+                    &transformed_field.schema,
+                    claims,
+                    path,
+                );
+                path.0.pop();
+                result?;
+            }
+            Ok(())
+        }
+        (
+            SchemaKind::Custom {
+                type_id: source_type,
+                value: source_value,
+            },
+            SchemaKind::Custom {
+                type_id: transformed_type,
+                value: transformed_value,
+            },
+        ) if source_type == transformed_type => {
+            path.0.push(SchemaPathSegment::LogicalValue);
+            let result =
+                ensure_node_changes_are_claimed(source_value, transformed_value, claims, path);
+            path.0.pop();
+            result
+        }
+        _ if source == transformed => Ok(()),
+        _ => Err(unclaimed_schema_change(path)),
+    }
+}
+
+fn unclaimed_schema_change(path: &SchemaPath) -> S4Error {
+    plan_error(format!(
+        "reductor changed schema outside its declared claims at {path}"
+    ))
+}
+
 fn reject_unclaimed_custom_nodes(
     schema: &SchemaIr,
     claims: &[BinaryReductorClaim],
@@ -465,6 +768,7 @@ fn usize_bytes(value: usize) -> [u8; 8] {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use super::*;
@@ -554,6 +858,32 @@ mod tests {
         }))
     }
 
+    fn guest_custom_schema() -> SchemaIr {
+        SchemaIr::new(required(SchemaKind::Custom {
+            type_id: "vendor.money".to_string(),
+            value: Box::new(required(SchemaKind::String)),
+        }))
+    }
+
+    fn guest_custom_value() -> ValueIr {
+        ValueIr::new(Value::Custom {
+            type_id: "vendor.money".to_string(),
+            value: Box::new(Value::String {
+                value: "12.34".to_string(),
+            }),
+        })
+    }
+
+    fn test_reductor_component() -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-components")
+            .join("test-binary-reductor.component.wasm");
+        std::fs::read(path).expect("test component missing; run just build-filters")
+    }
+
     #[test]
     fn trait_is_object_safe() {
         fn accept(_: &mut dyn BinaryReductor) {}
@@ -634,5 +964,63 @@ mod tests {
             .plan(&SchemaIr::new(required(SchemaKind::String)))
             .unwrap();
         assert_ne!(first.plan_hash(), other.plan_hash());
+    }
+
+    #[test]
+    fn wasm_adapter_validates_and_round_trips_custom_values() {
+        let engine = WasmBinaryReductorEngine::new(&test_reductor_component()).unwrap();
+        let mut reductor = WasmBinaryReductor::start(&engine, BinaryIrLimits::default()).unwrap();
+        let source_schema = guest_custom_schema();
+        let source_value = guest_custom_value();
+
+        let plan = reductor.plan(&source_schema).unwrap();
+        assert_eq!(plan.claims().len(), 1);
+        assert_eq!(plan.claims()[0].path(), &SchemaPath::root());
+        assert_eq!(plan.claims()[0].type_id(), "vendor.money");
+        assert_eq!(plan.component_digest(), Some(engine.component_digest()));
+        assert_eq!(plan.reduced_schema().root.kind, SchemaKind::String);
+
+        let reduced = reductor.reduce(&plan, &source_value).unwrap();
+        assert_eq!(
+            reduced,
+            ValueIr::new(Value::String {
+                value: "12.34".to_string(),
+            })
+        );
+
+        let restore_plan = reductor.plan_restore(&plan, plan.reduced_schema()).unwrap();
+        let restored = reductor.restore(&restore_plan, &reduced).unwrap();
+        assert_eq!(restored, source_value);
+        assert_eq!(restore_plan.output_schema(), &source_schema);
+        assert!(reductor.fuel_consumed() > 0);
+    }
+
+    #[test]
+    fn wasm_adapter_rejects_claims_that_do_not_match_the_source_schema() {
+        let engine = WasmBinaryReductorEngine::new(&test_reductor_component()).unwrap();
+        let mut reductor = WasmBinaryReductor::start(&engine, BinaryIrLimits::default()).unwrap();
+
+        let error = reductor.plan(&custom_schema()).unwrap_err();
+        assert_eq!(error.code(), codes::WASM_REDUCTOR_CLAIM);
+        assert!(error.message().contains("$.custom"));
+    }
+
+    #[test]
+    fn schema_changes_outside_wasm_claims_are_rejected() {
+        let source = SchemaIr::new(required(SchemaKind::String));
+        let transformed = SchemaIr::new(required(SchemaKind::I64));
+
+        let error = ensure_schema_changes_are_claimed(&source, &transformed, &[]).unwrap_err();
+        assert_eq!(error.code(), codes::WASM_REDUCTOR_PLAN);
+        assert!(error.message().contains('$'));
+    }
+
+    #[test]
+    fn schema_changes_inside_a_wasm_claim_are_allowed() {
+        let source = guest_custom_schema();
+        let transformed = SchemaIr::new(required(SchemaKind::String));
+        let claims = vec![BinaryReductorClaim::new(SchemaPath::root(), "vendor.money")];
+
+        ensure_schema_changes_are_claimed(&source, &transformed, &claims).unwrap();
     }
 }

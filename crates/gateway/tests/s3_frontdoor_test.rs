@@ -12,7 +12,8 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
 use s4_gateway::control::{
-    AuthenticatedRequestContext, ControlPlane, NoopControlPlane, RequestKind, StreamingWriteMode,
+    AuthenticatedRequestContext, ControlPlane, MeteringError, NoopControlPlane, RequestKind,
+    StreamingWriteMode, UsageEvent, UsageRoute,
 };
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
 use s4_gateway::object::BodyLimits;
@@ -28,8 +29,8 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
@@ -87,10 +88,9 @@ impl ControlPlane for StreamingOffControl {
     async fn record(
         &self,
         _context: &AuthenticatedRequestContext,
-        _bucket: &str,
-        _kind: RequestKind,
-        _bytes: u64,
-    ) {
+        _event: &UsageEvent,
+    ) -> Result<(), MeteringError> {
+        Ok(())
     }
 
     async fn streaming_write_mode(
@@ -98,6 +98,41 @@ impl ControlPlane for StreamingOffControl {
         _context: &AuthenticatedRequestContext,
     ) -> Option<StreamingWriteMode> {
         Some(StreamingWriteMode::Off)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedUsage {
+    context: AuthenticatedRequestContext,
+    event: UsageEvent,
+}
+
+#[derive(Debug, Default)]
+struct RecordingMeteringControl {
+    events: Mutex<Vec<RecordedUsage>>,
+    failure: Option<MeteringError>,
+}
+
+#[async_trait::async_trait]
+impl ControlPlane for RecordingMeteringControl {
+    async fn authorize(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _kind: RequestKind,
+    ) -> Option<s4_gateway::control::BlockReason> {
+        None
+    }
+
+    async fn record(
+        &self,
+        context: &AuthenticatedRequestContext,
+        event: &UsageEvent,
+    ) -> Result<(), MeteringError> {
+        self.events.lock().unwrap().push(RecordedUsage {
+            context: context.clone(),
+            event: event.clone(),
+        });
+        self.failure.map_or(Ok(()), Err)
     }
 }
 
@@ -308,7 +343,12 @@ async fn create_key_persistence_failure_returns_unavailable_without_secret() {
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "headers: {:?}",
+        response.headers()
+    );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1951,6 +1991,216 @@ async fn head_and_delete_remain_available() {
 }
 
 #[tokio::test]
+async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let control = Arc::new(RecordingMeteringControl::default());
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .control = control.clone();
+    let app = build_router(state);
+    let ids = [
+        uuid::Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c171").unwrap(),
+        uuid::Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c172").unwrap(),
+        uuid::Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c173").unwrap(),
+        uuid::Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c174").unwrap(),
+    ];
+    let operation_headers = |id: uuid::Uuid| {
+        let mut headers = auth_headers(&access_key, &secret_key);
+        headers.push(("x-s4-metering-id", id.to_string()));
+        headers
+    };
+
+    let response = app
+        .clone()
+        .oneshot(add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/metered/object.txt")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("payload"))
+                .unwrap(),
+            &operation_headers(ids[0]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/metered/object.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &operation_headers(ids[1]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "payload"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(add_headers(
+            Request::builder()
+                .method("HEAD")
+                .uri("/metered/object.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &operation_headers(ids[2]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("DELETE")
+                .uri("/metered/object.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &operation_headers(ids[3]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let events = control.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 4);
+    assert!(events.iter().all(|call| {
+        call.context.user_id == "test-user"
+            && call.context.workspace_id.as_str() == "test-user"
+            && call.event.bucket == "metered"
+    }));
+    assert_eq!(
+        events
+            .iter()
+            .map(|call| {
+                (
+                    call.event.id,
+                    call.event.kind,
+                    call.event.route,
+                    call.event.source_bytes,
+                    call.event.output_bytes,
+                    call.event.processed_bytes,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (ids[0], RequestKind::Write, UsageRoute::PutObject, 7, 7, 7),
+            (ids[1], RequestKind::Read, UsageRoute::GetObject, 7, 7, 7),
+            (ids[2], RequestKind::Read, UsageRoute::HeadObject, 0, 0, 0),
+            (
+                ids[3],
+                RequestKind::Write,
+                UsageRoute::DeleteObject,
+                0,
+                0,
+                0,
+            ),
+        ]
+    );
+    assert!(events.iter().all(|call| {
+        call.event.operation_id != call.event.id && call.event.operation_id.get_version_num() == 5
+    }));
+}
+
+#[tokio::test]
+async fn metering_unavailable_after_put_returns_service_unavailable_without_rolling_back_data() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let control = Arc::new(RecordingMeteringControl {
+        failure: Some(MeteringError::Unavailable),
+        ..RecordingMeteringControl::default()
+    });
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .control = control;
+    let app = build_router(state.clone());
+    let mut headers = auth_headers(&access_key, &secret_key);
+    headers.push((
+        "x-s4-metering-id",
+        "018f0f6e-7b31-7c1d-8f2f-84f808b9c175".to_string(),
+    ));
+
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/metered/persisted.txt")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("persisted"))
+                .unwrap(),
+            &headers,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>ServiceUnavailable</Code>"));
+    assert_eq!(
+        state
+            .store
+            .get("metered", "persisted.txt")
+            .expect("backend mutation remains committed")
+            .data,
+        Bytes::from_static(b"persisted")
+    );
+}
+
+#[tokio::test]
+async fn malformed_and_duplicate_metering_ids_are_rejected_before_mutation() {
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+
+    for (key, metering_headers) in [
+        ("malformed", vec!["not-a-uuid"]),
+        (
+            "duplicate",
+            vec![
+                "018f0f6e-7b31-7c1d-8f2f-84f808b9c175",
+                "018f0f6e-7b31-7c1d-8f2f-84f808b9c176",
+            ],
+        ),
+    ] {
+        let request = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/metered/{key}.txt"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("must not commit"))
+                .unwrap(),
+            &auth_headers(&access_key, &secret_key),
+        );
+        let request = append_headers(
+            request,
+            &metering_headers
+                .into_iter()
+                .map(|value| ("x-s4-metering-id", value.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("<Code>InvalidRequest</Code>"));
+        assert!(state.store.get("metered", &format!("{key}.txt")).is_none());
+    }
+}
+
+#[tokio::test]
 async fn conditional_get_and_head_preserve_object_identity_without_a_body() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
@@ -2866,6 +3116,16 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             HeaderChange::Remove("x-s4-process"),
             StatusCode::FORBIDDEN,
         ),
+        (
+            "mutated metering id",
+            HeaderChange::Replace("x-s4-metering-id", "018f0f6e-7b31-7c1d-8f2f-84f808b9c176"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "removed metering id",
+            HeaderChange::Remove("x-s4-metering-id"),
+            StatusCode::FORBIDDEN,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -2880,6 +3140,7 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             &[
                 ("content-type", "text/plain"),
                 ("x-s4-process", "write"),
+                ("x-s4-metering-id", "018f0f6e-7b31-7c1d-8f2f-84f808b9c175"),
                 ("x-amz-meta-dynamic-name", "one"),
             ],
         );
@@ -2940,6 +3201,14 @@ async fn sigv4_rejects_ambiguous_or_noncanonical_integrity_headers_before_body_p
                 signed: "https://storage.example/one,https://storage.example/two",
                 first: "https://storage.example/one",
                 second: "https://storage.example/two",
+            },
+        ),
+        (
+            "x-s4-metering-id",
+            HeaderShape::Duplicate {
+                signed: "018f0f6e-7b31-7c1d-8f2f-84f808b9c175,018f0f6e-7b31-7c1d-8f2f-84f808b9c176",
+                first: "018f0f6e-7b31-7c1d-8f2f-84f808b9c175",
+                second: "018f0f6e-7b31-7c1d-8f2f-84f808b9c176",
             },
         ),
         (
@@ -3033,6 +3302,7 @@ async fn sigv4_rejects_unsigned_integrity_header_injection_before_polling_the_bo
         ("x-s4-backend-url", "https://storage.example/object"),
         ("x-s4-process", "read"),
         ("x-s4-stable-fields", "email"),
+        ("x-s4-metering-id", "018f0f6e-7b31-7c1d-8f2f-84f808b9c175"),
         ("content-type", "text/plain"),
         ("content-encoding", "gzip"),
         ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
@@ -4538,25 +4808,68 @@ async fn unsafe_transformed_source_limit_has_no_disclosure() {
 
 #[tokio::test]
 async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
+    async fn unknown_length_source(
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+    ) -> axum::response::Response {
+        let empty = method == axum::http::Method::HEAD || uri.path().ends_with("/empty.txt");
+        let body = if empty {
+            Body::new(FrameSequenceBody::data(std::iter::empty::<Bytes>()))
+        } else {
+            Body::new(FrameSequenceBody::data([Bytes::from_static(b"one\ntwo\n")]))
+        };
+        let mut response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::ETAG, "\"unknown-length\"");
+        if !empty {
+            response = response.header(header::CONTENT_LENGTH, "8");
+        }
+        response.body(body).unwrap()
+    }
+
+    let upstream = Router::new().route(
+        "/{bucket}/{*key}",
+        axum::routing::get(unknown_length_source).head(unknown_length_source),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
     let mut state = test_state().await;
+    let control = Arc::new(RecordingMeteringControl::default());
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = false;
+    state_mut.control = control.clone();
+    state_mut.s3_client = Some(aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "source-access",
+                "source-secret",
+                None,
+                None,
+                "unknown-length-source",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(format!("http://{address}"))
+            .force_path_style(true)
+            .build(),
+    ));
     for plugin in state.plugins.list() {
         state.plugins.set_enabled(&plugin.id, false);
     }
-    state.store.put(
-        "read",
-        "direct.txt",
-        Bytes::from_static(b"one\ntwo\n"),
-        "text/plain",
-    );
     let (ak, sk) = make_key(&state).await;
-    let response = build_router(state)
+    let app = build_router(state);
+    let response = app
+        .clone()
         .oneshot(add_headers(
             Request::builder()
                 .method("GET")
-                .uri("/read/direct.txt")
+                .uri("/read/empty.txt")
                 .header("x-s4-process", "read")
                 .body(Body::empty())
                 .unwrap(),
@@ -4569,13 +4882,46 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
         response.headers()[header::CACHE_CONTROL],
         "private, no-store"
     );
-    assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
     assert_eq!(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap(),
-        "one\ntwo\n"
+        ""
     );
+
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/read/nonempty.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    assert_eq!(
+        control
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| {
+                (
+                    call.event.kind,
+                    call.event.route,
+                    call.event.source_bytes,
+                    call.event.output_bytes,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![(RequestKind::Read, UsageRoute::GetObject, 0, 0)]
+    );
+    task.abort();
 }
 
 #[tokio::test]

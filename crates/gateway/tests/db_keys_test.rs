@@ -630,6 +630,7 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
                     etag: Some("\"result\"".to_string()),
                     checksum_sha256: "result-sha".to_string(),
                     version_id: Some("version".to_string()),
+                    source_bytes: 24,
                     size_bytes: 42,
                 },
                 now + 12,

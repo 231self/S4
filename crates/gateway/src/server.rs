@@ -1268,6 +1268,7 @@ impl HeaderAuthentication {
 enum HeaderAuthError {
     Denied,
     InvalidPayload(IntegrityError),
+    CredentialStoreUnavailable(String),
     Unavailable(String),
 }
 
@@ -1309,6 +1310,10 @@ fn authentication_error_response(key: &str, error: HeaderAuthError) -> axum::res
         HeaderAuthError::InvalidPayload(error) => {
             s3_error::invalid_request(key, &error.to_string())
         }
+        HeaderAuthError::CredentialStoreUnavailable(error) => {
+            warn!("credential storage unavailable during authentication: {error}");
+            s3_error::service_unavailable(key, "credential storage is temporarily unavailable")
+        }
         HeaderAuthError::Unavailable(error) => {
             warn!("workspace resolution failed: {error}");
             s3_error::service_unavailable(key, "workspace storage is temporarily unavailable")
@@ -1342,6 +1347,7 @@ async fn authenticate_headers(
         let key = keys
             .get_key(sigv4.access_key())
             .await
+            .map_err(|error| HeaderAuthError::CredentialStoreUnavailable(error.to_string()))?
             .ok_or(HeaderAuthError::Denied)?;
         if key_expired(key.expires_at.as_deref()) {
             return Err(HeaderAuthError::Denied);
@@ -1349,6 +1355,7 @@ async fn authenticate_headers(
         let secret = keys
             .decrypt_secret(sigv4.access_key())
             .await
+            .map_err(|error| HeaderAuthError::CredentialStoreUnavailable(error.to_string()))?
             .ok_or(HeaderAuthError::Denied)?;
         let body_verifier = sigv4
             .authorize(
@@ -1380,7 +1387,10 @@ async fn authenticate_headers(
             let token = &a[7..];
             // MCP bearer token (s4m_...): a self-contained credential.
             if token.starts_with("s4m_") {
-                if let Some(user_id) = keys.resolve_mcp_token(token).await {
+                let user_id = keys.resolve_mcp_token(token).await.map_err(|error| {
+                    HeaderAuthError::CredentialStoreUnavailable(error.to_string())
+                })?;
+                if let Some(user_id) = user_id {
                     return Ok(HeaderAuthentication::without_body(
                         authenticated_request(
                             state,
@@ -1399,6 +1409,9 @@ async fn authenticate_headers(
                 let (user_id, public_key_pem) = keys
                     .resolve_credentials(ak, sk)
                     .await
+                    .map_err(|error| {
+                        HeaderAuthError::CredentialStoreUnavailable(error.to_string())
+                    })?
                     .ok_or(HeaderAuthError::Denied)?;
                 return Ok(HeaderAuthentication::without_body(
                     authenticated_request(
@@ -1426,9 +1439,14 @@ async fn authenticate_headers(
     };
     // x-s4-mcp-token header: MCP bearer token.
     if let Some(tok) = headers.get("x-s4-mcp-token").and_then(|v| v.to_str().ok()) {
-        if tok.starts_with("s4m_")
-            && let Some(user_id) = keys.resolve_mcp_token(tok).await
-        {
+        let user_id = if tok.starts_with("s4m_") {
+            keys.resolve_mcp_token(tok)
+                .await
+                .map_err(|error| HeaderAuthError::CredentialStoreUnavailable(error.to_string()))?
+        } else {
+            None
+        };
+        if let Some(user_id) = user_id {
             return Ok(HeaderAuthentication::without_body(
                 authenticated_request(
                     state,
@@ -1450,7 +1468,11 @@ async fn authenticate_headers(
         .get("x-s4-secret-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some((user_id, public_key_pem)) = keys.resolve_credentials(ak, sk).await {
+    let resolved = keys
+        .resolve_credentials(ak, sk)
+        .await
+        .map_err(|error| HeaderAuthError::CredentialStoreUnavailable(error.to_string()))?;
+    if let Some((user_id, public_key_pem)) = resolved {
         return Ok(HeaderAuthentication::without_body(
             authenticated_request(
                 state,
@@ -1704,7 +1726,13 @@ async fn get_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
         .and_then(|v| v.as_str())
         .unwrap_or("email")
         .to_string();
-    let keys = state.keys.list_for_user(user_id).await;
+    let keys = match state.keys.list_for_user(user_id).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::error!(user_id, error = %error, "credential storage unavailable");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     Json(serde_json::json!({
         "user_id": user_id,
         "email": email,
@@ -6172,7 +6200,13 @@ async fn get_keys(
     let Some(uid) = require_user_id(&headers, &state).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let keys = state.keys.list_for_user(&uid).await;
+    let keys = match state.keys.list_for_user(&uid).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::error!(user_id = uid, error = %error, "API key listing failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let resp: Vec<ListKeyResponse> = keys
         .into_iter()
         .map(|k| ListKeyResponse {
@@ -6222,7 +6256,7 @@ async fn create_key(
         .keys
         .create_key(&uid, &label, body.expires_in, public_key_pem)
         .await;
-    let (key_id, secret) = match result {
+    let (secret, created) = match result {
         Ok(created) => created,
         Err(error) => {
             tracing::error!(
@@ -6231,7 +6265,7 @@ async fn create_key(
                 "API key creation persistence failed"
             );
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(InternalErrorResponse {
                     error: "internal_error".to_string(),
                 }),
@@ -6239,19 +6273,13 @@ async fn create_key(
                 .into_response();
         }
     };
-    let key = state.keys.get_key(&key_id).await;
-    let created_at = key
-        .as_ref()
-        .map_or_else(|| "0".to_string(), |k| k.created_at.clone());
-    let expires_at = key.as_ref().and_then(|k| k.expires_at.clone());
-    let public_key_pem = key.as_ref().and_then(|k| k.public_key_pem.clone());
     Json(ApiKeyResponse {
-        key_id,
+        key_id: created.key_id,
         secret,
-        label,
-        created_at,
-        expires_at,
-        public_key_pem,
+        label: created.label,
+        created_at: created.created_at,
+        expires_at: created.expires_at,
+        public_key_pem: created.public_key_pem,
     })
     .into_response()
 }
@@ -6272,10 +6300,13 @@ async fn delete_key(
     let Some(uid) = require_user_id(&headers, &state).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if state.keys.delete_key(&body.key_id, &uid).await {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "key not found").into_response()
+    match state.keys.delete_key(&body.key_id, &uid).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "key not found").into_response(),
+        Err(error) => {
+            tracing::error!(user_id = uid, error = %error, "API key deletion failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 
@@ -6293,7 +6324,13 @@ async fn get_mcp_tokens(
     let Some(uid) = require_user_id(&headers, &state).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let tokens = state.keys.list_mcp_tokens(&uid).await;
+    let tokens = match state.keys.list_mcp_tokens(&uid).await {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            tracing::error!(user_id = uid, error = %error, "MCP token listing failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let resp: Vec<McpTokenResponse> = tokens
         .into_iter()
         .map(|t| McpTokenResponse {
@@ -6336,9 +6373,9 @@ async fn create_mcp_token(
         .await
     {
         Ok(created) => created,
-        Err(_) => {
-            tracing::error!(user_id = uid, "MCP token creation persistence failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        Err(error) => {
+            tracing::error!(user_id = uid, error = %error, "MCP token creation persistence failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
     Json(McpTokenCreatedResponse {
@@ -6366,10 +6403,13 @@ async fn delete_mcp_token(
     let Some(uid) = require_user_id(&headers, &state).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if state.keys.delete_mcp_token(&body.token_hash, &uid).await {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "token not found").into_response()
+    match state.keys.delete_mcp_token(&body.token_hash, &uid).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "token not found").into_response(),
+        Err(error) => {
+            tracing::error!(user_id = uid, error = %error, "MCP token deletion failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 
@@ -6527,11 +6567,15 @@ async fn authenticate_public_key_mutation(
         let secret_key = secret_key
             .filter(|value| !value.is_empty())
             .ok_or(StatusCode::UNAUTHORIZED)?;
-        let (user_id, _) = state
+        let resolved = state
             .keys
             .resolve_credentials(access_key, secret_key)
             .await
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .map_err(|error| {
+                tracing::error!(error = %error, "credential storage unavailable");
+                StatusCode::SERVICE_UNAVAILABLE
+            })?;
+        let (user_id, _) = resolved.ok_or(StatusCode::UNAUTHORIZED)?;
         return Ok(PublicKeyMutationActor::ApiKey {
             access_key: access_key.to_string(),
             user_id,
@@ -6546,11 +6590,15 @@ async fn authenticate_public_key_mutation(
         if access_key.is_empty() || secret_key.is_empty() {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let (user_id, _) = state
+        let resolved = state
             .keys
             .resolve_credentials(access_key, secret_key)
             .await
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .map_err(|error| {
+                tracing::error!(error = %error, "credential storage unavailable");
+                StatusCode::SERVICE_UNAVAILABLE
+            })?;
+        let (user_id, _) = resolved.ok_or(StatusCode::UNAUTHORIZED)?;
         return Ok(PublicKeyMutationActor::ApiKey {
             access_key: access_key.to_string(),
             user_id,
@@ -6598,9 +6646,9 @@ async fn set_public_key(
     {
         Ok(true) => StatusCode::OK.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "key not found").into_response(),
-        Err(_) => {
-            tracing::error!(user_id = uid, "public key persistence failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        Err(error) => {
+            tracing::error!(user_id = uid, error = %error, "public key persistence failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
@@ -6984,11 +7032,11 @@ pub async fn build_state(
         Arc::new(FileKeyStore::with_cipher(
             PathBuf::from(keys_file),
             cipher.clone(),
-        ))
+        )?)
     } else if auth_disabled {
         let path = FileKeyStore::default_path();
         info!("Key store: file ({}) (local mode)", path.display());
-        Arc::new(FileKeyStore::with_cipher(path, cipher))
+        Arc::new(FileKeyStore::with_cipher(path, cipher)?)
     } else {
         info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
         Arc::new(KeyStore::with_cipher(cipher))
@@ -7120,15 +7168,15 @@ pub async fn build_state(
     // Local mode: ensure a demo key exists and print it so SDK demos and
     // `aws s3 --endpoint-url` work out of the box.
     if auth_disabled {
-        let existing = keys.list_for_user("demo-user").await;
+        let existing = keys.list_for_user("demo-user").await?;
         if existing.is_empty() {
-            let (key_id, secret) = keys
+            let (secret, created) = keys
                 .create_key("demo-user", "local-default", 0, None)
                 .await?;
-            println!("S4_ACCESS_KEY={key_id}");
+            println!("S4_ACCESS_KEY={}", created.key_id);
             println!("S4_SECRET_KEY={secret}");
         } else if let Some(k) = existing.into_iter().find(|k| k.label == "local-default")
-            && let Some(secret) = keys.decrypt_secret(&k.key_id).await
+            && let Some(secret) = keys.decrypt_secret(&k.key_id).await?
         {
             println!("S4_ACCESS_KEY={}", k.key_id);
             println!("S4_SECRET_KEY={secret}");

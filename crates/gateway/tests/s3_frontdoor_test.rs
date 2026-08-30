@@ -343,7 +343,12 @@ async fn create_key_persistence_failure_returns_unavailable_without_secret() {
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "headers: {:?}",
+        response.headers()
+    );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -4803,25 +4808,68 @@ async fn unsafe_transformed_source_limit_has_no_disclosure() {
 
 #[tokio::test]
 async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
+    async fn unknown_length_source(
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+    ) -> axum::response::Response {
+        let empty = method == axum::http::Method::HEAD || uri.path().ends_with("/empty.txt");
+        let body = if empty {
+            Body::new(FrameSequenceBody::data(std::iter::empty::<Bytes>()))
+        } else {
+            Body::new(FrameSequenceBody::data([Bytes::from_static(b"one\ntwo\n")]))
+        };
+        let mut response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::ETAG, "\"unknown-length\"");
+        if !empty {
+            response = response.header(header::CONTENT_LENGTH, "8");
+        }
+        response.body(body).unwrap()
+    }
+
+    let upstream = Router::new().route(
+        "/{bucket}/{*key}",
+        axum::routing::get(unknown_length_source).head(unknown_length_source),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
     let mut state = test_state().await;
+    let control = Arc::new(RecordingMeteringControl::default());
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = false;
+    state_mut.control = control.clone();
+    state_mut.s3_client = Some(aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "source-access",
+                "source-secret",
+                None,
+                None,
+                "unknown-length-source",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(format!("http://{address}"))
+            .force_path_style(true)
+            .build(),
+    ));
     for plugin in state.plugins.list() {
         state.plugins.set_enabled(&plugin.id, false);
     }
-    state.store.put(
-        "read",
-        "direct.txt",
-        Bytes::from_static(b"one\ntwo\n"),
-        "text/plain",
-    );
     let (ak, sk) = make_key(&state).await;
-    let response = build_router(state)
+    let app = build_router(state);
+    let response = app
+        .clone()
         .oneshot(add_headers(
             Request::builder()
                 .method("GET")
-                .uri("/read/direct.txt")
+                .uri("/read/empty.txt")
                 .header("x-s4-process", "read")
                 .body(Body::empty())
                 .unwrap(),
@@ -4834,13 +4882,46 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
         response.headers()[header::CACHE_CONTROL],
         "private, no-store"
     );
-    assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
     assert_eq!(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap(),
-        "one\ntwo\n"
+        ""
     );
+
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/read/nonempty.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    assert_eq!(
+        control
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| {
+                (
+                    call.event.kind,
+                    call.event.route,
+                    call.event.source_bytes,
+                    call.event.output_bytes,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![(RequestKind::Read, UsageRoute::GetObject, 0, 0)]
+    );
+    task.abort();
 }
 
 #[tokio::test]

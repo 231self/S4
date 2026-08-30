@@ -1,0 +1,59 @@
+package s4:binary-reductor@0.1.0;
+
+world binary-reductor {
+  variant path-segment {
+    field(string),
+    array-element,
+    map-value,
+    logical-value,
+  }
+
+  /// A canonical Schema IR path and the logical type claimed at that path.
+  record claim {
+    path: list<path-segment>,
+    type-id: string,
+  }
+
+  record planned-reduction {
+    claims: list<claim>,
+    /// Canonical, versioned S4 Schema IR bytes.
+    reduced-schema-ir: list<u8>,
+    /// An opaque component-owned plan. It may be empty for a stateless reductor;
+    /// the host persists and bounds these bytes.
+    plan: list<u8>,
+  }
+
+  record planned-restoration {
+    /// Canonical, versioned S4 Schema IR bytes after restoration.
+    output-schema-ir: list<u8>,
+    /// Opaque state derived from the source and transformed reduced schemas.
+    /// It may be empty for a stateless reductor and is passed only to restore.
+    restore-plan: list<u8>,
+  }
+
+  /// A guest-declared failure. Codes are component-defined and diagnostic;
+  /// the host maps them to stable S4 error codes.
+  record reductor-error {
+    code: string,
+    message: string,
+  }
+
+  /// Plans forward reduction. The returned plan is used by reduce and
+  /// plan-restore, but never by restore.
+  export plan: func(source-schema-ir: list<u8>) -> result<planned-reduction, reductor-error>;
+  /// Plans restoration after the reduced schema has been transformed.
+  export plan-restore: func(
+    source-schema-ir: list<u8>,
+    transformed-reduced-schema-ir: list<u8>,
+    plan: list<u8>,
+  ) -> result<planned-restoration, reductor-error>;
+  export reduce: func(
+    plan: list<u8>,
+    source-value-ir: list<u8>,
+  ) -> result<list<u8>, reductor-error>;
+  /// Restores a transformed value using only the schema-dependent restore plan.
+  export restore: func(
+    restore-plan: list<u8>,
+    transformed-value-ir: list<u8>,
+  ) -> result<list<u8>, reductor-error>;
+}

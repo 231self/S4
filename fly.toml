@@ -24,3 +24,5 @@ app = "s4"
 # All configuration is runtime env/secrets, never baked into the image.
 [env]
   AUTH_DISABLED = "false"
+  S4_MAX_OBJECT_BYTES = "67108864"
+  S4_MAX_PIPELINE_OUTPUT_BYTES = "67108864"

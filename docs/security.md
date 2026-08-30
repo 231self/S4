@@ -342,16 +342,15 @@ durable transaction layer:
   aborted and the destination multipart upload is cleaned up.
 - **`COMMIT_UNKNOWN` reconciliation.** When a completion outcome is ambiguous
   (the request failed after `complete` was issued), the operation transitions
-  to `COMMIT_UNKNOWN` and a reconciler probes the destination with
-  head-with-operation-identity; it either records the committed object or,
-  if proven absent, aborts discovered incomplete uploads and marks the
-  operation `PROVEN_ABORTED`. A lease on the operation row prevents two
-  reconcilers from acting on the same operation, and the backend capability
-  gate (see §12) guarantees the recovery primitives exist.
-- **Direct vs. spooled sinks.** For direct S3 destinations the output is
-  streamed as a multipart upload; for presigned-HTTP destinations the output
-  is spooled to a bounded, quota-accounted local spool (`S4_SPOOL_DIR`,
-  `S4_SPOOL_MAX_OBJECT_BYTES`, `S4_SPOOL_QUOTA_BYTES`) and then uploaded.
+  to `COMMIT_UNKNOWN`. Request-scoped cleanup may reconcile only that exact
+  operation using the backend bound to the request. Per-user operations that
+  cannot be safely reprobed remain pending for an external reconciler with the
+  original credentials; one request never scans or probes another tenant's
+  operations.
+- **Launch sink boundary.** Direct S3 output is streamed as a multipart upload.
+  Managed and presigned-HTTP streaming writes are rejected before request-body
+  polling or multipart staging until their commit evidence can share the same
+  authorization identity and reconciliation guarantees.
 
 ## 9. Managed replication — authority and repair fencing
 
@@ -429,8 +428,9 @@ Persisted S3-compatible workspace endpoints use a separate
 - **Cleanup/reconciliation workers.** Startup and periodic jobs remove stale
   compatibility spool files, orphaned encrypted multipart spool files,
   reconcile pending staging outboxes against the artifact store, reap expired
-  multipart uploads, and reconcile `COMMIT_UNKNOWN` operations and managed
-  repairs.
+  multipart uploads, and reconcile managed repairs. Direct `COMMIT_UNKNOWN`
+  operations require exact-operation reconciliation with the backend and
+  credentials originally bound to the request.
 
 ## 12. Bounded parsing and memory
 

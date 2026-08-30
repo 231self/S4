@@ -3,8 +3,25 @@ wasmtime::component::bindgen!({
     path: "../../wit/s4-filter/world.wit",
 });
 
+mod binary_reductor_bindings {
+    wasmtime::component::bindgen!({
+        world: "binary-reductor",
+        path: "../../wit/s4-binary-reductor/world.wit",
+    });
+}
+
+mod binary_reductor;
 mod executor;
 
+pub use binary_reductor::{
+    BinaryReductorClaim, BinaryReductorConfig, BinaryReductorEngine, BinaryReductorPathSegment,
+    BinaryReductorPlan, BinaryReductorRestorationPlan, BinaryReductorSession,
+    DEFAULT_MAX_BINARY_REDUCTOR_CLAIM_PATH_DEPTH, DEFAULT_MAX_BINARY_REDUCTOR_CLAIMS,
+    DEFAULT_MAX_BINARY_REDUCTOR_COMPONENT_BYTES,
+    DEFAULT_MAX_BINARY_REDUCTOR_GUEST_DIAGNOSTIC_BYTES,
+    DEFAULT_MAX_BINARY_REDUCTOR_IDENTIFIER_BYTES, DEFAULT_MAX_BINARY_REDUCTOR_PLAN_BYTES,
+    DEFAULT_MAX_BINARY_REDUCTOR_SCHEMA_IR_BYTES, DEFAULT_MAX_BINARY_REDUCTOR_VALUE_IR_BYTES,
+};
 pub use executor::{
     CancellationToken, ExecutorConfig, MemoryAdmission, MemoryPermit, WasmExecutor,
 };
@@ -13,7 +30,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use s4_error::{S4Error, codes};
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, Instance, Linker, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::p2::add_to_linker_sync as add_wasi_to_linker;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
@@ -109,9 +126,20 @@ fn zeroize_stable_key(stable_key: &mut Option<Vec<u8>>) {
 }
 
 pub struct FilterEngine {
+    runtime: RuntimeComponent,
+}
+
+struct RuntimeComponent {
     epoch_engine: Arc<EpochEngine>,
     component: Component,
     limits: RuntimeLimits,
+    capability_profile: RuntimeCapabilityProfile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeCapabilityProfile {
+    FilterWasi,
+    NoHostImports,
 }
 
 struct EpochEngine {
@@ -153,8 +181,12 @@ pub enum TransformOutcome {
 }
 
 pub struct FilterSession {
-    store: Store<S4HostState>,
+    runtime: RuntimeSession,
     funcs: Filter,
+}
+
+struct RuntimeSession {
+    store: Store<S4HostState>,
     cancellation: CancellationToken,
     control: Arc<CallControl>,
     limits: RuntimeLimits,
@@ -184,9 +216,11 @@ impl FilterSession {
         payload: &[u8],
         fuel_limit: u64,
     ) -> Result<TransformOutcome, S4Error> {
-        let window = self.prepare_call(fuel_limit)?;
-        let result = self.funcs.call_transform(&mut self.store, payload);
-        let decision = self.complete_call(window, result, "transform", codes::WASM_TRAP)?;
+        let window = self.runtime.prepare_call(fuel_limit)?;
+        let result = self.funcs.call_transform(&mut self.runtime.store, payload);
+        let decision = self
+            .runtime
+            .complete_call(window, result, "transform", codes::WASM_TRAP)?;
         let decision = decision.map_err(|error| S4Error::new(codes::WASM_TRAP, error))?;
         match decision {
             Decision::Emit(data) => Ok(TransformOutcome::Emit(data)),
@@ -201,25 +235,29 @@ impl FilterSession {
     }
 
     pub fn finish_with_fuel_limit(mut self, fuel_limit: u64) -> Result<(Vec<u8>, u64), S4Error> {
-        let window = self.prepare_call(fuel_limit)?;
-        let result = self.funcs.call_finish(&mut self.store);
+        let window = self.runtime.prepare_call(fuel_limit)?;
+        let result = self.funcs.call_finish(&mut self.runtime.store);
         let output = self
+            .runtime
             .complete_call(window, result, "finish", codes::WASM_TRAP)?
             .map_err(|error| S4Error::new(codes::WASM_TRAP, error))?;
-        Ok((output, self.fuel_consumed))
+        Ok((output, self.runtime.fuel_consumed))
     }
 
     pub fn fuel_consumed(&self) -> u64 {
-        self.fuel_consumed
+        self.runtime.fuel_consumed
     }
 
     fn call_begin(&mut self, context: &Context, fuel_limit: u64) -> Result<(), S4Error> {
-        let window = self.prepare_call(fuel_limit)?;
-        let result = self.funcs.call_begin(&mut self.store, context);
-        self.complete_call(window, result, "begin", codes::WASM_INIT)?
+        let window = self.runtime.prepare_call(fuel_limit)?;
+        let result = self.funcs.call_begin(&mut self.runtime.store, context);
+        self.runtime
+            .complete_call(window, result, "begin", codes::WASM_INIT)?
             .map_err(|error| S4Error::new(codes::WASM_INIT, error))
     }
+}
 
+impl RuntimeSession {
     fn prepare_call(&mut self, fuel_limit: u64) -> Result<FuelWindow, S4Error> {
         if self.cancellation.is_cancelled() {
             return Err(S4Error::new(
@@ -304,78 +342,17 @@ impl FilterEngine {
     }
 
     pub fn with_limits(component_bytes: &[u8], limits: RuntimeLimits) -> anyhow::Result<Self> {
-        if limits.guest_memory_bytes == 0
-            || limits.max_memories == 0
-            || limits.table_elements == 0
-            || limits.cumulative_fuel == 0
-            || limits.per_call_fuel == 0
-            || limits.per_call_timeout.is_zero()
-            || limits.object_timeout.is_zero()
-        {
-            anyhow::bail!("Wasm runtime limits must be greater than zero");
-        }
-        let mut config = wasmtime::Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-        config.epoch_interruption(true);
-        config.max_wasm_stack(512 * 1024);
-        let engine = Engine::new(&config)?;
-        let component = Component::new(&engine, component_bytes)?;
-        let epoch_engine = Arc::new(EpochEngine { engine });
-        register_epoch_engine(&epoch_engine);
         Ok(Self {
-            epoch_engine,
-            component,
-            limits,
+            runtime: RuntimeComponent::compile(
+                component_bytes,
+                limits,
+                RuntimeCapabilityProfile::FilterWasi,
+            )?,
         })
     }
 
     pub fn guest_memory_limit(&self) -> usize {
-        self.limits.guest_memory_bytes
-    }
-
-    fn create_store(
-        &self,
-        cancellation: &CancellationToken,
-        object_deadline: Instant,
-        initial_fuel: u64,
-    ) -> Result<(Store<S4HostState>, Arc<CallControl>), S4Error> {
-        let wasi = WasiCtxBuilder::new()
-            .inherit_stdout()
-            .inherit_stderr()
-            .build();
-        let state = S4HostState {
-            resource_limiter: S4ResourceLimiter {
-                memory_limit: self.limits.guest_memory_bytes,
-                memory_used: 0,
-                max_memories: self.limits.max_memories,
-                table_elements: self.limits.table_elements,
-            },
-            wasi,
-            table: ResourceTable::new(),
-        };
-        let mut store = Store::new(&self.epoch_engine.engine, state);
-        store
-            .set_fuel(initial_fuel)
-            .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
-        store.limiter(|s| &mut s.resource_limiter);
-        let control = Arc::new(CallControl {
-            deadline: Mutex::new(object_deadline),
-            cancellation: cancellation.clone(),
-        });
-        let callback_control = Arc::clone(&control);
-        store.epoch_deadline_callback(move |_| {
-            if callback_control.cancellation.is_cancelled() {
-                return Err(wasmtime::Error::msg("Wasm execution cancelled"));
-            }
-            if Instant::now() >= *callback_control.deadline.lock().unwrap() {
-                return Err(wasmtime::Error::msg("Wasm execution deadline exceeded"));
-            }
-            Ok(UpdateDeadline::Continue(1))
-        });
-        store.set_epoch_deadline(1);
-        cancellation.register_engine(&self.epoch_engine.engine);
-        Ok((store, control))
+        self.runtime.limits.guest_memory_bytes
     }
 
     pub fn run_session(
@@ -421,7 +398,7 @@ impl FilterEngine {
             session,
             cancellation,
             begin_fuel_limit,
-            Instant::now() + self.limits.object_timeout,
+            Instant::now() + self.runtime.limits.object_timeout,
         )
     }
 
@@ -432,36 +409,28 @@ impl FilterEngine {
         begin_fuel_limit: u64,
         object_deadline: Instant,
     ) -> Result<FilterSession, S4Error> {
-        let object_deadline = object_deadline.min(Instant::now() + self.limits.object_timeout);
+        let object_deadline =
+            object_deadline.min(Instant::now() + self.runtime.limits.object_timeout);
         check_start_control(&cancellation, object_deadline)?;
-        let initial_fuel = self.limits.cumulative_fuel.min(begin_fuel_limit);
+        let initial_fuel = self.runtime.limits.cumulative_fuel.min(begin_fuel_limit);
         if initial_fuel == 0 {
             return Err(S4Error::new(
                 codes::WASM_FUEL,
                 "Wasm startup fuel budget exhausted",
             ));
         }
-        let (mut store, control) = self
-            .create_store(&cancellation, object_deadline, initial_fuel)
-            .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
-        let mut linker = Linker::new(&self.epoch_engine.engine);
-        add_wasi_to_linker(&mut linker)
-            .map_err(|e| S4Error::new(codes::WASM_INIT, e.to_string()))?;
-        check_start_control(&cancellation, object_deadline)?;
-        let instance = linker
-            .instantiate(&mut store, &self.component)
-            .map_err(|error| startup_error("instantiate", error, &cancellation, object_deadline))?;
+        let (mut runtime, instance) =
+            self.runtime
+                .instantiate(cancellation, object_deadline, initial_fuel)?;
 
-        let remaining_after_start = store
-            .get_fuel()
-            .map_err(|error| S4Error::new(codes::WASM_FUEL, error.to_string()))?;
-        let startup_fuel = initial_fuel.saturating_sub(remaining_after_start);
-        check_start_control(&cancellation, object_deadline)?;
-
-        let funcs = Filter::new(&mut store, &instance).map_err(|error| {
-            startup_error("bind exports", error, &cancellation, object_deadline)
+        let funcs = Filter::new(&mut runtime.store, &instance).map_err(|error| {
+            startup_error(
+                codes::WASM_INIT,
+                error,
+                &runtime.cancellation,
+                runtime.object_deadline,
+            )
         })?;
-        check_start_control(&cancellation, object_deadline)?;
 
         let entropy_seed: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
 
@@ -475,20 +444,9 @@ impl FilterEngine {
             stable_fields: session.stable_fields.clone(),
         };
 
-        let mut filter_session = FilterSession {
-            store,
-            funcs,
-            cancellation,
-            control,
-            limits: self.limits.clone(),
-            object_deadline,
-            fuel_consumed: startup_fuel,
-        };
+        let mut filter_session = FilterSession { runtime, funcs };
         let begin = filter_session.call_begin(&ctx, begin_fuel_limit);
         zeroize_stable_key(&mut ctx.stable_key);
-        // The trusted guest receives its own linear-memory copy. That memory is
-        // destroyed with this per-request store, but Wasmtime does not
-        // synchronously scrub every guest byte before releasing the pages.
         begin?;
         Ok(filter_session)
     }
@@ -501,6 +459,130 @@ impl FilterEngine {
         }
         Ok(out)
     }
+}
+
+impl RuntimeComponent {
+    fn compile(
+        component_bytes: &[u8],
+        limits: RuntimeLimits,
+        capability_profile: RuntimeCapabilityProfile,
+    ) -> anyhow::Result<Self> {
+        validate_runtime_limits(&limits)?;
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        config.max_wasm_stack(512 * 1024);
+        let engine = Engine::new(&config)?;
+        let component = Component::new(&engine, component_bytes)?;
+        let epoch_engine = Arc::new(EpochEngine { engine });
+        register_epoch_engine(&epoch_engine);
+        Ok(Self {
+            epoch_engine,
+            component,
+            limits,
+            capability_profile,
+        })
+    }
+
+    fn instantiate(
+        &self,
+        cancellation: CancellationToken,
+        object_deadline: Instant,
+        initial_fuel: u64,
+    ) -> Result<(RuntimeSession, Instance), S4Error> {
+        let object_deadline = object_deadline.min(Instant::now() + self.limits.object_timeout);
+        check_start_control(&cancellation, object_deadline)?;
+        let mut wasi = WasiCtxBuilder::new();
+        if self.capability_profile == RuntimeCapabilityProfile::FilterWasi {
+            wasi.inherit_stdout().inherit_stderr();
+        }
+        let wasi = wasi.build();
+        let state = S4HostState {
+            resource_limiter: S4ResourceLimiter {
+                memory_limit: self.limits.guest_memory_bytes,
+                memory_used: 0,
+                max_memories: self.limits.max_memories,
+                table_elements: self.limits.table_elements,
+            },
+            wasi,
+            table: ResourceTable::new(),
+        };
+        let mut store = Store::new(&self.epoch_engine.engine, state);
+        store
+            .set_fuel(initial_fuel)
+            .map_err(|error| S4Error::new(codes::WASM_INIT, error.to_string()))?;
+        store.limiter(|state| &mut state.resource_limiter);
+        let control = Arc::new(CallControl {
+            deadline: Mutex::new(object_deadline),
+            cancellation: cancellation.clone(),
+        });
+        let callback_control = Arc::clone(&control);
+        store.epoch_deadline_callback(move |_| {
+            if callback_control.cancellation.is_cancelled() {
+                return Err(wasmtime::Error::msg("Wasm execution cancelled"));
+            }
+            if Instant::now() >= *callback_control.deadline.lock().unwrap() {
+                return Err(wasmtime::Error::msg("Wasm execution deadline exceeded"));
+            }
+            Ok(UpdateDeadline::Continue(1))
+        });
+        store.set_epoch_deadline(1);
+        cancellation.register_engine(&self.epoch_engine.engine);
+        check_start_control(&cancellation, object_deadline)?;
+
+        let mut linker = Linker::new(&self.epoch_engine.engine);
+        if self.capability_profile == RuntimeCapabilityProfile::FilterWasi {
+            add_wasi_to_linker(&mut linker)
+                .map_err(|error| S4Error::new(codes::WASM_INIT, error.to_string()))?;
+        }
+        let instantiation_code = match self.capability_profile {
+            RuntimeCapabilityProfile::FilterWasi => codes::WASM_INIT,
+            RuntimeCapabilityProfile::NoHostImports => codes::WIT_INVALID,
+        };
+        let instance = linker
+            .instantiate(&mut store, &self.component)
+            .map_err(|error| {
+                let code = if cancellation.is_cancelled() {
+                    codes::WASM_CANCELLED
+                } else if Instant::now() >= *control.deadline.lock().unwrap() {
+                    codes::WASM_DEADLINE
+                } else if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+                    codes::WASM_FUEL
+                } else {
+                    instantiation_code
+                };
+                S4Error::new(code, error.to_string())
+            })?;
+        let remaining_after_start = store
+            .get_fuel()
+            .map_err(|error| S4Error::new(codes::WASM_FUEL, error.to_string()))?;
+        let startup_fuel = initial_fuel.saturating_sub(remaining_after_start);
+        check_start_control(&cancellation, object_deadline)?;
+        let runtime = RuntimeSession {
+            store,
+            cancellation,
+            control,
+            limits: self.limits.clone(),
+            object_deadline,
+            fuel_consumed: startup_fuel,
+        };
+        Ok((runtime, instance))
+    }
+}
+
+fn validate_runtime_limits(limits: &RuntimeLimits) -> anyhow::Result<()> {
+    if limits.guest_memory_bytes == 0
+        || limits.max_memories == 0
+        || limits.table_elements == 0
+        || limits.cumulative_fuel == 0
+        || limits.per_call_fuel == 0
+        || limits.per_call_timeout.is_zero()
+        || limits.object_timeout.is_zero()
+    {
+        anyhow::bail!("Wasm runtime limits must be greater than zero");
+    }
+    Ok(())
 }
 
 fn check_start_control(
@@ -523,7 +605,7 @@ fn check_start_control(
 }
 
 fn startup_error(
-    stage: &str,
+    default_code: &'static str,
     error: wasmtime::Error,
     cancellation: &CancellationToken,
     object_deadline: Instant,
@@ -535,9 +617,9 @@ fn startup_error(
     } else if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
         codes::WASM_FUEL
     } else {
-        codes::WASM_INIT
+        default_code
     };
-    S4Error::new(code, format!("{stage}: {error}"))
+    S4Error::new(code, error.to_string())
 }
 
 fn register_epoch_engine(engine: &Arc<EpochEngine>) {
@@ -572,6 +654,7 @@ fn register_epoch_engine(engine: &Arc<EpochEngine>) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::*;
 
@@ -796,6 +879,16 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_guest_memory_growth_is_limited() {
+        let engine = FilterEngine::new(&test_component()).unwrap();
+        let mut filter = engine.start_session(&session()).unwrap();
+        assert_eq!(
+            filter.transform(b"memory").unwrap_err().code(),
+            codes::WASM_TRAP
+        );
+    }
+
+    #[test]
     fn constrained_fuel_interrupts_a_hostile_core_start_function() {
         let engine = FilterEngine::with_limits(
             hostile_start_component(),
@@ -841,15 +934,5 @@ mod tests {
             .err()
             .expect("hostile start must hit the object deadline");
         assert_eq!(error.code(), codes::WASM_DEADLINE);
-    }
-
-    #[test]
-    fn aggregate_guest_memory_growth_is_limited() {
-        let engine = FilterEngine::new(&test_component()).unwrap();
-        let mut filter = engine.start_session(&session()).unwrap();
-        assert_eq!(
-            filter.transform(b"memory").unwrap_err().code(),
-            codes::WASM_TRAP
-        );
     }
 }

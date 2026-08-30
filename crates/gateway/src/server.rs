@@ -79,9 +79,9 @@ use crate::store::{
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, CompatibilitySpoolConfig,
     CompatibilitySpoolTransaction, CompletionReconciliation, ConditionalReadCapability,
-    DirectOperationScope, DirectS3Sink, ExpectedObject, IncompleteUploadDiscovery, ListCapability,
-    MemorySinkTransaction, MultipartResponseCapability, ObjectDestination, ObjectSinkTransaction,
-    OperationJournal, OperationReconciler, OperationRecord, OperationState,
+    DirectOperationScope, DirectS3Sink, EvidenceRecord, ExpectedObject, IncompleteUploadDiscovery,
+    ListCapability, MemorySinkTransaction, MultipartResponseCapability, ObjectDestination,
+    ObjectSinkTransaction, OperationJournal, OperationReconciler, OperationRecord, OperationState,
     ResponseChecksumCapability, SpoolQuota, StoredObjectMeta, TransactionError,
     VersioningCapability,
 };
@@ -309,6 +309,36 @@ async fn record_operation(
 ) -> Result<(), axum::response::Response> {
     let event = usage.event();
     record_usage(control, context, &event, key).await
+}
+
+/// Persist the canonical usage event as durable journal evidence before the
+/// control-plane receipt is recorded. If the receipt write fails after a
+/// storage commit (503) or the process dies in that window, the hosted control
+/// plane can later reconcile the committed operation from this evidence.
+async fn persist_usage_evidence(journal: Option<&Arc<dyn OperationJournal>>, event: &UsageEvent) {
+    let Some(journal) = journal else {
+        return;
+    };
+    let evidence = EvidenceRecord::new(
+        event.operation_id,
+        "usage",
+        serde_json::json!({
+            "receipt_id": event.id,
+            "source_bytes": event.source_bytes,
+            "output_bytes": event.output_bytes,
+            "processed_bytes": event.processed_bytes,
+            "route": event.route.as_str(),
+            "kind": event.kind.as_str(),
+            "bucket": &event.bucket,
+        }),
+    );
+    if let Err(error) = journal.append_evidence(evidence).await {
+        warn!(
+            operation_id = %event.operation_id,
+            error = %error,
+            "failed to persist usage evidence"
+        );
+    }
 }
 
 fn admitted_response_bytes(response: &axum::response::Response) -> Option<u64> {
@@ -4180,18 +4210,15 @@ async fn s3_put(
     .await
     {
         Ok((auth, stored, source_bytes, output_bytes)) => {
-            if let Err(response) = record_operation(
-                state.control.clone(),
-                &auth.context,
-                OperationUsage {
-                    operation,
-                    authorization: &authorization,
-                    source_bytes,
-                    output_bytes,
-                },
-                &key,
-            )
-            .await
+            let usage = OperationUsage {
+                operation,
+                authorization: &authorization,
+                source_bytes,
+                output_bytes,
+            };
+            persist_usage_evidence(state.operation_journal.as_ref(), &usage.event()).await;
+            if let Err(response) =
+                record_operation(state.control.clone(), &auth.context, usage, &key).await
             {
                 return response;
             }
@@ -5228,6 +5255,36 @@ mod tests {
         assert!(validate_storage_boundary_startup(false, false, true).is_ok());
         assert!(validate_storage_boundary_startup(true, true, false).is_ok());
         assert!(validate_storage_boundary_startup(true, false, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn persist_usage_evidence_writes_durable_journal_record() {
+        let journal: Arc<dyn OperationJournal> =
+            Arc::new(crate::transaction::InMemoryOperationJournal::new());
+        let event = UsageEvent::new(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "bucket",
+            RequestKind::Write,
+            UsageRoute::PutObject,
+            64,
+            32,
+        );
+        persist_usage_evidence(Some(&journal), &event).await;
+
+        let evidence = journal.evidence(event.operation_id).await.unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].kind, "usage");
+        assert_eq!(
+            evidence[0].detail["receipt_id"].as_str().unwrap(),
+            event.id.to_string()
+        );
+        assert_eq!(evidence[0].detail["source_bytes"].as_u64(), Some(64));
+        assert_eq!(evidence[0].detail["output_bytes"].as_u64(), Some(32));
+        assert_eq!(evidence[0].detail["processed_bytes"].as_u64(), Some(64));
+        assert_eq!(evidence[0].detail["route"].as_str(), Some("PutObject"));
+        assert_eq!(evidence[0].detail["kind"].as_str(), Some("write"));
+        assert_eq!(evidence[0].detail["bucket"].as_str(), Some("bucket"));
     }
 
     #[tokio::test]

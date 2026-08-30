@@ -24,6 +24,16 @@ pub enum RequestKind {
     Read,
 }
 
+impl RequestKind {
+    /// Canonical lowercase name used in durable usage evidence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+        }
+    }
+}
+
 /// Canonical S3 route that produced a usage receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageRoute {
@@ -34,6 +44,21 @@ pub enum UsageRoute {
     DeleteObject,
     AbortMultipartUpload,
     CompleteMultipartUpload,
+}
+
+impl UsageRoute {
+    /// Canonical S3 method name used in durable usage evidence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PutObject => "PutObject",
+            Self::GetObject => "GetObject",
+            Self::HeadObject => "HeadObject",
+            Self::ListObjects => "ListObjects",
+            Self::DeleteObject => "DeleteObject",
+            Self::AbortMultipartUpload => "AbortMultipartUpload",
+            Self::CompleteMultipartUpload => "CompleteMultipartUpload",
+        }
+    }
 }
 
 /// Canonical server-generated reservation request for one billable operation.

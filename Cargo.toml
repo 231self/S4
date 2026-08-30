@@ -15,6 +15,7 @@ members = [
   "filters/envelope-encrypt",
   "filters/stable-encrypt",
   "filters/test-filter",
+  "filters/test-binary-reductor",
 ]
 
 [workspace.package]

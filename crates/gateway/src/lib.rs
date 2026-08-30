@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod binary_ir;
+pub mod binary_reductor;
 pub mod control;
 pub mod entity;
 pub mod format;

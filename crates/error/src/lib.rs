@@ -24,7 +24,9 @@ pub mod codes {
     pub const WASM_CANCELLED: &str = "wasm.cancelled";
     pub const WASM_ADMISSION: &str = "wasm.admission";
     pub const WASM_INIT: &str = "wasm.init";
+    pub const WASM_REDUCTOR: &str = "wasm.reductor";
     pub const WASM_REDUCTOR_CLAIM: &str = "wasm.reductor_claim";
+    pub const WASM_REDUCTOR_LIMIT: &str = "wasm.reductor_limit";
     pub const WASM_REDUCTOR_PLAN: &str = "wasm.reductor_plan";
     pub const POLICY_UNAVAILABLE: &str = "policy.unavailable";
     pub const POLICY_EXPIRED: &str = "policy.expired";
@@ -93,7 +95,9 @@ mod tests {
     fn all_codes_are_stable() {
         assert_eq!(codes::DECODE_JSON, "decode.json");
         assert_eq!(codes::WASM_REJECT, "wasm.reject");
+        assert_eq!(codes::WASM_REDUCTOR, "wasm.reductor");
         assert_eq!(codes::WASM_REDUCTOR_CLAIM, "wasm.reductor_claim");
+        assert_eq!(codes::WASM_REDUCTOR_LIMIT, "wasm.reductor_limit");
         assert_eq!(codes::WASM_REDUCTOR_PLAN, "wasm.reductor_plan");
         assert_eq!(codes::POLICY_TAMPERED, "policy.tampered");
     }

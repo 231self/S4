@@ -21,7 +21,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
         with:
-          targets: wasm32-wasip1
+          targets: wasm32-wasip1,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
@@ -37,7 +37,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
         with:
-          targets: wasm32-wasip1
+          targets: wasm32-wasip1,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
@@ -63,7 +63,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
         with:
-          targets: wasm32-wasip1
+          targets: wasm32-wasip1,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0

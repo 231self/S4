@@ -9,6 +9,8 @@ OUT_DIR="$ROOT/target/components"
 # standard WASI interfaces (random, io, environment) when they need them.
 TARGET="wasm32-wasip1"
 BIN_DIR="$ROOT/target/$TARGET/release"
+NO_WASI_TARGET="wasm32-unknown-unknown"
+NO_WASI_BIN_DIR="$ROOT/target/$NO_WASI_TARGET/release"
 
 # Keep the adapter aligned with the workspace's Wasmtime major and verify the
 # release asset instead of depending on arbitrary Cargo registry cache state.
@@ -76,8 +78,8 @@ for entry in "${FILTERS[@]}"; do
   echo "    -> ${OUT_DIR}/${name}.component.wasm (WASI)"
 done
 
-# Failure-injection component is built for runtime tests but never placed in the
-# production auto-load directory.
+# Test components are built for runtime tests but never placed in the production
+# auto-load directory.
 TEST_OUT_DIR="$ROOT/target/test-components"
 mkdir -p "$TEST_OUT_DIR"
 cargo build --release -p test-filter --target "$TARGET"
@@ -86,4 +88,11 @@ wasm-tools component new \
   --adapt "wasi_snapshot_preview1=${ADAPTER}" \
   -o "${TEST_OUT_DIR}/test-filter.component.wasm"
 
-echo "=== All filters built (WASI) ==="
+# Binary reductors receive no host imports. Build this fixture for the bare Wasm
+# target and componentize it without a WASI adapter.
+cargo build --release -p test-binary-reductor --target "$NO_WASI_TARGET"
+wasm-tools component new \
+  "${NO_WASI_BIN_DIR}/test_binary_reductor.wasm" \
+  -o "${TEST_OUT_DIR}/test-binary-reductor.component.wasm"
+
+echo "=== All filter and runtime test components built ==="

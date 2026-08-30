@@ -4347,20 +4347,24 @@ async fn transformed_read_response(
     response_metadata: ObjectMetadata,
     object: OpenedObject,
     key: &str,
-) -> axum::response::Response {
+) -> (axum::response::Response, Option<u64>) {
     let (format, content_type) = preflight;
     let snapshot = match state.gateway.pipeline_snapshot() {
         Some(snapshot) => snapshot,
         None => {
-            return transformed_read_error_response(
-                key,
-                TransformedReadError::Capacity(
-                    "transformed reads require a plugin registry".to_string(),
+            return (
+                transformed_read_error_response(
+                    key,
+                    TransformedReadError::Capacity(
+                        "transformed reads require a plugin registry".to_string(),
+                    ),
                 ),
+                None,
             );
         }
     };
     let source_cancellation = object.cancellation.clone();
+    let source_counters = object.counters.clone();
     let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
     let pipeline = match snapshot
         .clone()
@@ -4371,7 +4375,7 @@ async fn transformed_read_response(
         .await
     {
         Ok(pipeline) => pipeline,
-        Err(error) => return transformed_read_error_response(key, error.into()),
+        Err(error) => return (transformed_read_error_response(key, error.into()), None),
     };
     let direct = snapshot
         .capabilities()
@@ -4414,15 +4418,18 @@ async fn transformed_read_response(
                     .headers_mut()
                     .unwrap()
                     .extend(transformed_response_headers(&response_metadata, None));
-                response
-                    .body(axum::body::Body::new(DirectReadBody {
-                        first: Some(first),
-                        receiver,
-                        source_cancellation,
-                        pipeline_cancellation,
-                        done: false,
-                    }))
-                    .unwrap()
+                (
+                    response
+                        .body(axum::body::Body::new(DirectReadBody {
+                            first: Some(first),
+                            receiver,
+                            source_cancellation,
+                            pipeline_cancellation,
+                            done: false,
+                        }))
+                        .unwrap(),
+                    None,
+                )
             }
             Some(DirectReadEvent::Done) | None => {
                 let mut response = axum::response::Response::builder().status(StatusCode::OK);
@@ -4430,18 +4437,27 @@ async fn transformed_read_response(
                     .headers_mut()
                     .unwrap()
                     .extend(transformed_response_headers(&response_metadata, Some(0)));
-                response.body(axum::body::Body::empty()).unwrap()
+                (
+                    response.body(axum::body::Body::empty()).unwrap(),
+                    Some(source_counters.bytes()),
+                )
             }
-            Some(DirectReadEvent::Failed(error)) => transformed_read_error_response(key, error),
+            Some(DirectReadEvent::Failed(error)) => {
+                (transformed_read_error_response(key, error), None)
+            }
         };
     }
     if !state.transformed_read_spool_enabled {
         source_cancellation.cancel();
-        return transformed_read_error_response(
-            key,
-            TransformedReadError::Capacity(
-                "unsafe transformed reads require S4_TRANSFORMED_READ_SPOOL=encrypted".to_string(),
+        return (
+            transformed_read_error_response(
+                key,
+                TransformedReadError::Capacity(
+                    "unsafe transformed reads require S4_TRANSFORMED_READ_SPOOL=encrypted"
+                        .to_string(),
+                ),
             ),
+            None,
         );
     }
     let spool = match EncryptedReadSpool::begin(
@@ -4452,7 +4468,7 @@ async fn transformed_read_response(
     .await
     {
         Ok(spool) => spool,
-        Err(error) => return transformed_read_error_response(key, error.into()),
+        Err(error) => return (transformed_read_error_response(key, error.into()), None),
     };
     let (spool_sender, mut spool_receiver) = tokio::sync::mpsc::channel(2);
     let spool_writer = tokio::spawn(async move {
@@ -4486,23 +4502,26 @@ async fn transformed_read_response(
     drop(spool_sender);
     if let Err(error) = result {
         let _ = spool_writer.await;
-        return transformed_read_error_response(key, error);
+        return (transformed_read_error_response(key, error), None);
     }
     let spool = match spool_writer.await {
         Ok(Ok(spool)) => spool,
-        Ok(Err(error)) => return transformed_read_error_response(key, error),
+        Ok(Err(error)) => return (transformed_read_error_response(key, error), None),
         Err(error) => {
-            return transformed_read_error_response(
-                key,
-                TransformedReadError::Capacity(format!(
-                    "encrypted transformed-read staging task failed: {error}"
-                )),
+            return (
+                transformed_read_error_response(
+                    key,
+                    TransformedReadError::Capacity(format!(
+                        "encrypted transformed-read staging task failed: {error}"
+                    )),
+                ),
+                None,
             );
         }
     };
     let (body, content_length) = match spool.into_body(source_cancellation).await {
         Ok(result) => result,
-        Err(error) => return transformed_read_error_response(key, error.into()),
+        Err(error) => return (transformed_read_error_response(key, error.into()), None),
     };
     let mut response = axum::response::Response::builder().status(StatusCode::OK);
     response
@@ -4512,7 +4531,7 @@ async fn transformed_read_response(
             &response_metadata,
             Some(content_length),
         ));
-    response.body(body).unwrap()
+    (response.body(body).unwrap(), Some(source_counters.bytes()))
 }
 
 async fn s3_get(
@@ -4677,15 +4696,9 @@ async fn s3_get(
             }
             return response;
         }
+        let source_bytes = content_length(&object.metadata.headers);
         let response_metadata = object.metadata.clone();
-        let Some(source_bytes) = content_length(&response_metadata.headers) else {
-            object.cancellation.cancel();
-            return s3_error::service_unavailable(
-                &key,
-                "The source size is unavailable for usage metering.",
-            );
-        };
-        let response = transformed_read_response(
+        let (response, completed_source_bytes) = transformed_read_response(
             &state,
             &auth,
             &headers,
@@ -4701,7 +4714,7 @@ async fn s3_get(
             operation,
             &bucket,
             &key,
-            Some(source_bytes),
+            source_bytes.or(completed_source_bytes),
             response,
         )
         .await;

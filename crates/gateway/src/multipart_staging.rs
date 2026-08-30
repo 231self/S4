@@ -7,6 +7,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(test, debug_assertions))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -42,6 +44,8 @@ const MAGIC: &[u8] = b"S4MP10\0";
 const NONCE_LEN: usize = 12;
 const FILE_PREFIX: &str = "s4-multipart-";
 pub const ARTIFACT_PREFIX: &str = "multipart/";
+#[cfg(any(test, debug_assertions))]
+static FAIL_ABORT_AFTER_UPDATE: AtomicBool = AtomicBool::new(false);
 pub const RECONCILIATION_GRACE: Duration = Duration::from_secs(5 * 60);
 pub const COMPLETION_LEASE: Duration = Duration::from_secs(30);
 const MAX_ARTIFACT_HEADER_BYTES: usize = 64 * 1024;
@@ -222,6 +226,14 @@ pub enum StagingError {
     Crypto(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AbortMutationError {
+    #[error(transparent)]
+    PreMutation(StagingError),
+    #[error(transparent)]
+    MutationUnknown(StagingError),
+}
+
 #[async_trait]
 pub trait MultipartRepository: Send + Sync {
     fn is_durable(&self) -> bool;
@@ -308,7 +320,7 @@ pub trait MultipartRepository: Send + Sync {
         &self,
         identity: &MultipartIdentity,
         now_ms: i64,
-    ) -> Result<Vec<MultipartPart>, StagingError>;
+    ) -> Result<Vec<MultipartPart>, AbortMutationError>;
     async fn delete_terminal_upload(
         &self,
         identity: &MultipartIdentity,
@@ -365,6 +377,11 @@ impl PostgresMultipartRepository {
                 global_bytes: i64::MAX as u64,
             },
         )
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub fn fail_next_abort_after_update() {
+        FAIL_ABORT_AFTER_UPDATE.store(true, Ordering::Release);
     }
 
     pub fn with_quotas(pool: sqlx::PgPool, quotas: StagingQuotaLimits) -> Self {
@@ -1463,13 +1480,16 @@ impl MultipartRepository for PostgresMultipartRepository {
         &self,
         identity: &MultipartIdentity,
         now: i64,
-    ) -> Result<Vec<MultipartPart>, StagingError> {
-        let upload = self.get_authorized(identity).await?;
+    ) -> Result<Vec<MultipartPart>, AbortMutationError> {
+        let upload = self
+            .get_authorized(identity)
+            .await
+            .map_err(AbortMutationError::PreMutation)?;
         if upload.lifecycle == MultipartLifecycle::Aborted {
             return Ok(Vec::new());
         }
         if upload.lifecycle != MultipartLifecycle::Open {
-            return Err(StagingError::NotOpen);
+            return Err(AbortMutationError::PreMutation(StagingError::NotOpen));
         }
         let result = multipart_upload::Entity::update_many()
             .col_expr(
@@ -1484,13 +1504,22 @@ impl MultipartRepository for PostgresMultipartRepository {
             .filter(multipart_upload::Column::Lifecycle.eq("OPEN"))
             .exec(&self.db)
             .await
-            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+            .map_err(|error| {
+                AbortMutationError::MutationUnknown(StagingError::Persistence(error.to_string()))
+            })?;
         if result.rows_affected != 1 {
-            return Err(StagingError::NotOpen);
+            return Err(AbortMutationError::PreMutation(StagingError::NotOpen));
+        }
+        #[cfg(any(test, debug_assertions))]
+        if FAIL_ABORT_AFTER_UPDATE.swap(false, Ordering::AcqRel) {
+            return Err(AbortMutationError::MutationUnknown(
+                StagingError::Persistence("injected post-abort persistence failure".to_string()),
+            ));
         }
         self.list_parts(identity, 0, MAX_PARTS as usize)
             .await
             .map(|value| value.0)
+            .map_err(AbortMutationError::MutationUnknown)
     }
     async fn delete_terminal_upload(
         &self,
@@ -2167,18 +2196,18 @@ impl MultipartRepository for InMemoryMultipartRepository {
         &self,
         identity: &MultipartIdentity,
         now_ms: i64,
-    ) -> Result<Vec<MultipartPart>, StagingError> {
+    ) -> Result<Vec<MultipartPart>, AbortMutationError> {
         let mut state = self.state.lock().await;
         let upload = state
             .uploads
             .get_mut(&identity.upload_id)
             .filter(|upload| same_identity(upload, identity))
-            .ok_or(StagingError::NotFound)?;
+            .ok_or(AbortMutationError::PreMutation(StagingError::NotFound))?;
         if upload.lifecycle != MultipartLifecycle::Open {
             if upload.lifecycle == MultipartLifecycle::Aborted {
                 return Ok(Vec::new());
             }
-            return Err(StagingError::NotOpen);
+            return Err(AbortMutationError::PreMutation(StagingError::NotOpen));
         }
         upload.lifecycle = MultipartLifecycle::Aborted;
         upload.tombstone_until_ms = Some(now_ms + DEFAULT_EXPIRY.as_millis() as i64);

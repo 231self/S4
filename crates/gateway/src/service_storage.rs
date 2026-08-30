@@ -1199,8 +1199,9 @@ impl ServiceStorage {
         )?;
         tokio::spawn(async move {
             while let Some(operation_id) = abort_receiver.recv().await {
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 if let Err(error) = reconciler
-                    .reconcile_operation(operation_id, Duration::ZERO)
+                    .reconcile_operation(operation_id, Duration::from_secs(1))
                     .await
                 {
                     warn!("managed transaction cleanup failed: {error}");
@@ -1265,7 +1266,6 @@ impl ServiceStorage {
         });
         Ok(Box::new(ManagedDirectSink {
             sink,
-            backend,
             journal: journal.clone(),
             operation_id,
             repository,
@@ -1442,7 +1442,6 @@ impl ServiceStorage {
 
 struct ManagedDirectSink {
     sink: DirectS3Sink,
-    backend: Arc<dyn TransactionBackend>,
     journal: Arc<dyn OperationJournal>,
     operation_id: uuid::Uuid,
     repository: Arc<dyn ManagedRepository>,
@@ -1640,12 +1639,6 @@ async fn complete_reconciled(
     match destination.sink.complete().await {
         Ok(stored) => Ok(stored),
         Err(original) => {
-            let reconciler = OperationReconciler::new(
-                journal.clone(),
-                destination.backend.clone(),
-                format!("managed-complete-{}", uuid::Uuid::now_v7()),
-            )?;
-            reconciler.reconcile_due(Duration::ZERO, 16).await?;
             let operation = journal
                 .get(destination.operation_id)
                 .await?
@@ -1688,6 +1681,16 @@ impl ManagedReplicatedSink {
 
 #[async_trait::async_trait]
 impl ObjectSinkTransaction for ManagedReplicatedSink {
+    fn commit_state(&self) -> crate::transaction::SinkCommitState {
+        if self.finished {
+            crate::transaction::SinkCommitState::Committed
+        } else if self.output.is_some() {
+            crate::transaction::SinkCommitState::CommitUnknown
+        } else {
+            crate::transaction::SinkCommitState::PreCommit
+        }
+    }
+
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);

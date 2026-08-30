@@ -10,7 +10,7 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use super::{ObjectSinkTransaction, StoredObjectMeta, TransactionError};
+use super::{ObjectSinkTransaction, SinkCommitState, StoredObjectMeta, TransactionError};
 
 const FILE_PREFIX: &str = "s4-spool-";
 /// Encrypted transformed-read staging shares the compatibility spool directory.
@@ -87,6 +87,7 @@ pub struct CompatibilitySpoolTransaction {
     reserved_bytes: u64,
     output_hasher: Sha256,
     output_verified: bool,
+    commit_started: bool,
     finished: bool,
 }
 
@@ -132,6 +133,7 @@ impl CompatibilitySpoolTransaction {
             reserved_bytes,
             output_hasher: Sha256::new(),
             output_verified: false,
+            commit_started: false,
             finished: false,
         })
     }
@@ -186,6 +188,16 @@ fn is_recognized_spool_file(name: &str) -> bool {
 
 #[async_trait]
 impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
+    fn commit_state(&self) -> SinkCommitState {
+        if self.finished {
+            SinkCommitState::Committed
+        } else if self.commit_started {
+            SinkCommitState::CommitUnknown
+        } else {
+            SinkCommitState::PreCommit
+        }
+    }
+
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);
@@ -236,6 +248,7 @@ impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
         let file = self.file.as_mut().ok_or(TransactionError::Finished)?;
         file.flush().await.map_err(spool_error)?;
         file.sync_all().await.map_err(spool_error)?;
+        self.commit_started = true;
         let result = self.uploader.upload_file(&self.path, self.bytes).await?;
         self.remove_file().await?;
         self.quota.release_bytes(self.reserved_bytes);

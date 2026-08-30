@@ -36,6 +36,54 @@ pub enum UsageRoute {
     CompleteMultipartUpload,
 }
 
+/// Canonical server-generated reservation request for one billable operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageAuthorization {
+    operation_id: Uuid,
+    bucket: String,
+    route: UsageRoute,
+    kind: RequestKind,
+    max_processed_bytes: u64,
+}
+
+impl UsageAuthorization {
+    pub(crate) fn new(
+        operation_id: Uuid,
+        bucket: impl Into<String>,
+        route: UsageRoute,
+        kind: RequestKind,
+        max_processed_bytes: u64,
+    ) -> Self {
+        Self {
+            operation_id,
+            bucket: bucket.into(),
+            route,
+            kind,
+            max_processed_bytes,
+        }
+    }
+
+    pub fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn route(&self) -> UsageRoute {
+        self.route
+    }
+
+    pub fn kind(&self) -> RequestKind {
+        self.kind
+    }
+
+    pub fn max_processed_bytes(&self) -> u64 {
+        self.max_processed_bytes
+    }
+}
+
 /// Durable, idempotent usage receipt submitted after a billable operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UsageEvent {
@@ -114,8 +162,8 @@ impl BlockReason {
 }
 
 /// SaaS control-plane seam. The engine calls [`ControlPlane::authorize`]
-/// before running the pipeline and [`ControlPlane::record`] after a
-/// successful operation.
+/// before running a billable operation, [`ControlPlane::release`] after a
+/// non-billable outcome, and [`ControlPlane::record`] after success.
 #[async_trait]
 pub trait ControlPlane: Send + Sync + 'static {
     /// Authorize an authenticated user/workspace context. Return a block reason
@@ -124,8 +172,16 @@ pub trait ControlPlane: Send + Sync + 'static {
     async fn authorize(
         &self,
         context: &AuthenticatedRequestContext,
-        kind: RequestKind,
+        authorization: &UsageAuthorization,
     ) -> Result<Option<BlockReason>, AuthorizationError>;
+
+    /// Release a successful reservation when the operation did not become
+    /// billable. Implementations must make exact replays idempotent.
+    async fn release(
+        &self,
+        context: &AuthenticatedRequestContext,
+        operation_id: Uuid,
+    ) -> Result<(), AuthorizationError>;
 
     /// Durably record usage after a successful operation. The gateway supplies
     /// canonical route and byte counts, with `processed_bytes` equal to
@@ -158,9 +214,17 @@ impl ControlPlane for NoopControlPlane {
     async fn authorize(
         &self,
         _context: &AuthenticatedRequestContext,
-        _kind: RequestKind,
+        _authorization: &UsageAuthorization,
     ) -> Result<Option<BlockReason>, AuthorizationError> {
         Ok(None)
+    }
+
+    async fn release(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _operation_id: Uuid,
+    ) -> Result<(), AuthorizationError> {
+        Ok(())
     }
 
     async fn record(
@@ -183,8 +247,23 @@ mod tests {
             user_id: "any-user".to_string(),
             workspace_id: WorkspaceId::new("workspace").unwrap(),
         };
-        assert_eq!(cp.authorize(&context, RequestKind::Write).await, Ok(None));
-        assert_eq!(cp.authorize(&context, RequestKind::Read).await, Ok(None));
+        let write = UsageAuthorization::new(
+            Uuid::now_v7(),
+            "bucket",
+            UsageRoute::PutObject,
+            RequestKind::Write,
+            64,
+        );
+        let read = UsageAuthorization::new(
+            Uuid::now_v7(),
+            "bucket",
+            UsageRoute::GetObject,
+            RequestKind::Read,
+            64,
+        );
+        assert_eq!(cp.authorize(&context, &write).await, Ok(None));
+        assert_eq!(cp.authorize(&context, &read).await, Ok(None));
+        assert_eq!(cp.release(&context, write.operation_id()).await, Ok(()));
     }
 
     #[tokio::test]

@@ -27,6 +27,14 @@ use std::sync::Arc;
 
 pub use format::Format;
 
+/// Apply the public engine schema while tolerating private migrations sharing
+/// the same `_sqlx_migrations` table.
+pub async fn run_engine_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut migrator = sqlx::migrate!("../../migrations");
+    migrator.set_ignore_missing(true);
+    migrator.run(pool).await
+}
+
 pub struct Gateway {
     pub engine: Arc<FilterEngine>,
     pub plugins: Option<Arc<PluginRegistry>>,

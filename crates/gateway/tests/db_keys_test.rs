@@ -23,7 +23,7 @@ use s4_gateway::managed::{
     ObjectAuthority, PhysicalWriteIntent, Placement, PostgresManagedRepository,
 };
 use s4_gateway::multipart_staging::{
-    CompletePart, CompletionAcquire, MultipartCompletionResult, MultipartIdentity,
+    ARTIFACT_PREFIX, CompletePart, CompletionAcquire, MultipartCompletionResult, MultipartIdentity,
     MultipartLifecycle, MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
     PostgresMultipartRepository,
 };
@@ -37,13 +37,19 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, SqlxPos
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request, StatusCode, header};
-use s4_gateway::control::NoopControlPlane;
+use s4_gateway::control::{
+    AuthenticatedRequestContext, AuthorizationError, ControlPlane, MeteringError,
+    UsageAuthorization, UsageEvent, UsageRoute,
+};
 use s4_gateway::server::{build_router, build_state};
 use tower::ServiceExt;
 
@@ -52,11 +58,110 @@ const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/cryp
 const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
 static DB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[derive(Default)]
+struct MultipartBillingControl {
+    authorizations: Mutex<Vec<(AuthenticatedRequestContext, UsageAuthorization)>>,
+    releases: Mutex<Vec<(AuthenticatedRequestContext, uuid::Uuid)>>,
+    events: Mutex<Vec<(AuthenticatedRequestContext, UsageEvent)>>,
+}
+
+#[async_trait::async_trait]
+impl ControlPlane for MultipartBillingControl {
+    async fn authorize(
+        &self,
+        context: &AuthenticatedRequestContext,
+        authorization: &UsageAuthorization,
+    ) -> Result<Option<s4_gateway::control::BlockReason>, AuthorizationError> {
+        self.authorizations
+            .lock()
+            .unwrap()
+            .push((context.clone(), authorization.clone()));
+        Ok(None)
+    }
+
+    async fn release(
+        &self,
+        context: &AuthenticatedRequestContext,
+        operation_id: uuid::Uuid,
+    ) -> Result<(), AuthorizationError> {
+        self.releases
+            .lock()
+            .unwrap()
+            .push((context.clone(), operation_id));
+        Ok(())
+    }
+
+    async fn record(
+        &self,
+        context: &AuthenticatedRequestContext,
+        event: &UsageEvent,
+    ) -> Result<(), MeteringError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push((context.clone(), event.clone()));
+        Ok(())
+    }
+}
+
 fn unix_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+#[test]
+fn engine_migration_helper_ignores_unknown_private_versions_but_rejects_checksum_mismatch() {
+    with_pool(|pool| async move {
+        let unknown_version = 99_999_999_999_999_i64;
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES ($1, $2, NOW(), TRUE, $3, 0)",
+        )
+        .bind(unknown_version)
+        .bind("private integration migration")
+        .bind(vec![0x5a_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+        s4_gateway::run_engine_migrations(&pool)
+            .await
+            .expect("unknown private migration must be ignored");
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+            .bind(unknown_version)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (version, checksum): (i64, Vec<u8>) = sqlx::query_as(
+            "SELECT version, checksum FROM _sqlx_migrations \
+             WHERE success = TRUE ORDER BY version LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut mismatched = checksum.clone();
+        mismatched[0] ^= 0xff;
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
+            .bind(&mismatched)
+            .bind(version)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mismatch = s4_gateway::run_engine_migrations(&pool).await;
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
+            .bind(&checksum)
+            .bind(version)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(mismatch.is_err(), "public checksum mismatch must fail");
+        s4_gateway::run_engine_migrations(&pool)
+            .await
+            .expect("restored public checksum must migrate cleanly");
+    });
 }
 
 async fn ledger_managed_test_version(
@@ -417,8 +522,7 @@ where
             .connect(&url)
             .await
             .expect("DATABASE_URL must be reachable when configured");
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
+        s4_gateway::run_engine_migrations(&pool)
             .await
             .expect("migrations should apply");
         body(pool.clone()).await;
@@ -1216,6 +1320,30 @@ fn extract_xml(xml: &str, tag: &str) -> String {
 
 type MockObjects = Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>;
 
+#[derive(Clone, Default)]
+struct MockS3State {
+    objects: MockObjects,
+    block_destination_put: Arc<AtomicBool>,
+    destination_put_started: Arc<tokio::sync::Notify>,
+    release_destination_put: Arc<tokio::sync::Notify>,
+    omit_destination_head_length: Arc<AtomicBool>,
+    fail_destination_delete: Arc<AtomicBool>,
+}
+
+struct UnknownSizeEmptyBody;
+
+impl http_body::Body for UnknownSizeEmptyBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(None)
+    }
+}
+
 const MOCK_STAGING_BUCKET: &str = "staging-bucket";
 
 /// Decodes the SigV4 streaming (`aws-chunked`) framing the SDK applies to a
@@ -1252,7 +1380,7 @@ fn decode_aws_chunked(data: &[u8]) -> Vec<u8> {
 /// staging store only needs PutObject/GetObject/DeleteObject/ListObjectsV2,
 /// and the AWS SDK addresses a custom endpoint path-style (`/{bucket}/{key}`).
 async fn mock_s3_handler(
-    State(objects): State<MockObjects>,
+    State(state): State<MockS3State>,
     request: Request<Body>,
 ) -> axum::response::Response {
     let (parts, body) = request.into_parts();
@@ -1265,7 +1393,7 @@ async fn mock_s3_handler(
             .find_map(|kv| kv.strip_prefix("prefix="))
             .unwrap_or_default()
             .replace("%2F", "/");
-        let objects = objects.lock().await;
+        let objects = state.objects.lock().await;
         let mut keys: Vec<String> = objects
             .keys()
             .filter(|key| key.starts_with(&prefix))
@@ -1293,26 +1421,38 @@ async fn mock_s3_handler(
     let key = path
         .strip_prefix(&format!("{MOCK_STAGING_BUCKET}/"))
         .map(str::to_owned)
-        .unwrap_or(path);
+        .unwrap_or_else(|| path.clone());
 
     match parts.method {
         Method::PUT => {
+            if !path.starts_with(&format!("{MOCK_STAGING_BUCKET}/"))
+                && state.block_destination_put.load(Ordering::Acquire)
+            {
+                state.destination_put_started.notify_one();
+                state.release_destination_put.notified().await;
+            }
             let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024)
                 .await
                 .unwrap_or_default();
-            let decoded = if bytes.starts_with(b"S4MP10\0") {
-                bytes.to_vec()
-            } else {
+            let decoded = if parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("aws-chunked"))
+            {
                 decode_aws_chunked(&bytes)
+            } else {
+                bytes.to_vec()
             };
-            objects.lock().await.insert(key, decoded);
+            state.objects.lock().await.insert(key, decoded);
             axum::response::Response::builder()
                 .status(StatusCode::OK)
+                .header(header::ETAG, "\"mock-etag\"")
                 .body(Body::empty())
                 .unwrap()
         }
         Method::GET => {
-            let objects = objects.lock().await;
+            let objects = state.objects.lock().await;
             match objects.get(&key) {
                 Some(bytes) => axum::response::Response::builder()
                     .status(StatusCode::OK)
@@ -1325,8 +1465,34 @@ async fn mock_s3_handler(
                     .unwrap(),
             }
         }
+        Method::HEAD => {
+            let objects = state.objects.lock().await;
+            match objects.get(&key) {
+                Some(bytes) => {
+                    let mut response = axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::ETAG, "\"mock-etag\"");
+                    if !state.omit_destination_head_length.load(Ordering::Acquire) {
+                        response = response.header(header::CONTENT_LENGTH, bytes.len().to_string());
+                    }
+                    response.body(Body::new(UnknownSizeEmptyBody)).unwrap()
+                }
+                None => axum::response::Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .unwrap(),
+            }
+        }
         Method::DELETE => {
-            objects.lock().await.remove(&key);
+            if !path.starts_with(&format!("{MOCK_STAGING_BUCKET}/"))
+                && state.fail_destination_delete.load(Ordering::Acquire)
+            {
+                return axum::response::Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap();
+            }
+            state.objects.lock().await.remove(&key);
             axum::response::Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .body(Body::empty())
@@ -1370,22 +1536,96 @@ async fn upload_part(
         .to_string()
 }
 
+async fn state_assertions_for_unknown_head_and_ambiguous_delete(
+    app: &axum::Router,
+    headers: &[(&'static str, String)],
+    bucket: &str,
+    key: &str,
+    mock_state: &MockS3State,
+    control: &MultipartBillingControl,
+) {
+    let releases_before = control.releases.lock().unwrap().len();
+    mock_state
+        .omit_destination_head_length
+        .store(true, Ordering::Release);
+    let head = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri(format!("/{bucket}/{key}"))
+            .body(Body::empty())
+            .unwrap(),
+        headers,
+    );
+    let response = app.clone().oneshot(head).await.unwrap();
+    mock_state
+        .omit_destination_head_length
+        .store(false, Ordering::Release);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let head_operation = control
+        .authorizations
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .operation_id();
+    assert_eq!(control.releases.lock().unwrap().len(), releases_before + 1);
+    assert_eq!(
+        control.releases.lock().unwrap().last().unwrap().1,
+        head_operation
+    );
+
+    mock_state
+        .fail_destination_delete
+        .store(true, Ordering::Release);
+    let delete = add_headers(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/{bucket}/{key}"))
+            .body(Body::empty())
+            .unwrap(),
+        headers,
+    );
+    let response = app.clone().oneshot(delete).await.unwrap();
+    mock_state
+        .fail_destination_delete
+        .store(false, Ordering::Release);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let delete_authorization = control
+        .authorizations
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(delete_authorization.route(), UsageRoute::DeleteObject);
+    assert_eq!(control.releases.lock().unwrap().len(), releases_before + 1);
+    assert!(
+        control
+            .releases
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, operation_id)| *operation_id != delete_authorization.operation_id())
+    );
+}
+
 /// Drives the full S3 multipart HTTP surface through `build_router` against a
-/// durable Postgres repository, an in-memory staging object store, and the
-/// dev-memory destination. Runs only when `DATABASE_URL` is set.
+/// durable Postgres repository and a mock S3 service used for both encrypted
+/// staging and the direct destination. Runs only when `DATABASE_URL` is set.
 #[test]
 fn router_staged_multipart_flow_is_durable_and_idempotent() {
     with_pool(|pool| async move {
-        let _ = &pool;
-
         let staging_dir =
             std::env::temp_dir().join(format!("s4-multipart-staging-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&staging_dir).await.unwrap();
 
-        let objects: MockObjects = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let mock_state = MockS3State::default();
+        let objects = mock_state.objects.clone();
         let mock_app = axum::Router::new()
             .fallback(mock_s3_handler)
-            .with_state(objects.clone());
+            .with_state(mock_state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let mock_task = tokio::spawn(async move {
@@ -1399,10 +1639,12 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             std::env::set_var("AUTH_DISABLED", "0");
             std::env::set_var("S4_SINGLE_TENANT", "1");
             std::env::remove_var("S4_KEYS_FILE");
-            std::env::remove_var("S3_ENDPOINT");
+            std::env::set_var("S3_ENDPOINT", &endpoint);
+            std::env::set_var("S3_ACCESS_KEY_ID", "destination-access");
+            std::env::set_var("S3_SECRET_ACCESS_KEY", "destination-secret");
             std::env::remove_var("S4_SERVICE_BUCKETS");
             std::env::remove_var("S4_SECRET_KEK");
-            std::env::remove_var("S4_STREAMING_S3_PROVIDER");
+            std::env::set_var("S4_STREAMING_S3_PROVIDER", "minio");
             std::env::remove_var("S4_PLUGINS_DIR");
             std::env::remove_var("S4_FILTER_COMPONENT");
             std::env::remove_var("S4_MANAGED_STREAMING_MODE");
@@ -1419,8 +1661,9 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             std::env::set_var("S4_MULTIPART_STAGING_REGION", "us-east-1");
         }
 
+        let control = Arc::new(MultipartBillingControl::default());
         let state = build_state(
-            Arc::new(NoopControlPlane),
+            control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
             Arc::new(s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
         )
@@ -1506,7 +1749,39 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
                 .unwrap(),
             &hdrs,
         );
-        let resp = app.clone().oneshot(complete).await.unwrap();
+        mock_state
+            .block_destination_put
+            .store(true, Ordering::Release);
+        let first_completion = tokio::spawn(app.clone().oneshot(complete));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mock_state.destination_put_started.notified(),
+        )
+        .await
+        .expect("first completion reached the direct destination");
+        let busy = add_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploadId={upload_id}"))
+                .body(Body::from(complete_xml.clone()))
+                .unwrap(),
+            &hdrs,
+        );
+        let busy_response = app.clone().oneshot(busy).await.unwrap();
+        assert_eq!(
+            busy_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "concurrent exact completion must observe Busy"
+        );
+        assert!(
+            control.releases.lock().unwrap().is_empty(),
+            "Busy must not release the active worker's reservation"
+        );
+        mock_state
+            .block_destination_put
+            .store(false, Ordering::Release);
+        mock_state.release_destination_put.notify_waiters();
+        let resp = first_completion.await.unwrap().unwrap();
         let status = resp.status();
         let complete_body = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1600,6 +1875,63 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             StatusCode::BAD_REQUEST,
             "conflicting completion"
         );
+        let completion_authorizations: Vec<_> = control
+            .authorizations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, authorization)| {
+                authorization.route() == UsageRoute::CompleteMultipartUpload
+            })
+            .cloned()
+            .collect();
+        let completion_events: Vec<_> = control
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, event)| event.route == UsageRoute::CompleteMultipartUpload)
+            .cloned()
+            .collect();
+        assert_eq!(completion_authorizations.len(), 4);
+        assert_eq!(completion_events.len(), 2);
+        assert_eq!(completion_authorizations[0], completion_authorizations[1]);
+        assert_eq!(completion_authorizations[0], completion_authorizations[2]);
+        assert_eq!(completion_events[0], completion_events[1]);
+        assert_eq!(
+            completion_authorizations[0].1.operation_id(),
+            completion_events[0].1.operation_id
+        );
+        let journal_operation =
+            object_operation::Entity::find_by_id(completion_authorizations[0].1.operation_id())
+                .one(&sea_db(pool.clone()))
+                .await
+                .unwrap()
+                .expect("direct completion journal row");
+        assert_eq!(journal_operation.tenant_id.as_deref(), Some("test-user"));
+        assert_eq!(journal_operation.namespace_epoch, None);
+        assert_eq!(journal_operation.state, OperationState::Committed.as_str());
+        assert_ne!(
+            completion_authorizations[0].1.operation_id(),
+            completion_authorizations[3].1.operation_id()
+        );
+        assert_eq!(
+            control.releases.lock().unwrap().as_slice(),
+            &[(
+                completion_authorizations[3].0.clone(),
+                completion_authorizations[3].1.operation_id()
+            )]
+        );
+
+        state_assertions_for_unknown_head_and_ambiguous_delete(
+            &app,
+            &hdrs,
+            &bucket,
+            &key,
+            &mock_state,
+            &control,
+        )
+        .await;
 
         // Abort is idempotent and removes the staged artifacts.
         let abort_key = format!("abort-{}.txt", uuid::Uuid::new_v4());
@@ -1637,6 +1969,44 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             "staged artifact exists before abort"
         );
 
+        let releases_before_abort = control.releases.lock().unwrap().len();
+        PostgresMultipartRepository::fail_next_abort_after_update();
+        let ambiguous_abort = add_headers(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/{bucket}/{abort_key}?uploadId={abort_upload_id}"))
+                .body(Body::empty())
+                .unwrap(),
+            &hdrs,
+        );
+        let response = app.clone().oneshot(ambiguous_abort).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let abort_authorization = control
+            .authorizations
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            abort_authorization.route(),
+            UsageRoute::AbortMultipartUpload
+        );
+        assert_eq!(
+            control.releases.lock().unwrap().len(),
+            releases_before_abort,
+            "post-mutation abort failure must preserve its reservation"
+        );
+        assert!(
+            control
+                .releases
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, operation_id)| *operation_id != abort_authorization.operation_id())
+        );
+
         for _ in 0..2 {
             let abort = add_headers(
                 Request::builder()
@@ -1654,8 +2024,12 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             );
         }
         assert!(
-            objects.lock().await.is_empty(),
-            "abort removed all staging artifacts"
+            objects
+                .lock()
+                .await
+                .keys()
+                .any(|key| !key.starts_with(ARTIFACT_PREFIX)),
+            "completed destination remains visible after abort reconciliation"
         );
 
         mock_task.abort();

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::store::MemoryStore;
 
-use super::{ObjectSinkTransaction, StoredObjectMeta, TransactionError};
+use super::{ObjectSinkTransaction, SinkCommitState, StoredObjectMeta, TransactionError};
 
 /// Development-only atomic sink. Its configured limit is a hard memory bound;
 /// bytes are published to MemoryStore only after complete validation.
@@ -49,6 +49,14 @@ impl MemorySinkTransaction {
 
 #[async_trait]
 impl ObjectSinkTransaction for MemorySinkTransaction {
+    fn commit_state(&self) -> SinkCommitState {
+        if self.finished {
+            SinkCommitState::Committed
+        } else {
+            SinkCommitState::PreCommit
+        }
+    }
+
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);

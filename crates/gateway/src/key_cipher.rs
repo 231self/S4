@@ -182,21 +182,41 @@ impl SecretCipher {
         ))
     }
 
-    /// Decrypt a v1 or v2 envelope. v2 must match `key_id`'s AAD binding.
+    /// Decrypt a v1 or v2 envelope, preserving the original compatibility
+    /// behavior that collapses invalid data and wrapping-provider errors.
     pub fn decrypt(&self, key_id: &str, blob: &str) -> Option<String> {
+        self.decrypt_result(key_id, blob).ok().flatten()
+    }
+
+    /// Decrypt while distinguishing wrapping-provider failures from invalid
+    /// envelope data. Credential repositories use this method so operational
+    /// KMS/Vault outages can propagate instead of becoming authentication
+    /// denials.
+    pub fn decrypt_result(&self, key_id: &str, blob: &str) -> Result<Option<String>> {
         let parts: Vec<&str> = blob.splitn(4, ':').collect();
         if parts.len() != 4 || (parts[0] != ENVELOPE_VERSION && parts[0] != LEGACY_ENVELOPE_VERSION)
         {
-            return None;
+            return Ok(None);
         }
-        let wrapped = B64.decode(parts[1]).ok()?;
-        let nonce = B64.decode(parts[2]).ok()?;
+        let Ok(wrapped) = B64.decode(parts[1]) else {
+            return Ok(None);
+        };
+        let Ok(nonce) = B64.decode(parts[2]) else {
+            return Ok(None);
+        };
         if nonce.len() != NONCE_LEN {
-            return None;
+            return Ok(None);
         }
-        let ct = B64.decode(parts[3]).ok()?;
-        let dek = self.wrapping.unwrap(&wrapped).ok()?;
-        let cipher = Aes256Gcm::new_from_slice(&dek).ok()?;
+        let Ok(ct) = B64.decode(parts[3]) else {
+            return Ok(None);
+        };
+        let dek = self
+            .wrapping
+            .unwrap(&wrapped)
+            .context("key wrapping provider failed to unwrap API key DEK")?;
+        let Ok(cipher) = Aes256Gcm::new_from_slice(&dek) else {
+            return Ok(None);
+        };
         let plaintext = if parts[0] == ENVELOPE_VERSION {
             let aad = envelope_aad(key_id);
             cipher.decrypt(
@@ -209,7 +229,10 @@ impl SecretCipher {
         } else {
             cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref())
         };
-        plaintext.ok().and_then(|p| String::from_utf8(p).ok())
+        let Ok(plaintext) = plaintext else {
+            return Ok(None);
+        };
+        Ok(String::from_utf8(plaintext).ok())
     }
 
     pub fn is_legacy_envelope(blob: &str) -> bool {
@@ -239,6 +262,19 @@ mod tests {
 
     fn cipher_with_kek(kek: u8) -> SecretCipher {
         SecretCipher::new(Arc::new(LocalKeyWrapping::with_kek([kek; KEY_LEN])))
+    }
+
+    #[derive(Debug)]
+    struct FailingUnwrapper;
+
+    impl KeyWrapping for FailingUnwrapper {
+        fn wrap(&self, _dek: &[u8]) -> Result<Vec<u8>> {
+            Err(anyhow!("unexpected wrap"))
+        }
+
+        fn unwrap(&self, _wrapped: &[u8]) -> Result<Vec<u8>> {
+            Err(anyhow!("wrapping provider unavailable"))
+        }
     }
 
     #[test]
@@ -298,10 +334,20 @@ mod tests {
     }
 
     #[test]
-    fn wrong_kek_fails() {
+    fn wrong_kek_preserves_compatibility_and_is_a_fallible_unwrap_error() {
         let blob = cipher_with_kek(7).encrypt("key-a", "secret").unwrap();
         let other = cipher_with_kek(9);
         assert_eq!(other.decrypt("key-a", &blob), None);
+        assert!(other.decrypt_result("key-a", &blob).is_err());
+    }
+
+    #[test]
+    fn wrapping_provider_failure_is_an_operational_error() {
+        let blob = cipher_with_kek(7).encrypt("key-a", "secret").unwrap();
+        let cipher = SecretCipher::new(Arc::new(FailingUnwrapper));
+
+        assert_eq!(cipher.decrypt("key-a", &blob), None);
+        assert!(cipher.decrypt_result("key-a", &blob).is_err());
     }
 
     #[test]
@@ -320,6 +366,34 @@ mod tests {
         parts[2] = B64.encode([0u8; NONCE_LEN - 1]);
 
         assert_eq!(cipher.decrypt("key-a", &parts.join(":")), None);
+    }
+
+    #[test]
+    fn invalid_utf8_plaintext_returns_none() {
+        let wrapping = Arc::new(LocalKeyWrapping::with_kek([7; KEY_LEN]));
+        let dek = [5u8; KEY_LEN];
+        let wrapped = wrapping.wrap(&dek).unwrap();
+        let nonce = [3u8; NONCE_LEN];
+        let cipher = Aes256Gcm::new_from_slice(&dek).unwrap();
+        let aad = envelope_aad("key-a");
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &[0xff],
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let blob = format!(
+            "v2:{}:{}:{}",
+            B64.encode(wrapped),
+            B64.encode(nonce),
+            B64.encode(ciphertext)
+        );
+        let secret_cipher = SecretCipher::new(wrapping);
+
+        assert_eq!(secret_cipher.decrypt("key-a", &blob), None);
     }
 
     #[test]

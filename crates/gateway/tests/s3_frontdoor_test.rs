@@ -14,13 +14,13 @@ use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
 use s4_gateway::control::{
     AuthenticatedRequestContext, ControlPlane, NoopControlPlane, RequestKind, StreamingWriteMode,
 };
-use s4_gateway::key_cipher::default_wrapping;
+use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
 use s4_gateway::object::BodyLimits;
 use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
 use s4_gateway::sigv4::SigV4Policy;
 use s4_gateway::store::{
-    FileKeyStore, KeyRepository, MAX_CREDENTIAL_LABEL_BYTES, MAX_CREDENTIAL_TTL_SECONDS,
-    MAX_PUBLIC_KEY_PEM_BYTES,
+    FileKeyStore, KeyRepository, KeyStore, MAX_CREDENTIAL_LABEL_BYTES, MAX_CREDENTIAL_TTL_SECONDS,
+    MAX_PUBLIC_KEY_PEM_BYTES, PostgresKeyStore,
 };
 use s4_gateway::transaction::SpoolQuota;
 use s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
@@ -287,13 +287,16 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
 }
 
 #[tokio::test]
-async fn create_key_persistence_failure_returns_internal_error_without_secret() {
+async fn create_key_persistence_failure_returns_unavailable_without_secret() {
     let mut state = test_state().await;
     let blocking_parent =
         std::env::temp_dir().join(format!("s4-create-key-failure-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&blocking_parent).unwrap();
+    let file_store = FileKeyStore::new(blocking_parent.join("keys.json")).unwrap();
+    std::fs::remove_dir_all(&blocking_parent).unwrap();
     std::fs::write(&blocking_parent, "not a directory").unwrap();
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.keys = Arc::new(FileKeyStore::new(blocking_parent.join("keys.json")));
+    state_mut.keys = Arc::new(file_store);
     state_mut.auth_disabled = true;
     let app = build_router(state);
 
@@ -305,7 +308,7 @@ async fn create_key_persistence_failure_returns_internal_error_without_secret() 
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -315,18 +318,19 @@ async fn create_key_persistence_failure_returns_internal_error_without_secret() 
 }
 
 #[tokio::test]
-async fn public_key_persistence_failure_returns_generic_500_and_rolls_back() {
+async fn public_key_persistence_failure_returns_generic_503_and_rolls_back() {
     let mut state = test_state().await;
     let parent =
         std::env::temp_dir().join(format!("s4-public-key-handler-{}", uuid::Uuid::new_v4()));
     let durable_parent = parent.with_extension("durable");
     std::fs::create_dir_all(&parent).unwrap();
     let path = parent.join("keys.json");
-    let file_store = Arc::new(FileKeyStore::new(path.clone()));
-    let (key_id, secret_key) = file_store
+    let file_store = Arc::new(FileKeyStore::new(path.clone()).unwrap());
+    let (secret_key, created) = file_store
         .create_key("test-user", "persist-failure", 0, None)
         .await
         .unwrap();
+    let key_id = created.key_id;
     Arc::get_mut(&mut state)
         .expect("test state is uniquely owned")
         .keys = file_store.clone();
@@ -340,7 +344,7 @@ async fn public_key_persistence_failure_returns_generic_500_and_rolls_back() {
     );
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -352,6 +356,7 @@ async fn public_key_persistence_failure_returns_generic_500_and_rolls_back() {
             .get_key(&key_id)
             .await
             .unwrap()
+            .unwrap()
             .public_key_pem
             .is_none(),
         "failed persistence must roll back the in-memory value"
@@ -360,11 +365,12 @@ async fn public_key_persistence_failure_returns_generic_500_and_rolls_back() {
     std::fs::rename(&durable_parent, &parent).unwrap();
     drop(file_store);
 
-    let restarted = FileKeyStore::new(path);
+    let restarted = FileKeyStore::new(path).unwrap();
     assert!(
         restarted
             .get_key(&key_id)
             .await
+            .unwrap()
             .unwrap()
             .public_key_pem
             .is_none(),
@@ -373,16 +379,143 @@ async fn public_key_persistence_failure_returns_generic_500_and_rolls_back() {
     std::fs::remove_dir_all(parent).unwrap();
 }
 
+fn unavailable_key_store() -> Arc<dyn KeyRepository> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(25))
+        .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/s4")
+        .unwrap();
+    Arc::new(PostgresKeyStore::new(pool))
+}
+
+#[derive(Debug)]
+struct FailingUnwrapWrapping(LocalKeyWrapping);
+
+impl KeyWrapping for FailingUnwrapWrapping {
+    fn wrap(&self, dek: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.0.wrap(dek)
+    }
+
+    fn unwrap(&self, _wrapped: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Err(anyhow::anyhow!("wrapping provider unavailable"))
+    }
+}
+
+#[tokio::test]
+async fn dashboard_credential_repository_failures_return_generic_503() {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.keys = unavailable_key_store();
+    state_mut.auth_disabled = true;
+    let app = build_router(state);
+    let requests = [
+        Request::builder()
+            .uri("/dashboard/api/me")
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .uri("/dashboard/api/keys")
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri("/dashboard/api/keys")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"label":"unavailable"}"#))
+            .unwrap(),
+        Request::builder()
+            .method("DELETE")
+            .uri("/dashboard/api/keys")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"key_id":"s4_missing"}"#))
+            .unwrap(),
+        Request::builder()
+            .uri("/dashboard/api/mcp-tokens")
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri("/dashboard/api/mcp-tokens")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"label":"unavailable"}"#))
+            .unwrap(),
+        Request::builder()
+            .method("DELETE")
+            .uri("/dashboard/api/mcp-tokens")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"token_hash":"{}"}}"#,
+                "a".repeat(64)
+            )))
+            .unwrap(),
+        add_headers(
+            public_key_request("s4_missing", TEST_PUBLIC_KEY_PEM),
+            &auth_headers("s4_missing", "s4s_missing"),
+        ),
+    ];
+
+    for request in requests {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("s4s_"));
+        assert!(!body.contains("s4m_"));
+        assert!(!body.contains("Postgres"));
+        assert!(!body.contains("127.0.0.1"));
+    }
+}
+
+#[tokio::test]
+async fn credential_authentication_store_failures_return_s3_service_unavailable() {
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .keys = unavailable_key_store();
+    let app = build_router(state);
+    let requests = [
+        add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/outage/key.txt")
+                .body(Body::from("sensitive"))
+                .unwrap(),
+            &auth_headers("s4_missing", "s4s_missing"),
+        ),
+        Request::builder()
+            .method("PUT")
+            .uri("/outage/token.txt")
+            .header("authorization", "Bearer s4m_missing")
+            .body(Body::from("sensitive"))
+            .unwrap(),
+    ];
+
+    for request in requests {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(!body.contains("sensitive"));
+        assert!(!body.contains("Postgres"));
+        assert!(!body.contains("127.0.0.1"));
+    }
+}
+
 async fn make_key(state: &Arc<AppState>) -> (String, String) {
     make_key_for(state, "test-user").await
 }
 
 async fn make_key_for(state: &Arc<AppState>, user_id: &str) -> (String, String) {
-    state
+    let (secret, created) = state
         .keys
         .create_key(user_id, "sigv4-test", 0, None)
         .await
-        .expect("create test API key")
+        .expect("create test API key");
+    (created.key_id, secret)
 }
 
 fn configure_dashboard_jwt(state: &mut Arc<AppState>, user_id: &str) -> String {
@@ -540,6 +673,7 @@ async fn public_key_mutation_rejects_unauthenticated_requests_in_production_and_
                 .get_key(&key_id)
                 .await
                 .unwrap()
+                .unwrap()
                 .public_key_pem
                 .is_none(),
             "rejected request must not mutate the key"
@@ -581,6 +715,7 @@ async fn public_key_mutation_rejects_incomplete_or_invalid_api_key_credentials()
                 .keys
                 .get_key(&key_id)
                 .await
+                .unwrap()
                 .unwrap()
                 .public_key_pem
                 .is_none(),
@@ -644,6 +779,7 @@ async fn public_key_mutation_rejects_duplicate_security_headers_without_mutation
                 .keys
                 .get_key(&key_id)
                 .await
+                .unwrap()
                 .unwrap()
                 .public_key_pem
                 .is_none(),
@@ -714,6 +850,7 @@ async fn public_key_mutation_rejects_mixed_credential_classes_without_mutation()
                 .get_key(&key_id)
                 .await
                 .unwrap()
+                .unwrap()
                 .public_key_pem
                 .is_none(),
             "mixed credential classes must not mutate the key"
@@ -755,6 +892,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
             .get_key(&header_key)
             .await
             .unwrap()
+            .unwrap()
             .public_key_pem
             .as_deref(),
         Some(TEST_PUBLIC_KEY_PEM.trim())
@@ -764,6 +902,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
             .keys
             .get_key(&bearer_key)
             .await
+            .unwrap()
             .unwrap()
             .public_key_pem
             .as_deref(),
@@ -790,6 +929,7 @@ async fn local_public_key_mutation_accepts_real_target_credentials() {
             .keys
             .get_key(&key_id)
             .await
+            .unwrap()
             .unwrap()
             .public_key_pem
             .as_deref(),
@@ -821,6 +961,7 @@ async fn public_key_mutation_rejects_invalid_pem_before_persistence() {
             .keys
             .get_key(&key_id)
             .await
+            .unwrap()
             .unwrap()
             .public_key_pem
             .is_none()
@@ -857,6 +998,7 @@ async fn api_key_public_key_mutation_hides_and_rejects_sibling_and_foreign_keys(
                 .keys
                 .get_key(key_id)
                 .await
+                .unwrap()
                 .unwrap()
                 .public_key_pem
                 .is_none(),
@@ -903,6 +1045,7 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
             .get_key(&owned_key)
             .await
             .unwrap()
+            .unwrap()
             .public_key_pem
             .as_deref(),
         Some(TEST_PUBLIC_KEY_PEM.trim())
@@ -913,6 +1056,7 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
             .get_key(&second_owned_key)
             .await
             .unwrap()
+            .unwrap()
             .public_key_pem
             .as_deref(),
         Some(TEST_CERTIFICATE_PEM.trim())
@@ -922,6 +1066,7 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
             .keys
             .get_key(&foreign_key)
             .await
+            .unwrap()
             .unwrap()
             .public_key_pem
             .is_none(),
@@ -961,6 +1106,7 @@ async fn mcp_tokens_cannot_mutate_public_keys() {
                 .keys
                 .get_key(&key_id)
                 .await
+                .unwrap()
                 .unwrap()
                 .public_key_pem
                 .is_none(),
@@ -1004,6 +1150,7 @@ async fn create_key_still_accepts_an_initial_public_key() {
             .keys
             .get_key(key_id)
             .await
+            .unwrap()
             .unwrap()
             .public_key_pem
             .as_deref(),
@@ -2652,6 +2799,42 @@ async fn sigv4_signed_request_accepted_and_rejected() {
 }
 
 #[tokio::test]
+async fn sigv4_wrapping_provider_failure_returns_generic_service_unavailable() {
+    let mut state = test_state().await;
+    let cipher = Arc::new(SecretCipher::new(Arc::new(FailingUnwrapWrapping(
+        LocalKeyWrapping::with_kek([7; 32]),
+    ))));
+    let store = Arc::new(KeyStore::with_cipher(cipher));
+    let (secret, created) = store
+        .create_key("test-user", "unwrap-outage", 0, None)
+        .await
+        .unwrap();
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .keys = store;
+    let app = build_router(state);
+    let request = signed_request(
+        &created.key_id,
+        &secret,
+        "PUT",
+        "http://s4.local/outage/unwrap.txt",
+        b"sensitive",
+        &[],
+    );
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+    assert!(!body.contains("wrapping"));
+    assert!(!body.contains("sensitive"));
+}
+
+#[tokio::test]
 async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
     enum HeaderChange {
         None,
@@ -3154,16 +3337,18 @@ async fn managed_storage_isolates_users() {
     // can act as the other. The namespace prefix itself is exercised
     // end-to-end against real B2 by e2e-b2.sh / e2e-hosted.sh.
     let (app, state) = router().await;
-    let (ak1, sk1) = state
+    let (sk1, created1) = state
         .keys
         .create_key("user-one", "ns-test", 0, None)
         .await
         .expect("create user-one API key");
-    let (ak2, sk2) = state
+    let ak1 = created1.key_id;
+    let (sk2, created2) = state
         .keys
         .create_key("user-two", "ns-test", 0, None)
         .await
         .expect("create user-two API key");
+    let ak2 = created2.key_id;
     let h1 = auth_headers(&ak1, &sk1);
     let h2 = auth_headers(&ak2, &sk2);
 
@@ -3488,11 +3673,12 @@ boto3.client(
 async fn non_expiring_key_works() {
     let (app, state) = router().await;
     // expires_in=0 means never expires.
-    let (ak, sk) = state
+    let (sk, created) = state
         .keys
         .create_key("never-exp", "exp", 0, None)
         .await
         .expect("create non-expiring API key");
+    let ak = created.key_id;
     let hdrs = auth_headers(&ak, &sk);
     let put = add_headers(
         Request::builder()
@@ -3565,8 +3751,20 @@ async fn mcp_token_roundtrip_and_auth() {
 
     // Delete works (returns 200/204).
     let hash = s4_gateway::store::sha256_hash(&token);
-    assert!(state.keys.delete_mcp_token(&hash, "mcp-user").await);
-    assert!(!state.keys.delete_mcp_token(&hash, "mcp-user").await);
+    assert!(
+        state
+            .keys
+            .delete_mcp_token(&hash, "mcp-user")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !state
+            .keys
+            .delete_mcp_token(&hash, "mcp-user")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -3600,8 +3798,8 @@ async fn mcp_token_identity_is_per_user() {
     );
 
     // Tokens resolve to distinct users.
-    let uid1 = state.keys.resolve_mcp_token(&t1).await.unwrap();
-    let uid2 = state.keys.resolve_mcp_token(&t2).await.unwrap();
+    let uid1 = state.keys.resolve_mcp_token(&t1).await.unwrap().unwrap();
+    let uid2 = state.keys.resolve_mcp_token(&t2).await.unwrap().unwrap();
     assert_ne!(uid1, uid2, "tokens must bind to distinct users");
     assert_eq!(uid1, "user-a");
 }

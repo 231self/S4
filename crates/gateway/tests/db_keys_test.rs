@@ -435,17 +435,22 @@ fn postgres_secret_envelope_roundtrip() {
         ))));
         let store = PostgresKeyStore::with_cipher(pool, cipher);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store
+        let (secret, created) = store
             .create_key(&user, "encrypted", 0, None)
             .await
             .expect("create encrypted Postgres API key");
+        let key_id = created.key_id;
 
-        let persisted = store.get_key(&key_id).await.expect("persisted key");
+        let persisted = store
+            .get_key(&key_id)
+            .await
+            .expect("read persisted key")
+            .expect("persisted key");
         let envelope = persisted.secret_encrypted.expect("encrypted secret");
         assert!(envelope.starts_with("v2:"));
         assert!(!envelope.contains(&secret));
         assert_eq!(
-            store.decrypt_secret(&key_id).await.as_deref(),
+            store.decrypt_secret(&key_id).await.unwrap().as_deref(),
             Some(secret.as_str())
         );
         delete_api_key(&db, &key_id).await;
@@ -936,15 +941,16 @@ fn postgres_v1_secret_is_rewrapped_to_identity_bound_v2() {
         ))));
         let store = PostgresKeyStore::with_cipher(pool, cipher.clone());
         let user = format!("unit-v1-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store
+        let (secret, created) = store
             .create_key(&user, "legacy-rewrap", 0, None)
             .await
             .expect("create Postgres API key");
+        let key_id = created.key_id;
         let legacy = v1_envelope(&secret);
         update_secret_state(&db, &key_id, None, &legacy).await;
 
         assert_eq!(
-            store.decrypt_secret(&key_id).await.as_deref(),
+            store.decrypt_secret(&key_id).await.unwrap().as_deref(),
             Some(secret.as_str())
         );
 
@@ -970,15 +976,16 @@ fn postgres_v1_hash_mismatch_returns_none_without_rewrap() {
         ))));
         let store = PostgresKeyStore::with_cipher(pool, cipher);
         let user = format!("unit-v1-hash-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store
+        let (secret, created) = store
             .create_key(&user, "legacy-hash-mismatch", 0, None)
             .await
             .expect("create Postgres API key");
+        let key_id = created.key_id;
         let legacy = v1_envelope(&secret);
         let mismatched_hash = sha256_hash("different-secret");
         update_secret_state(&db, &key_id, Some(&mismatched_hash), &legacy).await;
 
-        assert_eq!(store.decrypt_secret(&key_id).await, None);
+        assert_eq!(store.decrypt_secret(&key_id).await.unwrap(), None);
 
         let persisted = fetch_api_key(&db, &key_id).await;
         assert_eq!(persisted.secret_hash, mismatched_hash);
@@ -993,10 +1000,11 @@ fn postgres_v1_rewrap_cas_accepts_concurrent_matching_v2() {
         let db = sea_db(pool.clone());
         let initial_store = PostgresKeyStore::new(pool.clone());
         let user = format!("unit-v1-cas-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = initial_store
+        let (secret, created) = initial_store
             .create_key(&user, "legacy-cas", 0, None)
             .await
             .expect("create hash-only Postgres API key");
+        let key_id = created.key_id;
         let legacy = v1_envelope(&secret);
         update_secret_state(&db, &key_id, None, &legacy).await;
 
@@ -1029,7 +1037,11 @@ fn postgres_v1_rewrap_cas_accepts_concurrent_matching_v2() {
         release_tx.send(()).expect("release legacy rewrap");
 
         assert_eq!(
-            decrypt.await.expect("join legacy decrypt").as_deref(),
+            decrypt
+                .await
+                .expect("join legacy decrypt")
+                .unwrap()
+                .as_deref(),
             Some(secret.as_str())
         );
         let persisted = fetch_api_key(&db, &key_id).await;
@@ -1043,13 +1055,21 @@ fn postgres_key_roundtrip() {
     with_pool(|pool| async move {
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store
+        let (secret, created) = store
             .create_key(&user, "roundtrip", 0, None)
             .await
             .expect("create Postgres API key");
+        let key_id = created.key_id.clone();
+        let persisted = store
+            .get_key(&key_id)
+            .await
+            .expect("read persisted key")
+            .expect("persisted key");
+        assert_eq!(created, persisted);
         let (uid, pk) = store
             .resolve_credentials(&key_id, &secret)
             .await
+            .unwrap()
             .expect("valid credentials resolve");
         assert_eq!(uid, user);
         assert!(pk.is_none());
@@ -1057,23 +1077,25 @@ fn postgres_key_roundtrip() {
             store
                 .resolve_credentials(&key_id, "wrong-secret")
                 .await
+                .unwrap()
                 .is_none()
         );
         assert!(
             store
                 .resolve_credentials("missing-key", &secret)
                 .await
+                .unwrap()
                 .is_none()
         );
 
-        let keys = store.list_for_user(&user).await;
+        let keys = store.list_for_user(&user).await.unwrap();
         assert_eq!(keys.len(), 1);
         assert!(keys[0].secret_hash.is_empty(), "list must strip the hash");
         assert_eq!(keys[0].label, "roundtrip");
 
-        assert!(store.delete_key(&key_id, &user).await);
-        assert!(!store.delete_key(&key_id, &user).await);
-        assert!(store.get_key(&key_id).await.is_none());
+        assert!(store.delete_key(&key_id, &user).await.unwrap());
+        assert!(!store.delete_key(&key_id, &user).await.unwrap());
+        assert!(store.get_key(&key_id).await.unwrap().is_none());
     });
 }
 
@@ -1083,10 +1105,11 @@ fn postgres_public_key_binding() {
         let db = sea_db(pool.clone());
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store
+        let (secret, created) = store
             .create_key(&user, "enc", 0, None)
             .await
             .expect("create Postgres API key");
+        let key_id = created.key_id;
         assert!(
             store
                 .set_public_key(&key_id, &user, TEST_PUBLIC_KEY_PEM)
@@ -1103,6 +1126,7 @@ fn postgres_public_key_binding() {
         let (uid, pk) = store
             .resolve_credentials(&key_id, &secret)
             .await
+            .unwrap()
             .expect("resolve after binding");
         assert_eq!(uid, user);
         assert_eq!(pk.as_deref(), Some(TEST_PUBLIC_KEY_PEM.trim()));
@@ -1116,13 +1140,18 @@ fn postgres_expired_key_rejected() {
         let db = sea_db(pool.clone());
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
-        let (key_id, secret) = store
+        let (secret, created) = store
             .create_key(&user, "exp", 1, None)
             .await
             .expect("create Postgres API key");
+        let key_id = created.key_id;
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         assert!(
-            store.resolve_credentials(&key_id, &secret).await.is_none(),
+            store
+                .resolve_credentials(&key_id, &secret)
+                .await
+                .unwrap()
+                .is_none(),
             "expired key must be rejected"
         );
         delete_api_key(&db, &key_id).await;
@@ -1141,6 +1170,7 @@ fn postgres_mcp_creation_returns_persisted_metadata() {
         let listed = store
             .list_mcp_tokens(&user)
             .await
+            .unwrap()
             .into_iter()
             .find(|candidate| candidate.token_hash == created.token_hash)
             .expect("persisted MCP token is listed");
@@ -1149,7 +1179,12 @@ fn postgres_mcp_creation_returns_persisted_metadata() {
         assert_eq!(created, listed);
         assert_eq!(created.label, "agent");
         assert!(created.expires_at.is_some());
-        assert!(store.delete_mcp_token(&created.token_hash, &user).await);
+        assert!(
+            store
+                .delete_mcp_token(&created.token_hash, &user)
+                .await
+                .unwrap()
+        );
     });
 }
 
@@ -1390,11 +1425,12 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         )
         .await
         .expect("build_state with durable staged multipart");
-        let (ak, sk) = state
+        let (sk, created) = state
             .keys
             .create_key("test-user", "multipart-test", 0, None)
             .await
             .expect("create test API key");
+        let ak = created.key_id;
         let app = build_router(state.clone());
         let hdrs = auth_headers(&ak, &sk);
 

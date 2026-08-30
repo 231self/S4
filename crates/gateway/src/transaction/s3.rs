@@ -13,8 +13,8 @@ use crate::s3_safety::record_s3_failure;
 use super::{
     AbortSignal, BackendCapabilities, BackendError, CompletionProbe, DIRECT_PART_BYTES,
     DiscoveredUpload, EvidenceRecord, ObjectDestination, ObjectSinkTransaction, OperationJournal,
-    OperationRecord, OperationState, PartRecord, StoredObjectMeta, TransactionBackend,
-    TransactionError, UploadedPart, sha256_hex, unix_time_ms,
+    OperationRecord, OperationState, PartRecord, SinkCommitState, StoredObjectMeta,
+    TransactionBackend, TransactionError, UploadedPart, sha256_hex, unix_time_ms,
 };
 
 #[derive(Clone)]
@@ -497,6 +497,25 @@ impl DirectS3Sink {
         .await
     }
 
+    pub async fn new_direct(
+        journal: Arc<dyn OperationJournal>,
+        backend: Arc<dyn TransactionBackend>,
+        scope: super::DirectOperationScope,
+        destination: ObjectDestination,
+        expected: super::ExpectedObject,
+        max_attempts: usize,
+        abort_signal: AbortSignal,
+    ) -> Result<Self, TransactionError> {
+        Self::from_operation(
+            journal,
+            backend,
+            OperationRecord::direct_intent(scope, destination, expected),
+            max_attempts,
+            abort_signal,
+        )
+        .await
+    }
+
     async fn from_operation(
         journal: Arc<dyn OperationJournal>,
         backend: Arc<dyn TransactionBackend>,
@@ -642,25 +661,37 @@ impl DirectS3Sink {
                     if attempt > 1 {
                         meta.version_history_complete = false;
                     }
-                    self.journal
+                    if let Err(error) = self
+                        .journal
                         .transition(
                             self.operation.id,
                             OperationState::Completing,
                             OperationState::Committed,
                             Some(&meta),
                         )
-                        .await?;
-                    self.evidence("put_object_after", json!({"attempt": attempt}))
-                        .await?;
+                        .await
+                    {
+                        if let Ok(Some(recovered)) = self.reconcile_completion().await {
+                            return Ok(recovered);
+                        }
+                        return Err(error.into());
+                    }
+                    self.operation.state = OperationState::Committed;
+                    let _ = self
+                        .evidence("put_object_after", json!({"attempt": attempt}))
+                        .await;
                     return Ok(meta);
                 }
                 Err(error) => last_error = Some(error),
             }
         }
         self.mark_commit_unknown().await?;
-        Err(last_error
-            .unwrap_or_else(|| BackendError::ambiguous("PUT retry budget exhausted"))
-            .into())
+        let error =
+            last_error.unwrap_or_else(|| BackendError::ambiguous("PUT retry budget exhausted"));
+        if let Some(recovered) = self.reconcile_completion().await? {
+            return Ok(recovered);
+        }
+        Err(error.into())
     }
 
     async fn complete_multipart(&mut self) -> Result<StoredObjectMeta, TransactionError> {
@@ -697,25 +728,37 @@ impl DirectS3Sink {
                     if attempt > 1 {
                         meta.version_history_complete = false;
                     }
-                    self.journal
+                    if let Err(error) = self
+                        .journal
                         .transition(
                             self.operation.id,
                             OperationState::Completing,
                             OperationState::Committed,
                             Some(&meta),
                         )
-                        .await?;
-                    self.evidence("complete_multipart_after", json!({"attempt": attempt}))
-                        .await?;
+                        .await
+                    {
+                        if let Ok(Some(recovered)) = self.reconcile_completion().await {
+                            return Ok(recovered);
+                        }
+                        return Err(error.into());
+                    }
+                    self.operation.state = OperationState::Committed;
+                    let _ = self
+                        .evidence("complete_multipart_after", json!({"attempt": attempt}))
+                        .await;
                     return Ok(meta);
                 }
                 Err(error) => last_error = Some(error),
             }
         }
         self.mark_commit_unknown().await?;
-        Err(last_error
-            .unwrap_or_else(|| BackendError::ambiguous("complete retry budget exhausted"))
-            .into())
+        let error = last_error
+            .unwrap_or_else(|| BackendError::ambiguous("complete retry budget exhausted"));
+        if let Some(recovered) = self.reconcile_completion().await? {
+            return Ok(recovered);
+        }
+        Err(error.into())
     }
 
     async fn mark_commit_unknown(&mut self) -> Result<(), TransactionError> {
@@ -729,6 +772,54 @@ impl DirectS3Sink {
             .await?;
         self.operation.state = OperationState::CommitUnknown;
         self.evidence("completion_unknown", json!({})).await
+    }
+
+    async fn reconcile_completion(&mut self) -> Result<Option<StoredObjectMeta>, TransactionError> {
+        let mut operation =
+            self.journal
+                .get(self.operation.id)
+                .await?
+                .ok_or(TransactionError::Journal(super::JournalError::NotFound(
+                    self.operation.id,
+                )))?;
+        if operation.state == OperationState::Completing {
+            self.journal
+                .transition(
+                    operation.id,
+                    OperationState::Completing,
+                    OperationState::CommitUnknown,
+                    None,
+                )
+                .await?;
+            operation.state = OperationState::CommitUnknown;
+        }
+        if operation.state == OperationState::CommitUnknown {
+            match self.backend.probe_completion(&operation).await? {
+                CompletionProbe::Committed(mut meta) => {
+                    meta.version_history_complete = false;
+                    self.journal
+                        .transition(
+                            operation.id,
+                            OperationState::CommitUnknown,
+                            OperationState::Committed,
+                            Some(&meta),
+                        )
+                        .await?;
+                    operation.state = OperationState::Committed;
+                    operation.committed = Some(meta);
+                }
+                CompletionProbe::ProvenAbsent | CompletionProbe::Inconclusive => {}
+            }
+        }
+        self.operation = operation;
+        if self.operation.state == OperationState::Committed {
+            return self.operation.committed.clone().map(Some).ok_or_else(|| {
+                TransactionError::Journal(super::JournalError::Corrupt(
+                    "committed operation has no destination metadata".to_string(),
+                ))
+            });
+        }
+        Ok(None)
     }
 
     async fn abort_discovered(&self) -> Result<(), TransactionError> {
@@ -753,6 +844,19 @@ impl DirectS3Sink {
 
 #[async_trait]
 impl ObjectSinkTransaction for DirectS3Sink {
+    fn commit_state(&self) -> SinkCommitState {
+        match self.operation.state {
+            OperationState::Completing | OperationState::CommitUnknown => {
+                SinkCommitState::CommitUnknown
+            }
+            OperationState::Committed => SinkCommitState::Committed,
+            OperationState::Intent
+            | OperationState::Open
+            | OperationState::Aborting
+            | OperationState::ProvenAborted => SinkCommitState::PreCommit,
+        }
+    }
+
     async fn write(&mut self, mut chunk: Bytes) -> Result<(), TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);
@@ -900,6 +1004,7 @@ mod tests {
         bodies: HashMap<String, Vec<Vec<u8>>>,
         committed: HashMap<uuid::Uuid, StoredObjectMeta>,
         uploads: HashMap<uuid::Uuid, String>,
+        force_absent_probe: bool,
     }
 
     #[derive(Default)]
@@ -938,6 +1043,10 @@ mod tests {
                 .get(event)
                 .cloned()
                 .unwrap_or_default()
+        }
+
+        fn force_absent_probe(&self) {
+            self.state.lock().unwrap().force_absent_probe = true;
         }
     }
 
@@ -1074,10 +1183,11 @@ mod tests {
             operation: &OperationRecord,
         ) -> Result<CompletionProbe, BackendError> {
             self.event("probe")?;
-            Ok(self
-                .state
-                .lock()
-                .unwrap()
+            let state = self.state.lock().unwrap();
+            if state.force_absent_probe {
+                return Ok(CompletionProbe::ProvenAbsent);
+            }
+            Ok(state
                 .committed
                 .get(&operation.id)
                 .cloned()
@@ -1119,6 +1229,43 @@ mod tests {
         sink.verify_output(sink.output_bytes, &digest)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_scope_persists_authorization_operation_and_workspace() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        let backend = Arc::new(ScriptBackend::default());
+        let authorization = crate::control::UsageAuthorization::new(
+            uuid::Uuid::now_v7(),
+            "bucket",
+            crate::control::UsageRoute::PutObject,
+            crate::control::RequestKind::Write,
+            64 * 1024 * 1024,
+        );
+        let (signal, _receiver) = AbortSignal::channel(1);
+        let sink = DirectS3Sink::new_direct(
+            journal.clone(),
+            backend,
+            super::super::DirectOperationScope {
+                operation_id: authorization.operation_id(),
+                tenant_id: "workspace-a".to_string(),
+            },
+            destination(),
+            ExpectedObject::default(),
+            1,
+            signal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.operation_id(), authorization.operation_id());
+        let operation = journal
+            .get(authorization.operation_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.tenant_id.as_deref(), Some("workspace-a"));
+        assert_eq!(operation.namespace_epoch, None);
     }
 
     #[test]
@@ -1204,7 +1351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lost_complete_response_is_never_aborted_and_restart_reconciles_commit() {
+    async fn lost_complete_response_is_reconciled_before_returning() {
         let journal = Arc::new(InMemoryOperationJournal::new());
         let backend = Arc::new(ScriptBackend::default());
         backend.fail_next("complete");
@@ -1213,20 +1360,8 @@ mod tests {
             .await
             .unwrap();
         verify_buffered_output(&mut sink).await;
-        assert!(sink.complete().await.is_err());
+        sink.complete().await.unwrap();
         let operation_id = sink.operation_id();
-        assert_eq!(
-            journal.get(operation_id).await.unwrap().unwrap().state,
-            OperationState::CommitUnknown
-        );
-        assert!(matches!(
-            sink.abort().await,
-            Err(TransactionError::CompletionAmbiguous)
-        ));
-
-        let reconciler =
-            OperationReconciler::new(journal.clone(), backend.clone(), "restart").unwrap();
-        reconciler.reconcile_due(Duration::ZERO, 10).await.unwrap();
         assert_eq!(
             journal.get(operation_id).await.unwrap().unwrap().state,
             OperationState::Committed
@@ -1248,6 +1383,159 @@ mod tests {
                 .unwrap()
                 .events
                 .contains(&"abort".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_commit_survives_transient_committed_journal_failure() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        journal.fail_next_committed_transitions(1);
+        let backend = Arc::new(ScriptBackend::default());
+        let (mut sink, _) = sink(journal.clone(), backend, 1).await;
+        sink.write(Bytes::from_static(b"committed")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+
+        sink.complete().await.unwrap();
+
+        assert_eq!(sink.commit_state(), SinkCommitState::Committed);
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_committed_journal_failure_reports_commit_unknown() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        journal.fail_next_committed_transitions(2);
+        let backend = Arc::new(ScriptBackend::default());
+        let (mut sink, _) = sink(journal.clone(), backend.clone(), 1).await;
+        sink.write(Bytes::from_static(b"committed")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+
+        assert!(sink.complete().await.is_err());
+        assert_eq!(sink.commit_state(), SinkCommitState::CommitUnknown);
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::CommitUnknown
+        );
+
+        let reconciler = OperationReconciler::new(journal.clone(), backend, "retry").unwrap();
+        reconciler
+            .reconcile_operation(sink.operation_id(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_provider_success_with_absent_probe_stays_commit_unknown() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        journal.fail_next_committed_transitions(1);
+        let backend = Arc::new(ScriptBackend::default());
+        backend.force_absent_probe();
+        let (mut sink, _) = sink(journal.clone(), backend, 1).await;
+        sink.write(Bytes::from_static(b"committed")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+
+        assert!(sink.complete().await.is_err());
+        assert_eq!(sink.commit_state(), SinkCommitState::CommitUnknown);
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::CommitUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_provider_result_with_absent_probe_stays_commit_unknown() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        let backend = Arc::new(ScriptBackend::default());
+        backend.fail_next("put");
+        backend.force_absent_probe();
+        let (mut sink, _) = sink(journal.clone(), backend, 1).await;
+        sink.write(Bytes::from_static(b"ambiguous")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+
+        assert!(sink.complete().await.is_err());
+        assert_eq!(sink.commit_state(), SinkCommitState::CommitUnknown);
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::CommitUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_reconciliation_never_claims_another_backend_operation() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        let backend = Arc::new(ScriptBackend::default());
+        let first = OperationRecord::intent(destination(), ExpectedObject::default());
+        let mut second_destination = destination();
+        second_destination.backend_id = "other-backend".to_string();
+        let second = OperationRecord::intent(second_destination, ExpectedObject::default());
+        for operation in [&first, &second] {
+            journal.insert_intent(operation.clone()).await.unwrap();
+            journal.set_open(operation.id, None).await.unwrap();
+            journal
+                .transition(
+                    operation.id,
+                    OperationState::Open,
+                    OperationState::Completing,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        backend.state.lock().unwrap().committed.insert(
+            first.id,
+            StoredObjectMeta {
+                etag: Some("first".to_string()),
+                version_id: None,
+                superseded_version_ids: Vec::new(),
+                version_history_complete: true,
+            },
+        );
+
+        let reconciler = OperationReconciler::new(journal.clone(), backend, "exact").unwrap();
+        reconciler
+            .reconcile_operation(first.id, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            journal.get(first.id).await.unwrap().unwrap().state,
+            OperationState::Committed
+        );
+        assert_eq!(
+            journal.get(second.id).await.unwrap().unwrap().state,
+            OperationState::Completing
         );
     }
 
@@ -1303,7 +1591,10 @@ mod tests {
 
         let reconciler =
             OperationReconciler::new(journal.clone(), backend.clone(), "restart").unwrap();
-        reconciler.reconcile_due(Duration::ZERO, 10).await.unwrap();
+        reconciler
+            .reconcile_operation(operation.id, Duration::ZERO)
+            .await
+            .unwrap();
         assert_eq!(
             journal.get(operation.id).await.unwrap().unwrap().state,
             OperationState::ProvenAborted

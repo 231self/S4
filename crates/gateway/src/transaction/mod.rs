@@ -136,6 +136,12 @@ pub struct ManagedOperationScope {
     pub namespace_epoch: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectOperationScope {
+    pub operation_id: Uuid,
+    pub tenant_id: String,
+}
+
 impl OperationRecord {
     pub fn intent(destination: ObjectDestination, expected: ExpectedObject) -> Self {
         let now = unix_time_ms();
@@ -166,6 +172,17 @@ impl OperationRecord {
         operation.id = id;
         operation.tenant_id = Some(tenant_id);
         operation.namespace_epoch = Some(namespace_epoch);
+        operation
+    }
+
+    pub fn direct_intent(
+        scope: DirectOperationScope,
+        destination: ObjectDestination,
+        expected: ExpectedObject,
+    ) -> Self {
+        let mut operation = Self::intent(destination, expected);
+        operation.id = scope.operation_id;
+        operation.tenant_id = Some(scope.tenant_id);
         operation
     }
 }
@@ -470,8 +487,22 @@ pub enum TransactionError {
     Publication(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SinkCommitState {
+    PreCommit,
+    CommitUnknown,
+    Committed,
+}
+
+impl SinkCommitState {
+    pub fn preserves_reservation(self) -> bool {
+        self != Self::PreCommit
+    }
+}
+
 #[async_trait]
 pub trait ObjectSinkTransaction: Send {
+    fn commit_state(&self) -> SinkCommitState;
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError>;
     async fn verify_output(
         &mut self,
@@ -518,25 +549,6 @@ impl OperationReconciler {
             owner: owner.into(),
             lease: Duration::from_secs(30),
         })
-    }
-
-    pub async fn reconcile_due(
-        &self,
-        stale_after: Duration,
-        limit: u64,
-    ) -> Result<usize, TransactionError> {
-        let now = unix_time_ms();
-        let stale_before = now.saturating_sub(duration_ms(stale_after));
-        let lease_until = now.saturating_add(duration_ms(self.lease));
-        let operations = self
-            .journal
-            .claim_reconcilable(&self.owner, stale_before, lease_until, limit)
-            .await?;
-        let count = operations.len();
-        for operation in operations {
-            self.reconcile(operation).await?;
-        }
-        Ok(count)
     }
 
     pub async fn reconcile_operation(
@@ -647,19 +659,15 @@ impl OperationReconciler {
                     .await?;
             }
             CompletionProbe::ProvenAbsent => {
-                let uploads = self.backend.discover_incomplete(operation).await?;
-                for upload in uploads {
-                    self.backend
-                        .abort_multipart(operation, &upload.upload_id)
-                        .await?;
-                }
+                // A point-in-time read cannot prove that a timed-out provider
+                // mutation did not commit. Keep the operation fail-closed until
+                // an external reconciler has provider-appropriate durable proof.
                 self.journal
-                    .transition(
+                    .append_evidence(EvidenceRecord::new(
                         operation.id,
-                        OperationState::CommitUnknown,
-                        OperationState::ProvenAborted,
-                        None,
-                    )
+                        "completion_absent_inconclusive",
+                        serde_json::json!({}),
+                    ))
                     .await?;
             }
             CompletionProbe::Inconclusive => {}

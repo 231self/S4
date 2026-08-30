@@ -121,6 +121,8 @@ pub struct AppState {
     pub spool_quota: Arc<SpoolQuota>,
     /// Unsafe transformed reads are allowed only with encrypted durable staging.
     pub transformed_read_spool_enabled: bool,
+    /// Enables the opt-in Avro OCF processing path. Disabled by default.
+    pub binary_avro_enabled: bool,
     pub dev_memory_max_object_bytes: usize,
     pub dev_memory_streaming_enabled: bool,
     demo_pipelines: DemoPipelines,
@@ -572,6 +574,11 @@ impl StreamingReadMode {
 fn transformed_read_spool_enabled() -> bool {
     std::env::var("S4_TRANSFORMED_READ_SPOOL")
         .is_ok_and(|value| value.eq_ignore_ascii_case("encrypted"))
+}
+
+fn binary_avro_enabled() -> bool {
+    std::env::var("S4_ENABLE_AVRO")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 /// Imported plugins are unsafe by default. Operators may opt known component
@@ -2802,6 +2809,23 @@ async fn streaming_single_put(
             "Content-Encoding is unsupported for transformed streaming".to_string(),
         ));
     }
+    if is_avro_content_type(headers) {
+        if !state.binary_avro_enabled {
+            return Err(StreamingPutError::Unsupported(
+                "Avro processing is disabled; set S4_ENABLE_AVRO=true".to_string(),
+            ));
+        }
+        return streaming_avro_single_put(
+            state,
+            authentication,
+            backend,
+            authorization,
+            headers,
+            body,
+            key,
+        )
+        .await;
+    }
     let (format, content_type) = streaming_format(headers)?;
     let sink = begin_streaming_sink(
         state,
@@ -2956,6 +2980,153 @@ async fn streaming_single_put(
             }
         }
     }
+}
+
+fn avro_media_type(content_type: &str) -> Option<String> {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        media_type.as_str(),
+        "application/avro" | "application/x-avro" | "application/vnd.apache.avro+binary"
+    )
+    .then_some(media_type)
+}
+
+fn is_avro_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(avro_media_type)
+        .is_some()
+}
+
+fn avro_pump(
+    auth: &Auth,
+    headers: &HeaderMap,
+    limits: crate::avro::AvroLimits,
+) -> Result<
+    crate::binary_pump::BinaryPump<
+        crate::binary_reductor::CommonTypeBinaryReductor,
+        crate::binary_pump::EnvelopeBinaryTransform,
+    >,
+    s4_error::S4Error,
+> {
+    let targets = headers
+        .get("x-s4-encrypt-fields")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| {
+                    s4_error::S4Error::new(
+                        s4_error::codes::CONFIG_INVALID,
+                        "invalid x-s4-encrypt-fields",
+                    )
+                })
+                .and_then(crate::binary_pump::parse_envelope_targets)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let transform =
+        crate::binary_pump::EnvelopeBinaryTransform::new(targets, auth.public_key_pem.as_deref())?;
+    Ok(crate::binary_pump::BinaryPump::new(
+        crate::binary_reductor::CommonTypeBinaryReductor::default(),
+        transform,
+        limits.ir,
+    ))
+}
+
+async fn streaming_avro_single_put(
+    state: &AppState,
+    mut authentication: HeaderAuthentication,
+    backend: ResolvedBackend,
+    authorization: &UsageAuthorization,
+    headers: &HeaderMap,
+    mut body: axum::body::Body,
+    key: &str,
+) -> Result<(Auth, StoredObjectMeta, u64, u64), StreamingPutError> {
+    use http_body_util::BodyExt as _;
+    use sha2::Digest as _;
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| StreamingPutError::InvalidRequest("Content-Type is required".to_string()))?
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let mut input = Vec::new();
+    let mut input_bytes = 0_u64;
+    while let Some(frame) = body
+        .frame()
+        .await
+        .transpose()
+        .map_err(|_| StreamingPutError::Transport)?
+    {
+        let data = frame
+            .into_data()
+            .map_err(|_| StreamingPutError::Transport)?;
+        if data.len() > state.source_body_limits.max_frame_bytes {
+            return Err(StreamingPutError::SourceFrameTooLarge);
+        }
+        let decoded = if let Some(verifier) = &mut authentication.body_verifier {
+            verifier.push(&data).map_err(StreamingPutError::Integrity)?
+        } else {
+            vec![data]
+        };
+        for chunk in decoded {
+            input_bytes = input_bytes
+                .checked_add(chunk.len() as u64)
+                .ok_or(StreamingPutError::InputTooLarge)?;
+            if input_bytes > state.source_body_limits.max_bytes {
+                return Err(StreamingPutError::InputTooLarge);
+            }
+            input.extend_from_slice(&chunk);
+        }
+    }
+    if let Some(verifier) = authentication.body_verifier.take() {
+        let verified = verifier.finish().map_err(StreamingPutError::Integrity)?;
+        if verified != input_bytes {
+            return Err(StreamingPutError::Integrity(
+                IntegrityError::DecodedLengthMismatch,
+            ));
+        }
+    }
+
+    let limits = crate::avro::AvroLimits {
+        max_source_bytes: state.source_body_limits.max_bytes.min(64 * 1024 * 1024) as usize,
+        ..crate::avro::AvroLimits::default()
+    };
+    let mut pump = avro_pump(&authentication.auth, headers, limits)?;
+    let output = crate::avro::process_ocf(input.as_slice(), limits, &mut pump)?;
+    let output_bytes = u64::try_from(output.len()).map_err(|_| StreamingPutError::InputTooLarge)?;
+    let sink = begin_streaming_sink(
+        state,
+        backend,
+        AuthorizedOperation {
+            auth: &authentication.auth,
+            authorization,
+        },
+        authorization.bucket(),
+        key,
+        &content_type,
+    )
+    .await?;
+    let mut sink_guard = SinkAbortGuard::new(sink);
+    let digest = hex::encode(sha2::Sha256::digest(&output));
+    let stored = {
+        let mut sink = sink_guard.sink.lock().await;
+        sink.write(bytes::Bytes::from(output)).await?;
+        sink.verify_output(output_bytes, &digest).await?;
+        sink.complete().await?
+    };
+    sink_guard.disarm();
+    Ok((authentication.auth, stored, input_bytes, output_bytes))
 }
 
 #[derive(Debug)]
@@ -3454,6 +3625,26 @@ async fn complete_staged_multipart(
         .ok_or_else(|| {
             MultipartCompletionError::Invalid("multipart Content-Type is missing".to_string())
         })?;
+    if let Some(avro_media) = avro_media_type(content_type) {
+        if !state.binary_avro_enabled {
+            return Err(MultipartCompletionError::Streaming(
+                StreamingPutError::Unsupported(
+                    "Avro processing is disabled; set S4_ENABLE_AVRO=true".to_string(),
+                ),
+            ));
+        }
+        return complete_staged_avro_multipart(
+            state,
+            staging,
+            identity,
+            upload,
+            lease,
+            operation,
+            backend,
+            &avro_media,
+        )
+        .await;
+    }
     let (format, content_type) = streaming_format_content_type(content_type)?;
     renew_and_fence_completion(staging, identity, lease).await?;
     let mut sink = begin_streaming_sink(
@@ -3792,6 +3983,118 @@ fn recovered_multipart_result(
         source_bytes,
         size_bytes,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_staged_avro_multipart(
+    state: &AppState,
+    staging: &MultipartStaging,
+    identity: &MultipartIdentity,
+    upload: &MultipartUpload,
+    lease: &CompletionLease,
+    operation: AuthorizedOperation<'_>,
+    backend: ResolvedBackend,
+    content_type: &str,
+) -> Result<MultipartCompletionResult, MultipartCompletionError> {
+    use sha2::Digest as _;
+
+    let max_source_bytes = state.source_body_limits.max_bytes.min(64 * 1024 * 1024) as usize;
+    let mut input = Vec::new();
+    let mut input_bytes = 0_u64;
+    for part in &lease.selected_parts {
+        renew_and_fence_completion(staging, identity, lease).await?;
+        let body = staging.artifacts.get(&part.artifact_key).await?;
+        renew_and_fence_completion(staging, identity, lease).await?;
+        let mut reader = EncryptedPartReader::open(
+            body.into_async_read(),
+            identity,
+            part,
+            &upload.snapshot,
+            staging.wrapping.clone(),
+        )
+        .await?;
+        let mut part_bytes = 0_u64;
+        let mut part_sha256 = sha2::Sha256::new();
+        let mut part_md5 = Md5::new();
+        loop {
+            renew_and_fence_completion(staging, identity, lease).await?;
+            let Some(chunk) = reader.next_chunk().await? else {
+                break;
+            };
+            part_bytes = part_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                MultipartCompletionError::Invalid("multipart part is too large".to_string())
+            })?;
+            input_bytes = input_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                MultipartCompletionError::Invalid("multipart input is too large".to_string())
+            })?;
+            if part_bytes > part.size_bytes || input_bytes as usize > max_source_bytes {
+                return Err(MultipartCompletionError::Invalid(
+                    "multipart input exceeds its limit".to_string(),
+                ));
+            }
+            part_sha256.update(&chunk);
+            part_md5.update(&chunk);
+            input.extend_from_slice(&chunk);
+        }
+        if part_bytes != part.size_bytes
+            || hex::encode(part_sha256.finalize()) != part.checksum_sha256
+            || format!("\"{}\"", hex::encode(part_md5.finalize())) != part.etag
+        {
+            return Err(MultipartCompletionError::Invalid(
+                "staged multipart artifact does not match its committed part".to_string(),
+            ));
+        }
+    }
+    let limits = crate::avro::AvroLimits {
+        max_source_bytes,
+        ..crate::avro::AvroLimits::default()
+    };
+    let headers = HeaderMap::new();
+    let mut pump = avro_pump(operation.auth, &headers, limits)?;
+    let output = crate::avro::process_ocf(input.as_slice(), limits, &mut pump)?;
+    let output_bytes = u64::try_from(output.len())
+        .map_err(|_| MultipartCompletionError::Invalid("Avro output is too large".to_string()))?;
+    let output_digest = hex::encode(sha2::Sha256::digest(&output));
+
+    let mut sink = begin_streaming_sink(
+        state,
+        backend,
+        operation,
+        &identity.bucket,
+        &identity.key,
+        content_type,
+    )
+    .await?;
+    let result = async {
+        renew_and_fence_completion(staging, identity, lease).await?;
+        sink.write(bytes::Bytes::from(output)).await?;
+        sink.verify_output(output_bytes, &output_digest).await?;
+        renew_and_fence_completion(staging, identity, lease).await?;
+        let stored = sink.complete().await?;
+        let result = MultipartCompletionResult {
+            etag: stored.etag,
+            checksum_sha256: output_digest,
+            version_id: stored.version_id,
+            source_bytes: input_bytes,
+            size_bytes: output_bytes,
+        };
+        renew_and_fence_completion(staging, identity, lease).await?;
+        staging
+            .repository
+            .complete_completion(identity, lease.fencing_token, result.clone(), now_ms())
+            .await?;
+        Ok(result)
+    }
+    .await;
+
+    if result.is_err()
+        && renew_and_fence_completion(staging, identity, lease)
+            .await
+            .is_ok()
+    {
+        let _ = sink.abort().await;
+    }
+    result
 }
 
 async fn reconcile_staged_artifacts(staging: &MultipartStaging) -> Result<(), StagingError> {
@@ -4341,6 +4644,34 @@ fn transformed_response_headers(
     headers
 }
 
+fn avro_read_preflight(
+    headers: &HeaderMap,
+    params: &S3Query,
+    metadata: &ObjectMetadata,
+) -> Option<TransformedReadError> {
+    if headers.contains_key(header::RANGE) {
+        return Some(TransformedReadError::InvalidRequest(
+            "Range is not supported for transformed reads".to_string(),
+        ));
+    }
+    if params.part_number.is_some() {
+        return Some(TransformedReadError::InvalidRequest(
+            "part-number reads are not supported for transformed reads".to_string(),
+        ));
+    }
+    if let Some(encoding) = metadata.headers.get(header::CONTENT_ENCODING)
+        && !encoding
+            .to_str()
+            .map(|value| value.eq_ignore_ascii_case("identity"))
+            .unwrap_or(false)
+    {
+        return Some(TransformedReadError::InvalidRequest(
+            "Content-Encoding is unsupported for transformed reads".to_string(),
+        ));
+    }
+    None
+}
+
 fn transformed_read_preflight(
     headers: &HeaderMap,
     params: &S3Query,
@@ -4501,6 +4832,118 @@ fn transformed_session(
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned),
     }
+}
+
+async fn collect_opened_object(
+    object: &mut OpenedObject,
+    max_bytes: usize,
+) -> Result<Vec<u8>, TransformedReadError> {
+    let mut output = Vec::new();
+    while let Some(frame) = object.body.frame().await {
+        let frame = frame.map_err(|error| TransformedReadError::Source(error.to_string()))?;
+        let data = frame.into_data().map_err(|frame| {
+            if frame.into_trailers().is_ok() {
+                TransformedReadError::Source(
+                    "source trailers are not valid for transformed reads".to_string(),
+                )
+            } else {
+                TransformedReadError::Source("source returned a non-data frame".to_string())
+            }
+        })?;
+        if output.len().saturating_add(data.len()) > max_bytes {
+            object.cancellation.cancel();
+            return Err(TransformedReadError::Source(
+                "Avro source exceeds the configured byte limit".to_string(),
+            ));
+        }
+        output.extend_from_slice(&data);
+    }
+    Ok(output)
+}
+
+async fn serve_spooled_bytes(
+    state: &AppState,
+    bytes: Vec<u8>,
+    source_cancellation: s4_wasm_runtime::CancellationToken,
+) -> Result<(axum::body::Body, u64), TransformedReadError> {
+    let mut spool = EncryptedReadSpool::begin(
+        state.spool_config.directory.clone(),
+        state.spool_config.max_object_bytes,
+        Arc::clone(&state.spool_quota),
+    )
+    .await?;
+    if let Err(error) = spool.write(bytes::Bytes::from(bytes)).await {
+        spool.abort().await;
+        return Err(TransformedReadError::from(error));
+    }
+    spool
+        .into_body(source_cancellation)
+        .await
+        .map_err(TransformedReadError::from)
+}
+
+async fn avro_transformed_read_response(
+    state: &AppState,
+    auth: &Auth,
+    headers: &HeaderMap,
+    response_metadata: ObjectMetadata,
+    mut object: OpenedObject,
+    key: &str,
+) -> (axum::response::Response, Option<u64>) {
+    if !state.transformed_read_spool_enabled {
+        object.cancellation.cancel();
+        return (
+            transformed_read_error_response(
+                key,
+                TransformedReadError::Capacity(
+                    "unsafe transformed reads require S4_TRANSFORMED_READ_SPOOL=encrypted"
+                        .to_string(),
+                ),
+            ),
+            None,
+        );
+    }
+    let max_source_bytes = state.source_body_limits.max_bytes.min(64 * 1024 * 1024) as usize;
+    let source = match collect_opened_object(&mut object, max_source_bytes).await {
+        Ok(source) => source,
+        Err(error) => return (transformed_read_error_response(key, error), None),
+    };
+    let limits = crate::avro::AvroLimits {
+        max_source_bytes,
+        ..crate::avro::AvroLimits::default()
+    };
+    let mut pump = match avro_pump(auth, headers, limits) {
+        Ok(pump) => pump,
+        Err(error) => {
+            return (
+                transformed_read_error_response(key, TransformedReadError::Pipeline(error)),
+                None,
+            );
+        }
+    };
+    let output = match crate::avro::process_ocf(source.as_slice(), limits, &mut pump) {
+        Ok(output) => output,
+        Err(error) => {
+            return (
+                transformed_read_error_response(key, TransformedReadError::Pipeline(error)),
+                None,
+            );
+        }
+    };
+    let (body, content_length) =
+        match serve_spooled_bytes(state, output, object.cancellation.clone()).await {
+            Ok(result) => result,
+            Err(error) => return (transformed_read_error_response(key, error), None),
+        };
+    let mut response = axum::response::Response::builder().status(StatusCode::OK);
+    response
+        .headers_mut()
+        .unwrap()
+        .extend(transformed_response_headers(
+            &response_metadata,
+            Some(content_length),
+        ));
+    (response.body(body).unwrap(), Some(object.counters.bytes()))
 }
 
 async fn process_transformed_source<F, Fut>(
@@ -4982,6 +5425,47 @@ async fn s3_get(
                 .await;
             }
         };
+        if is_avro_content_type(&metadata.headers) {
+            if let Some(error) = avro_read_preflight(&headers, &params, &metadata) {
+                return transformed_read_error_response(&key, error);
+            }
+            if !state.binary_avro_enabled {
+                return transformed_read_error_response(
+                    &key,
+                    TransformedReadError::InvalidRequest(
+                        "Avro processing is disabled; set S4_ENABLE_AVRO=true".to_string(),
+                    ),
+                );
+            }
+            let object =
+                match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false)
+                    .await
+                {
+                    Ok(object) => object,
+                    Err(error) => return open_error_response(&key, error),
+                };
+            let source_bytes = content_length(&object.metadata.headers);
+            let response_metadata = object.metadata.clone();
+            let (response, completed_source_bytes) = avro_transformed_read_response(
+                &state,
+                &auth,
+                &headers,
+                response_metadata,
+                object,
+                &key,
+            )
+            .await;
+            return metered_read_response(
+                state.control.clone(),
+                &auth,
+                operation,
+                &authorization,
+                &key,
+                source_bytes.or(completed_source_bytes),
+                response,
+            )
+            .await;
+        }
         let preflight = match transformed_read_preflight(&headers, &params, &metadata) {
             Ok(preflight) => preflight,
             Err(error) => {
@@ -5143,6 +5627,22 @@ mod tests {
     use http_body::{Frame, SizeHint};
 
     use super::*;
+
+    #[test]
+    fn avro_content_types_are_distinguished_from_text_formats() {
+        for content_type in [
+            "application/avro",
+            "application/x-avro; charset=binary",
+            "application/vnd.apache.avro+binary",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+            assert!(is_avro_content_type(&headers));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        assert!(!is_avro_content_type(&headers));
+    }
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct UsageCall {
@@ -8406,6 +8906,7 @@ pub async fn build_state(
         spool_config,
         spool_quota,
         transformed_read_spool_enabled: transformed_read_spool_enabled(),
+        binary_avro_enabled: binary_avro_enabled(),
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
         demo_pipelines,

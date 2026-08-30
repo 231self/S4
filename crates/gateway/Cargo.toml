@@ -55,6 +55,9 @@ utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-swagger-ui = { workspace = true, features = ["axum"] }
 tower-http = { version = "0.6", features = ["cors"] }
 thiserror.workspace = true
+apache-avro = { version = "0.22", features = ["snappy", "zstandard"] }
+chrono = "0.4"
+num-bigint = "0.4"
 
 [dev-dependencies]
 libc = "0.2"

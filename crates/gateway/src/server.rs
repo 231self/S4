@@ -42,8 +42,8 @@ use crate::backend::{
     WorkspaceEndpointPolicy,
 };
 use crate::control::{
-    AuthenticatedRequestContext, ControlPlane, MeteringError, RequestKind, StreamingWriteMode,
-    UsageEvent, UsageRoute,
+    AuthenticatedRequestContext, AuthorizationError, ControlPlane, MeteringError, RequestKind,
+    StreamingWriteMode, UsageEvent, UsageRoute,
 };
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
@@ -146,12 +146,6 @@ impl Auth {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MeteringIdError {
-    Duplicate,
-    Invalid,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OperationIdentity {
     receipt_id: Uuid,
     operation_id: Uuid,
@@ -180,30 +174,16 @@ impl OperationUsage<'_> {
     }
 }
 
-fn parse_metering_id(headers: &HeaderMap) -> Result<Option<Uuid>, MeteringIdError> {
-    let mut values = headers.get_all("x-s4-metering-id").iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(MeteringIdError::Duplicate);
-    }
-    let value = value.to_str().map_err(|_| MeteringIdError::Invalid)?;
-    Uuid::parse_str(value)
-        .map(Some)
-        .map_err(|_| MeteringIdError::Invalid)
-}
-
 fn operation_id_for_receipt(receipt_id: Uuid) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_X500, receipt_id.as_bytes())
 }
 
-fn request_operation_identity(headers: &HeaderMap) -> Result<OperationIdentity, MeteringIdError> {
-    let receipt_id = parse_metering_id(headers)?.unwrap_or_else(Uuid::now_v7);
-    Ok(OperationIdentity {
+fn request_operation_identity() -> OperationIdentity {
+    let receipt_id = Uuid::now_v7();
+    OperationIdentity {
         receipt_id,
         operation_id: operation_id_for_receipt(receipt_id),
-    })
+    }
 }
 
 fn multipart_completion_operation_identity(upload_id: &str) -> OperationIdentity {
@@ -213,25 +193,45 @@ fn multipart_completion_operation_identity(upload_id: &str) -> OperationIdentity
     }
 }
 
-fn metering_id_error_response(key: &str, error: MeteringIdError) -> axum::response::Response {
-    let detail = match error {
-        MeteringIdError::Duplicate => "x-s4-metering-id must appear exactly once",
-        MeteringIdError::Invalid => "x-s4-metering-id must be a valid UUID",
-    };
-    s3_error::invalid_request(key, detail)
+fn client_metering_id_rejection(
+    headers: &HeaderMap,
+    key: &str,
+) -> Option<axum::response::Response> {
+    if headers.contains_key("x-s4-metering-id") {
+        return Some(s3_error::invalid_request(
+            key,
+            "The request contains an unsupported header.",
+        ));
+    }
+    None
 }
 
 fn metering_error_response(key: &str, error: MeteringError) -> axum::response::Response {
     match error {
-        MeteringError::Unavailable => s3_error::service_unavailable(
-            key,
-            "Usage metering is temporarily unavailable; retry with the same x-s4-metering-id.",
-        ),
+        MeteringError::Unavailable => {
+            s3_error::service_unavailable(key, "Usage metering is temporarily unavailable.")
+        }
         MeteringError::IdempotencyConflict => s3_error::invalid_request(
             key,
-            "The x-s4-metering-id conflicts with an existing usage event.",
+            "The usage receipt conflicts with an existing usage event.",
         ),
         MeteringError::Rejected => s3_error::payment_required(key, "The usage event was rejected."),
+    }
+}
+
+async fn authorize_request(
+    control: &dyn ControlPlane,
+    context: &AuthenticatedRequestContext,
+    kind: RequestKind,
+    key: &str,
+) -> Result<(), axum::response::Response> {
+    match control.authorize(context, kind).await {
+        Ok(None) => Ok(()),
+        Ok(Some(reason)) => Err(s3_error::payment_required(key, reason.message)),
+        Err(AuthorizationError::Unavailable) => Err(s3_error::service_unavailable(
+            key,
+            "Authorization is temporarily unavailable.",
+        )),
     }
 }
 
@@ -3609,12 +3609,18 @@ async fn s3_upload_part(
         Ok(value) => value,
         Err(error) => return authentication_error_response(&key, error),
     };
-    if let Some(reason) = state
-        .control
-        .authorize(&authentication.auth.context, RequestKind::Write)
-        .await
+    if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+        return response;
+    }
+    if let Err(response) = authorize_request(
+        state.control.as_ref(),
+        &authentication.auth.context,
+        RequestKind::Write,
+        &key,
+    )
+    .await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
     if state
         .control
@@ -3863,16 +3869,19 @@ async fn s3_put(
         Err(error) => return authentication_error_response(&key, error),
     };
     let auth = &header_auth.auth;
-    let operation = match request_operation_identity(&parts.headers) {
-        Ok(operation) => operation,
-        Err(error) => return metering_id_error_response(&key, error),
-    };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Write)
-        .await
+    if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+        return response;
+    }
+    let operation = request_operation_identity();
+    if let Err(response) = authorize_request(
+        state.control.as_ref(),
+        &auth.context,
+        RequestKind::Write,
+        &key,
+    )
+    .await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
     let tenant_write_mode = state
         .control
@@ -4546,12 +4555,18 @@ async fn s3_get(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Read)
-        .await
+    if let Some(response) = client_metering_id_rejection(&headers, &key) {
+        return response;
+    }
+    if let Err(response) = authorize_request(
+        state.control.as_ref(),
+        &auth.context,
+        RequestKind::Read,
+        &key,
+    )
+    .await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
 
     let transformed_read = wants_transformed_read(&headers);
@@ -4614,10 +4629,7 @@ async fn s3_get(
             Err(error) => s3_error::internal_error(&key, &error.to_string()),
         };
     }
-    let operation = match request_operation_identity(&headers) {
-        Ok(operation) => operation,
-        Err(error) => return metering_id_error_response(&key, error),
-    };
+    let operation = request_operation_identity();
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Get).await {
         Ok(backend) => backend,
         Err(_) => return backend_resolution_error_response(&key),
@@ -4797,8 +4809,8 @@ mod tests {
             &self,
             _context: &AuthenticatedRequestContext,
             _kind: RequestKind,
-        ) -> Option<crate::control::BlockReason> {
-            None
+        ) -> Result<Option<crate::control::BlockReason>, AuthorizationError> {
+            Ok(None)
         }
 
         async fn record(
@@ -5001,33 +5013,18 @@ mod tests {
     }
 
     #[test]
-    fn operation_identities_are_validated_and_stable() {
-        let supplied = Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c175").unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-s4-metering-id", supplied.to_string().parse().unwrap());
-        let first = request_operation_identity(&headers).unwrap();
-        assert_eq!(first.receipt_id, supplied);
-        assert_eq!(first.operation_id, operation_id_for_receipt(supplied));
+    fn operation_identities_are_server_generated_and_completion_is_stable() {
+        let first = request_operation_identity();
+        let second = request_operation_identity();
+        assert_eq!(first.receipt_id.get_version_num(), 7);
+        assert_eq!(first.operation_id.get_version_num(), 5);
+        assert_eq!(
+            first.operation_id,
+            operation_id_for_receipt(first.receipt_id)
+        );
         assert_ne!(first.receipt_id, first.operation_id);
-
-        headers.append(
-            "x-s4-metering-id",
-            Uuid::now_v7().to_string().parse().unwrap(),
-        );
-        assert_eq!(
-            request_operation_identity(&headers),
-            Err(MeteringIdError::Duplicate)
-        );
-        headers = HeaderMap::new();
-        headers.insert("x-s4-metering-id", "not-a-uuid".parse().unwrap());
-        assert_eq!(
-            request_operation_identity(&headers),
-            Err(MeteringIdError::Invalid)
-        );
-
-        let generated = request_operation_identity(&HeaderMap::new()).unwrap();
-        assert_eq!(generated.receipt_id.get_version_num(), 7);
-        assert_eq!(generated.operation_id.get_version_num(), 5);
+        assert_ne!(first.receipt_id, second.receipt_id);
+        assert_ne!(first.operation_id, second.operation_id);
         let multipart = multipart_completion_operation_identity("upload-1");
         assert_eq!(
             multipart,
@@ -5324,16 +5321,19 @@ async fn s3_head(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
-    let operation = match request_operation_identity(&headers) {
-        Ok(operation) => operation,
-        Err(error) => return metering_id_error_response(&key, error),
-    };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Read)
-        .await
+    if let Some(response) = client_metering_id_rejection(&headers, &key) {
+        return response;
+    }
+    let operation = request_operation_identity();
+    if let Err(response) = authorize_request(
+        state.control.as_ref(),
+        &auth.context,
+        RequestKind::Read,
+        &key,
+    )
+    .await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
     if wants_transformed_read(&headers) {
         return s3_error::invalid_request(
@@ -5389,16 +5389,19 @@ async fn s3_delete(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
-    let operation = match request_operation_identity(&headers) {
-        Ok(operation) => operation,
-        Err(error) => return metering_id_error_response(&key, error),
-    };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Write)
-        .await
+    if let Some(response) = client_metering_id_rejection(&headers, &key) {
+        return response;
+    }
+    let operation = request_operation_identity();
+    if let Err(response) = authorize_request(
+        state.control.as_ref(),
+        &auth.context,
+        RequestKind::Write,
+        &key,
+    )
+    .await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
     info!("DELETE /{bucket}/{key} user={}", auth.user_id());
 
@@ -5641,8 +5644,8 @@ async fn s3_post(
             Ok(value) => value,
             Err(error) => return authentication_error_response(&key, error),
         };
-        if let Err(error) = parse_metering_id(&parts.headers) {
-            return metering_id_error_response(&key, error);
+        if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+            return response;
         }
         // Completion retries are keyed by the durable upload identity, never a
         // per-attempt client or generated request ID.
@@ -5666,12 +5669,15 @@ async fn s3_post(
                     );
                 }
             };
-        if let Some(reason) = state
-            .control
-            .authorize(&auth.context, RequestKind::Write)
-            .await
+        if let Err(response) = authorize_request(
+            state.control.as_ref(),
+            &auth.context,
+            RequestKind::Write,
+            &key,
+        )
+        .await
         {
-            return s3_error::payment_required(&key, reason.message);
+            return response;
         }
         if state
             .control
@@ -5845,12 +5851,18 @@ async fn s3_post(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Write)
-        .await
+    if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+        return response;
+    }
+    if let Err(response) = authorize_request(
+        state.control.as_ref(),
+        &auth.context,
+        RequestKind::Write,
+        &key,
+    )
+    .await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
     info!("POST /{bucket}/{key} user={}", auth.user_id());
 
@@ -5961,19 +5973,26 @@ async fn s3_list_objects(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&bucket, error),
     };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Read)
-        .await
-    {
-        return s3_error::payment_required(&bucket, reason.message);
+    if let Some(response) = client_metering_id_rejection(&headers, &bucket) {
+        return response;
     }
+    if let Err(response) = authorize_request(
+        state.control.as_ref(),
+        &auth.context,
+        RequestKind::Read,
+        &bucket,
+    )
+    .await
+    {
+        return response;
+    }
+    let operation = request_operation_identity();
 
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
         Ok(backend) => backend,
         Err(_) => return backend_resolution_error_response(&bucket),
     };
-    match backend {
+    let response = match backend {
         ResolvedBackend::S3 { client, .. } => match list_from_s3(&client, &bucket, &params).await {
             Ok(xml) => s3_xml_ok(xml),
             Err(failure) => s3_error::internal_error(&bucket, failure.client_message()),
@@ -5994,7 +6013,28 @@ async fn s3_list_objects(
                 Err(error) => open_error_response(&bucket, error),
             }
         }
+    };
+    if !response.status().is_success() {
+        return response;
     }
+    if let Err(response) = record_operation(
+        state.control.clone(),
+        &auth.context,
+        OperationUsage {
+            operation,
+            bucket: &bucket,
+            kind: RequestKind::Read,
+            route: UsageRoute::ListObjects,
+            source_bytes: 0,
+            output_bytes: 0,
+        },
+        &bucket,
+    )
+    .await
+    {
+        return response;
+    }
+    response
 }
 
 /// Forward a ListObjectsV2 request to an S3 backend.

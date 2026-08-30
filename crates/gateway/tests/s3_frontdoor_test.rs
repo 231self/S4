@@ -12,8 +12,8 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
 use s4_gateway::control::{
-    AuthenticatedRequestContext, ControlPlane, MeteringError, NoopControlPlane, RequestKind,
-    StreamingWriteMode, UsageEvent, UsageRoute,
+    AuthenticatedRequestContext, AuthorizationError, ControlPlane, MeteringError, NoopControlPlane,
+    RequestKind, StreamingWriteMode, UsageEvent, UsageRoute,
 };
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
 use s4_gateway::object::BodyLimits;
@@ -81,8 +81,8 @@ impl ControlPlane for StreamingOffControl {
         &self,
         _context: &AuthenticatedRequestContext,
         _kind: RequestKind,
-    ) -> Option<s4_gateway::control::BlockReason> {
-        None
+    ) -> Result<Option<s4_gateway::control::BlockReason>, AuthorizationError> {
+        Ok(None)
     }
 
     async fn record(
@@ -110,6 +110,7 @@ struct RecordedUsage {
 #[derive(Debug, Default)]
 struct RecordingMeteringControl {
     events: Mutex<Vec<RecordedUsage>>,
+    authorization_failure: Option<AuthorizationError>,
     failure: Option<MeteringError>,
 }
 
@@ -119,8 +120,8 @@ impl ControlPlane for RecordingMeteringControl {
         &self,
         _context: &AuthenticatedRequestContext,
         _kind: RequestKind,
-    ) -> Option<s4_gateway::control::BlockReason> {
-        None
+    ) -> Result<Option<s4_gateway::control::BlockReason>, AuthorizationError> {
+        self.authorization_failure.map_or(Ok(None), Err)
     }
 
     async fn record(
@@ -1991,7 +1992,7 @@ async fn head_and_delete_remain_available() {
 }
 
 #[tokio::test]
-async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
+async fn launch_contract_billable_handlers_generate_distinct_server_usage_event_identities() {
     let mut state = test_state().await;
     let (access_key, secret_key) = make_key(&state).await;
     let control = Arc::new(RecordingMeteringControl::default());
@@ -1999,17 +2000,7 @@ async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
         .expect("test state is uniquely owned")
         .control = control.clone();
     let app = build_router(state);
-    let ids = [
-        uuid::Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c171").unwrap(),
-        uuid::Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c172").unwrap(),
-        uuid::Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c173").unwrap(),
-        uuid::Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c174").unwrap(),
-    ];
-    let operation_headers = |id: uuid::Uuid| {
-        let mut headers = auth_headers(&access_key, &secret_key);
-        headers.push(("x-s4-metering-id", id.to_string()));
-        headers
-    };
+    let headers = auth_headers(&access_key, &secret_key);
 
     let response = app
         .clone()
@@ -2020,7 +2011,7 @@ async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
                 .header(header::CONTENT_TYPE, "text/plain")
                 .body(Body::from("payload"))
                 .unwrap(),
-            &operation_headers(ids[0]),
+            &headers,
         ))
         .await
         .unwrap();
@@ -2034,7 +2025,7 @@ async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
                 .uri("/metered/object.txt")
                 .body(Body::empty())
                 .unwrap(),
-            &operation_headers(ids[1]),
+            &headers,
         ))
         .await
         .unwrap();
@@ -2054,7 +2045,21 @@ async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
                 .uri("/metered/object.txt")
                 .body(Body::empty())
                 .unwrap(),
-            &operation_headers(ids[2]),
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(add_headers(
+            Request::builder()
+                .method("HEAD")
+                .uri("/metered/object.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
         ))
         .await
         .unwrap();
@@ -2067,14 +2072,14 @@ async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
                 .uri("/metered/object.txt")
                 .body(Body::empty())
                 .unwrap(),
-            &operation_headers(ids[3]),
+            &headers,
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let events = control.events.lock().unwrap().clone();
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     assert!(events.iter().all(|call| {
         call.context.user_id == "test-user"
             && call.context.workspace_id.as_str() == "test-user"
@@ -2085,7 +2090,6 @@ async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
             .iter()
             .map(|call| {
                 (
-                    call.event.id,
                     call.event.kind,
                     call.event.route,
                     call.event.source_bytes,
@@ -2095,22 +2099,27 @@ async fn billable_handlers_propagate_the_supplied_usage_event_identity() {
             })
             .collect::<Vec<_>>(),
         vec![
-            (ids[0], RequestKind::Write, UsageRoute::PutObject, 7, 7, 7),
-            (ids[1], RequestKind::Read, UsageRoute::GetObject, 7, 7, 7),
-            (ids[2], RequestKind::Read, UsageRoute::HeadObject, 0, 0, 0),
-            (
-                ids[3],
-                RequestKind::Write,
-                UsageRoute::DeleteObject,
-                0,
-                0,
-                0,
-            ),
+            (RequestKind::Write, UsageRoute::PutObject, 7, 7, 7),
+            (RequestKind::Read, UsageRoute::GetObject, 7, 7, 7),
+            (RequestKind::Read, UsageRoute::HeadObject, 0, 0, 0),
+            (RequestKind::Read, UsageRoute::HeadObject, 0, 0, 0),
+            (RequestKind::Write, UsageRoute::DeleteObject, 0, 0, 0,),
         ]
     );
     assert!(events.iter().all(|call| {
-        call.event.operation_id != call.event.id && call.event.operation_id.get_version_num() == 5
+        call.event.id.get_version_num() == 7
+            && call.event.operation_id != call.event.id
+            && call.event.operation_id.get_version_num() == 5
     }));
+    assert_eq!(
+        events
+            .iter()
+            .map(|call| call.event.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        events.len()
+    );
+    assert_ne!(events[2].event.id, events[3].event.id);
 }
 
 #[tokio::test]
@@ -2125,11 +2134,7 @@ async fn metering_unavailable_after_put_returns_service_unavailable_without_roll
         .expect("test state is uniquely owned")
         .control = control;
     let app = build_router(state.clone());
-    let mut headers = auth_headers(&access_key, &secret_key);
-    headers.push((
-        "x-s4-metering-id",
-        "018f0f6e-7b31-7c1d-8f2f-84f808b9c175".to_string(),
-    ));
+    let headers = auth_headers(&access_key, &secret_key);
 
     let response = app
         .oneshot(add_headers(
@@ -2160,44 +2165,170 @@ async fn metering_unavailable_after_put_returns_service_unavailable_without_roll
 }
 
 #[tokio::test]
-async fn malformed_and_duplicate_metering_ids_are_rejected_before_mutation() {
+async fn launch_contract_supplied_metering_id_is_rejected_generically_before_mutation() {
     let (app, state) = router().await;
     let (access_key, secret_key) = make_key(&state).await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/metered/rejected.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header("x-s4-metering-id", "018f0f6e-7b31-7c1d-8f2f-84f808b9c175")
+            .body(Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not commit")),
+            }))
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
 
-    for (key, metering_headers) in [
-        ("malformed", vec!["not-a-uuid"]),
-        (
-            "duplicate",
-            vec![
-                "018f0f6e-7b31-7c1d-8f2f-84f808b9c175",
-                "018f0f6e-7b31-7c1d-8f2f-84f808b9c176",
-            ],
-        ),
-    ] {
-        let request = add_headers(
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("<Code>InvalidRequest</Code>"));
+    assert!(!body.contains("metering"));
+    assert!(state.store.get("metered", "rejected.txt").is_none());
+}
+
+#[tokio::test]
+async fn launch_contract_authorization_unavailable_returns_service_unavailable_before_mutation() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let control = Arc::new(RecordingMeteringControl {
+        authorization_failure: Some(AuthorizationError::Unavailable),
+        ..RecordingMeteringControl::default()
+    });
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .control = control.clone();
+    let app = build_router(state.clone());
+    let polls = Arc::new(AtomicUsize::new(0));
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/authorization/unavailable.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not commit")),
+            }))
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>ServiceUnavailable</Code>"));
+    assert!(control.events.lock().unwrap().is_empty());
+    assert!(
+        state
+            .store
+            .get("authorization", "unavailable.txt")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn launch_contract_successful_list_records_receipt_and_failed_list_is_not_billed() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    state.store.put(
+        "listed",
+        "object.txt",
+        Bytes::from_static(b"payload"),
+        "text/plain",
+    );
+    let control = Arc::new(RecordingMeteringControl::default());
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .control = control.clone();
+    let app = build_router(state);
+    let headers = auth_headers(&access_key, &secret_key);
+
+    let response = app
+        .clone()
+        .oneshot(add_headers(
             Request::builder()
-                .method("PUT")
-                .uri(format!("/metered/{key}.txt"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from("must not commit"))
+                .method("GET")
+                .uri("/listed?list-type=2")
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = control.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].context.user_id, "test-user");
+    assert_eq!(events[0].context.workspace_id.as_str(), "test-user");
+    assert_eq!(events[0].event.bucket, "listed");
+    assert_eq!(events[0].event.kind, RequestKind::Read);
+    assert_eq!(events[0].event.route, UsageRoute::ListObjects);
+    assert_eq!(events[0].event.source_bytes, 0);
+    assert_eq!(events[0].event.output_bytes, 0);
+    assert_eq!(events[0].event.processed_bytes, 0);
+    assert_eq!(events[0].event.id.get_version_num(), 7);
+    assert_eq!(events[0].event.operation_id.get_version_num(), 5);
+
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/listed?list-type=2&continuation-token=not-a-token")
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(control.events.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn launch_contract_list_metering_failure_replaces_success_with_service_unavailable() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let control = Arc::new(RecordingMeteringControl {
+        failure: Some(MeteringError::Unavailable),
+        ..RecordingMeteringControl::default()
+    });
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .control = control.clone();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/listed?list-type=2")
+                .body(Body::empty())
                 .unwrap(),
             &auth_headers(&access_key, &secret_key),
-        );
-        let request = append_headers(
-            request,
-            &metering_headers
-                .into_iter()
-                .map(|value| ("x-s4-metering-id", value.to_string()))
-                .collect::<Vec<_>>(),
-        );
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("<Code>InvalidRequest</Code>"));
-        assert!(state.store.get("metered", &format!("{key}.txt")).is_none());
-    }
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>ServiceUnavailable</Code>"));
+    let events = control.events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.route, UsageRoute::ListObjects);
+    assert_eq!(events[0].event.source_bytes, 0);
+    assert_eq!(events[0].event.output_bytes, 0);
 }
 
 #[tokio::test]
@@ -3116,16 +3247,6 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             HeaderChange::Remove("x-s4-process"),
             StatusCode::FORBIDDEN,
         ),
-        (
-            "mutated metering id",
-            HeaderChange::Replace("x-s4-metering-id", "018f0f6e-7b31-7c1d-8f2f-84f808b9c176"),
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            "removed metering id",
-            HeaderChange::Remove("x-s4-metering-id"),
-            StatusCode::FORBIDDEN,
-        ),
     ]
     .into_iter()
     .enumerate()
@@ -3140,7 +3261,6 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             &[
                 ("content-type", "text/plain"),
                 ("x-s4-process", "write"),
-                ("x-s4-metering-id", "018f0f6e-7b31-7c1d-8f2f-84f808b9c175"),
                 ("x-amz-meta-dynamic-name", "one"),
             ],
         );
@@ -3201,14 +3321,6 @@ async fn sigv4_rejects_ambiguous_or_noncanonical_integrity_headers_before_body_p
                 signed: "https://storage.example/one,https://storage.example/two",
                 first: "https://storage.example/one",
                 second: "https://storage.example/two",
-            },
-        ),
-        (
-            "x-s4-metering-id",
-            HeaderShape::Duplicate {
-                signed: "018f0f6e-7b31-7c1d-8f2f-84f808b9c175,018f0f6e-7b31-7c1d-8f2f-84f808b9c176",
-                first: "018f0f6e-7b31-7c1d-8f2f-84f808b9c175",
-                second: "018f0f6e-7b31-7c1d-8f2f-84f808b9c176",
             },
         ),
         (
@@ -3302,7 +3414,6 @@ async fn sigv4_rejects_unsigned_integrity_header_injection_before_polling_the_bo
         ("x-s4-backend-url", "https://storage.example/object"),
         ("x-s4-process", "read"),
         ("x-s4-stable-fields", "email"),
-        ("x-s4-metering-id", "018f0f6e-7b31-7c1d-8f2f-84f808b9c175"),
         ("content-type", "text/plain"),
         ("content-encoding", "gzip"),
         ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),

@@ -41,7 +41,10 @@ use crate::backend::{
     BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation,
     WorkspaceEndpointPolicy,
 };
-use crate::control::{AuthenticatedRequestContext, ControlPlane, RequestKind, StreamingWriteMode};
+use crate::control::{
+    AuthenticatedRequestContext, ControlPlane, MeteringError, RequestKind, StreamingWriteMode,
+    UsageEvent, UsageRoute,
+};
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::managed::{
@@ -142,92 +145,177 @@ impl Auth {
     }
 }
 
-struct MeteredBody {
-    inner: axum::body::Body,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MeteringIdError {
+    Duplicate,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperationIdentity {
+    receipt_id: Uuid,
+    operation_id: Uuid,
+}
+
+struct OperationUsage<'a> {
+    operation: OperationIdentity,
+    bucket: &'a str,
+    kind: RequestKind,
+    route: UsageRoute,
+    source_bytes: u64,
+    output_bytes: u64,
+}
+
+impl OperationUsage<'_> {
+    fn event(&self) -> UsageEvent {
+        UsageEvent::new(
+            self.operation.receipt_id,
+            self.operation.operation_id,
+            self.bucket,
+            self.kind,
+            self.route,
+            self.source_bytes,
+            self.output_bytes,
+        )
+    }
+}
+
+fn parse_metering_id(headers: &HeaderMap) -> Result<Option<Uuid>, MeteringIdError> {
+    let mut values = headers.get_all("x-s4-metering-id").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(MeteringIdError::Duplicate);
+    }
+    let value = value.to_str().map_err(|_| MeteringIdError::Invalid)?;
+    Uuid::parse_str(value)
+        .map(Some)
+        .map_err(|_| MeteringIdError::Invalid)
+}
+
+fn operation_id_for_receipt(receipt_id: Uuid) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_X500, receipt_id.as_bytes())
+}
+
+fn request_operation_identity(headers: &HeaderMap) -> Result<OperationIdentity, MeteringIdError> {
+    let receipt_id = parse_metering_id(headers)?.unwrap_or_else(Uuid::now_v7);
+    Ok(OperationIdentity {
+        receipt_id,
+        operation_id: operation_id_for_receipt(receipt_id),
+    })
+}
+
+fn multipart_completion_operation_identity(upload_id: &str) -> OperationIdentity {
+    OperationIdentity {
+        receipt_id: Uuid::new_v5(&Uuid::NAMESPACE_OID, upload_id.as_bytes()),
+        operation_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, upload_id.as_bytes()),
+    }
+}
+
+fn metering_id_error_response(key: &str, error: MeteringIdError) -> axum::response::Response {
+    let detail = match error {
+        MeteringIdError::Duplicate => "x-s4-metering-id must appear exactly once",
+        MeteringIdError::Invalid => "x-s4-metering-id must be a valid UUID",
+    };
+    s3_error::invalid_request(key, detail)
+}
+
+fn metering_error_response(key: &str, error: MeteringError) -> axum::response::Response {
+    match error {
+        MeteringError::Unavailable => s3_error::service_unavailable(
+            key,
+            "Usage metering is temporarily unavailable; retry with the same x-s4-metering-id.",
+        ),
+        MeteringError::IdempotencyConflict => s3_error::invalid_request(
+            key,
+            "The x-s4-metering-id conflicts with an existing usage event.",
+        ),
+        MeteringError::Rejected => s3_error::payment_required(key, "The usage event was rejected."),
+    }
+}
+
+async fn record_usage(
     control: Arc<dyn ControlPlane>,
-    context: AuthenticatedRequestContext,
-    bucket: String,
-    bytes: u64,
-    finished: bool,
+    context: &AuthenticatedRequestContext,
+    event: &UsageEvent,
+    key: &str,
+) -> Result<(), axum::response::Response> {
+    control.record(context, event).await.map_err(|error| {
+        warn!(event_id = %event.id, ?error, "usage event was not recorded");
+        metering_error_response(key, error)
+    })
 }
 
-impl MeteredBody {
-    fn finish(&mut self) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-        let control = self.control.clone();
-        let context = self.context.clone();
-        let bucket = self.bucket.clone();
-        let bytes = self.bytes;
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                control
-                    .record(&context, &bucket, RequestKind::Read, bytes)
-                    .await;
-            });
-        }
+async fn record_operation(
+    control: Arc<dyn ControlPlane>,
+    context: &AuthenticatedRequestContext,
+    usage: OperationUsage<'_>,
+    key: &str,
+) -> Result<(), axum::response::Response> {
+    let event = usage.event();
+    record_usage(control, context, &event, key).await
+}
+
+fn admitted_response_bytes(response: &axum::response::Response) -> Option<u64> {
+    if matches!(
+        response.status(),
+        StatusCode::NOT_MODIFIED | StatusCode::PRECONDITION_FAILED
+    ) {
+        return Some(0);
     }
-}
-
-impl Drop for MeteredBody {
-    fn drop(&mut self) {
-        // Hyper can stop polling after the final Content-Length data frame,
-        // without polling the body once more for `None`.
-        self.finish();
-    }
-}
-
-impl http_body::Body for MeteredBody {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        if self.finished {
-            return std::task::Poll::Ready(None);
+    let mut lengths = response.headers().get_all(header::CONTENT_LENGTH).iter();
+    if let Some(length) = lengths.next() {
+        if lengths.next().is_some() {
+            return None;
         }
-        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
-            std::task::Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    self.bytes = self.bytes.saturating_add(data.len() as u64);
-                }
-                std::task::Poll::Ready(Some(Ok(frame)))
-            }
-            std::task::Poll::Ready(Some(Err(error))) => {
-                self.finished = true;
-                std::task::Poll::Ready(Some(Err(error)))
-            }
-            std::task::Poll::Ready(None) => {
-                self.finish();
-                std::task::Poll::Ready(None)
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        return length.to_str().ok()?.parse().ok();
     }
+    http_body::Body::size_hint(response.body()).exact()
 }
 
-fn metered_read_response(
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()?.parse().ok()
+}
+
+/// Launch policy: persist the admitted representation size before releasing a
+/// streaming body. This intentionally never relies on body drop or background
+/// best effort. Responses without a trustworthy size fail closed.
+async fn metered_read_response(
     control: Arc<dyn ControlPlane>,
     auth: &Auth,
+    operation: OperationIdentity,
     bucket: &str,
-    mut response: axum::response::Response,
+    key: &str,
+    source_bytes: Option<u64>,
+    response: axum::response::Response,
 ) -> axum::response::Response {
     if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
         return response;
     }
-    let body = std::mem::replace(response.body_mut(), axum::body::Body::empty());
-    *response.body_mut() = axum::body::Body::new(MeteredBody {
-        inner: body,
-        control,
-        context: auth.context.clone(),
-        bucket: bucket.to_string(),
-        bytes: 0,
-        finished: false,
-    });
+    let Some(bytes) = admitted_response_bytes(&response) else {
+        return s3_error::service_unavailable(
+            key,
+            "The response size is unavailable for usage metering.",
+        );
+    };
+    let event = UsageEvent::new(
+        operation.receipt_id,
+        operation.operation_id,
+        bucket,
+        RequestKind::Read,
+        UsageRoute::GetObject,
+        source_bytes.unwrap_or(bytes),
+        bytes,
+    );
+    if let Err(response) = record_usage(control, &auth.context, &event, key).await {
+        return response;
+    }
     response
 }
 
@@ -2626,7 +2714,7 @@ async fn streaming_single_put(
     mut body: axum::body::Body,
     bucket: &str,
     key: &str,
-) -> Result<(Auth, StoredObjectMeta, u64), StreamingPutError> {
+) -> Result<(Auth, StoredObjectMeta, u64, u64), StreamingPutError> {
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
 
@@ -2764,7 +2852,7 @@ async fn streaming_single_put(
     match processing {
         Ok((stored, output_bytes)) => {
             sink_guard.disarm();
-            Ok((authentication.auth, stored, output_bytes))
+            Ok((authentication.auth, stored, input_bytes, output_bytes))
         }
         Err(error) => {
             cancellation.cancel();
@@ -3429,6 +3517,7 @@ async fn complete_staged_multipart(
             etag: stored.etag,
             checksum_sha256,
             version_id: stored.version_id,
+            source_bytes: input_bytes,
             size_bytes: output_bytes,
         };
         renew_and_fence_completion(staging, identity, lease).await?;
@@ -3774,6 +3863,10 @@ async fn s3_put(
         Err(error) => return authentication_error_response(&key, error),
     };
     let auth = &header_auth.auth;
+    let operation = match request_operation_identity(&parts.headers) {
+        Ok(operation) => operation,
+        Err(error) => return metering_id_error_response(&key, error),
+    };
     if let Some(reason) = state
         .control
         .authorize(&auth.context, RequestKind::Write)
@@ -3822,13 +3915,26 @@ async fn s3_put(
     )
     .await
     {
-        Ok((auth, stored, stored_bytes)) => {
-            state
-                .control
-                .record(&auth.context, &bucket, RequestKind::Write, stored_bytes)
-                .await;
+        Ok((auth, stored, source_bytes, output_bytes)) => {
+            if let Err(response) = record_operation(
+                state.control.clone(),
+                &auth.context,
+                OperationUsage {
+                    operation,
+                    bucket: &bucket,
+                    kind: RequestKind::Write,
+                    route: UsageRoute::PutObject,
+                    source_bytes,
+                    output_bytes,
+                },
+                &key,
+            )
+            .await
+            {
+                return response;
+            }
             info!(
-                "streaming PUT /{bucket}/{key} committed ({stored_bytes} stored bytes, user={})",
+                "streaming PUT /{bucket}/{key} committed ({output_bytes} stored bytes, user={})",
                 auth.user_id()
             );
             let mut response = axum::response::Response::builder().status(StatusCode::OK);
@@ -4241,20 +4347,24 @@ async fn transformed_read_response(
     response_metadata: ObjectMetadata,
     object: OpenedObject,
     key: &str,
-) -> axum::response::Response {
+) -> (axum::response::Response, Option<u64>) {
     let (format, content_type) = preflight;
     let snapshot = match state.gateway.pipeline_snapshot() {
         Some(snapshot) => snapshot,
         None => {
-            return transformed_read_error_response(
-                key,
-                TransformedReadError::Capacity(
-                    "transformed reads require a plugin registry".to_string(),
+            return (
+                transformed_read_error_response(
+                    key,
+                    TransformedReadError::Capacity(
+                        "transformed reads require a plugin registry".to_string(),
+                    ),
                 ),
+                None,
             );
         }
     };
     let source_cancellation = object.cancellation.clone();
+    let source_counters = object.counters.clone();
     let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
     let pipeline = match snapshot
         .clone()
@@ -4265,7 +4375,7 @@ async fn transformed_read_response(
         .await
     {
         Ok(pipeline) => pipeline,
-        Err(error) => return transformed_read_error_response(key, error.into()),
+        Err(error) => return (transformed_read_error_response(key, error.into()), None),
     };
     let direct = snapshot
         .capabilities()
@@ -4308,15 +4418,18 @@ async fn transformed_read_response(
                     .headers_mut()
                     .unwrap()
                     .extend(transformed_response_headers(&response_metadata, None));
-                response
-                    .body(axum::body::Body::new(DirectReadBody {
-                        first: Some(first),
-                        receiver,
-                        source_cancellation,
-                        pipeline_cancellation,
-                        done: false,
-                    }))
-                    .unwrap()
+                (
+                    response
+                        .body(axum::body::Body::new(DirectReadBody {
+                            first: Some(first),
+                            receiver,
+                            source_cancellation,
+                            pipeline_cancellation,
+                            done: false,
+                        }))
+                        .unwrap(),
+                    None,
+                )
             }
             Some(DirectReadEvent::Done) | None => {
                 let mut response = axum::response::Response::builder().status(StatusCode::OK);
@@ -4324,18 +4437,27 @@ async fn transformed_read_response(
                     .headers_mut()
                     .unwrap()
                     .extend(transformed_response_headers(&response_metadata, Some(0)));
-                response.body(axum::body::Body::empty()).unwrap()
+                (
+                    response.body(axum::body::Body::empty()).unwrap(),
+                    Some(source_counters.bytes()),
+                )
             }
-            Some(DirectReadEvent::Failed(error)) => transformed_read_error_response(key, error),
+            Some(DirectReadEvent::Failed(error)) => {
+                (transformed_read_error_response(key, error), None)
+            }
         };
     }
     if !state.transformed_read_spool_enabled {
         source_cancellation.cancel();
-        return transformed_read_error_response(
-            key,
-            TransformedReadError::Capacity(
-                "unsafe transformed reads require S4_TRANSFORMED_READ_SPOOL=encrypted".to_string(),
+        return (
+            transformed_read_error_response(
+                key,
+                TransformedReadError::Capacity(
+                    "unsafe transformed reads require S4_TRANSFORMED_READ_SPOOL=encrypted"
+                        .to_string(),
+                ),
             ),
+            None,
         );
     }
     let spool = match EncryptedReadSpool::begin(
@@ -4346,7 +4468,7 @@ async fn transformed_read_response(
     .await
     {
         Ok(spool) => spool,
-        Err(error) => return transformed_read_error_response(key, error.into()),
+        Err(error) => return (transformed_read_error_response(key, error.into()), None),
     };
     let (spool_sender, mut spool_receiver) = tokio::sync::mpsc::channel(2);
     let spool_writer = tokio::spawn(async move {
@@ -4380,23 +4502,26 @@ async fn transformed_read_response(
     drop(spool_sender);
     if let Err(error) = result {
         let _ = spool_writer.await;
-        return transformed_read_error_response(key, error);
+        return (transformed_read_error_response(key, error), None);
     }
     let spool = match spool_writer.await {
         Ok(Ok(spool)) => spool,
-        Ok(Err(error)) => return transformed_read_error_response(key, error),
+        Ok(Err(error)) => return (transformed_read_error_response(key, error), None),
         Err(error) => {
-            return transformed_read_error_response(
-                key,
-                TransformedReadError::Capacity(format!(
-                    "encrypted transformed-read staging task failed: {error}"
-                )),
+            return (
+                transformed_read_error_response(
+                    key,
+                    TransformedReadError::Capacity(format!(
+                        "encrypted transformed-read staging task failed: {error}"
+                    )),
+                ),
+                None,
             );
         }
     };
     let (body, content_length) = match spool.into_body(source_cancellation).await {
         Ok(result) => result,
-        Err(error) => return transformed_read_error_response(key, error.into()),
+        Err(error) => return (transformed_read_error_response(key, error.into()), None),
     };
     let mut response = axum::response::Response::builder().status(StatusCode::OK);
     response
@@ -4406,7 +4531,7 @@ async fn transformed_read_response(
             &response_metadata,
             Some(content_length),
         ));
-    response.body(body).unwrap()
+    (response.body(body).unwrap(), Some(source_counters.bytes()))
 }
 
 async fn s3_get(
@@ -4489,6 +4614,10 @@ async fn s3_get(
             Err(error) => s3_error::internal_error(&key, &error.to_string()),
         };
     }
+    let operation = match request_operation_identity(&headers) {
+        Ok(operation) => operation,
+        Err(error) => return metering_id_error_response(&key, error),
+    };
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Get).await {
         Ok(backend) => backend,
         Err(_) => return backend_resolution_error_response(&key),
@@ -4548,14 +4677,28 @@ async fn s3_get(
         }
         if let Some(status) = conditional_read_status(&headers, &object.metadata) {
             let response = conditional_read_response(object, status);
-            state
-                .control
-                .record(&auth.context, &bucket, RequestKind::Read, 0)
-                .await;
+            if let Err(response) = record_operation(
+                state.control.clone(),
+                &auth.context,
+                OperationUsage {
+                    operation,
+                    bucket: &bucket,
+                    kind: RequestKind::Read,
+                    route: UsageRoute::GetObject,
+                    source_bytes: 0,
+                    output_bytes: 0,
+                },
+                &key,
+            )
+            .await
+            {
+                return response;
+            }
             return response;
         }
+        let source_bytes = content_length(&object.metadata.headers);
         let response_metadata = object.metadata.clone();
-        let response = transformed_read_response(
+        let (response, completed_source_bytes) = transformed_read_response(
             &state,
             &auth,
             &headers,
@@ -4565,7 +4708,16 @@ async fn s3_get(
             &key,
         )
         .await;
-        return metered_read_response(state.control.clone(), &auth, &bucket, response);
+        return metered_read_response(
+            state.control.clone(),
+            &auth,
+            operation,
+            &bucket,
+            &key,
+            source_bytes.or(completed_source_bytes),
+            response,
+        )
+        .await;
     }
     let object =
         match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false).await {
@@ -4574,10 +4726,23 @@ async fn s3_get(
         };
     if let Some(status) = conditional_read_status(&headers, &object.metadata) {
         let response = conditional_read_response(object, status);
-        state
-            .control
-            .record(&auth.context, &bucket, RequestKind::Read, 0)
-            .await;
+        if let Err(response) = record_operation(
+            state.control.clone(),
+            &auth.context,
+            OperationUsage {
+                operation,
+                bucket: &bucket,
+                kind: RequestKind::Read,
+                route: UsageRoute::GetObject,
+                source_bytes: 0,
+                output_bytes: 0,
+            },
+            &key,
+        )
+        .await
+        {
+            return response;
+        }
         return response;
     }
 
@@ -4585,9 +4750,13 @@ async fn s3_get(
         return metered_read_response(
             state.control.clone(),
             &auth,
+            operation,
             &bucket,
+            &key,
+            None,
             object.into_response(),
-        );
+        )
+        .await;
     }
 
     // Legacy whole-object GET buffering was removed in Phase 12. With reads
@@ -4613,14 +4782,13 @@ mod tests {
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct UsageCall {
         context: AuthenticatedRequestContext,
-        bucket: String,
-        kind: RequestKind,
-        bytes: u64,
+        event: UsageEvent,
     }
 
     #[derive(Default)]
     struct RecordingControlPlane {
         calls: std::sync::Mutex<Vec<UsageCall>>,
+        failure: Option<MeteringError>,
     }
 
     #[async_trait::async_trait]
@@ -4636,16 +4804,13 @@ mod tests {
         async fn record(
             &self,
             context: &AuthenticatedRequestContext,
-            bucket: &str,
-            kind: RequestKind,
-            bytes: u64,
-        ) {
+            event: &UsageEvent,
+        ) -> Result<(), MeteringError> {
             self.calls.lock().unwrap().push(UsageCall {
                 context: context.clone(),
-                bucket: bucket.to_string(),
-                kind,
-                bytes,
+                event: event.clone(),
             });
+            self.failure.map_or(Ok(()), Err)
         }
     }
 
@@ -4750,8 +4915,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metered_body_records_exact_completed_response_bytes_and_workspace() {
+    async fn metered_read_records_admitted_bytes_before_returning_the_body() {
         let control = Arc::new(RecordingControlPlane::default());
+        let operation = OperationIdentity {
+            receipt_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+        };
         let auth = Auth {
             context: AuthenticatedRequestContext {
                 user_id: "user-a".to_string(),
@@ -4764,61 +4933,113 @@ mod tests {
         let response = metered_read_response(
             control.clone(),
             &auth,
+            operation,
             "bucket-a",
+            "key-a",
+            None,
             axum::response::Response::new(Body::from("range")),
+        )
+        .await;
+        assert_eq!(
+            *control.calls.lock().unwrap(),
+            vec![UsageCall {
+                context: auth.context.clone(),
+                event: UsageEvent::new(
+                    operation.receipt_id,
+                    operation.operation_id,
+                    "bucket-a",
+                    RequestKind::Read,
+                    UsageRoute::GetObject,
+                    5,
+                    5,
+                ),
+            }]
         );
+
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         assert_eq!(body.as_ref(), b"range");
-        tokio::task::yield_now().await;
-
-        assert_eq!(
-            *control.calls.lock().unwrap(),
-            vec![UsageCall {
-                context: auth.context,
-                bucket: "bucket-a".to_string(),
-                kind: RequestKind::Read,
-                bytes: 5,
-            }]
-        );
     }
 
     #[tokio::test]
-    async fn metered_body_records_when_dropped_after_final_data_frame() {
-        let control = Arc::new(RecordingControlPlane::default());
-        let context = AuthenticatedRequestContext {
-            user_id: "user-a".to_string(),
-            workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
+    async fn metered_read_failure_replaces_the_stream_with_a_generic_s3_error() {
+        let control = Arc::new(RecordingControlPlane {
+            failure: Some(MeteringError::Unavailable),
+            ..RecordingControlPlane::default()
+        });
+        let auth = Auth {
+            context: AuthenticatedRequestContext {
+                user_id: "user-a".to_string(),
+                workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
+            },
+            credential_policy_id: "test".to_string(),
+            public_key_pem: None,
+            stable_key: None,
         };
-        let mut body = MeteredBody {
-            inner: Body::from("range"),
-            control: control.clone(),
-            context: context.clone(),
-            bucket: "bucket-a".to_string(),
-            bytes: 0,
-            finished: false,
-        };
+        let response = metered_read_response(
+            control,
+            &auth,
+            OperationIdentity {
+                receipt_id: Uuid::now_v7(),
+                operation_id: Uuid::now_v7(),
+            },
+            "bucket-a",
+            "key-a",
+            None,
+            axum::response::Response::new(Body::from("range")),
+        )
+        .await;
 
-        let frame = std::future::poll_fn(|cx| {
-            http_body::Body::poll_frame(std::pin::Pin::new(&mut body), cx)
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(frame.data_ref().unwrap().as_ref(), b"range");
-        drop(body);
-        tokio::task::yield_now().await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(!body.contains("database"));
+    }
 
-        assert_eq!(
-            *control.calls.lock().unwrap(),
-            vec![UsageCall {
-                context,
-                bucket: "bucket-a".to_string(),
-                kind: RequestKind::Read,
-                bytes: 5,
-            }]
+    #[test]
+    fn operation_identities_are_validated_and_stable() {
+        let supplied = Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c175").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-s4-metering-id", supplied.to_string().parse().unwrap());
+        let first = request_operation_identity(&headers).unwrap();
+        assert_eq!(first.receipt_id, supplied);
+        assert_eq!(first.operation_id, operation_id_for_receipt(supplied));
+        assert_ne!(first.receipt_id, first.operation_id);
+
+        headers.append(
+            "x-s4-metering-id",
+            Uuid::now_v7().to_string().parse().unwrap(),
         );
+        assert_eq!(
+            request_operation_identity(&headers),
+            Err(MeteringIdError::Duplicate)
+        );
+        headers = HeaderMap::new();
+        headers.insert("x-s4-metering-id", "not-a-uuid".parse().unwrap());
+        assert_eq!(
+            request_operation_identity(&headers),
+            Err(MeteringIdError::Invalid)
+        );
+
+        let generated = request_operation_identity(&HeaderMap::new()).unwrap();
+        assert_eq!(generated.receipt_id.get_version_num(), 7);
+        assert_eq!(generated.operation_id.get_version_num(), 5);
+        let multipart = multipart_completion_operation_identity("upload-1");
+        assert_eq!(
+            multipart,
+            multipart_completion_operation_identity("upload-1")
+        );
+        assert_ne!(
+            multipart,
+            multipart_completion_operation_identity("upload-2")
+        );
+        assert_eq!(multipart.receipt_id.get_version_num(), 5);
+        assert_eq!(multipart.operation_id.get_version_num(), 5);
+        assert_ne!(multipart.receipt_id, multipart.operation_id);
     }
 
     #[test]
@@ -5103,6 +5324,10 @@ async fn s3_head(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
+    let operation = match request_operation_identity(&headers) {
+        Ok(operation) => operation,
+        Err(error) => return metering_id_error_response(&key, error),
+    };
     if let Some(reason) = state
         .control
         .authorize(&auth.context, RequestKind::Read)
@@ -5129,10 +5354,23 @@ async fn s3_head(
             } else {
                 object.into_response()
             };
-            state
-                .control
-                .record(&auth.context, &bucket, RequestKind::Read, 0)
-                .await;
+            if let Err(response) = record_operation(
+                state.control.clone(),
+                &auth.context,
+                OperationUsage {
+                    operation,
+                    bucket: &bucket,
+                    kind: RequestKind::Read,
+                    route: UsageRoute::HeadObject,
+                    source_bytes: 0,
+                    output_bytes: 0,
+                },
+                &key,
+            )
+            .await
+            {
+                return response;
+            }
             response
         }
         Err(error) => open_error_response(&key, error),
@@ -5150,6 +5388,10 @@ async fn s3_delete(
     let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
+    };
+    let operation = match request_operation_identity(&headers) {
+        Ok(operation) => operation,
+        Err(error) => return metering_id_error_response(&key, error),
     };
     if let Some(reason) = state
         .control
@@ -5193,18 +5435,44 @@ async fn s3_delete(
         return match staging.repository.abort(&identity, now_ms()).await {
             Ok(parts) => {
                 cleanup_staged_parts(&staging, upload_id, parts, "abort").await;
-                state
-                    .control
-                    .record(&auth.context, &bucket, RequestKind::Write, 0)
-                    .await;
+                if let Err(response) = record_operation(
+                    state.control.clone(),
+                    &auth.context,
+                    OperationUsage {
+                        operation,
+                        bucket: &bucket,
+                        kind: RequestKind::Write,
+                        route: UsageRoute::AbortMultipartUpload,
+                        source_bytes: 0,
+                        output_bytes: 0,
+                    },
+                    &key,
+                )
+                .await
+                {
+                    return response;
+                }
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(StagingError::NotFound) => s3_error::no_such_upload(&key),
             Err(StagingError::NotOpen) => {
-                state
-                    .control
-                    .record(&auth.context, &bucket, RequestKind::Write, 0)
-                    .await;
+                if let Err(response) = record_operation(
+                    state.control.clone(),
+                    &auth.context,
+                    OperationUsage {
+                        operation,
+                        bucket: &bucket,
+                        kind: RequestKind::Write,
+                        route: UsageRoute::AbortMultipartUpload,
+                        source_bytes: 0,
+                        output_bytes: 0,
+                    },
+                    &key,
+                )
+                .await
+                {
+                    return response;
+                }
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(error) => s3_error::internal_error(&key, &error.to_string()),
@@ -5227,10 +5495,23 @@ async fn s3_delete(
             };
             match client.delete(url).send().await {
                 Ok(response) if response.status().is_success() => {
-                    state
-                        .control
-                        .record(&auth.context, &bucket, RequestKind::Write, 0)
-                        .await;
+                    if let Err(response) = record_operation(
+                        state.control.clone(),
+                        &auth.context,
+                        OperationUsage {
+                            operation,
+                            bucket: &bucket,
+                            kind: RequestKind::Write,
+                            route: UsageRoute::DeleteObject,
+                            source_bytes: 0,
+                            output_bytes: 0,
+                        },
+                        &key,
+                    )
+                    .await
+                    {
+                        return response;
+                    }
                     StatusCode::NO_CONTENT.into_response()
                 }
                 Ok(response) => s3_error::internal_error(
@@ -5256,10 +5537,23 @@ async fn s3_delete(
             .await
         {
             Ok(_) => {
-                state
-                    .control
-                    .record(&auth.context, &bucket, RequestKind::Write, 0)
-                    .await;
+                if let Err(response) = record_operation(
+                    state.control.clone(),
+                    &auth.context,
+                    OperationUsage {
+                        operation,
+                        bucket: &bucket,
+                        kind: RequestKind::Write,
+                        route: UsageRoute::DeleteObject,
+                        source_bytes: 0,
+                        output_bytes: 0,
+                    },
+                    &key,
+                )
+                .await
+                {
+                    return response;
+                }
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(error) => {
@@ -5284,18 +5578,44 @@ async fn s3_delete(
             if let Err(error) = result {
                 return s3_error::internal_error(&key, &error.to_string());
             }
-            state
-                .control
-                .record(&auth.context, &bucket, RequestKind::Write, 0)
-                .await;
+            if let Err(response) = record_operation(
+                state.control.clone(),
+                &auth.context,
+                OperationUsage {
+                    operation,
+                    bucket: &bucket,
+                    kind: RequestKind::Write,
+                    route: UsageRoute::DeleteObject,
+                    source_bytes: 0,
+                    output_bytes: 0,
+                },
+                &key,
+            )
+            .await
+            {
+                return response;
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         ResolvedBackend::Memory(store) => {
             store.delete(&bucket, &key);
-            state
-                .control
-                .record(&auth.context, &bucket, RequestKind::Write, 0)
-                .await;
+            if let Err(response) = record_operation(
+                state.control.clone(),
+                &auth.context,
+                OperationUsage {
+                    operation,
+                    bucket: &bucket,
+                    kind: RequestKind::Write,
+                    route: UsageRoute::DeleteObject,
+                    source_bytes: 0,
+                    output_bytes: 0,
+                },
+                &key,
+            )
+            .await
+            {
+                return response;
+            }
             StatusCode::NO_CONTENT.into_response()
         }
     }
@@ -5321,6 +5641,12 @@ async fn s3_post(
             Ok(value) => value,
             Err(error) => return authentication_error_response(&key, error),
         };
+        if let Err(error) = parse_metering_id(&parts.headers) {
+            return metering_id_error_response(&key, error);
+        }
+        // Completion retries are keyed by the durable upload identity, never a
+        // per-attempt client or generated request ID.
+        let operation = multipart_completion_operation_identity(upload_id);
         let (auth, body) =
             match read_verified_body(authentication, body, MAX_COMPLETE_XML_BYTES).await {
                 Ok(value) => value,
@@ -5407,6 +5733,23 @@ async fn s3_post(
             .await
         {
             Ok(CompletionAcquire::Replayed(result)) => {
+                if let Err(response) = record_operation(
+                    state.control.clone(),
+                    &auth.context,
+                    OperationUsage {
+                        operation,
+                        bucket: &bucket,
+                        kind: RequestKind::Write,
+                        route: UsageRoute::CompleteMultipartUpload,
+                        source_bytes: result.source_bytes,
+                        output_bytes: result.size_bytes,
+                    },
+                    &key,
+                )
+                .await
+                {
+                    return response;
+                }
                 let mut response = s3_xml_ok(complete_multipart_xml(&bucket, &key, &result));
                 if let Some(version) = result.version_id
                     && let Ok(version) = version.parse()
@@ -5464,15 +5807,23 @@ async fn s3_post(
             }
         };
         cleanup_staged_parts(&staging, upload_id, lease.cleanup_parts, "complete").await;
-        state
-            .control
-            .record(
-                &auth.context,
-                &bucket,
-                RequestKind::Write,
-                result.size_bytes,
-            )
-            .await;
+        if let Err(response) = record_operation(
+            state.control.clone(),
+            &auth.context,
+            OperationUsage {
+                operation,
+                bucket: &bucket,
+                kind: RequestKind::Write,
+                route: UsageRoute::CompleteMultipartUpload,
+                source_bytes: result.source_bytes,
+                output_bytes: result.size_bytes,
+            },
+            &key,
+        )
+        .await
+        {
+            return response;
+        }
         let mut response = s3_xml_ok(complete_multipart_xml(&bucket, &key, &result));
         if let Some(version) = result.version_id
             && let Ok(version) = version.parse()

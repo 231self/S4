@@ -163,6 +163,8 @@ pub struct MultipartCompletionResult {
     pub checksum_sha256: String,
     pub version_id: Option<String>,
     #[serde(default)]
+    pub source_bytes: u64,
+    #[serde(default)]
     pub size_bytes: u64,
 }
 
@@ -3195,6 +3197,7 @@ mod tests {
                 etag: Some("\"output\"".to_string()),
                 checksum_sha256: "output-sha".to_string(),
                 version_id: Some("version-a".to_string()),
+                source_bytes: 24,
                 size_bytes: 42,
             },
             1,
@@ -3204,7 +3207,7 @@ mod tests {
         assert!(matches!(
             repo.acquire_completion(&identity(), "fingerprint", &request, "worker-b", 200, 2)
                 .await,
-            Ok(CompletionAcquire::Replayed(MultipartCompletionResult { ref etag, ref checksum_sha256, ref version_id, size_bytes: 42 }))
+            Ok(CompletionAcquire::Replayed(MultipartCompletionResult { ref etag, ref checksum_sha256, ref version_id, source_bytes: 24, size_bytes: 42 }))
                 if etag.as_deref() == Some("\"output\"")
                     && checksum_sha256 == "output-sha"
                     && version_id.as_deref() == Some("version-a")

@@ -5168,6 +5168,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-binary-reductor"
+version = "0.3.5"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "test-filter"
 version = "0.3.5"
 dependencies = [

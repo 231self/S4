@@ -2,6 +2,8 @@
 use std::collections::HashMap;
 #[cfg(any(test, debug_assertions))]
 use std::sync::Arc;
+#[cfg(any(test, debug_assertions))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
@@ -510,12 +512,18 @@ struct MemoryState {
 #[derive(Clone, Default)]
 pub struct InMemoryOperationJournal {
     state: Arc<Mutex<MemoryState>>,
+    fail_committed_transitions: Arc<AtomicUsize>,
 }
 
 #[cfg(any(test, debug_assertions))]
 impl InMemoryOperationJournal {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fail_next_committed_transitions(&self, count: usize) {
+        self.fail_committed_transitions
+            .store(count, Ordering::Release);
     }
 }
 
@@ -610,6 +618,18 @@ impl OperationJournal for InMemoryOperationJournal {
         if (next == OperationState::Committed) != committed.is_some() {
             return Err(JournalError::Conflict(
                 "COMMITTED transitions require object metadata only".to_string(),
+            ));
+        }
+        if next == OperationState::Committed
+            && self
+                .fail_committed_transitions
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(JournalError::Persistence(
+                "injected COMMITTED transition failure".to_string(),
             ));
         }
         let mut state = self.state.lock().await;

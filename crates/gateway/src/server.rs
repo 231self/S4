@@ -7,7 +7,7 @@
 //! its own control-plane implementation.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -38,12 +38,12 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::backend::{
-    BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation,
+    BackendKind, BackendResolver, PresignedHttpPolicy, ResolvedBackend, StorageOperation,
     WorkspaceEndpointPolicy,
 };
 use crate::control::{
-    AuthenticatedRequestContext, ControlPlane, MeteringError, RequestKind, StreamingWriteMode,
-    UsageEvent, UsageRoute,
+    AuthenticatedRequestContext, AuthorizationError, ControlPlane, MeteringError, RequestKind,
+    StreamingWriteMode, UsageAuthorization, UsageEvent, UsageRoute,
 };
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
@@ -52,12 +52,12 @@ use crate::managed::{
     PLACEMENT_VERSION_V1, PostgresManagedRepository, validate_mode,
 };
 use crate::multipart_staging::{
-    ARTIFACT_PREFIX, COMPLETION_LEASE, CleanupAudit, CompletePart, CompletionAcquire,
-    CompletionLease, EncryptedPartReader, EncryptedPartWriter, MAX_ACTIVE_UPLOADS,
-    MultipartCompletionResult, MultipartIdentity, MultipartLifecycle, MultipartPart,
-    MultipartRepository, MultipartSnapshot, MultipartUpload, PostgresMultipartRepository,
-    S3StagingArtifactStore, StagedArtifact, StagingArtifactStore, StagingError, StagingQuotaLimits,
-    completion_fingerprint, now_ms,
+    ARTIFACT_PREFIX, AbortMutationError, COMPLETION_LEASE, CleanupAudit, CompletePart,
+    CompletionAcquire, CompletionLease, EncryptedPartReader, EncryptedPartWriter,
+    MAX_ACTIVE_UPLOADS, MultipartCompletionResult, MultipartIdentity, MultipartLifecycle,
+    MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
+    PostgresMultipartRepository, S3StagingArtifactStore, StagedArtifact, StagingArtifactStore,
+    StagingError, StagingQuotaLimits, completion_fingerprint, now_ms,
 };
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, filter_presigned_response_headers,
@@ -78,11 +78,12 @@ use crate::store::{
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, CompatibilitySpoolConfig,
-    CompatibilitySpoolTransaction, CompatibilitySpoolUploader, CompletionReconciliation,
-    ConditionalReadCapability, DirectS3Sink, ExpectedObject, IncompleteUploadDiscovery,
-    ListCapability, MemorySinkTransaction, MultipartResponseCapability, ObjectDestination,
-    ObjectSinkTransaction, OperationJournal, OperationReconciler, ResponseChecksumCapability,
-    SpoolQuota, StoredObjectMeta, TransactionError, VersioningCapability,
+    CompatibilitySpoolTransaction, CompletionReconciliation, ConditionalReadCapability,
+    DirectOperationScope, DirectS3Sink, ExpectedObject, IncompleteUploadDiscovery, ListCapability,
+    MemorySinkTransaction, MultipartResponseCapability, ObjectDestination, ObjectSinkTransaction,
+    OperationJournal, OperationReconciler, OperationRecord, OperationState,
+    ResponseChecksumCapability, SpoolQuota, StoredObjectMeta, TransactionError,
+    VersioningCapability,
 };
 use crate::workspace_storage::{
     BackendConfigRequest, BackendConfigResponse, BackendType, WorkspaceId, WorkspaceStorageError,
@@ -109,6 +110,7 @@ pub struct AppState {
     pub streaming_read_mode: StreamingReadMode,
     pub streaming_write_mode: StreamingWriteMode,
     pub source_body_limits: BodyLimits,
+    pub max_pipeline_output_bytes: u64,
     pub presigned_http_policy: PresignedHttpPolicy,
     pub sigv4_cache: Arc<SigningKeyCache>,
     pub sigv4_policy: SigV4Policy,
@@ -146,12 +148,6 @@ impl Auth {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MeteringIdError {
-    Duplicate,
-    Invalid,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OperationIdentity {
     receipt_id: Uuid,
     operation_id: Uuid,
@@ -159,79 +155,137 @@ struct OperationIdentity {
 
 struct OperationUsage<'a> {
     operation: OperationIdentity,
-    bucket: &'a str,
-    kind: RequestKind,
-    route: UsageRoute,
+    authorization: &'a UsageAuthorization,
     source_bytes: u64,
     output_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct AuthorizedOperation<'a> {
+    auth: &'a Auth,
+    authorization: &'a UsageAuthorization,
 }
 
 impl OperationUsage<'_> {
     fn event(&self) -> UsageEvent {
         UsageEvent::new(
             self.operation.receipt_id,
-            self.operation.operation_id,
-            self.bucket,
-            self.kind,
-            self.route,
+            self.authorization.operation_id(),
+            self.authorization.bucket(),
+            self.authorization.kind(),
+            self.authorization.route(),
             self.source_bytes,
             self.output_bytes,
         )
     }
 }
 
-fn parse_metering_id(headers: &HeaderMap) -> Result<Option<Uuid>, MeteringIdError> {
-    let mut values = headers.get_all("x-s4-metering-id").iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(MeteringIdError::Duplicate);
-    }
-    let value = value.to_str().map_err(|_| MeteringIdError::Invalid)?;
-    Uuid::parse_str(value)
-        .map(Some)
-        .map_err(|_| MeteringIdError::Invalid)
-}
-
 fn operation_id_for_receipt(receipt_id: Uuid) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_X500, receipt_id.as_bytes())
 }
 
-fn request_operation_identity(headers: &HeaderMap) -> Result<OperationIdentity, MeteringIdError> {
-    let receipt_id = parse_metering_id(headers)?.unwrap_or_else(Uuid::now_v7);
-    Ok(OperationIdentity {
+fn request_operation_identity() -> OperationIdentity {
+    let receipt_id = Uuid::now_v7();
+    OperationIdentity {
         receipt_id,
         operation_id: operation_id_for_receipt(receipt_id),
-    })
-}
-
-fn multipart_completion_operation_identity(upload_id: &str) -> OperationIdentity {
-    OperationIdentity {
-        receipt_id: Uuid::new_v5(&Uuid::NAMESPACE_OID, upload_id.as_bytes()),
-        operation_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, upload_id.as_bytes()),
     }
 }
 
-fn metering_id_error_response(key: &str, error: MeteringIdError) -> axum::response::Response {
-    let detail = match error {
-        MeteringIdError::Duplicate => "x-s4-metering-id must appear exactly once",
-        MeteringIdError::Invalid => "x-s4-metering-id must be a valid UUID",
-    };
-    s3_error::invalid_request(key, detail)
+impl OperationIdentity {
+    fn authorization(
+        self,
+        bucket: &str,
+        route: UsageRoute,
+        kind: RequestKind,
+        max_processed_bytes: u64,
+    ) -> UsageAuthorization {
+        UsageAuthorization::new(self.operation_id, bucket, route, kind, max_processed_bytes)
+    }
+}
+
+fn object_max_processed_bytes(state: &AppState) -> u64 {
+    state
+        .source_body_limits
+        .max_bytes
+        .max(state.max_pipeline_output_bytes)
+}
+
+fn multipart_completion_operation_identity(
+    upload_id: &str,
+    request_fingerprint: &str,
+) -> OperationIdentity {
+    let identity = format!("{upload_id}\0{request_fingerprint}");
+    OperationIdentity {
+        receipt_id: Uuid::new_v5(&Uuid::NAMESPACE_OID, identity.as_bytes()),
+        operation_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, identity.as_bytes()),
+    }
+}
+
+fn client_metering_id_rejection(
+    headers: &HeaderMap,
+    key: &str,
+) -> Option<axum::response::Response> {
+    if ["x-s4-metering-id", "x-s4-operation-id", "x-s4-usage-id"]
+        .into_iter()
+        .any(|name| headers.contains_key(name))
+    {
+        return Some(s3_error::invalid_request(
+            key,
+            "The request contains an unsupported header.",
+        ));
+    }
+    None
 }
 
 fn metering_error_response(key: &str, error: MeteringError) -> axum::response::Response {
     match error {
-        MeteringError::Unavailable => s3_error::service_unavailable(
-            key,
-            "Usage metering is temporarily unavailable; retry with the same x-s4-metering-id.",
-        ),
+        MeteringError::Unavailable => {
+            s3_error::service_unavailable(key, "Usage metering is temporarily unavailable.")
+        }
         MeteringError::IdempotencyConflict => s3_error::invalid_request(
             key,
-            "The x-s4-metering-id conflicts with an existing usage event.",
+            "The usage receipt conflicts with an existing usage event.",
         ),
         MeteringError::Rejected => s3_error::payment_required(key, "The usage event was rejected."),
+    }
+}
+
+async fn authorize_request(
+    control: &dyn ControlPlane,
+    context: &AuthenticatedRequestContext,
+    authorization: &UsageAuthorization,
+    key: &str,
+) -> Result<(), axum::response::Response> {
+    match control.authorize(context, authorization).await {
+        Ok(None) => Ok(()),
+        Ok(Some(reason)) => Err(s3_error::payment_required(key, reason.message)),
+        Err(AuthorizationError::Unavailable) => Err(s3_error::service_unavailable(
+            key,
+            "Authorization is temporarily unavailable.",
+        )),
+    }
+}
+
+async fn release_failure(
+    control: &dyn ControlPlane,
+    context: &AuthenticatedRequestContext,
+    authorization: &UsageAuthorization,
+    key: &str,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    match control.release(context, authorization.operation_id()).await {
+        Ok(()) => response,
+        Err(AuthorizationError::Unavailable) => {
+            warn!(
+                operation_id = %authorization.operation_id(),
+                "usage reservation was not released"
+            );
+            s3_error::service_unavailable(
+                key,
+                "Authorization is temporarily unavailable while releasing the operation.",
+            )
+        }
     }
 }
 
@@ -258,12 +312,6 @@ async fn record_operation(
 }
 
 fn admitted_response_bytes(response: &axum::response::Response) -> Option<u64> {
-    if matches!(
-        response.status(),
-        StatusCode::NOT_MODIFIED | StatusCode::PRECONDITION_FAILED
-    ) {
-        return Some(0);
-    }
     let mut lengths = response.headers().get_all(header::CONTENT_LENGTH).iter();
     if let Some(length) = lengths.next() {
         if lengths.next().is_some() {
@@ -290,27 +338,53 @@ async fn metered_read_response(
     control: Arc<dyn ControlPlane>,
     auth: &Auth,
     operation: OperationIdentity,
-    bucket: &str,
+    authorization: &UsageAuthorization,
     key: &str,
     source_bytes: Option<u64>,
     response: axum::response::Response,
 ) -> axum::response::Response {
-    if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
-        return response;
+    if !response.status().is_success() {
+        return release_failure(
+            control.as_ref(),
+            &auth.context,
+            authorization,
+            key,
+            response,
+        )
+        .await;
     }
     let Some(bytes) = admitted_response_bytes(&response) else {
-        return s3_error::service_unavailable(
+        let response = s3_error::service_unavailable(
             key,
             "The response size is unavailable for usage metering.",
         );
+        return release_failure(
+            control.as_ref(),
+            &auth.context,
+            authorization,
+            key,
+            response,
+        )
+        .await;
     };
+    let source_bytes = source_bytes.unwrap_or(bytes);
+    if source_bytes.max(bytes) > authorization.max_processed_bytes() {
+        return release_failure(
+            control.as_ref(),
+            &auth.context,
+            authorization,
+            key,
+            s3_error::entity_too_large(key),
+        )
+        .await;
+    }
     let event = UsageEvent::new(
         operation.receipt_id,
-        operation.operation_id,
-        bucket,
-        RequestKind::Read,
-        UsageRoute::GetObject,
-        source_bytes.unwrap_or(bytes),
+        authorization.operation_id(),
+        authorization.bucket(),
+        authorization.kind(),
+        authorization.route(),
+        source_bytes,
         bytes,
     );
     if let Err(response) = record_usage(control, &auth.context, &event, key).await {
@@ -2360,71 +2434,6 @@ fn wants_transformed_read(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-struct PresignedSpoolUploader {
-    client: reqwest::Client,
-    url: reqwest::Url,
-    max_attempts: usize,
-}
-
-#[async_trait::async_trait]
-impl CompatibilitySpoolUploader for PresignedSpoolUploader {
-    async fn upload_file(
-        &self,
-        path: &FsPath,
-        content_length: u64,
-    ) -> Result<StoredObjectMeta, TransactionError> {
-        let mut last_error = None;
-        for _ in 0..self.max_attempts.max(1) {
-            let file = tokio::fs::File::open(path)
-                .await
-                .map_err(|error| TransactionError::Spool(error.to_string()))?;
-            let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-            match self
-                .client
-                .put(self.url.clone())
-                .header(header::CONTENT_LENGTH, content_length)
-                .body(body)
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {
-                    return Ok(StoredObjectMeta {
-                        etag: response
-                            .headers()
-                            .get(header::ETAG)
-                            .and_then(|value| value.to_str().ok())
-                            .map(ToOwned::to_owned),
-                        version_id: response
-                            .headers()
-                            .get("x-amz-version-id")
-                            .and_then(|value| value.to_str().ok())
-                            .map(ToOwned::to_owned),
-                        superseded_version_ids: Vec::new(),
-                        version_history_complete: true,
-                    });
-                }
-                Ok(response) => {
-                    last_error = Some(format!(
-                        "presigned destination returned HTTP {}",
-                        response.status()
-                    ));
-                }
-                Err(error) => {
-                    let failure = PresignedTransportFailure::from_reqwest(&error);
-                    warn!(
-                        category = failure.as_str(),
-                        "presigned destination transport failed"
-                    );
-                    last_error = Some("presigned destination request failed".to_string());
-                }
-            }
-        }
-        Err(TransactionError::Spool(last_error.unwrap_or_else(|| {
-            "presigned destination retry budget exhausted".to_string()
-        })))
-    }
-}
-
 #[derive(Debug)]
 enum StreamingPutError {
     Integrity(IntegrityError),
@@ -2435,6 +2444,13 @@ enum StreamingPutError {
     Transport,
     InvalidRequest(String),
     Unsupported(String),
+    PreserveReservation(Box<StreamingPutError>),
+}
+
+impl StreamingPutError {
+    fn preserves_reservation(&self) -> bool {
+        matches!(self, Self::PreserveReservation(_))
+    }
 }
 
 impl From<s4_error::S4Error> for StreamingPutError {
@@ -2451,6 +2467,7 @@ impl From<TransactionError> for StreamingPutError {
 
 fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::response::Response {
     match error {
+        StreamingPutError::PreserveReservation(error) => streaming_put_error_response(key, *error),
         StreamingPutError::Integrity(
             IntegrityError::PayloadHashMismatch | IntegrityError::SignatureMismatch,
         ) => s3_error::signature_mismatch(key),
@@ -2513,6 +2530,22 @@ fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::re
     }
 }
 
+async fn streaming_put_failure_response(
+    control: &dyn ControlPlane,
+    context: &AuthenticatedRequestContext,
+    authorization: &UsageAuthorization,
+    key: &str,
+    error: StreamingPutError,
+) -> axum::response::Response {
+    let preserve_reservation = error.preserves_reservation();
+    let response = streaming_put_error_response(key, error);
+    if preserve_reservation {
+        response
+    } else {
+        release_failure(control, context, authorization, key, response).await
+    }
+}
+
 fn streaming_format(headers: &HeaderMap) -> Result<(Format, String), StreamingPutError> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -2549,11 +2582,12 @@ fn streaming_format_content_type(
 async fn begin_streaming_sink(
     state: &AppState,
     backend: ResolvedBackend,
-    auth: &Auth,
+    operation: AuthorizedOperation<'_>,
     bucket: &str,
     key: &str,
     content_type: &str,
 ) -> Result<Box<dyn ObjectSinkTransaction>, StreamingPutError> {
+    validate_streaming_backend(state, &backend)?;
     match backend {
         ResolvedBackend::S3 { kind, client } => {
             let capabilities = state.s3_streaming_capabilities.ok_or_else(|| {
@@ -2588,36 +2622,33 @@ async fn begin_streaming_sink(
             )
             .map_err(TransactionError::from)?;
             tokio::spawn(async move {
-                while abort_receiver.recv().await.is_some() {
-                    if let Err(error) = reconciler.reconcile_due(Duration::ZERO, 16).await {
+                while let Some(operation_id) = abort_receiver.recv().await {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Err(error) = reconciler
+                        .reconcile_operation(operation_id, Duration::from_secs(1))
+                        .await
+                    {
                         warn!("streaming transaction cleanup failed: {error}");
                     }
                 }
             });
             Ok(Box::new(
-                DirectS3Sink::new(journal, backend, destination, expected, 3, abort_signal).await?,
-            ))
-        }
-        ResolvedBackend::PresignedHttp(url) => {
-            let client = state
-                .presigned_http_policy
-                .client_for_destination(&url, Duration::from_secs(30))
-                .await
-                .map_err(StreamingPutError::InvalidRequest)?;
-            let uploader = Arc::new(PresignedSpoolUploader {
-                client,
-                url,
-                max_attempts: 3,
-            });
-            Ok(Box::new(
-                CompatibilitySpoolTransaction::begin(
-                    state.spool_config.clone(),
-                    Arc::clone(&state.spool_quota),
-                    uploader,
+                DirectS3Sink::new_direct(
+                    journal,
+                    backend,
+                    direct_operation_scope(operation),
+                    destination,
+                    expected,
+                    3,
+                    abort_signal,
                 )
                 .await?,
             ))
         }
+        ResolvedBackend::PresignedHttp(_) => Err(StreamingPutError::Unsupported(
+            "presigned streaming cannot durably align the authorization and transaction journals"
+                .to_string(),
+        )),
         ResolvedBackend::Memory(store) if state.dev_memory_streaming_enabled => {
             Ok(Box::new(MemorySinkTransaction::new(
                 store,
@@ -2630,27 +2661,45 @@ async fn begin_streaming_sink(
         ResolvedBackend::Memory(_) => Err(StreamingPutError::Unsupported(
             "development memory streaming is not enabled".to_string(),
         )),
-        ResolvedBackend::Managed(storage) => {
-            let capabilities = state.managed_streaming_capabilities.ok_or_else(|| {
-                StreamingPutError::Unsupported(
-                    "managed streaming needs S4_MANAGED_STREAMING_TRANSACTIONAL=true".to_string(),
-                )
-            })?;
-            let journal = state.operation_journal.clone().ok_or_else(|| {
-                StreamingPutError::Unsupported(
-                    "managed streaming needs a durable operation journal".to_string(),
-                )
-            })?;
-            storage
-                .begin_authoritative_sink(
-                    journal,
-                    capabilities,
-                    managed_logical_key(auth, bucket, key),
-                    content_type,
-                )
-                .await
-                .map_err(StreamingPutError::from)
+        ResolvedBackend::Managed(_) => Err(StreamingPutError::Unsupported(
+            "managed streaming cannot use one authorization identity for replicated journals"
+                .to_string(),
+        )),
+    }
+}
+
+fn direct_operation_scope(operation: AuthorizedOperation<'_>) -> DirectOperationScope {
+    DirectOperationScope {
+        operation_id: operation.authorization.operation_id(),
+        tenant_id: operation.auth.workspace_id().as_str().to_string(),
+    }
+}
+
+fn validate_streaming_backend(
+    state: &AppState,
+    backend: &ResolvedBackend,
+) -> Result<(), StreamingPutError> {
+    match backend {
+        ResolvedBackend::S3 { .. }
+            if state.s3_streaming_capabilities.is_some() && state.operation_journal.is_some() =>
+        {
+            Ok(())
         }
+        ResolvedBackend::S3 { .. } => Err(StreamingPutError::Unsupported(
+            "direct S3 streaming needs configured capabilities and a durable operation journal"
+                .to_string(),
+        )),
+        ResolvedBackend::Memory(_) if state.dev_memory_streaming_enabled => Ok(()),
+        ResolvedBackend::Memory(_) => Err(StreamingPutError::Unsupported(
+            "development memory streaming is not enabled".to_string(),
+        )),
+        ResolvedBackend::PresignedHttp(_) => Err(StreamingPutError::Unsupported(
+            "presigned streaming cannot durably align authorization and destination commit"
+                .to_string(),
+        )),
+        ResolvedBackend::Managed(_) => Err(StreamingPutError::Unsupported(
+            "managed replicated streaming cannot use one authorization commit identity".to_string(),
+        )),
     }
 }
 
@@ -2710,9 +2759,9 @@ async fn streaming_single_put(
     state: &AppState,
     mut authentication: HeaderAuthentication,
     backend: ResolvedBackend,
+    authorization: &UsageAuthorization,
     headers: &HeaderMap,
     mut body: axum::body::Body,
-    bucket: &str,
     key: &str,
 ) -> Result<(Auth, StoredObjectMeta, u64, u64), StreamingPutError> {
     use http_body_util::BodyExt as _;
@@ -2727,8 +2776,11 @@ async fn streaming_single_put(
     let sink = begin_streaming_sink(
         state,
         backend,
-        &authentication.auth,
-        bucket,
+        AuthorizedOperation {
+            auth: &authentication.auth,
+            authorization,
+        },
+        authorization.bucket(),
         key,
         &content_type,
     )
@@ -2859,11 +2911,19 @@ async fn streaming_single_put(
             if let Some(pipeline) = pipeline.take() {
                 let _ = pipeline.cancel_and_wait().await;
             }
-            if let Err(abort_error) = sink.lock().await.abort().await {
-                warn!("streaming sink abort failed for /{bucket}/{key}: {abort_error}");
+            let preserve_reservation = sink.lock().await.commit_state().preserves_reservation();
+            if !preserve_reservation && let Err(abort_error) = sink.lock().await.abort().await {
+                warn!(
+                    "streaming sink abort failed for /{}/{key}: {abort_error}",
+                    authorization.bucket()
+                );
             }
             sink_guard.disarm();
-            Err(error)
+            if preserve_reservation {
+                Err(StreamingPutError::PreserveReservation(Box::new(error)))
+            } else {
+                Err(error)
+            }
         }
     }
 }
@@ -3234,6 +3294,20 @@ enum MultipartCompletionError {
     Staging(StagingError),
     Streaming(StreamingPutError),
     Invalid(String),
+    PreserveReservation(Box<MultipartCompletionError>),
+}
+
+impl MultipartCompletionError {
+    fn preserves_reservation(&self) -> bool {
+        matches!(self, Self::PreserveReservation(_))
+    }
+
+    fn into_cause(self) -> Self {
+        match self {
+            Self::PreserveReservation(error) => *error,
+            error => error,
+        }
+    }
 }
 
 impl From<StagingError> for MultipartCompletionError {
@@ -3311,7 +3385,7 @@ async fn complete_staged_multipart(
     identity: &MultipartIdentity,
     upload: &MultipartUpload,
     lease: &CompletionLease,
-    auth: &Auth,
+    operation: AuthorizedOperation<'_>,
     backend: ResolvedBackend,
 ) -> Result<MultipartCompletionResult, MultipartCompletionError> {
     use sha2::Digest as _;
@@ -3355,7 +3429,7 @@ async fn complete_staged_multipart(
     let mut sink = begin_streaming_sink(
         state,
         backend,
-        auth,
+        operation,
         &identity.bucket,
         &identity.key,
         &content_type,
@@ -3366,8 +3440,8 @@ async fn complete_staged_multipart(
         format: format.as_str().to_string(),
         content_type,
         policy_version: 0,
-        public_key_pem: auth.public_key_pem.clone(),
-        stable_key: auth.stable_key.clone(),
+        public_key_pem: operation.auth.public_key_pem.clone(),
+        stable_key: operation.auth.stable_key.clone(),
         stable_fields: None,
     };
     let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
@@ -3535,15 +3609,159 @@ async fn complete_staged_multipart(
         }
         // Never allow a stale worker to issue an abort. The durable Phase 5
         // journal reconciles ambiguous destination outcomes after a crash.
-        if renew_and_fence_completion(staging, identity, lease)
-            .await
-            .is_ok()
+        if !sink.commit_state().preserves_reservation()
+            && renew_and_fence_completion(staging, identity, lease)
+                .await
+                .is_ok()
         {
             let _ = sink.abort().await;
         }
         let _ = error;
     }
-    processing
+    processing.map_err(|error| {
+        if sink.commit_state().preserves_reservation() {
+            MultipartCompletionError::PreserveReservation(Box::new(error))
+        } else {
+            error
+        }
+    })
+}
+
+fn multipart_completion_error_response(
+    key: &str,
+    error: MultipartCompletionError,
+) -> axum::response::Response {
+    match error.into_cause() {
+        MultipartCompletionError::Staging(StagingError::Fenced) => {
+            s3_error::service_unavailable(key, "multipart completion lease was lost")
+        }
+        MultipartCompletionError::Staging(StagingError::InvalidPart) => {
+            s3_error::invalid_part(key, "staged part validation failed")
+        }
+        MultipartCompletionError::Staging(error) => {
+            s3_error::internal_error(key, &error.to_string())
+        }
+        MultipartCompletionError::Streaming(error) => streaming_put_error_response(key, error),
+        MultipartCompletionError::Invalid(error) => s3_error::invalid_request(key, &error),
+        MultipartCompletionError::PreserveReservation(_) => unreachable!("cause is unwrapped"),
+    }
+}
+
+async fn multipart_completion_failure_response(
+    control: &dyn ControlPlane,
+    context: &AuthenticatedRequestContext,
+    authorization: &UsageAuthorization,
+    key: &str,
+    error: MultipartCompletionError,
+) -> axum::response::Response {
+    let preserve_reservation = error.preserves_reservation();
+    let response = multipart_completion_error_response(key, error);
+    if preserve_reservation {
+        response
+    } else {
+        release_failure(control, context, authorization, key, response).await
+    }
+}
+
+enum ExistingDirectCompletion {
+    New,
+    Committed(Box<OperationRecord>),
+    ProvenAborted,
+    Pending,
+}
+
+async fn reconcile_existing_direct_completion(
+    state: &AppState,
+    backend: &ResolvedBackend,
+    operation_id: Uuid,
+    workspace_id: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<ExistingDirectCompletion, TransactionError> {
+    let ResolvedBackend::S3 { kind, client } = backend else {
+        return Ok(ExistingDirectCompletion::New);
+    };
+    let Some(journal) = state.operation_journal.clone() else {
+        return Ok(ExistingDirectCompletion::New);
+    };
+    let Some(mut operation) = journal.get(operation_id).await? else {
+        return Ok(ExistingDirectCompletion::New);
+    };
+    if operation.tenant_id.as_deref() != Some(workspace_id)
+        || operation.destination.backend_id != format!("{kind:?}")
+        || operation.destination.bucket != bucket
+        || operation.destination.logical_key != key
+        || operation.destination.physical_key != key
+    {
+        return Ok(ExistingDirectCompletion::Pending);
+    }
+    if !operation.state.is_terminal() {
+        if *kind == BackendKind::PerUserS3 {
+            return Ok(ExistingDirectCompletion::Pending);
+        }
+        let capabilities = state.s3_streaming_capabilities.ok_or_else(|| {
+            TransactionError::Publication(
+                "direct completion reconciliation capabilities are unavailable".to_string(),
+            )
+        })?;
+        let reconciler = OperationReconciler::new(
+            journal.clone(),
+            Arc::new(AwsS3TransactionBackend::new(client.clone(), capabilities)),
+            format!("multipart-retry-{}", Uuid::now_v7()),
+        )?;
+        reconciler
+            .reconcile_operation(operation_id, COMPLETION_LEASE)
+            .await?;
+        operation = journal.get(operation_id).await?.ok_or_else(|| {
+            TransactionError::Publication(
+                "direct completion journal row disappeared during reconciliation".to_string(),
+            )
+        })?;
+    }
+    Ok(match operation.state {
+        OperationState::Committed => ExistingDirectCompletion::Committed(Box::new(operation)),
+        OperationState::ProvenAborted => ExistingDirectCompletion::ProvenAborted,
+        OperationState::Intent
+        | OperationState::Open
+        | OperationState::Completing
+        | OperationState::CommitUnknown
+        | OperationState::Aborting => ExistingDirectCompletion::Pending,
+    })
+}
+
+fn recovered_multipart_result(
+    operation: OperationRecord,
+    lease: &CompletionLease,
+) -> Result<MultipartCompletionResult, MultipartCompletionError> {
+    let stored = operation.committed.ok_or_else(|| {
+        MultipartCompletionError::Invalid(
+            "committed direct operation is missing destination metadata".to_string(),
+        )
+    })?;
+    let size_bytes = operation.expected.size.ok_or_else(|| {
+        MultipartCompletionError::Invalid(
+            "committed direct operation is missing expected output size".to_string(),
+        )
+    })?;
+    let checksum_sha256 = operation.expected.digest.ok_or_else(|| {
+        MultipartCompletionError::Invalid(
+            "committed direct operation is missing expected output checksum".to_string(),
+        )
+    })?;
+    let source_bytes = lease
+        .selected_parts
+        .iter()
+        .try_fold(0_u64, |total, part| total.checked_add(part.size_bytes))
+        .ok_or_else(|| {
+            MultipartCompletionError::Invalid("multipart source size overflow".to_string())
+        })?;
+    Ok(MultipartCompletionResult {
+        etag: stored.etag,
+        checksum_sha256,
+        version_id: stored.version_id,
+        source_bytes,
+        size_bytes,
+    })
 }
 
 async fn reconcile_staged_artifacts(staging: &MultipartStaging) -> Result<(), StagingError> {
@@ -3609,12 +3827,8 @@ async fn s3_upload_part(
         Ok(value) => value,
         Err(error) => return authentication_error_response(&key, error),
     };
-    if let Some(reason) = state
-        .control
-        .authorize(&authentication.auth.context, RequestKind::Write)
-        .await
-    {
-        return s3_error::payment_required(&key, reason.message);
+    if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+        return response;
     }
     if state
         .control
@@ -3639,6 +3853,9 @@ async fn s3_upload_part(
         Ok(backend) => backend,
         Err(_) => return backend_resolution_error_response(&key),
     };
+    if let Err(error) = validate_streaming_backend(&state, &multipart_backend) {
+        return streaming_put_error_response(&key, error);
+    }
     let identity = multipart_identity(&authentication.auth, &bucket, &key, &upload_id);
     let upload = match staging.repository.get_authorized(&identity).await {
         Ok(upload) => upload,
@@ -3863,16 +4080,21 @@ async fn s3_put(
         Err(error) => return authentication_error_response(&key, error),
     };
     let auth = &header_auth.auth;
-    let operation = match request_operation_identity(&parts.headers) {
-        Ok(operation) => operation,
-        Err(error) => return metering_id_error_response(&key, error),
-    };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Write)
-        .await
+    let auth_context = auth.context.clone();
+    if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+        return response;
+    }
+    let operation = request_operation_identity();
+    let authorization = operation.authorization(
+        &bucket,
+        UsageRoute::PutObject,
+        RequestKind::Write,
+        object_max_processed_bytes(&state),
+    );
+    if let Err(response) =
+        authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
     let tenant_write_mode = state
         .control
@@ -3882,18 +4104,53 @@ async fn s3_put(
     let effective_write_mode = state.streaming_write_mode.min(tenant_write_mode);
     let backend = match resolve_backend(&state, auth, &parts.headers, StorageOperation::Put).await {
         Ok(backend) => backend,
-        Err(_) => return backend_resolution_error_response(&key),
+        Err(_) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth_context,
+                &authorization,
+                &key,
+                backend_resolution_error_response(&key),
+            )
+            .await;
+        }
     };
+    if let Err(error) = validate_streaming_backend(&state, &backend) {
+        let response = streaming_put_error_response(&key, error);
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &authorization,
+            &key,
+            response,
+        )
+        .await;
+    }
     if let ResolvedBackend::Managed(storage) = &backend {
         match storage.managed_mode() {
             ManagedStreamingMode::Observe => {
-                return s3_error::service_unavailable(
+                let response = s3_error::service_unavailable(
                     &key,
                     "managed mutations are disabled in observe mode",
                 );
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    response,
+                )
+                .await;
             }
             ManagedStreamingMode::Enforce if effective_write_mode < StreamingWriteMode::Single => {
-                return s3_error::not_implemented(&key);
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::not_implemented(&key),
+                )
+                .await;
             }
             ManagedStreamingMode::Off | ManagedStreamingMode::Enforce => {}
         }
@@ -3902,15 +4159,22 @@ async fn s3_put(
     // rejects without polling the request body; there is no fallback to a
     // whole-object buffer.
     if effective_write_mode < StreamingWriteMode::Single {
-        return s3_error::not_implemented(&key);
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &authorization,
+            &key,
+            s3_error::not_implemented(&key),
+        )
+        .await;
     }
     match streaming_single_put(
         &state,
         header_auth,
         backend,
+        &authorization,
         &parts.headers,
         request_body,
-        &bucket,
         &key,
     )
     .await
@@ -3921,9 +4185,7 @@ async fn s3_put(
                 &auth.context,
                 OperationUsage {
                     operation,
-                    bucket: &bucket,
-                    kind: RequestKind::Write,
-                    route: UsageRoute::PutObject,
+                    authorization: &authorization,
                     source_bytes,
                     output_bytes,
                 },
@@ -3946,7 +4208,16 @@ async fn s3_put(
             }
             response.body(axum::body::Body::empty()).unwrap()
         }
-        Err(error) => streaming_put_error_response(&key, error),
+        Err(error) => {
+            streaming_put_failure_response(
+                state.control.as_ref(),
+                &auth_context,
+                &authorization,
+                &key,
+                error,
+            )
+            .await
+        }
     }
 }
 
@@ -4546,18 +4817,10 @@ async fn s3_get(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Read)
-        .await
-    {
-        return s3_error::payment_required(&key, reason.message);
+    if let Some(response) = client_metering_id_rejection(&headers, &key) {
+        return response;
     }
-
     let transformed_read = wants_transformed_read(&headers);
-    if transformed_read && state.streaming_read_mode != StreamingReadMode::Transformed {
-        return s3_error::transformed_read_not_supported(&key);
-    }
     if params.upload_id.is_some() {
         let backend =
             match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
@@ -4614,25 +4877,60 @@ async fn s3_get(
             Err(error) => s3_error::internal_error(&key, &error.to_string()),
         };
     }
-    let operation = match request_operation_identity(&headers) {
-        Ok(operation) => operation,
-        Err(error) => return metering_id_error_response(&key, error),
-    };
+    let operation = request_operation_identity();
+    let authorization = operation.authorization(
+        &bucket,
+        UsageRoute::GetObject,
+        RequestKind::Read,
+        object_max_processed_bytes(&state),
+    );
+    if let Err(response) =
+        authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
+    {
+        return response;
+    }
+    if transformed_read && state.streaming_read_mode != StreamingReadMode::Transformed {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &authorization,
+            &key,
+            s3_error::transformed_read_not_supported(&key),
+        )
+        .await;
+    }
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Get).await {
         Ok(backend) => backend,
-        Err(_) => return backend_resolution_error_response(&key),
+        Err(_) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &authorization,
+                &key,
+                backend_resolution_error_response(&key),
+            )
+            .await;
+        }
     };
     // A transformed representation must be admitted from authoritative object
     // metadata before a source GET can start delivering bytes. Passthrough keeps
     // its existing one-request behavior below.
     if transformed_read {
         if matches!(&backend, ResolvedBackend::PresignedHttp(_)) {
-            return transformed_read_error_response(
+            let response = transformed_read_error_response(
                 &key,
                 TransformedReadError::InvalidRequest(
                     "transformed reads require stored object metadata".to_string(),
                 ),
             );
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &authorization,
+                &key,
+                response,
+            )
+            .await;
         }
         let metadata = match open_backend_object(
             &state,
@@ -4646,55 +4944,89 @@ async fn s3_get(
         .await
         {
             Ok(object) => object.metadata,
-            Err(error) => return open_error_response(&key, error),
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    open_error_response(&key, error),
+                )
+                .await;
+            }
         };
         let preflight = match transformed_read_preflight(&headers, &params, &metadata) {
             Ok(preflight) => preflight,
-            Err(error) => return transformed_read_error_response(&key, error),
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    transformed_read_error_response(&key, error),
+                )
+                .await;
+            }
         };
         let object =
             match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false).await
             {
                 Ok(object) => object,
-                Err(error) => return open_error_response(&key, error),
+                Err(error) => {
+                    return release_failure(
+                        state.control.as_ref(),
+                        &auth.context,
+                        &authorization,
+                        &key,
+                        open_error_response(&key, error),
+                    )
+                    .await;
+                }
             };
         let source_preflight = match transformed_read_preflight(&headers, &params, &object.metadata)
         {
             Ok(preflight) => preflight,
-            Err(error) => return transformed_read_error_response(&key, error),
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    transformed_read_error_response(&key, error),
+                )
+                .await;
+            }
         };
         if source_preflight.0 != preflight.0
             || source_preflight.1 != preflight.1
             || !transformed_source_matches_preflight(&metadata, &object.metadata)
         {
             object.cancellation.cancel();
-            return transformed_read_error_response(
+            let response = transformed_read_error_response(
                 &key,
                 TransformedReadError::Source(
                     "source metadata changed after transformed-read preflight".to_string(),
                 ),
             );
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &authorization,
+                &key,
+                response,
+            )
+            .await;
         }
         if let Some(status) = conditional_read_status(&headers, &object.metadata) {
             let response = conditional_read_response(object, status);
-            if let Err(response) = record_operation(
-                state.control.clone(),
+            return release_failure(
+                state.control.as_ref(),
                 &auth.context,
-                OperationUsage {
-                    operation,
-                    bucket: &bucket,
-                    kind: RequestKind::Read,
-                    route: UsageRoute::GetObject,
-                    source_bytes: 0,
-                    output_bytes: 0,
-                },
+                &authorization,
                 &key,
+                response,
             )
-            .await
-            {
-                return response;
-            }
-            return response;
+            .await;
         }
         let source_bytes = content_length(&object.metadata.headers);
         let response_metadata = object.metadata.clone();
@@ -4712,7 +5044,7 @@ async fn s3_get(
             state.control.clone(),
             &auth,
             operation,
-            &bucket,
+            &authorization,
             &key,
             source_bytes.or(completed_source_bytes),
             response,
@@ -4722,28 +5054,27 @@ async fn s3_get(
     let object =
         match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false).await {
             Ok(object) => object,
-            Err(error) => return open_error_response(&key, error),
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    open_error_response(&key, error),
+                )
+                .await;
+            }
         };
     if let Some(status) = conditional_read_status(&headers, &object.metadata) {
         let response = conditional_read_response(object, status);
-        if let Err(response) = record_operation(
-            state.control.clone(),
+        return release_failure(
+            state.control.as_ref(),
             &auth.context,
-            OperationUsage {
-                operation,
-                bucket: &bucket,
-                kind: RequestKind::Read,
-                route: UsageRoute::GetObject,
-                source_bytes: 0,
-                output_bytes: 0,
-            },
+            &authorization,
             &key,
+            response,
         )
-        .await
-        {
-            return response;
-        }
-        return response;
+        .await;
     }
 
     if state.streaming_read_mode.streams_passthrough() {
@@ -4751,7 +5082,7 @@ async fn s3_get(
             state.control.clone(),
             &auth,
             operation,
-            &bucket,
+            &authorization,
             &key,
             None,
             object.into_response(),
@@ -4762,7 +5093,14 @@ async fn s3_get(
     // Legacy whole-object GET buffering was removed in Phase 12. With reads
     // administratively disabled, reject without collecting the object body;
     // dropping `object` cancels the source before any byte is buffered.
-    s3_error::not_implemented(&key)
+    release_failure(
+        state.control.as_ref(),
+        &auth.context,
+        &authorization,
+        &key,
+        s3_error::not_implemented(&key),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -4788,6 +5126,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingControlPlane {
         calls: std::sync::Mutex<Vec<UsageCall>>,
+        releases: std::sync::Mutex<Vec<Uuid>>,
         failure: Option<MeteringError>,
     }
 
@@ -4796,9 +5135,18 @@ mod tests {
         async fn authorize(
             &self,
             _context: &AuthenticatedRequestContext,
-            _kind: RequestKind,
-        ) -> Option<crate::control::BlockReason> {
-            None
+            _authorization: &UsageAuthorization,
+        ) -> Result<Option<crate::control::BlockReason>, AuthorizationError> {
+            Ok(None)
+        }
+
+        async fn release(
+            &self,
+            _context: &AuthenticatedRequestContext,
+            operation_id: Uuid,
+        ) -> Result<(), AuthorizationError> {
+            self.releases.lock().unwrap().push(operation_id);
+            Ok(())
         }
 
         async fn record(
@@ -4930,11 +5278,13 @@ mod tests {
             public_key_pem: None,
             stable_key: None,
         };
+        let authorization =
+            operation.authorization("bucket-a", UsageRoute::GetObject, RequestKind::Read, 1024);
         let response = metered_read_response(
             control.clone(),
             &auth,
             operation,
-            "bucket-a",
+            &authorization,
             "key-a",
             None,
             axum::response::Response::new(Body::from("range")),
@@ -4977,14 +5327,17 @@ mod tests {
             public_key_pem: None,
             stable_key: None,
         };
+        let operation = OperationIdentity {
+            receipt_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+        };
+        let authorization =
+            operation.authorization("bucket-a", UsageRoute::GetObject, RequestKind::Read, 1024);
         let response = metered_read_response(
             control,
             &auth,
-            OperationIdentity {
-                receipt_id: Uuid::now_v7(),
-                operation_id: Uuid::now_v7(),
-            },
-            "bucket-a",
+            operation,
+            &authorization,
             "key-a",
             None,
             axum::response::Response::new(Body::from("range")),
@@ -5001,41 +5354,30 @@ mod tests {
     }
 
     #[test]
-    fn operation_identities_are_validated_and_stable() {
-        let supplied = Uuid::parse_str("018f0f6e-7b31-7c1d-8f2f-84f808b9c175").unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-s4-metering-id", supplied.to_string().parse().unwrap());
-        let first = request_operation_identity(&headers).unwrap();
-        assert_eq!(first.receipt_id, supplied);
-        assert_eq!(first.operation_id, operation_id_for_receipt(supplied));
+    fn operation_identities_are_server_generated_and_completion_is_stable() {
+        let first = request_operation_identity();
+        let second = request_operation_identity();
+        assert_eq!(first.receipt_id.get_version_num(), 7);
+        assert_eq!(first.operation_id.get_version_num(), 5);
+        assert_eq!(
+            first.operation_id,
+            operation_id_for_receipt(first.receipt_id)
+        );
         assert_ne!(first.receipt_id, first.operation_id);
-
-        headers.append(
-            "x-s4-metering-id",
-            Uuid::now_v7().to_string().parse().unwrap(),
-        );
-        assert_eq!(
-            request_operation_identity(&headers),
-            Err(MeteringIdError::Duplicate)
-        );
-        headers = HeaderMap::new();
-        headers.insert("x-s4-metering-id", "not-a-uuid".parse().unwrap());
-        assert_eq!(
-            request_operation_identity(&headers),
-            Err(MeteringIdError::Invalid)
-        );
-
-        let generated = request_operation_identity(&HeaderMap::new()).unwrap();
-        assert_eq!(generated.receipt_id.get_version_num(), 7);
-        assert_eq!(generated.operation_id.get_version_num(), 5);
-        let multipart = multipart_completion_operation_identity("upload-1");
+        assert_ne!(first.receipt_id, second.receipt_id);
+        assert_ne!(first.operation_id, second.operation_id);
+        let multipart = multipart_completion_operation_identity("upload-1", "fingerprint-a");
         assert_eq!(
             multipart,
-            multipart_completion_operation_identity("upload-1")
+            multipart_completion_operation_identity("upload-1", "fingerprint-a")
         );
         assert_ne!(
             multipart,
-            multipart_completion_operation_identity("upload-2")
+            multipart_completion_operation_identity("upload-2", "fingerprint-a")
+        );
+        assert_ne!(
+            multipart,
+            multipart_completion_operation_identity("upload-1", "fingerprint-b")
         );
         assert_eq!(multipart.receipt_id.get_version_num(), 5);
         assert_eq!(multipart.operation_id.get_version_num(), 5);
@@ -5059,6 +5401,125 @@ mod tests {
         assert_eq!(logical.tenant_id, "workspace-b");
         assert_eq!(multipart.tenant_id, "workspace-b");
         assert_ne!(logical.tenant_id, auth.user_id());
+    }
+
+    #[test]
+    fn direct_handler_scope_uses_authorization_operation_and_workspace() {
+        let auth = Auth {
+            context: AuthenticatedRequestContext {
+                user_id: "user-a".to_string(),
+                workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-b").unwrap(),
+            },
+            credential_policy_id: "credential".to_string(),
+            public_key_pem: None,
+            stable_key: None,
+        };
+        let operation = request_operation_identity();
+        let authorization =
+            operation.authorization("bucket", UsageRoute::PutObject, RequestKind::Write, 64);
+
+        let scope = direct_operation_scope(AuthorizedOperation {
+            auth: &auth,
+            authorization: &authorization,
+        });
+
+        assert_eq!(scope.operation_id, authorization.operation_id());
+        assert_eq!(scope.tenant_id, "workspace-b");
+    }
+
+    #[tokio::test]
+    async fn multipart_success_and_exact_replay_meter_with_one_stable_identity() {
+        let control = Arc::new(RecordingControlPlane::default());
+        let context = AuthenticatedRequestContext {
+            user_id: "user-a".to_string(),
+            workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
+        };
+        let operation = multipart_completion_operation_identity("upload-a", "fingerprint-a");
+        let authorization = operation.authorization(
+            "bucket-a",
+            UsageRoute::CompleteMultipartUpload,
+            RequestKind::Write,
+            64,
+        );
+
+        for _ in 0..2 {
+            record_operation(
+                control.clone(),
+                &context,
+                OperationUsage {
+                    operation,
+                    authorization: &authorization,
+                    source_bytes: 32,
+                    output_bytes: 24,
+                },
+                "key-a",
+            )
+            .await
+            .unwrap();
+        }
+
+        let calls = control.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+        assert_eq!(calls[0].event.operation_id, authorization.operation_id());
+        assert_eq!(calls[0].event.route, UsageRoute::CompleteMultipartUpload);
+        assert_eq!(calls[0].event.processed_bytes, 32);
+    }
+
+    #[tokio::test]
+    async fn commit_unknown_failure_does_not_release_reservation() {
+        let control = RecordingControlPlane::default();
+        let context = AuthenticatedRequestContext {
+            user_id: "user-a".to_string(),
+            workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
+        };
+        let operation = request_operation_identity();
+        let authorization =
+            operation.authorization("bucket", UsageRoute::PutObject, RequestKind::Write, 64);
+
+        let response = streaming_put_failure_response(
+            &control,
+            &context,
+            &authorization,
+            "key",
+            StreamingPutError::PreserveReservation(Box::new(StreamingPutError::Transaction(
+                TransactionError::CompletionAmbiguous,
+            ))),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(control.releases.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn multipart_post_commit_failure_does_not_release_reservation() {
+        let control = RecordingControlPlane::default();
+        let context = AuthenticatedRequestContext {
+            user_id: "user-a".to_string(),
+            workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
+        };
+        let operation = multipart_completion_operation_identity("upload-a", "fingerprint-a");
+        let authorization = operation.authorization(
+            "bucket",
+            UsageRoute::CompleteMultipartUpload,
+            RequestKind::Write,
+            64,
+        );
+
+        let response = multipart_completion_failure_response(
+            &control,
+            &context,
+            &authorization,
+            "key",
+            MultipartCompletionError::PreserveReservation(Box::new(
+                MultipartCompletionError::Staging(StagingError::Fenced),
+            )),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(control.releases.lock().unwrap().is_empty());
     }
 
     struct PollTrackingBody {
@@ -5324,44 +5785,98 @@ async fn s3_head(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
-    let operation = match request_operation_identity(&headers) {
-        Ok(operation) => operation,
-        Err(error) => return metering_id_error_response(&key, error),
-    };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Read)
-        .await
+    if let Some(response) = client_metering_id_rejection(&headers, &key) {
+        return response;
+    }
+    let operation = request_operation_identity();
+    let authorization =
+        operation.authorization(&bucket, UsageRoute::HeadObject, RequestKind::Read, 0);
+    if let Err(response) =
+        authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
     if wants_transformed_read(&headers) {
-        return s3_error::invalid_request(
+        let response = s3_error::invalid_request(
             &key,
             "HEAD is not supported for transformed reads until transformed metadata is available",
         );
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &authorization,
+            &key,
+            response,
+        )
+        .await;
     }
 
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Head).await {
         Ok(backend) => backend,
-        Err(_) => return backend_resolution_error_response(&key),
+        Err(_) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &authorization,
+                &key,
+                backend_resolution_error_response(&key),
+            )
+            .await;
+        }
     };
     match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, true).await {
         Ok(object) => {
-            let response = if let Some(status) = conditional_read_status(&headers, &object.metadata)
-            {
-                conditional_read_response(object, status)
-            } else {
-                object.into_response()
+            if let Some(status) = conditional_read_status(&headers, &object.metadata) {
+                let response = conditional_read_response(object, status);
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    response,
+                )
+                .await;
+            }
+            let Some(object_bytes) = content_length(&object.metadata.headers) else {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::service_unavailable(
+                        &key,
+                        "The object size is unavailable for HEAD accounting.",
+                    ),
+                )
+                .await;
             };
+            if object_bytes > state.source_body_limits.max_bytes {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::entity_too_large(&key),
+                )
+                .await;
+            }
+            let response = object.into_response();
+            if !response.status().is_success() {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    response,
+                )
+                .await;
+            }
             if let Err(response) = record_operation(
                 state.control.clone(),
                 &auth.context,
                 OperationUsage {
                     operation,
-                    bucket: &bucket,
-                    kind: RequestKind::Read,
-                    route: UsageRoute::HeadObject,
+                    authorization: &authorization,
                     source_bytes: 0,
                     output_bytes: 0,
                 },
@@ -5373,7 +5888,16 @@ async fn s3_head(
             }
             response
         }
-        Err(error) => open_error_response(&key, error),
+        Err(error) => {
+            release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &authorization,
+                &key,
+                open_error_response(&key, error),
+            )
+            .await
+        }
     }
 }
 
@@ -5389,16 +5913,24 @@ async fn s3_delete(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
-    let operation = match request_operation_identity(&headers) {
-        Ok(operation) => operation,
-        Err(error) => return metering_id_error_response(&key, error),
-    };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Write)
-        .await
+    if let Some(response) = client_metering_id_rejection(&headers, &key) {
+        return response;
+    }
+    let operation = request_operation_identity();
+    let authorization = operation.authorization(
+        &bucket,
+        if params.upload_id.is_some() {
+            UsageRoute::AbortMultipartUpload
+        } else {
+            UsageRoute::DeleteObject
+        },
+        RequestKind::Write,
+        0,
+    );
+    if let Err(response) =
+        authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
     {
-        return s3_error::payment_required(&key, reason.message);
+        return response;
     }
     info!("DELETE /{bucket}/{key} user={}", auth.user_id());
 
@@ -5406,30 +5938,79 @@ async fn s3_delete(
         let backend =
             match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
                 Ok(backend) => backend,
-                Err(_) => return backend_resolution_error_response(&key),
+                Err(_) => {
+                    return release_failure(
+                        state.control.as_ref(),
+                        &auth.context,
+                        &authorization,
+                        &key,
+                        backend_resolution_error_response(&key),
+                    )
+                    .await;
+                }
             };
         let Some(staging) = staged_multipart(&state).cloned() else {
-            return s3_error::multipart_not_supported(&key);
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &authorization,
+                &key,
+                s3_error::multipart_not_supported(&key),
+            )
+            .await;
         };
         let upload_id = params.upload_id.as_deref().unwrap_or_default();
         let identity = multipart_identity(&auth, &bucket, &key, upload_id);
         let upload = match staging.repository.get_authorized(&identity).await {
             Ok(upload) => upload,
-            Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
-            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+            Err(StagingError::NotFound) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::no_such_upload(&key),
+                )
+                .await;
+            }
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::internal_error(&key, &error.to_string()),
+                )
+                .await;
+            }
         };
         if let ResolvedBackend::Managed(storage) = &backend {
             let Some(epoch) = upload.namespace_epoch else {
-                return s3_error::service_unavailable(
+                let response = s3_error::service_unavailable(
                     &key,
                     "managed multipart upload has no namespace epoch",
                 );
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    response,
+                )
+                .await;
             };
             if let Err(error) = storage
                 .assert_managed_multipart(upload_id, auth.workspace_id().as_str(), epoch, true)
                 .await
             {
-                return s3_error::service_unavailable(&key, &error.to_string());
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::service_unavailable(&key, &error.to_string()),
+                )
+                .await;
             }
         }
         return match staging.repository.abort(&identity, now_ms()).await {
@@ -5440,9 +6021,7 @@ async fn s3_delete(
                     &auth.context,
                     OperationUsage {
                         operation,
-                        bucket: &bucket,
-                        kind: RequestKind::Write,
-                        route: UsageRoute::AbortMultipartUpload,
+                        authorization: &authorization,
                         source_bytes: 0,
                         output_bytes: 0,
                     },
@@ -5454,16 +6033,23 @@ async fn s3_delete(
                 }
                 StatusCode::NO_CONTENT.into_response()
             }
-            Err(StagingError::NotFound) => s3_error::no_such_upload(&key),
-            Err(StagingError::NotOpen) => {
+            Err(AbortMutationError::PreMutation(StagingError::NotFound)) => {
+                release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::no_such_upload(&key),
+                )
+                .await
+            }
+            Err(AbortMutationError::PreMutation(StagingError::NotOpen)) => {
                 if let Err(response) = record_operation(
                     state.control.clone(),
                     &auth.context,
                     OperationUsage {
                         operation,
-                        bucket: &bucket,
-                        kind: RequestKind::Write,
-                        route: UsageRoute::AbortMultipartUpload,
+                        authorization: &authorization,
                         source_bytes: 0,
                         output_bytes: 0,
                     },
@@ -5475,13 +6061,34 @@ async fn s3_delete(
                 }
                 StatusCode::NO_CONTENT.into_response()
             }
-            Err(error) => s3_error::internal_error(&key, &error.to_string()),
+            Err(AbortMutationError::PreMutation(error)) => {
+                release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::internal_error(&key, &error.to_string()),
+                )
+                .await
+            }
+            Err(AbortMutationError::MutationUnknown(error)) => {
+                s3_error::internal_error(&key, &error.to_string())
+            }
         };
     }
 
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Delete).await {
         Ok(backend) => backend,
-        Err(_) => return backend_resolution_error_response(&key),
+        Err(_) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &authorization,
+                &key,
+                backend_resolution_error_response(&key),
+            )
+            .await;
+        }
     };
     match backend {
         ResolvedBackend::PresignedHttp(url) => {
@@ -5491,7 +6098,16 @@ async fn s3_delete(
                 .await
             {
                 Ok(client) => client,
-                Err(error) => return open_error_response(&key, OpenObjectError::Rejected(error)),
+                Err(error) => {
+                    return release_failure(
+                        state.control.as_ref(),
+                        &auth.context,
+                        &authorization,
+                        &key,
+                        open_error_response(&key, OpenObjectError::Rejected(error)),
+                    )
+                    .await;
+                }
             };
             match client.delete(url).send().await {
                 Ok(response) if response.status().is_success() => {
@@ -5500,9 +6116,7 @@ async fn s3_delete(
                         &auth.context,
                         OperationUsage {
                             operation,
-                            bucket: &bucket,
-                            kind: RequestKind::Write,
-                            route: UsageRoute::DeleteObject,
+                            authorization: &authorization,
                             source_bytes: 0,
                             output_bytes: 0,
                         },
@@ -5542,9 +6156,7 @@ async fn s3_delete(
                     &auth.context,
                     OperationUsage {
                         operation,
-                        bucket: &bucket,
-                        kind: RequestKind::Write,
-                        route: UsageRoute::DeleteObject,
+                        authorization: &authorization,
                         source_bytes: 0,
                         output_bytes: 0,
                     },
@@ -5562,14 +6174,25 @@ async fn s3_delete(
             }
         },
         ResolvedBackend::Managed(storage) => {
+            if storage.managed_mode() == ManagedStreamingMode::Observe {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::service_unavailable(
+                        &key,
+                        "managed mutations are disabled in observe mode",
+                    ),
+                )
+                .await;
+            }
             let result = match storage.managed_mode() {
                 ManagedStreamingMode::Off => storage
                     .delete(&format!("{}/{bucket}/{key}", auth.workspace_id().as_str()))
                     .await
                     .map_err(|error| error.to_string()),
-                ManagedStreamingMode::Observe => {
-                    Err("managed mutations are disabled in observe mode".to_string())
-                }
+                ManagedStreamingMode::Observe => unreachable!("handled above"),
                 ManagedStreamingMode::Enforce => storage
                     .tombstone_authoritative(&managed_logical_key(&auth, &bucket, &key))
                     .await
@@ -5583,9 +6206,7 @@ async fn s3_delete(
                 &auth.context,
                 OperationUsage {
                     operation,
-                    bucket: &bucket,
-                    kind: RequestKind::Write,
-                    route: UsageRoute::DeleteObject,
+                    authorization: &authorization,
                     source_bytes: 0,
                     output_bytes: 0,
                 },
@@ -5604,9 +6225,7 @@ async fn s3_delete(
                 &auth.context,
                 OperationUsage {
                     operation,
-                    bucket: &bucket,
-                    kind: RequestKind::Write,
-                    route: UsageRoute::DeleteObject,
+                    authorization: &authorization,
                     source_bytes: 0,
                     output_bytes: 0,
                 },
@@ -5641,12 +6260,23 @@ async fn s3_post(
             Ok(value) => value,
             Err(error) => return authentication_error_response(&key, error),
         };
-        if let Err(error) = parse_metering_id(&parts.headers) {
-            return metering_id_error_response(&key, error);
+        if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+            return response;
         }
-        // Completion retries are keyed by the durable upload identity, never a
-        // per-attempt client or generated request ID.
-        let operation = multipart_completion_operation_identity(upload_id);
+        let backend = match resolve_backend(
+            &state,
+            &authentication.auth,
+            &parts.headers,
+            StorageOperation::Multipart,
+        )
+        .await
+        {
+            Ok(backend) => backend,
+            Err(_) => return backend_resolution_error_response(&key),
+        };
+        if let Err(error) = validate_streaming_backend(&state, &backend) {
+            return streaming_put_error_response(&key, error);
+        }
         let (auth, body) =
             match read_verified_body(authentication, body, MAX_COMPLETE_XML_BYTES).await {
                 Ok(value) => value,
@@ -5666,13 +6296,6 @@ async fn s3_post(
                     );
                 }
             };
-        if let Some(reason) = state
-            .control
-            .authorize(&auth.context, RequestKind::Write)
-            .await
-        {
-            return s3_error::payment_required(&key, reason.message);
-        }
         if state
             .control
             .streaming_write_mode(&auth.context)
@@ -5684,8 +6307,12 @@ async fn s3_post(
         }
         let selected = match parse_complete_multipart_xml(&body) {
             Ok(parts) => parts,
-            Err(error) if error.contains("sorted") => return s3_error::invalid_part_order(&key),
-            Err(error) => return s3_error::invalid_request(&key, &error),
+            Err(error) if error.contains("sorted") => {
+                return s3_error::invalid_part_order(&key);
+            }
+            Err(error) => {
+                return s3_error::invalid_request(&key, &error);
+            }
         };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
@@ -5693,21 +6320,20 @@ async fn s3_post(
         let identity = multipart_identity(&auth, &bucket, &key, upload_id);
         let upload = match staging.repository.get_authorized(&identity).await {
             Ok(upload) => upload,
-            Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
-            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+            Err(StagingError::NotFound) => {
+                return s3_error::no_such_upload(&key);
+            }
+            Err(error) => {
+                return s3_error::internal_error(&key, &error.to_string());
+            }
         };
-        let backend =
-            match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
-            {
-                Ok(backend) => backend,
-                Err(_) => return backend_resolution_error_response(&key),
-            };
         if let ResolvedBackend::Managed(storage) = &backend {
             let Some(epoch) = upload.namespace_epoch else {
-                return s3_error::service_unavailable(
+                let response = s3_error::service_unavailable(
                     &key,
                     "managed multipart upload has no namespace epoch",
                 );
+                return response;
             };
             if let Err(error) = storage
                 .assert_managed_multipart(upload_id, auth.workspace_id().as_str(), epoch, false)
@@ -5718,8 +6344,23 @@ async fn s3_post(
         }
         let fingerprint = match completion_fingerprint(&upload, &selected) {
             Ok(fingerprint) => fingerprint,
-            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+            Err(error) => {
+                return s3_error::internal_error(&key, &error.to_string());
+            }
         };
+        // Exact retries share an operation; conflicting canonical requests do not.
+        let operation = multipart_completion_operation_identity(upload_id, &fingerprint);
+        let authorization = operation.authorization(
+            &bucket,
+            UsageRoute::CompleteMultipartUpload,
+            RequestKind::Write,
+            object_max_processed_bytes(&state),
+        );
+        if let Err(response) =
+            authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
+        {
+            return response;
+        }
         let lease = match staging
             .repository
             .acquire_completion(
@@ -5738,9 +6379,7 @@ async fn s3_post(
                     &auth.context,
                     OperationUsage {
                         operation,
-                        bucket: &bucket,
-                        kind: RequestKind::Write,
-                        route: UsageRoute::CompleteMultipartUpload,
+                        authorization: &authorization,
                         source_bytes: result.source_bytes,
                         output_bytes: result.size_bytes,
                     },
@@ -5758,52 +6397,141 @@ async fn s3_post(
                 }
                 return response;
             }
-            Ok(CompletionAcquire::Busy) => return s3_error::slow_down(&key),
+            Ok(CompletionAcquire::Busy) => {
+                // This exact operation may still be committing in another worker.
+                return s3_error::slow_down(&key);
+            }
             Ok(CompletionAcquire::Acquired(lease)) => lease,
             Err(StagingError::InvalidPart) => {
-                return s3_error::invalid_part(
+                let response = s3_error::invalid_part(
                     &key,
                     "submitted part is missing or does not match its staged ETag/checksum",
                 );
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    response,
+                )
+                .await;
             }
             Err(StagingError::CompletionConflict) => {
-                return s3_error::invalid_request(
+                let response =
+                    s3_error::invalid_request(&key, "conflicting CompleteMultipartUpload request");
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
                     &key,
-                    "conflicting CompleteMultipartUpload request",
-                );
+                    response,
+                )
+                .await;
             }
             Err(StagingError::NotFound | StagingError::NotOpen) => {
-                return s3_error::no_such_upload(&key);
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::no_such_upload(&key),
+                )
+                .await;
             }
-            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::internal_error(&key, &error.to_string()),
+                )
+                .await;
+            }
         };
-        let complete = tokio::time::timeout(
-            Duration::from_secs(MAX_MULTIPART_COMPLETION_SECS),
-            complete_staged_multipart(&state, &staging, &identity, &upload, &lease, &auth, backend),
+        let recovered = match reconcile_existing_direct_completion(
+            &state,
+            &backend,
+            authorization.operation_id(),
+            auth.workspace_id().as_str(),
+            &bucket,
+            &key,
         )
-        .await;
-        let result = match complete {
-            Ok(Ok(result)) => result,
-            Ok(Err(MultipartCompletionError::Staging(StagingError::Fenced))) => {
-                return s3_error::service_unavailable(&key, "multipart completion lease was lost");
+        .await
+        {
+            Ok(ExistingDirectCompletion::New) => None,
+            Ok(ExistingDirectCompletion::Committed(operation)) => Some(*operation),
+            Ok(ExistingDirectCompletion::ProvenAborted) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &authorization,
+                    &key,
+                    s3_error::service_unavailable(
+                        &key,
+                        "The previous multipart completion attempt was proven aborted.",
+                    ),
+                )
+                .await;
             }
-            Ok(Err(MultipartCompletionError::Staging(StagingError::InvalidPart))) => {
-                return s3_error::invalid_part(&key, "staged part validation failed");
-            }
-            Ok(Err(MultipartCompletionError::Staging(error))) => {
-                return s3_error::internal_error(&key, &error.to_string());
-            }
-            Ok(Err(MultipartCompletionError::Streaming(error))) => {
-                return streaming_put_error_response(&key, error);
-            }
-            Ok(Err(MultipartCompletionError::Invalid(error))) => {
-                return s3_error::invalid_request(&key, &error);
-            }
-            Err(_) => {
+            Ok(ExistingDirectCompletion::Pending) | Err(_) => {
                 return s3_error::service_unavailable(
                     &key,
-                    "multipart completion exceeded the configured hosted time limit",
+                    "The previous multipart completion outcome is still being reconciled.",
                 );
+            }
+        };
+        let result = if let Some(operation) = recovered {
+            let result = match recovered_multipart_result(operation, &lease) {
+                Ok(result) => result,
+                Err(error) => return multipart_completion_error_response(&key, error),
+            };
+            if let Err(error) = staging
+                .repository
+                .complete_completion(&identity, lease.fencing_token, result.clone(), now_ms())
+                .await
+            {
+                return multipart_completion_error_response(
+                    &key,
+                    MultipartCompletionError::Staging(error),
+                );
+            }
+            result
+        } else {
+            let complete = tokio::time::timeout(
+                Duration::from_secs(MAX_MULTIPART_COMPLETION_SECS),
+                complete_staged_multipart(
+                    &state,
+                    &staging,
+                    &identity,
+                    &upload,
+                    &lease,
+                    AuthorizedOperation {
+                        auth: &auth,
+                        authorization: &authorization,
+                    },
+                    backend,
+                ),
+            )
+            .await;
+            match complete {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    return multipart_completion_failure_response(
+                        state.control.as_ref(),
+                        &auth.context,
+                        &authorization,
+                        &key,
+                        error,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    return s3_error::service_unavailable(
+                        &key,
+                        "multipart completion exceeded the configured hosted time limit",
+                    );
+                }
             }
         };
         cleanup_staged_parts(&staging, upload_id, lease.cleanup_parts, "complete").await;
@@ -5812,9 +6540,7 @@ async fn s3_post(
             &auth.context,
             OperationUsage {
                 operation,
-                bucket: &bucket,
-                kind: RequestKind::Write,
-                route: UsageRoute::CompleteMultipartUpload,
+                authorization: &authorization,
                 source_bytes: result.source_bytes,
                 output_bytes: result.size_bytes,
             },
@@ -5845,12 +6571,8 @@ async fn s3_post(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&key, error),
     };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Write)
-        .await
-    {
-        return s3_error::payment_required(&key, reason.message);
+    if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+        return response;
     }
     info!("POST /{bucket}/{key} user={}", auth.user_id());
 
@@ -5861,6 +6583,9 @@ async fn s3_post(
                 Ok(backend) => backend,
                 Err(_) => return backend_resolution_error_response(&key),
             };
+        if let Err(error) = validate_streaming_backend(&state, &backend) {
+            return streaming_put_error_response(&key, error);
+        }
         if let ResolvedBackend::Managed(storage) = &backend
             && let Err(error) = storage
                 .assert_namespace_active(auth.workspace_id().as_str())
@@ -5961,19 +6686,36 @@ async fn s3_list_objects(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&bucket, error),
     };
-    if let Some(reason) = state
-        .control
-        .authorize(&auth.context, RequestKind::Read)
-        .await
-    {
-        return s3_error::payment_required(&bucket, reason.message);
+    if let Some(response) = client_metering_id_rejection(&headers, &bucket) {
+        return response;
     }
-
+    let operation = request_operation_identity();
+    let authorization =
+        operation.authorization(&bucket, UsageRoute::ListObjects, RequestKind::Read, 0);
+    if let Err(response) = authorize_request(
+        state.control.as_ref(),
+        &auth.context,
+        &authorization,
+        &bucket,
+    )
+    .await
+    {
+        return response;
+    }
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
         Ok(backend) => backend,
-        Err(_) => return backend_resolution_error_response(&bucket),
+        Err(_) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &authorization,
+                &bucket,
+                backend_resolution_error_response(&bucket),
+            )
+            .await;
+        }
     };
-    match backend {
+    let response = match backend {
         ResolvedBackend::S3 { client, .. } => match list_from_s3(&client, &bucket, &params).await {
             Ok(xml) => s3_xml_ok(xml),
             Err(failure) => s3_error::internal_error(&bucket, failure.client_message()),
@@ -5994,7 +6736,33 @@ async fn s3_list_objects(
                 Err(error) => open_error_response(&bucket, error),
             }
         }
+    };
+    if !response.status().is_success() {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &authorization,
+            &bucket,
+            response,
+        )
+        .await;
     }
+    if let Err(response) = record_operation(
+        state.control.clone(),
+        &auth.context,
+        OperationUsage {
+            operation,
+            authorization: &authorization,
+            source_bytes: 0,
+            output_bytes: 0,
+        },
+        &bucket,
+    )
+    .await
+    {
+        return response;
+    }
+    response
 }
 
 /// Forward a ListObjectsV2 request to an S3 backend.
@@ -7186,6 +7954,20 @@ pub async fn build_state(
     let workspace_endpoint_policy =
         WorkspaceEndpointPolicy::from_env(explicit_single_tenant).map_err(anyhow::Error::msg)?;
 
+    let source_body_limits = BodyLimits {
+        max_frame_bytes: std::env::var("S4_SOURCE_MAX_FRAME_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES),
+        max_bytes: std::env::var("S4_MAX_OBJECT_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
+            .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
+    };
+
     let component_bytes = std::fs::read(component_path())?;
     let pipeline_fuel = std::env::var("S4_WASM_FUEL")
         .ok()
@@ -7194,7 +7976,26 @@ pub async fn build_state(
     use sha2::Digest as _;
 
     let engine = s4_wasm_runtime::FilterEngine::with_fuel(&component_bytes, pipeline_fuel)?;
-    let plugins = Arc::new(PluginRegistry::with_fuel(pipeline_fuel));
+    let default_pipeline_limits = PipelineLimits::default();
+    let max_pipeline_output_bytes = std::env::var("S4_MAX_PIPELINE_OUTPUT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_pipeline_limits.max_output_bytes)
+        .min(default_pipeline_limits.max_output_bytes);
+    let pipeline_limits = PipelineLimits {
+        max_input_bytes: default_pipeline_limits
+            .max_input_bytes
+            .min(source_body_limits.max_bytes),
+        max_output_bytes: max_pipeline_output_bytes,
+        max_cumulative_fuel: pipeline_fuel,
+        ..default_pipeline_limits
+    };
+    let plugins = Arc::new(PluginRegistry::with_options(
+        pipeline_fuel,
+        pipeline_limits,
+        s4_wasm_runtime::ExecutorConfig::default(),
+    )?);
     let prefix_safe_hashes = prefix_safe_component_hashes();
 
     // Only a startup-controlled component digest can grant direct-read safety.
@@ -7282,19 +8083,6 @@ pub async fn build_state(
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(PLACEMENT_VERSION_V1);
-    let source_body_limits = BodyLimits {
-        max_frame_bytes: std::env::var("S4_SOURCE_MAX_FRAME_BYTES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES),
-        max_bytes: std::env::var("S4_MAX_OBJECT_BYTES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
-            .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
-    };
     let multipart_mode = multipart_mode();
     let multipart_tenant_quota_bytes = std::env::var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES")
         .ok()
@@ -7366,12 +8154,9 @@ pub async fn build_state(
             .connect(&database_url)
             .await
             .expect("failed to connect to DATABASE_URL");
-        let mut migrator = sqlx::migrate!("../../migrations");
-        // The SaaS control plane applies its own migrations (workspaces, usage,
-        // billing) to the same database and shares the `_sqlx_migrations` table.
-        // Ignore migrations we don't know about so both binaries can coexist.
-        migrator.set_ignore_missing(true);
-        migrator.run(&pool).await.expect("failed to run migrations");
+        crate::run_engine_migrations(&pool)
+            .await
+            .expect("failed to run migrations");
         info!("Key store: Postgres (migrations applied)");
         operation_journal = Some(Arc::new(crate::transaction::PostgresOperationJournal::new(
             pool.clone(),
@@ -7554,6 +8339,7 @@ pub async fn build_state(
         streaming_read_mode: StreamingReadMode::from_env(),
         streaming_write_mode,
         source_body_limits,
+        max_pipeline_output_bytes,
         presigned_http_policy: PresignedHttpPolicy::from_env().map_err(anyhow::Error::msg)?,
         sigv4_cache: Arc::new(SigningKeyCache::standard()),
         sigv4_policy: SigV4Policy::from_env(),

@@ -69,6 +69,22 @@ impl Gateway {
         }
     }
 
+    /// Hosted injection: keep the engine and registry as the compile cache but
+    /// substitute the relational resolver and artifact-backed component source.
+    pub fn with_runtime(
+        engine: FilterEngine,
+        plugins: Arc<PluginRegistry>,
+        resolver: Arc<dyn PipelineResolver>,
+        component_source: Arc<dyn ComponentSource>,
+    ) -> Self {
+        Self {
+            engine: Arc::new(engine),
+            plugins: Some(plugins),
+            resolver: Some(resolver),
+            component_source: Some(component_source),
+        }
+    }
+
     pub fn pipeline_snapshot(&self) -> Option<plugin_registry::PipelineSnapshot> {
         self.plugins.as_ref().map(|plugins| plugins.snapshot())
     }

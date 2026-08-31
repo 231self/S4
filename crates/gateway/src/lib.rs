@@ -39,6 +39,7 @@ pub async fn run_engine_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migr
     migrator.run(pool).await
 }
 
+#[derive(Clone)]
 pub struct Gateway {
     pub engine: Arc<FilterEngine>,
     pub plugins: Option<Arc<PluginRegistry>>,
@@ -69,20 +70,16 @@ impl Gateway {
         }
     }
 
-    /// Hosted injection: keep the engine and registry as the compile cache but
-    /// substitute the relational resolver and artifact-backed component source.
-    pub fn with_runtime(
-        engine: FilterEngine,
-        plugins: Arc<PluginRegistry>,
+    /// Rebuild this gateway with a new resolver/source pair, preserving the
+    /// engine and registry compile cache.
+    pub fn with_resolver(
+        mut self,
         resolver: Arc<dyn PipelineResolver>,
         component_source: Arc<dyn ComponentSource>,
     ) -> Self {
-        Self {
-            engine: Arc::new(engine),
-            plugins: Some(plugins),
-            resolver: Some(resolver),
-            component_source: Some(component_source),
-        }
+        self.resolver = Some(resolver);
+        self.component_source = Some(component_source);
+        self
     }
 
     pub fn pipeline_snapshot(&self) -> Option<plugin_registry::PipelineSnapshot> {

@@ -4573,6 +4573,7 @@ dependencies = [
  "hex",
  "rand 0.8.7",
  "s4-error",
+ "serde",
  "sha2 0.10.9",
  "wasmtime",
  "wasmtime-wasi",

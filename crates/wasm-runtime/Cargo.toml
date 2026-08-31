@@ -13,3 +13,4 @@ rand.workspace = true
 hex.workspace = true
 sha2 = "0.10"
 zeroize.workspace = true
+serde = { workspace = true, features = ["derive"] }

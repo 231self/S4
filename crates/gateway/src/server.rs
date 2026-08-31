@@ -2860,9 +2860,14 @@ async fn streaming_single_put(
         stable_fields,
     };
     let cancellation = s4_wasm_runtime::CancellationToken::new();
-    let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
-        StreamingPutError::Unsupported("streaming requires a plugin registry".to_string())
-    })?;
+    let snapshot = state
+        .gateway
+        .resolve_pipeline(
+            authentication.auth.workspace_id().as_str(),
+            authorization.bucket(),
+            crate::pipeline::PipelineDirection::Write,
+        )
+        .await?;
     let mut pipeline = match snapshot
         .start_streaming_session(session, cancellation.clone())
         .await
@@ -3210,7 +3215,7 @@ fn staged_multipart(state: &AppState) -> Option<&Arc<MultipartStaging>> {
 fn multipart_snapshot(
     headers: &HeaderMap,
     backend: &ResolvedBackend,
-    plugins: &PluginRegistry,
+    plugin_snapshot: serde_json::Value,
     max_bytes: u64,
 ) -> MultipartSnapshot {
     let mut metadata: std::collections::BTreeMap<String, String> = headers
@@ -3254,8 +3259,7 @@ fn multipart_snapshot(
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned),
         destination,
-        plugin_snapshot: serde_json::to_value(plugins.list())
-            .unwrap_or_else(|_| serde_json::json!([])),
+        plugin_snapshot,
         max_staged_bytes: max_bytes,
     }
 }
@@ -3614,16 +3618,32 @@ async fn complete_staged_multipart(
             "multipart destination changed since initiation".to_string(),
         ));
     }
-    // The Phase 10 snapshot records the ordered plugin identities. Until
-    // component snapshots are independently persisted, reject a changed
-    // registry rather than silently transforming with a different policy.
-    if serde_json::to_value(state.plugins.list()).ok()
-        != Some(upload.snapshot.plugin_snapshot.clone())
-    {
-        return Err(MultipartCompletionError::Invalid(
-            "multipart plugin snapshot is no longer available".to_string(),
-        ));
-    }
+    // Phase 2: the snapshot persists the immutable pipeline resolution. The
+    // exact revision is resolved at completion — never the current assignment.
+    // Legacy self-hosted snapshots stored a raw plugin identity list; keep
+    // them working through a static resolution when the registry is unchanged.
+    let snapshot = match serde_json::from_value::<crate::pipeline::PipelineResolution>(
+        upload.snapshot.plugin_snapshot.clone(),
+    ) {
+        Ok(resolution) => state.gateway.snapshot_for(&resolution).await?,
+        Err(_) => {
+            if serde_json::to_value(state.plugins.list()).ok()
+                != Some(upload.snapshot.plugin_snapshot.clone())
+            {
+                return Err(MultipartCompletionError::Invalid(
+                    "multipart plugin snapshot is no longer available".to_string(),
+                ));
+            }
+            state
+                .gateway
+                .resolve_pipeline(
+                    operation.auth.workspace_id().as_str(),
+                    &identity.bucket,
+                    crate::pipeline::PipelineDirection::Write,
+                )
+                .await?
+        }
+    };
     let content_type = upload
         .snapshot
         .metadata
@@ -3673,9 +3693,6 @@ async fn complete_staged_multipart(
         stable_key: operation.auth.stable_key.clone(),
         stable_fields: None,
     };
-    let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
-        MultipartCompletionError::Invalid("streaming pipeline is unavailable".to_string())
-    })?;
     let mut pipeline = Some(
         snapshot
             .start_streaming_session(session, cancellation.clone())
@@ -5090,6 +5107,7 @@ fn error_to_log(error: &TransformedReadError) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn transformed_read_response(
     state: &AppState,
     auth: &Auth,
@@ -5098,18 +5116,22 @@ async fn transformed_read_response(
     response_metadata: ObjectMetadata,
     object: OpenedObject,
     key: &str,
+    bucket: &str,
 ) -> (axum::response::Response, Option<u64>) {
     let (format, content_type) = preflight;
-    let snapshot = match state.gateway.pipeline_snapshot() {
-        Some(snapshot) => snapshot,
-        None => {
+    let snapshot = match state
+        .gateway
+        .resolve_pipeline(
+            auth.workspace_id().as_str(),
+            bucket,
+            crate::pipeline::PipelineDirection::Read,
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
             return (
-                transformed_read_error_response(
-                    key,
-                    TransformedReadError::Capacity(
-                        "transformed reads require a plugin registry".to_string(),
-                    ),
-                ),
+                transformed_read_error_response(key, TransformedReadError::Pipeline(error)),
                 None,
             );
         }
@@ -5559,6 +5581,7 @@ async fn s3_get(
             response_metadata,
             object,
             &key,
+            &bucket,
         )
         .await;
         return metered_read_response(
@@ -7186,6 +7209,18 @@ async fn s3_post(
         } else {
             None
         };
+        let plugin_snapshot = match state
+            .gateway
+            .resolve(
+                auth.workspace_id().as_str(),
+                &bucket,
+                crate::pipeline::PipelineDirection::Write,
+            )
+            .await
+        {
+            Ok(resolution) => serde_json::to_value(&resolution).unwrap_or(serde_json::json!(null)),
+            Err(error) => return s3_error::invalid_request(&key, error.message()),
+        };
         let now = now_ms();
         let upload = MultipartUpload {
             identity: multipart_identity(&auth, &bucket, &key, &upload_id),
@@ -7193,7 +7228,7 @@ async fn s3_post(
             snapshot: multipart_snapshot(
                 &parts.headers,
                 &backend,
-                &state.plugins,
+                plugin_snapshot,
                 state.source_body_limits.max_bytes,
             ),
             lifecycle: MultipartLifecycle::Open,

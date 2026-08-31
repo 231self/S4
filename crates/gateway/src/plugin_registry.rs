@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use s4_error::{S4Error, codes};
 use s4_wasm_runtime::{
@@ -13,11 +14,20 @@ use uuid::Uuid;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::pipeline::{
+    ComponentSource, PipelineResolution, PipelineStep, pipeline_requires_passthrough,
+    plugin_step_info,
+};
 use crate::record::Record;
 
 /// Default per-session fuel budget for the plugin pipeline. Set high enough
 /// for crypto filters (one RSA-2048 OAEP wrap costs ~25M wasm instructions).
 pub const DEFAULT_PIPELINE_FUEL: u64 = 1_000_000_000;
+
+/// Default bound for the digest-keyed compiled-component cache. Weight is the
+/// guest-memory reservation of each compiled engine, so this admits roughly
+/// sixteen 64 MiB components before evicting least-recently-used entries.
+pub const DEFAULT_COMPILE_CACHE_MAX_WEIGHT: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct PluginInfo {
@@ -30,7 +40,7 @@ pub struct PluginInfo {
     pub description: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PluginCapabilities {
     pub prefix_safe_for_read: bool,
 }
@@ -42,12 +52,23 @@ struct Plugin {
     engine: Arc<FilterEngine>,
 }
 
+/// One entry in the bounded digest-keyed compile cache. Weight is the guest
+/// memory reservation of the compiled engine; eviction is weighted LRU.
+struct CacheEntry {
+    engine: Arc<FilterEngine>,
+    capabilities: PluginCapabilities,
+    bytes: Arc<[u8]>,
+    weight: usize,
+}
+
 #[derive(Default)]
 struct RegistryState {
     plugins: HashMap<String, Plugin>,
     order: Vec<String>,
-    engines: HashMap<String, Arc<FilterEngine>>,
-    capabilities: HashMap<String, PluginCapabilities>,
+    engines: HashMap<String, CacheEntry>,
+    cache_order: VecDeque<String>,
+    cache_weight: usize,
+    cache_max_weight: usize,
 }
 
 pub struct PluginRegistry {
@@ -72,7 +93,7 @@ pub struct PipelineSnapshot {
     executor: Arc<WasmExecutor>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PipelineLimits {
     pub max_intermediate_record_bytes: usize,
     pub max_plugin_finish_bytes: usize,
@@ -182,6 +203,18 @@ impl Default for PluginRegistry {
     }
 }
 
+/// Self-hosted component source: serves the content-addressed bytes retained
+/// in the bounded compile cache. The static resolver only references digests
+/// that startup administration imported, so fetches always hit the cache.
+#[async_trait]
+impl ComponentSource for PluginRegistry {
+    async fn load(&self, component_hash: &str) -> Result<Bytes, S4Error> {
+        self.component_bytes(component_hash)
+            .map(|bytes| Bytes::from(bytes.to_vec()))
+            .ok_or_else(|| crate::pipeline::missing_component_error(component_hash))
+    }
+}
+
 impl PluginRegistry {
     pub fn new() -> Self {
         Self::with_fuel(DEFAULT_PIPELINE_FUEL)
@@ -201,14 +234,33 @@ impl PluginRegistry {
         pipeline_limits: PipelineLimits,
         executor_config: ExecutorConfig,
     ) -> Result<Self, S4Error> {
+        Self::with_options_and_cache(fuel, pipeline_limits, executor_config, None)
+    }
+
+    pub fn with_options_and_cache(
+        fuel: u64,
+        pipeline_limits: PipelineLimits,
+        executor_config: ExecutorConfig,
+        cache_max_weight: Option<usize>,
+    ) -> Result<Self, S4Error> {
         if fuel == 0 {
             return Err(S4Error::new(
                 codes::CONFIG_INVALID,
                 "pipeline fuel must be greater than zero",
             ));
         }
+        let cache_max_weight = cache_max_weight.unwrap_or(DEFAULT_COMPILE_CACHE_MAX_WEIGHT);
+        if cache_max_weight == 0 {
+            return Err(S4Error::new(
+                codes::CONFIG_INVALID,
+                "component compile cache weight must be greater than zero",
+            ));
+        }
         Ok(Self {
-            state: RwLock::new(RegistryState::default()),
+            state: RwLock::new(RegistryState {
+                cache_max_weight,
+                ..RegistryState::default()
+            }),
             fuel,
             pipeline_limits: pipeline_limits.validate()?,
             executor: Arc::new(WasmExecutor::new(executor_config)?),
@@ -226,27 +278,28 @@ impl PluginRegistry {
         capabilities: PluginCapabilities,
     ) -> anyhow::Result<PluginInfo> {
         let component_hash = hex::encode(Sha256::digest(component_bytes));
-        let mut state = self.state.write().unwrap();
-        let engine = if let Some(engine) = state.engines.get(&component_hash) {
-            let registered = state
-                .capabilities
-                .get(&component_hash)
-                .expect("cached component capabilities must exist");
-            if registered != &capabilities {
-                anyhow::bail!(
-                    "component {component_hash} is already registered with different capabilities"
-                );
+        let engine = match self.cached_engine(&component_hash) {
+            Some((engine, registered)) => {
+                if registered != capabilities {
+                    anyhow::bail!(
+                        "component {component_hash} is already registered with different capabilities"
+                    );
+                }
+                engine
             }
-            Arc::clone(engine)
-        } else {
-            let engine = Arc::new(FilterEngine::with_fuel(component_bytes, self.fuel)?);
-            state
-                .engines
-                .insert(component_hash.clone(), Arc::clone(&engine));
-            state
-                .capabilities
-                .insert(component_hash.clone(), capabilities);
-            engine
+            None => {
+                // Compile outside the registry lock so a slow first compile
+                // never stalls catalog reads or other request paths.
+                let engine = Arc::new(FilterEngine::with_fuel(component_bytes, self.fuel)?);
+                self.insert_engine(
+                    component_hash.clone(),
+                    Arc::clone(&engine),
+                    capabilities,
+                    Arc::from(component_bytes),
+                    engine.guest_memory_limit(),
+                );
+                engine
+            }
         };
         let id = Uuid::new_v4().to_string();
         let info = PluginInfo {
@@ -256,6 +309,7 @@ impl PluginRegistry {
             enabled: true,
             description: String::new(),
         };
+        let mut state = self.state.write().unwrap();
         state.plugins.insert(
             id.clone(),
             Plugin {
@@ -336,6 +390,197 @@ impl PluginRegistry {
             .map(|plugin| Arc::clone(&plugin.engine))
     }
 
+    /// Look up a compiled engine by component digest, refreshing LRU recency.
+    /// Returns the engine and the capabilities recorded at first registration.
+    pub(crate) fn cached_engine(
+        &self,
+        component_hash: &str,
+    ) -> Option<(Arc<FilterEngine>, PluginCapabilities)> {
+        let mut state = self.state.write().unwrap();
+        let entry = state.engines.get(component_hash)?;
+        let result = (Arc::clone(&entry.engine), entry.capabilities);
+        if let Some(pos) = state
+            .cache_order
+            .iter()
+            .position(|hash| hash == component_hash)
+        {
+            state.cache_order.remove(pos);
+            state.cache_order.push_back(component_hash.to_string());
+        }
+        Some(result)
+    }
+
+    /// Content-addressed bytes retained in the compile cache.
+    pub(crate) fn component_bytes(&self, component_hash: &str) -> Option<Arc<[u8]>> {
+        self.state
+            .read()
+            .unwrap()
+            .engines
+            .get(component_hash)
+            .map(|entry| Arc::clone(&entry.bytes))
+    }
+
+    /// Insert or refresh a compiled engine in the bounded digest-keyed cache.
+    /// Evicts least-recently-used entries until the weighted budget is met.
+    fn insert_engine(
+        &self,
+        component_hash: String,
+        engine: Arc<FilterEngine>,
+        capabilities: PluginCapabilities,
+        bytes: Arc<[u8]>,
+        weight: usize,
+    ) {
+        let mut state = self.state.write().unwrap();
+        if let Some(existing) = state.engines.get(&component_hash) {
+            if existing.capabilities != capabilities {
+                return;
+            }
+            if let Some(pos) = state
+                .cache_order
+                .iter()
+                .position(|hash| hash == &component_hash)
+            {
+                state.cache_order.remove(pos);
+            }
+            state.cache_order.push_back(component_hash);
+            return;
+        }
+        state.cache_weight = state.cache_weight.saturating_add(weight);
+        state.engines.insert(
+            component_hash.clone(),
+            CacheEntry {
+                engine,
+                capabilities,
+                bytes,
+                weight,
+            },
+        );
+        state.cache_order.push_back(component_hash);
+        // Weighted LRU eviction. Only evict entries no longer referenced by the
+        // catalog, so the self-hosted static chain is never dropped.
+        while state.cache_weight > state.cache_max_weight {
+            let referenced: HashSet<&str> = state
+                .plugins
+                .values()
+                .map(|plugin| plugin.component_hash.as_str())
+                .collect();
+            let victim = state.cache_order.iter().find(|hash| {
+                !referenced.contains(hash.as_str()) && state.engines.contains_key(*hash)
+            });
+            let Some(victim) = victim.cloned() else {
+                break;
+            };
+            if let Some(pos) = state.cache_order.iter().position(|hash| hash == &victim) {
+                state.cache_order.remove(pos);
+            }
+            if let Some(entry) = state.engines.remove(&victim) {
+                state.cache_weight = state.cache_weight.saturating_sub(entry.weight);
+            }
+        }
+    }
+
+    /// Snapshot builder over an immutable [`PipelineResolution`]. Missing
+    /// component bytes are fetched through `source`, hash-verified, compiled
+    /// outside the registry lock, and cached for the process lifetime budget.
+    pub async fn snapshot_for(
+        &self,
+        resolution: &PipelineResolution,
+        source: &dyn ComponentSource,
+    ) -> Result<PipelineSnapshot, S4Error> {
+        if pipeline_requires_passthrough(resolution) {
+            return Err(S4Error::new(
+                codes::CONFIG_INVALID,
+                "empty pipeline requires explicit pass-through",
+            ));
+        }
+        let limits = resolution.limits.validate()?;
+        let mut plugins = Vec::with_capacity(resolution.steps.len());
+        for step in &resolution.steps {
+            let engine = self.engine_for(step, source).await?;
+            plugins.push(SnapshotPlugin {
+                info: plugin_step_info(step),
+                component_hash: step.component_hash.clone(),
+                capabilities: step.capabilities,
+                engine,
+            });
+        }
+        Ok(PipelineSnapshot {
+            plugins,
+            limits,
+            executor: Arc::clone(&self.executor),
+        })
+    }
+
+    async fn engine_for(
+        &self,
+        step: &PipelineStep,
+        source: &dyn ComponentSource,
+    ) -> Result<Arc<FilterEngine>, S4Error> {
+        if let Some((engine, registered)) = self.cached_engine(&step.component_hash) {
+            if registered != step.capabilities {
+                return Err(S4Error::new(
+                    codes::CONFIG_INVALID,
+                    format!(
+                        "component {} is already registered with different capabilities",
+                        step.component_hash
+                    ),
+                ));
+            }
+            return Ok(engine);
+        }
+        let bytes = source.load(&step.component_hash).await?;
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != step.component_hash {
+            return Err(S4Error::new(
+                codes::WASM_INIT,
+                format!(
+                    "component {} digest mismatch after fetch",
+                    step.component_hash
+                ),
+            ));
+        }
+        // Compile outside the registry lock (we already hold no lock here).
+        let engine = Arc::new(FilterEngine::with_fuel(&bytes, self.fuel).map_err(|error| {
+            S4Error::new(
+                codes::WASM_INIT,
+                format!(
+                    "component {} failed to compile: {error}",
+                    step.component_hash
+                ),
+            )
+        })?);
+        self.insert_engine(
+            step.component_hash.clone(),
+            Arc::clone(&engine),
+            step.capabilities,
+            Arc::from(bytes.as_ref()),
+            engine.guest_memory_limit(),
+        );
+        Ok(engine)
+    }
+
+    /// Ordered enabled catalog entries for the static/self-hosted resolver.
+    pub(crate) fn enabled_catalog(&self) -> Vec<(PluginInfo, String, PluginCapabilities)> {
+        let state = self.state.read().unwrap();
+        state
+            .order
+            .iter()
+            .filter_map(|id| state.plugins.get(id))
+            .filter(|plugin| plugin.info.enabled)
+            .map(|plugin| {
+                (
+                    plugin.info.clone(),
+                    plugin.component_hash.clone(),
+                    plugin.capabilities,
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn pipeline_limits(&self) -> PipelineLimits {
+        self.pipeline_limits
+    }
+
     pub fn snapshot(&self) -> PipelineSnapshot {
         let state = self.state.read().unwrap();
         let plugins = state
@@ -386,6 +631,16 @@ impl PluginRegistry {
                 .and_then(|name| name.to_str())
                 .unwrap_or("unknown");
             let hash = hex::encode(Sha256::digest(&bytes));
+            // The directory is a catalog, not a pipeline: skip artifacts whose
+            // digest was already registered (for example `pii-default`, which
+            // the hosted image also loads explicitly). This stops duplicate
+            // default loading and preserves the first registration's caps.
+            if self.state.read().unwrap().engines.contains_key(&hash) {
+                tracing::debug!(
+                    "skipping duplicate component {name} ({hash}) already in the catalog"
+                );
+                continue;
+            }
             let capabilities = PluginCapabilities {
                 prefix_safe_for_read: prefix_safe_hashes.contains(&hash),
             };
@@ -1004,6 +1259,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::pipeline::PipelineResolver;
 
     fn component_named(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1712,5 +1968,148 @@ mod tests {
             Record::new("two", "\n")
         );
         assert!(pipeline.finish().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_rejects_empty_chain_without_explicit_passthrough() {
+        let registry = PluginRegistry::new();
+        let resolution = PipelineResolution {
+            locator: crate::pipeline::PipelineLocator {
+                revision: "test".to_string(),
+                fingerprint: "deadbeef".to_string(),
+            },
+            steps: Vec::new(),
+            explicit_passthrough: false,
+            limits: PipelineLimits::default(),
+        };
+        let error = registry
+            .snapshot_for(&resolution, &registry)
+            .await
+            .err()
+            .expect("empty pipeline without explicit passthrough must fail");
+        assert_eq!(error.code(), codes::CONFIG_INVALID);
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_accepts_explicit_passthrough() {
+        let registry = PluginRegistry::new();
+        let resolution = PipelineResolution {
+            locator: crate::pipeline::PipelineLocator {
+                revision: "test".to_string(),
+                fingerprint: "deadbeef".to_string(),
+            },
+            steps: Vec::new(),
+            explicit_passthrough: true,
+            limits: PipelineLimits::default(),
+        };
+        let snapshot = registry
+            .snapshot_for(&resolution, &registry)
+            .await
+            .expect("explicit pass-through is legal");
+        assert!(snapshot.component_hashes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_verifies_digest_after_component_source_fetch() {
+        let registry = PluginRegistry::new();
+        let step = PipelineStep {
+            component_hash: "bogus-not-a-real-sha256".to_string(),
+            version: None,
+            config_json: None,
+            capabilities: PluginCapabilities::default(),
+        };
+        let resolution = PipelineResolution {
+            locator: crate::pipeline::PipelineLocator {
+                revision: "test".to_string(),
+                fingerprint: "deadbeef".to_string(),
+            },
+            steps: vec![step],
+            explicit_passthrough: false,
+            limits: PipelineLimits::default(),
+        };
+        let error = registry
+            .snapshot_for(&resolution, &registry)
+            .await
+            .err()
+            .expect("digest mismatch must fail");
+        assert_eq!(error.code(), codes::WASM_INIT);
+    }
+
+    #[tokio::test]
+    async fn static_resolver_freezes_the_enabled_catalog_in_order() {
+        let registry = Arc::new(PluginRegistry::new());
+        registry.import("b", &component()).unwrap();
+        registry.import("a", &component()).unwrap();
+        let resolver = crate::pipeline::StaticPipelineResolver::new(registry.clone());
+        let resolved = resolver
+            .resolve("ws", "bucket", crate::pipeline::PipelineDirection::Write)
+            .await
+            .unwrap();
+        assert_eq!(resolved.locator.revision, "static");
+        assert_eq!(resolved.steps.len(), 2);
+        assert_eq!(
+            resolved.steps[0].version.as_deref(),
+            Some(registry.list()[0].version.as_str())
+        );
+        let snapshot = registry
+            .snapshot_for(&resolved, registry.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.component_hashes().len(), 2);
+
+        let read_resolved = resolver
+            .resolve("ws", "bucket", crate::pipeline::PipelineDirection::Read)
+            .await
+            .unwrap();
+        assert_ne!(
+            resolved.locator.fingerprint, read_resolved.locator.fingerprint,
+            "write and read pipelines must fingerprint distinctly"
+        );
+    }
+
+    #[tokio::test]
+    async fn component_source_compiles_and_caches_missing_digests() {
+        let registry = PluginRegistry::new();
+        let bytes = component();
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let step = PipelineStep {
+            component_hash: digest,
+            version: Some("1.0.0".to_string()),
+            config_json: None,
+            capabilities: PluginCapabilities::default(),
+        };
+        let resolution = PipelineResolution {
+            locator: crate::pipeline::PipelineLocator {
+                revision: "test".to_string(),
+                fingerprint: "deadbeef".to_string(),
+            },
+            steps: vec![step],
+            explicit_passthrough: false,
+            limits: PipelineLimits::default(),
+        };
+        let source = Arc::new(StaticComponentSource {
+            bytes: Arc::new(bytes),
+        });
+        let snapshot = registry
+            .snapshot_for(&resolution, source.as_ref())
+            .await
+            .expect("digest-verified fetch must compile");
+        assert_eq!(
+            snapshot.component_hashes(),
+            [resolution.steps[0].component_hash.clone()]
+        );
+        let cached = registry.cached_engine(&resolution.steps[0].component_hash);
+        assert!(cached.is_some(), "compiled engine must be cached");
+    }
+
+    struct StaticComponentSource {
+        bytes: Arc<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl ComponentSource for StaticComponentSource {
+        async fn load(&self, _component_hash: &str) -> Result<Bytes, S4Error> {
+            Ok(Bytes::from(self.bytes.as_ref().clone()))
+        }
     }
 }

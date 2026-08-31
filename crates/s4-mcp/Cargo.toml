@@ -1,0 +1,30 @@
+[package]
+name = "s4-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local stdio MCP server for the S4 object-processing gateway"
+publish = false
+
+[[bin]]
+name = "s4-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+futures-util = "0.3"
+quick-xml = { version = "0.38", features = ["serialize"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rmcp = { version = "3.1", features = ["server", "macros", "schemars", "transport-io"] }
+schemars = "1"
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2"
+
+[dev-dependencies]
+axum.workspace = true
+http-body-util = "0.1"
+serde_json.workspace = true

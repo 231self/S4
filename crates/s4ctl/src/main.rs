@@ -57,6 +57,20 @@ enum Command {
         cmd: PluginCmd,
     },
 
+    /// Manage hosted filter pipelines as a workspace owner. Authenticates with
+    /// a Supabase access token (`S4_ACCESS_TOKEN` / `--token`) — never an S4
+    /// data-plane API key.
+    Hosted {
+        /// Workspace ID (UUID)
+        #[arg(long, env = "S4_WORKSPACE_ID")]
+        workspace: String,
+        /// Supabase access token (JWT)
+        #[arg(long, env = "S4_ACCESS_TOKEN")]
+        token: Option<String>,
+        #[command(subcommand)]
+        cmd: HostedCmd,
+    },
+
     /// Upload a file through S4 (runs it through the plugin pipeline)
     Put {
         /// Source file to upload
@@ -194,6 +208,160 @@ enum PluginCmd {
 
     /// Reorder the plugin pipeline (list all plugin ids in desired order)
     Reorder { ids: Vec<String> },
+}
+
+#[derive(Subcommand)]
+enum HostedCmd {
+    /// List the workspace plugin catalog (built-ins and custom, with versions
+    /// and capability grants)
+    Catalog,
+
+    /// Stage a raw Wasm component into the private quarantine artifact store
+    /// (content-addressed; no relational records are created)
+    Stage {
+        /// Path to a .wasm component
+        file: PathBuf,
+    },
+
+    /// Stage a component and register a custom plugin version with a
+    /// validation run (upload -> validate)
+    Upload {
+        /// Path to a .wasm component
+        file: PathBuf,
+        /// Unique plugin slug, e.g. `my-redactor`
+        #[arg(long)]
+        slug: String,
+        /// Human-readable display name
+        #[arg(long)]
+        display_name: String,
+        /// Human-readable version label, e.g. `1.0.0`
+        #[arg(long)]
+        version: String,
+        /// WIT world, one of `s4-filter@0.1.0`, `s4-filter@0.2.0`
+        #[arg(long, default_value = "s4-filter@0.1.0")]
+        world: String,
+        /// WIT version label, e.g. `0.1.0` or `0.2.0`
+        #[arg(long, default_value = "0.1.0")]
+        wit_version: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+        /// Requested capability, repeatable (e.g. `stable_fields`)
+        #[arg(long = "capability")]
+        capability: Vec<String>,
+        /// Path to a JSON config schema (v0.2 world only)
+        #[arg(long)]
+        config_schema: Option<PathBuf>,
+    },
+
+    /// Poll the validation status of a plugin version
+    Validation { version_id: String },
+
+    /// Grant a capability to an installed plugin version
+    Grant {
+        /// Installation ID from the catalog
+        #[arg(long)]
+        installation_id: String,
+        /// Capability name (e.g. `stable_fields`)
+        #[arg(long)]
+        capability: String,
+        /// Plugin version ID being granted
+        #[arg(long)]
+        version_id: String,
+    },
+
+    /// Revoke a capability from an installed plugin version
+    Revoke {
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        capability: String,
+        #[arg(long)]
+        version_id: String,
+    },
+
+    /// List, create, edit, publish, or roll back pipelines
+    Pipelines {
+        #[command(subcommand)]
+        cmd: HostedPipelineCmd,
+    },
+
+    /// List pipeline assignments and bucket scopes
+    Assignments,
+
+    /// Set the workspace default pipeline for a direction
+    AssignDefault {
+        /// `write` or `read`
+        direction: String,
+        /// Pipeline ID
+        #[arg(long)]
+        pipeline_id: String,
+    },
+
+    /// Assign a pipeline to an exact logical bucket for a direction
+    AssignBucket {
+        /// `write` or `read`
+        direction: String,
+        /// Exact logical bucket name
+        bucket: String,
+        /// Pipeline ID
+        #[arg(long)]
+        pipeline_id: String,
+    },
+
+    /// Remove an exact bucket assignment (restores default inheritance)
+    UnassignBucket {
+        /// `write` or `read`
+        direction: String,
+        /// Exact logical bucket name
+        bucket: String,
+    },
+
+    /// Show the workspace filter audit trail
+    Audit {
+        /// Maximum events to return (default 100, max 500)
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostedPipelineCmd {
+    /// List pipelines with their published revisions
+    List,
+
+    /// Create a pipeline with an empty draft revision
+    Create {
+        /// `write` or `read`
+        direction: String,
+        /// Pipeline name
+        name: String,
+    },
+
+    /// Replace the draft steps of a pipeline
+    Draft {
+        /// Pipeline ID
+        pipeline_id: String,
+        /// Explicitly publish an empty (pass-through) chain; false requires
+        /// at least one step
+        #[arg(long, default_value_t = false)]
+        passthrough: bool,
+        /// Step as `installation_id:version_id[:config.json]`, repeatable, in
+        /// execution order
+        #[arg(long = "step")]
+        steps: Vec<String>,
+    },
+
+    /// Publish the current draft revision
+    Publish { pipeline_id: String },
+
+    /// Roll back to a prior published revision
+    Rollback {
+        /// Pipeline ID
+        pipeline_id: String,
+        /// Published revision ID to restore
+        revision_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -427,6 +595,143 @@ impl Client {
     }
 }
 
+/// Hosted (SaaS control plane) client. Authenticates exclusively with a
+/// Supabase access token; a data-plane API key is never accepted here.
+struct HostedApi {
+    gateway: String,
+    workspace: String,
+    token: String,
+    http: reqwest::Client,
+}
+
+impl HostedApi {
+    fn new(gateway: &str, workspace: &str, token: &str) -> Self {
+        Self {
+            gateway: gateway.trim_end_matches('/').to_string(),
+            workspace: workspace.to_string(),
+            token: token.to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn path(&self, suffix: &str) -> String {
+        format!(
+            "{}/dashboard/api/workspaces/{}/{}",
+            self.gateway, self.workspace, suffix
+        )
+    }
+
+    fn auth_headers(&self) -> anyhow::Result<HeaderMap> {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+        );
+        Ok(h)
+    }
+
+    fn json_headers(&self) -> anyhow::Result<HeaderMap> {
+        let mut h = self.auth_headers()?;
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        Ok(h)
+    }
+
+    async fn get<T: for<'de> Deserialize<'de>>(&self, suffix: &str) -> anyhow::Result<T> {
+        let resp = self
+            .http
+            .get(self.path(suffix))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            bail!("GET {}: {} — {}", suffix, status, body);
+        }
+        serde_json::from_str(&body).with_context(|| format!("parse GET {}: {}", suffix, body))
+    }
+
+    async fn post<T: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        suffix: &str,
+        body: &T,
+    ) -> anyhow::Result<R> {
+        let resp = self
+            .http
+            .post(self.path(suffix))
+            .headers(self.json_headers()?)
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            bail!("POST {}: {} — {}", suffix, status, text);
+        }
+        serde_json::from_str(&text).with_context(|| format!("parse POST {}: {}", suffix, text))
+    }
+
+    async fn put<T: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        suffix: &str,
+        body: &T,
+    ) -> anyhow::Result<R> {
+        let resp = self
+            .http
+            .put(self.path(suffix))
+            .headers(self.json_headers()?)
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            bail!("PUT {}: {} — {}", suffix, status, text);
+        }
+        serde_json::from_str(&text).with_context(|| format!("parse PUT {}: {}", suffix, text))
+    }
+
+    async fn delete<T: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        suffix: &str,
+        body: &T,
+    ) -> anyhow::Result<R> {
+        let resp = self
+            .http
+            .delete(self.path(suffix))
+            .headers(self.json_headers()?)
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            bail!("DELETE {}: {} — {}", suffix, status, text);
+        }
+        serde_json::from_str(&text).with_context(|| format!("parse DELETE {}: {}", suffix, text))
+    }
+
+    /// Stage raw Wasm bytes into the private quarantine artifact store.
+    async fn stage_artifact(&self, bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+        let mut headers = self.auth_headers()?;
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/wasm"));
+        let resp = self
+            .http
+            .post(self.path("filter-artifacts"))
+            .headers(headers)
+            .body(bytes.to_vec())
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            bail!("POST filter-artifacts: {} — {}", status, text);
+        }
+        serde_json::from_str(&text)
+            .with_context(|| format!("parse POST filter-artifacts: {}", text))
+    }
+}
+
 fn project_root() -> anyhow::Result<PathBuf> {
     let mut dir = std::env::current_dir()?;
     loop {
@@ -448,6 +753,31 @@ fn parse_expiry(expiry: &str) -> u64 {
         "1y" | "365" => 31536000,
         s => s.parse().unwrap_or(0),
     }
+}
+
+/// Parse a hosted draft step of the form
+/// `installation_id:version_id[:config.json]`. Config is optional and only
+/// valid for v0.2 world components (the server rejects it otherwise).
+fn parse_draft_step(raw: &str) -> anyhow::Result<serde_json::Value> {
+    let parts = raw.split(':').collect::<Vec<_>>();
+    if parts.len() < 2 || parts.len() > 3 {
+        bail!("invalid step {raw:?}; expected installation_id:version_id[:config.json]");
+    }
+    let config_json = match parts.get(2) {
+        Some(path) if !path.is_empty() => {
+            let raw_config = std::fs::read_to_string(path)
+                .with_context(|| format!("Cannot read step config {}", path))?;
+            let config: serde_json::Value = serde_json::from_str(&raw_config)
+                .with_context(|| format!("Invalid JSON in step config {}", path))?;
+            Some(config)
+        }
+        _ => None,
+    };
+    Ok(serde_json::json!({
+        "installation_id": parts[0],
+        "plugin_version_id": parts[1],
+        "config_json": config_json,
+    }))
 }
 
 #[tokio::main]
@@ -704,6 +1034,383 @@ async fn main() -> anyhow::Result<()> {
                         .api_put("/dashboard/api/plugins/reorder", &body)
                         .await?;
                     println!("Plugin pipeline reordered.");
+                }
+            }
+        }
+
+        Command::Hosted {
+            workspace,
+            token,
+            cmd,
+        } => {
+            let token = token
+                .clone()
+                .or_else(|| std::env::var("S4_ACCESS_TOKEN").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "hosted commands require a Supabase access token via --token or S4_ACCESS_TOKEN"
+                    )
+                })?;
+            if token.is_empty() {
+                bail!("S4_ACCESS_TOKEN must not be empty");
+            }
+            let api = HostedApi::new(&cli.gateway, workspace, &token);
+            match cmd {
+                HostedCmd::Catalog => {
+                    let value: serde_json::Value = api.get("filter-catalog").await?;
+                    let plugins = value["plugins"].as_array().cloned().unwrap_or_default();
+                    if plugins.is_empty() {
+                        println!("No plugins in the workspace catalog.");
+                    } else {
+                        for entry in &plugins {
+                            let installation = &entry["installation"];
+                            let plugin = &entry["plugin"];
+                            println!(
+                                "{}  {}  install={}  world={}",
+                                plugin["id"].as_str().unwrap_or("?"),
+                                plugin["display_name"].as_str().unwrap_or("?"),
+                                installation["id"].as_str().unwrap_or("?"),
+                                installation["world"]
+                                    .as_str()
+                                    .or_else(|| plugin["world"].as_str())
+                                    .unwrap_or("?")
+                            );
+                            for version in entry["versions"].as_array().unwrap_or(&vec![]) {
+                                println!(
+                                    "    version {}  digest={}  state={}",
+                                    version["version"].as_str().unwrap_or("?"),
+                                    version["digest"]
+                                        .as_str()
+                                        .unwrap_or("?")
+                                        .chars()
+                                        .take(12)
+                                        .collect::<String>(),
+                                    version["state"].as_str().unwrap_or("?")
+                                );
+                            }
+                        }
+                    }
+                }
+                HostedCmd::Stage { file } => {
+                    let bytes = std::fs::read(file)
+                        .with_context(|| format!("Cannot read {}", file.display()))?;
+                    let staged = api.stage_artifact(&bytes).await?;
+                    println!(
+                        "Staged {} bytes",
+                        staged["size_bytes"].as_u64().unwrap_or(0)
+                    );
+                    println!("Digest:    {}", staged["digest"].as_str().unwrap_or("?"));
+                    println!(
+                        "ObjectKey: {}",
+                        staged["object_key"].as_str().unwrap_or("?")
+                    );
+                }
+                HostedCmd::Upload {
+                    file,
+                    slug,
+                    display_name,
+                    version,
+                    world,
+                    wit_version,
+                    description,
+                    capability,
+                    config_schema,
+                } => {
+                    let bytes = std::fs::read(file)
+                        .with_context(|| format!("Cannot read {}", file.display()))?;
+                    let staged = api.stage_artifact(&bytes).await?;
+                    let digest = staged["digest"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("artifact staging returned no digest"))?
+                        .to_string();
+                    let object_key = staged["object_key"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("artifact staging returned no object key"))?
+                        .to_string();
+                    let config_schema = match &config_schema {
+                        Some(path) => {
+                            let raw = std::fs::read_to_string(path)
+                                .with_context(|| format!("Cannot read {}", path.display()))?;
+                            let schema: serde_json::Value = serde_json::from_str(&raw)
+                                .with_context(|| {
+                                    format!("Invalid JSON config schema in {}", path.display())
+                                })?;
+                            Some(schema)
+                        }
+                        None => None,
+                    };
+                    let body = serde_json::json!({
+                        "slug": slug,
+                        "display_name": display_name,
+                        "description": description,
+                        "version": version,
+                        "world": world,
+                        "wit_version": wit_version,
+                        "digest": digest,
+                        "artifact_object_key": object_key,
+                        "capability_requests": capability,
+                        "config_schema": config_schema,
+                    });
+                    let created: serde_json::Value = api.post("filter-plugins", &body).await?;
+                    println!(
+                        "Uploaded {}: plugin={} version={} validation_run={}",
+                        slug,
+                        created["plugin_id"].as_str().unwrap_or("?"),
+                        created["version_id"].as_str().unwrap_or("?"),
+                        created["validation_run_id"].as_str().unwrap_or("?")
+                    );
+                    println!(
+                        "Poll with: s4ctl hosted --workspace {} validation {}",
+                        api.workspace,
+                        created["version_id"].as_str().unwrap_or("?")
+                    );
+                }
+                HostedCmd::Validation { version_id } => {
+                    let value: serde_json::Value = api
+                        .get(&format!("filter-plugin-versions/{version_id}/validation"))
+                        .await?;
+                    let version = &value["version"];
+                    println!(
+                        "Version {} (world {})",
+                        version["version"].as_str().unwrap_or("?"),
+                        version["wit_world"].as_str().unwrap_or("?")
+                    );
+                    let runs = value["runs"].as_array().cloned().unwrap_or_default();
+                    if runs.is_empty() {
+                        println!("No validation runs yet.");
+                    } else {
+                        for run in &runs {
+                            let state = run["state"].as_str().unwrap_or("?");
+                            let diagnostic = run["diagnostic_code"]
+                                .as_str()
+                                .and_then(|code| {
+                                    run["diagnostic_message"]
+                                        .as_str()
+                                        .map(|msg| format!("{code}: {msg}"))
+                                })
+                                .unwrap_or_else(|| "ok".to_string());
+                            println!(
+                                "run {}  state={}  {}",
+                                run["id"].as_str().unwrap_or("?"),
+                                state,
+                                if state == "succeeded" {
+                                    "succeeded"
+                                } else {
+                                    &diagnostic
+                                }
+                            );
+                        }
+                    }
+                }
+                HostedCmd::Grant {
+                    installation_id,
+                    capability,
+                    version_id,
+                } => {
+                    let body = serde_json::json!({ "version_id": version_id });
+                    let _: serde_json::Value = api
+                        .put(
+                            &format!(
+                                "filter-installations/{installation_id}/capabilities/{capability}"
+                            ),
+                            &body,
+                        )
+                        .await?;
+                    println!("Capability {capability} granted on installation {installation_id}.");
+                }
+                HostedCmd::Revoke {
+                    installation_id,
+                    capability,
+                    version_id,
+                } => {
+                    let body = serde_json::json!({ "version_id": version_id });
+                    let _: serde_json::Value = api
+                        .delete(
+                            &format!(
+                                "filter-installations/{installation_id}/capabilities/{capability}"
+                            ),
+                            &body,
+                        )
+                        .await?;
+                    println!("Capability {capability} revoked on installation {installation_id}.");
+                }
+                HostedCmd::Pipelines { cmd } => match cmd {
+                    HostedPipelineCmd::List => {
+                        let value: serde_json::Value = api.get("filter-pipelines").await?;
+                        let pipelines = value["pipelines"].as_array().cloned().unwrap_or_default();
+                        if pipelines.is_empty() {
+                            println!("No pipelines.");
+                        } else {
+                            for pipeline in &pipelines {
+                                let active = pipeline["active_revision_id"].as_str().unwrap_or("-");
+                                println!(
+                                    "{}  {}  {}  active_revision={}",
+                                    pipeline["id"].as_str().unwrap_or("?"),
+                                    pipeline["direction"].as_str().unwrap_or("?"),
+                                    pipeline["name"].as_str().unwrap_or("?"),
+                                    active
+                                );
+                                for revision in pipeline["published_revisions"]
+                                    .as_array()
+                                    .unwrap_or(&vec![])
+                                {
+                                    let passthrough =
+                                        revision["explicit_passthrough"].as_bool().unwrap_or(false);
+                                    println!(
+                                        "    rev {}  published_at={}  passthrough={}",
+                                        revision["revision_no"].as_u64().unwrap_or(0),
+                                        revision["published_at"].as_str().unwrap_or("?"),
+                                        passthrough
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    HostedPipelineCmd::Create { direction, name } => {
+                        let body = serde_json::json!({ "direction": direction, "name": name });
+                        let created: serde_json::Value =
+                            api.post("filter-pipelines", &body).await?;
+                        println!(
+                            "Created pipeline {} (draft revision {})",
+                            created["pipeline"]["id"].as_str().unwrap_or("?"),
+                            created["draft_revision"]["id"].as_str().unwrap_or("?")
+                        );
+                    }
+                    HostedPipelineCmd::Draft {
+                        pipeline_id,
+                        passthrough,
+                        steps,
+                    } => {
+                        let parsed = steps
+                            .iter()
+                            .map(|raw| parse_draft_step(raw))
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        let body = serde_json::json!({
+                            "explicit_passthrough": passthrough,
+                            "steps": parsed,
+                        });
+                        let updated: serde_json::Value = api
+                            .put(&format!("filter-pipelines/{pipeline_id}/draft"), &body)
+                            .await?;
+                        println!(
+                            "Draft updated: revision {} fingerprint={} steps={}",
+                            updated["revision_id"].as_str().unwrap_or("?"),
+                            updated["fingerprint"].as_str().unwrap_or("?"),
+                            updated["steps"].as_u64().unwrap_or(0)
+                        );
+                    }
+                    HostedPipelineCmd::Publish { pipeline_id } => {
+                        let body = serde_json::json!({});
+                        let published: serde_json::Value = api
+                            .post(&format!("filter-pipelines/{pipeline_id}/publish"), &body)
+                            .await?;
+                        println!(
+                            "Published revision {} (revision_no {}) fingerprint={}",
+                            published["revision_id"].as_str().unwrap_or("?"),
+                            published["revision_no"].as_u64().unwrap_or(0),
+                            published["fingerprint"].as_str().unwrap_or("?")
+                        );
+                    }
+                    HostedPipelineCmd::Rollback {
+                        pipeline_id,
+                        revision_id,
+                    } => {
+                        let body = serde_json::json!({});
+                        let rolled_back: serde_json::Value = api
+                            .post(
+                                &format!("filter-pipelines/{pipeline_id}/rollback/{revision_id}"),
+                                &body,
+                            )
+                            .await?;
+                        println!(
+                            "Rolled back to revision {} (revision_no {}) fingerprint={}",
+                            rolled_back["revision_id"].as_str().unwrap_or("?"),
+                            rolled_back["revision_no"].as_u64().unwrap_or(0),
+                            rolled_back["fingerprint"].as_str().unwrap_or("?")
+                        );
+                    }
+                },
+                HostedCmd::Assignments => {
+                    let value: serde_json::Value = api.get("filter-assignments").await?;
+                    let assignments = value["assignments"].as_array().cloned().unwrap_or_default();
+                    let scopes = value["bucket_scopes"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    if assignments.is_empty() {
+                        println!("No assignments (workspace defaults inherit).");
+                    } else {
+                        for assignment in &assignments {
+                            let scope_id = assignment["bucket_scope_id"].as_str().unwrap_or("-");
+                            println!(
+                                "{}  pipeline={}  scope={}",
+                                assignment["direction"].as_str().unwrap_or("?"),
+                                assignment["pipeline_id"].as_str().unwrap_or("?"),
+                                scope_id
+                            );
+                        }
+                    }
+                    for scope in &scopes {
+                        println!(
+                            "bucket scope {} = {}",
+                            scope["id"].as_str().unwrap_or("?"),
+                            scope["bucket_name"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+                HostedCmd::AssignDefault {
+                    direction,
+                    pipeline_id,
+                } => {
+                    let body = serde_json::json!({ "pipeline_id": pipeline_id });
+                    let _: serde_json::Value = api
+                        .put(&format!("filter-assignments/{direction}/default"), &body)
+                        .await?;
+                    println!("Default {direction} pipeline set to {pipeline_id}.");
+                }
+                HostedCmd::AssignBucket {
+                    direction,
+                    bucket,
+                    pipeline_id,
+                } => {
+                    let body = serde_json::json!({ "pipeline_id": pipeline_id });
+                    let _: serde_json::Value = api
+                        .put(
+                            &format!("filter-assignments/{direction}/buckets/{bucket}"),
+                            &body,
+                        )
+                        .await?;
+                    println!("{direction} pipeline {pipeline_id} assigned to bucket {bucket}.");
+                }
+                HostedCmd::UnassignBucket { direction, bucket } => {
+                    let body = serde_json::json!({});
+                    let _: serde_json::Value = api
+                        .delete(
+                            &format!("filter-assignments/{direction}/buckets/{bucket}"),
+                            &body,
+                        )
+                        .await?;
+                    println!("Removed {direction} assignment for bucket {bucket}.");
+                }
+                HostedCmd::Audit { limit } => {
+                    let suffix = match limit {
+                        Some(limit) => format!("filter-audit?limit={limit}"),
+                        None => "filter-audit".to_string(),
+                    };
+                    let value: serde_json::Value = api.get(&suffix).await?;
+                    let events = value["events"].as_array().cloned().unwrap_or_default();
+                    if events.is_empty() {
+                        println!("No audit events.");
+                    } else {
+                        for event in &events {
+                            println!(
+                                "{}  {}  {}",
+                                event["created_at"].as_str().unwrap_or("?"),
+                                event["action"].as_str().unwrap_or("?"),
+                                event["actor_user_id"].as_str().unwrap_or("?")
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -987,4 +1694,63 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_draft_step_accepts_installation_and_version() {
+        let step = parse_draft_step("install-1:version-2").unwrap();
+        assert_eq!(step["installation_id"], "install-1");
+        assert_eq!(step["plugin_version_id"], "version-2");
+        assert!(step["config_json"].is_null());
+    }
+
+    #[test]
+    fn parse_draft_step_reads_config_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "s4ctl-step-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, r#"{"field": "pii"}"#).unwrap();
+        let raw = format!("install-1:version-2:{}", config.display());
+        let step = parse_draft_step(&raw).unwrap();
+        assert_eq!(step["config_json"]["field"], "pii");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_draft_step_rejects_malformed_input() {
+        assert!(parse_draft_step("only-one-part").is_err());
+        assert!(parse_draft_step("a:b:c:d").is_err());
+        assert!(parse_draft_step("").is_err());
+    }
+
+    #[test]
+    fn hosted_api_path_scopes_to_the_workspace() {
+        let api = HostedApi::new("http://localhost:9000/", "ws-abc", "token");
+        assert_eq!(
+            api.path("filter-catalog"),
+            "http://localhost:9000/dashboard/api/workspaces/ws-abc/filter-catalog"
+        );
+    }
+
+    #[test]
+    fn hosted_token_is_never_fallback_to_data_plane_keys() {
+        let api = HostedApi::new("http://localhost:9000", "ws-abc", "secret-token");
+        let headers = api.auth_headers().unwrap();
+        assert_eq!(
+            headers.get("Authorization").unwrap().to_str().unwrap(),
+            "Bearer secret-token"
+        );
+        assert!(headers.get("x-s4-access-key").is_none());
+    }
 }

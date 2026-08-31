@@ -1,5 +1,6 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use reqwest::Url;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -598,27 +599,46 @@ impl Client {
 /// Hosted (SaaS control plane) client. Authenticates exclusively with a
 /// Supabase access token; a data-plane API key is never accepted here.
 struct HostedApi {
-    gateway: String,
+    gateway: Url,
     workspace: String,
     token: String,
     http: reqwest::Client,
 }
 
 impl HostedApi {
-    fn new(gateway: &str, workspace: &str, token: &str) -> Self {
-        Self {
-            gateway: gateway.trim_end_matches('/').to_string(),
+    fn new(gateway: &str, workspace: &str, token: &str) -> anyhow::Result<Self> {
+        let gateway = Url::parse(gateway).context("invalid hosted gateway URL")?;
+        if gateway.cannot_be_a_base() {
+            bail!("hosted gateway URL cannot be used as a base URL");
+        }
+        Ok(Self {
+            gateway,
             workspace: workspace.to_string(),
             token: token.to_string(),
             http: reqwest::Client::new(),
-        }
+        })
     }
 
-    fn path(&self, suffix: &str) -> String {
-        format!(
-            "{}/dashboard/api/workspaces/{}/{}",
-            self.gateway, self.workspace, suffix
-        )
+    fn path(&self, segments: &[&str]) -> anyhow::Result<Url> {
+        let mut url = self.gateway.clone();
+        url.set_query(None);
+        url.set_fragment(None);
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("hosted gateway URL cannot contain path segments"))?;
+        path.pop_if_empty();
+        path.extend(["dashboard", "api", "workspaces"]);
+        path.push(&self.workspace);
+        path.extend(segments.iter().copied());
+        drop(path);
+        Ok(url)
+    }
+
+    fn path_with_query(&self, segments: &[&str], query: &[(&str, String)]) -> anyhow::Result<Url> {
+        let mut url = self.path(segments)?;
+        url.query_pairs_mut()
+            .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
+        Ok(url)
     }
 
     fn auth_headers(&self) -> anyhow::Result<HeaderMap> {
@@ -636,29 +656,39 @@ impl HostedApi {
         Ok(h)
     }
 
-    async fn get<T: for<'de> Deserialize<'de>>(&self, suffix: &str) -> anyhow::Result<T> {
+    async fn get<T: for<'de> Deserialize<'de>>(&self, segments: &[&str]) -> anyhow::Result<T> {
+        self.get_with_query(segments, &[]).await
+    }
+
+    async fn get_with_query<T: for<'de> Deserialize<'de>>(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> anyhow::Result<T> {
+        let url = self.path_with_query(segments, query)?;
         let resp = self
             .http
-            .get(self.path(suffix))
+            .get(url.clone())
             .headers(self.auth_headers()?)
             .send()
             .await?;
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            bail!("GET {}: {} — {}", suffix, status, body);
+            bail!("GET {}: {} — {}", url, status, body);
         }
-        serde_json::from_str(&body).with_context(|| format!("parse GET {}: {}", suffix, body))
+        serde_json::from_str(&body).with_context(|| format!("parse GET {}: {}", url, body))
     }
 
     async fn post<T: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
-        suffix: &str,
+        segments: &[&str],
         body: &T,
     ) -> anyhow::Result<R> {
+        let url = self.path(segments)?;
         let resp = self
             .http
-            .post(self.path(suffix))
+            .post(url.clone())
             .headers(self.json_headers()?)
             .json(body)
             .send()
@@ -666,19 +696,20 @@ impl HostedApi {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("POST {}: {} — {}", suffix, status, text);
+            bail!("POST {}: {} — {}", url, status, text);
         }
-        serde_json::from_str(&text).with_context(|| format!("parse POST {}: {}", suffix, text))
+        serde_json::from_str(&text).with_context(|| format!("parse POST {}: {}", url, text))
     }
 
     async fn put<T: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
-        suffix: &str,
+        segments: &[&str],
         body: &T,
     ) -> anyhow::Result<R> {
+        let url = self.path(segments)?;
         let resp = self
             .http
-            .put(self.path(suffix))
+            .put(url.clone())
             .headers(self.json_headers()?)
             .json(body)
             .send()
@@ -686,19 +717,16 @@ impl HostedApi {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("PUT {}: {} — {}", suffix, status, text);
+            bail!("PUT {}: {} — {}", url, status, text);
         }
-        serde_json::from_str(&text).with_context(|| format!("parse PUT {}: {}", suffix, text))
+        serde_json::from_str(&text).with_context(|| format!("parse PUT {}: {}", url, text))
     }
 
-    async fn delete<T: Serialize, R: for<'de> Deserialize<'de>>(
-        &self,
-        suffix: &str,
-        body: &T,
-    ) -> anyhow::Result<R> {
+    async fn put_unit<T: Serialize>(&self, segments: &[&str], body: &T) -> anyhow::Result<()> {
+        let url = self.path(segments)?;
         let resp = self
             .http
-            .delete(self.path(suffix))
+            .put(url.clone())
             .headers(self.json_headers()?)
             .json(body)
             .send()
@@ -706,9 +734,26 @@ impl HostedApi {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("DELETE {}: {} — {}", suffix, status, text);
+            bail!("PUT {}: {} — {}", url, status, text);
         }
-        serde_json::from_str(&text).with_context(|| format!("parse DELETE {}: {}", suffix, text))
+        Ok(())
+    }
+
+    async fn delete_unit<T: Serialize>(&self, segments: &[&str], body: &T) -> anyhow::Result<()> {
+        let url = self.path(segments)?;
+        let resp = self
+            .http
+            .delete(url.clone())
+            .headers(self.json_headers()?)
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            bail!("DELETE {}: {} — {}", url, status, text);
+        }
+        Ok(())
     }
 
     /// Stage raw Wasm bytes into the private quarantine artifact store.
@@ -717,7 +762,7 @@ impl HostedApi {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/wasm"));
         let resp = self
             .http
-            .post(self.path("filter-artifacts"))
+            .post(self.path(&["filter-artifacts"])?)
             .headers(headers)
             .body(bytes.to_vec())
             .send()
@@ -1054,10 +1099,10 @@ async fn main() -> anyhow::Result<()> {
             if token.is_empty() {
                 bail!("S4_ACCESS_TOKEN must not be empty");
             }
-            let api = HostedApi::new(&cli.gateway, workspace, &token);
+            let api = HostedApi::new(&cli.gateway, workspace, &token)?;
             match cmd {
                 HostedCmd::Catalog => {
-                    let value: serde_json::Value = api.get("filter-catalog").await?;
+                    let value: serde_json::Value = api.get(&["filter-catalog"]).await?;
                     let plugins = value["plugins"].as_array().cloned().unwrap_or_default();
                     if plugins.is_empty() {
                         println!("No plugins in the workspace catalog.");
@@ -1151,7 +1196,7 @@ async fn main() -> anyhow::Result<()> {
                         "capability_requests": capability,
                         "config_schema": config_schema,
                     });
-                    let created: serde_json::Value = api.post("filter-plugins", &body).await?;
+                    let created: serde_json::Value = api.post(&["filter-plugins"], &body).await?;
                     println!(
                         "Uploaded {}: plugin={} version={} validation_run={}",
                         slug,
@@ -1167,7 +1212,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 HostedCmd::Validation { version_id } => {
                     let value: serde_json::Value = api
-                        .get(&format!("filter-plugin-versions/{version_id}/validation"))
+                        .get(&["filter-plugin-versions", version_id, "validation"])
                         .await?;
                     let version = &value["version"];
                     println!(
@@ -1208,14 +1253,16 @@ async fn main() -> anyhow::Result<()> {
                     version_id,
                 } => {
                     let body = serde_json::json!({ "version_id": version_id });
-                    let _: serde_json::Value = api
-                        .put(
-                            &format!(
-                                "filter-installations/{installation_id}/capabilities/{capability}"
-                            ),
-                            &body,
-                        )
-                        .await?;
+                    api.put_unit(
+                        &[
+                            "filter-installations",
+                            installation_id,
+                            "capabilities",
+                            capability,
+                        ],
+                        &body,
+                    )
+                    .await?;
                     println!("Capability {capability} granted on installation {installation_id}.");
                 }
                 HostedCmd::Revoke {
@@ -1224,19 +1271,21 @@ async fn main() -> anyhow::Result<()> {
                     version_id,
                 } => {
                     let body = serde_json::json!({ "version_id": version_id });
-                    let _: serde_json::Value = api
-                        .delete(
-                            &format!(
-                                "filter-installations/{installation_id}/capabilities/{capability}"
-                            ),
-                            &body,
-                        )
-                        .await?;
+                    api.delete_unit(
+                        &[
+                            "filter-installations",
+                            installation_id,
+                            "capabilities",
+                            capability,
+                        ],
+                        &body,
+                    )
+                    .await?;
                     println!("Capability {capability} revoked on installation {installation_id}.");
                 }
                 HostedCmd::Pipelines { cmd } => match cmd {
                     HostedPipelineCmd::List => {
-                        let value: serde_json::Value = api.get("filter-pipelines").await?;
+                        let value: serde_json::Value = api.get(&["filter-pipelines"]).await?;
                         let pipelines = value["pipelines"].as_array().cloned().unwrap_or_default();
                         if pipelines.is_empty() {
                             println!("No pipelines.");
@@ -1269,7 +1318,7 @@ async fn main() -> anyhow::Result<()> {
                     HostedPipelineCmd::Create { direction, name } => {
                         let body = serde_json::json!({ "direction": direction, "name": name });
                         let created: serde_json::Value =
-                            api.post("filter-pipelines", &body).await?;
+                            api.post(&["filter-pipelines"], &body).await?;
                         println!(
                             "Created pipeline {} (draft revision {})",
                             created["pipeline"]["id"].as_str().unwrap_or("?"),
@@ -1290,7 +1339,7 @@ async fn main() -> anyhow::Result<()> {
                             "steps": parsed,
                         });
                         let updated: serde_json::Value = api
-                            .put(&format!("filter-pipelines/{pipeline_id}/draft"), &body)
+                            .put(&["filter-pipelines", pipeline_id, "draft"], &body)
                             .await?;
                         println!(
                             "Draft updated: revision {} fingerprint={} steps={}",
@@ -1302,7 +1351,7 @@ async fn main() -> anyhow::Result<()> {
                     HostedPipelineCmd::Publish { pipeline_id } => {
                         let body = serde_json::json!({});
                         let published: serde_json::Value = api
-                            .post(&format!("filter-pipelines/{pipeline_id}/publish"), &body)
+                            .post(&["filter-pipelines", pipeline_id, "publish"], &body)
                             .await?;
                         println!(
                             "Published revision {} (revision_no {}) fingerprint={}",
@@ -1318,7 +1367,7 @@ async fn main() -> anyhow::Result<()> {
                         let body = serde_json::json!({});
                         let rolled_back: serde_json::Value = api
                             .post(
-                                &format!("filter-pipelines/{pipeline_id}/rollback/{revision_id}"),
+                                &["filter-pipelines", pipeline_id, "rollback", revision_id],
                                 &body,
                             )
                             .await?;
@@ -1331,7 +1380,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 },
                 HostedCmd::Assignments => {
-                    let value: serde_json::Value = api.get("filter-assignments").await?;
+                    let value: serde_json::Value = api.get(&["filter-assignments"]).await?;
                     let assignments = value["assignments"].as_array().cloned().unwrap_or_default();
                     let scopes = value["bucket_scopes"]
                         .as_array()
@@ -1364,7 +1413,7 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     let body = serde_json::json!({ "pipeline_id": pipeline_id });
                     let _: serde_json::Value = api
-                        .put(&format!("filter-assignments/{direction}/default"), &body)
+                        .put(&["filter-assignments", direction, "default"], &body)
                         .await?;
                     println!("Default {direction} pipeline set to {pipeline_id}.");
                 }
@@ -1375,29 +1424,22 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     let body = serde_json::json!({ "pipeline_id": pipeline_id });
                     let _: serde_json::Value = api
-                        .put(
-                            &format!("filter-assignments/{direction}/buckets/{bucket}"),
-                            &body,
-                        )
+                        .put(&["filter-assignments", direction, "buckets", bucket], &body)
                         .await?;
                     println!("{direction} pipeline {pipeline_id} assigned to bucket {bucket}.");
                 }
                 HostedCmd::UnassignBucket { direction, bucket } => {
                     let body = serde_json::json!({});
-                    let _: serde_json::Value = api
-                        .delete(
-                            &format!("filter-assignments/{direction}/buckets/{bucket}"),
-                            &body,
-                        )
+                    api.delete_unit(&["filter-assignments", direction, "buckets", bucket], &body)
                         .await?;
                     println!("Removed {direction} assignment for bucket {bucket}.");
                 }
                 HostedCmd::Audit { limit } => {
-                    let suffix = match limit {
-                        Some(limit) => format!("filter-audit?limit={limit}"),
-                        None => "filter-audit".to_string(),
-                    };
-                    let value: serde_json::Value = api.get(&suffix).await?;
+                    let query = limit
+                        .map(|limit| vec![("limit", limit.to_string())])
+                        .unwrap_or_default();
+                    let value: serde_json::Value =
+                        api.get_with_query(&["filter-audit"], &query).await?;
                     let events = value["events"].as_array().cloned().unwrap_or_default();
                     if events.is_empty() {
                         println!("No audit events.");
@@ -1699,6 +1741,26 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn success_server(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let read = socket.read(&mut request).await.unwrap();
+            request.truncate(read);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}"), task)
+    }
 
     #[test]
     fn parse_draft_step_accepts_installation_and_version() {
@@ -1736,21 +1798,63 @@ mod tests {
 
     #[test]
     fn hosted_api_path_scopes_to_the_workspace() {
-        let api = HostedApi::new("http://localhost:9000/", "ws-abc", "token");
+        let api = HostedApi::new("http://localhost:9000/", "ws-abc", "token").unwrap();
         assert_eq!(
-            api.path("filter-catalog"),
+            api.path(&["filter-catalog"]).unwrap().as_str(),
             "http://localhost:9000/dashboard/api/workspaces/ws-abc/filter-catalog"
         );
     }
 
     #[test]
+    fn hosted_api_percent_encodes_every_dynamic_path_segment() {
+        let api = HostedApi::new("https://api.example/base", "ws/abc", "token").unwrap();
+        assert_eq!(
+            api.path(&["filter-assignments", "read/write", "buckets", "bucket name"])
+                .unwrap()
+                .as_str(),
+            "https://api.example/base/dashboard/api/workspaces/ws%2Fabc/filter-assignments/read%2Fwrite/buckets/bucket%20name"
+        );
+    }
+
+    #[test]
     fn hosted_token_is_never_fallback_to_data_plane_keys() {
-        let api = HostedApi::new("http://localhost:9000", "ws-abc", "secret-token");
+        let api = HostedApi::new("http://localhost:9000", "ws-abc", "secret-token").unwrap();
         let headers = api.auth_headers().unwrap();
         assert_eq!(
             headers.get("Authorization").unwrap().to_str().unwrap(),
             "Bearer secret-token"
         );
         assert!(headers.get("x-s4-access-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn hosted_unit_mutations_accept_text_and_empty_success_bodies() {
+        let (gateway, put_request) = success_server("capability granted").await;
+        let api = HostedApi::new(&gateway, "ws-abc", "secret-token").unwrap();
+        api.put_unit(
+            &[
+                "filter-installations",
+                "install-1",
+                "capabilities",
+                "stable_fields",
+            ],
+            &serde_json::json!({"version_id": "version-1"}),
+        )
+        .await
+        .unwrap();
+        let request = put_request.await.unwrap();
+        assert!(request.starts_with("PUT /dashboard/api/workspaces/ws-abc/"));
+        assert!(request.contains("authorization: Bearer secret-token\r\n"));
+
+        let (gateway, delete_request) = success_server("").await;
+        let api = HostedApi::new(&gateway, "ws-abc", "secret-token").unwrap();
+        api.delete_unit(
+            &["filter-assignments", "write", "buckets", "bucket-a"],
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let request = delete_request.await.unwrap();
+        assert!(request.starts_with("DELETE /dashboard/api/workspaces/ws-abc/"));
     }
 }

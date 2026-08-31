@@ -80,10 +80,10 @@ use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, CompatibilitySpoolConfig,
     CompatibilitySpoolTransaction, CompletionReconciliation, ConditionalReadCapability,
     DirectOperationScope, DirectS3Sink, EvidenceRecord, ExpectedObject, IncompleteUploadDiscovery,
-    ListCapability, MemorySinkTransaction, MultipartResponseCapability, ObjectDestination,
-    ObjectSinkTransaction, OperationJournal, OperationReconciler, OperationRecord, OperationState,
-    ResponseChecksumCapability, SpoolQuota, StoredObjectMeta, TransactionError,
-    VersioningCapability,
+    JournalError, ListCapability, MemorySinkTransaction, MultipartResponseCapability,
+    ObjectDestination, ObjectSinkTransaction, OperationJournal, OperationReconciler,
+    OperationRecord, OperationState, ResponseChecksumCapability, SpoolQuota, StoredObjectMeta,
+    TransactionError, VersioningCapability,
 };
 use crate::workspace_storage::{
     BackendConfigRequest, BackendConfigResponse, BackendType, WorkspaceId, WorkspaceStorageError,
@@ -165,6 +165,13 @@ struct OperationUsage<'a> {
 #[derive(Clone, Copy)]
 struct AuthorizedOperation<'a> {
     auth: &'a Auth,
+    authorization: &'a UsageAuthorization,
+    receipt_id: Uuid,
+}
+
+#[derive(Clone, Copy)]
+struct AuthorizedUsage<'a> {
+    operation: OperationIdentity,
     authorization: &'a UsageAuthorization,
 }
 
@@ -322,6 +329,26 @@ async fn record_operation_with_event(
     record_usage(control, context, &event, key).await
 }
 
+async fn record_durable_operation_with_event(
+    journal: Option<&Arc<dyn OperationJournal>>,
+    control: Arc<dyn ControlPlane>,
+    context: &AuthenticatedRequestContext,
+    event: UsageEvent,
+    key: &str,
+) -> Result<(), axum::response::Response> {
+    persist_usage_evidence(journal, &event)
+        .await
+        .map_err(|error| {
+            warn!(
+                operation_id = %event.operation_id,
+                error = %error,
+                "failed to persist usage evidence"
+            );
+            s3_error::service_unavailable(key, "Usage evidence could not be persisted.")
+        })?;
+    record_operation_with_event(control, context, event, key).await
+}
+
 fn multipart_completion_event(
     authorization: &UsageAuthorization,
     result: &MultipartCompletionResult,
@@ -342,44 +369,118 @@ fn multipart_completion_event(
     }
 }
 
-/// Persist the canonical usage event as durable journal evidence before the
-/// control-plane receipt is recorded. If the receipt write fails after a
-/// storage commit (503) or the process dies in that window, the hosted control
-/// plane can later reconcile the committed operation from this evidence.
-async fn persist_usage_evidence(journal: Option<&Arc<dyn OperationJournal>>, event: &UsageEvent) {
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct DurableUsageEvidence {
+    receipt_id: Uuid,
+    source_bytes: u64,
+    output_bytes: u64,
+    processed_bytes: u64,
+    route: String,
+    kind: String,
+    bucket: String,
+    #[serde(default)]
+    pipeline_evidence: Option<crate::control::PipelineEvidence>,
+}
+
+impl From<&UsageEvent> for DurableUsageEvidence {
+    fn from(event: &UsageEvent) -> Self {
+        Self {
+            receipt_id: event.id,
+            source_bytes: event.source_bytes,
+            output_bytes: event.output_bytes,
+            processed_bytes: event.processed_bytes,
+            route: event.route.as_str().to_string(),
+            kind: event.kind.as_str().to_string(),
+            bucket: event.bucket.clone(),
+            pipeline_evidence: event.pipeline_evidence.clone(),
+        }
+    }
+}
+
+fn usage_evidence_id(receipt_id: Uuid) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, receipt_id.as_bytes())
+}
+
+/// Persist the complete canonical usage event before entering a provider
+/// commit window. Exact retries use one deterministic evidence identity.
+async fn persist_usage_evidence(
+    journal: Option<&Arc<dyn OperationJournal>>,
+    event: &UsageEvent,
+) -> Result<(), JournalError> {
     let Some(journal) = journal else {
-        return;
+        return Ok(());
     };
-    let evidence = EvidenceRecord::new(
+    // A process may have a Postgres journal because DATABASE_URL is set while
+    // writing to the development memory sink. That sink has no operation row;
+    // skip evidence rather than violating the evidence foreign key.
+    if journal.get(event.operation_id).await?.is_none() {
+        return Ok(());
+    }
+    append_usage_evidence(journal, event).await
+}
+
+async fn persist_transaction_usage_evidence(
+    journal: Option<&Arc<dyn OperationJournal>>,
+    durable_operation_id: Option<Uuid>,
+    event: &UsageEvent,
+) -> Result<(), JournalError> {
+    let Some(durable_operation_id) = durable_operation_id else {
+        return Ok(());
+    };
+    if durable_operation_id != event.operation_id {
+        return Err(JournalError::Corrupt(
+            "sink operation does not match usage evidence operation".to_string(),
+        ));
+    }
+    let journal = journal.ok_or_else(|| {
+        JournalError::Persistence("durable sink has no operation journal".to_string())
+    })?;
+    if journal.get(durable_operation_id).await?.is_none() {
+        return Err(JournalError::Corrupt(format!(
+            "durable sink operation {durable_operation_id} has no journal intent"
+        )));
+    }
+    append_usage_evidence(journal, event).await
+}
+
+async fn append_usage_evidence(
+    journal: &Arc<dyn OperationJournal>,
+    event: &UsageEvent,
+) -> Result<(), JournalError> {
+    let mut evidence = EvidenceRecord::new(
         event.operation_id,
         "usage",
-        serde_json::json!({
-            "receipt_id": event.id,
-            "source_bytes": event.source_bytes,
-            "output_bytes": event.output_bytes,
-            "processed_bytes": event.processed_bytes,
-            "route": event.route.as_str(),
-            "kind": event.kind.as_str(),
-            "bucket": &event.bucket,
-            "pipeline_evidence": event.pipeline_evidence.as_ref().map(|evidence| {
-                serde_json::json!({
-                    "revision": evidence.revision,
-                    "fingerprint": evidence.fingerprint,
-                    "components": evidence.components,
-                    "fuel_consumed": evidence.fuel_consumed,
-                    "duration_ms": evidence.duration_ms,
-                    "spool_mode": evidence.spool_mode,
-                })
-            }),
-        }),
+        serde_json::to_value(DurableUsageEvidence::from(event))
+            .map_err(|error| JournalError::Persistence(error.to_string()))?,
     );
-    if let Err(error) = journal.append_evidence(evidence).await {
-        warn!(
-            operation_id = %event.operation_id,
-            error = %error,
-            "failed to persist usage evidence"
-        );
+    evidence.id = usage_evidence_id(event.id);
+    journal.append_evidence(evidence).await
+}
+
+async fn load_usage_evidence(
+    journal: &Arc<dyn OperationJournal>,
+    operation_id: Uuid,
+    receipt_id: Uuid,
+) -> Result<DurableUsageEvidence, JournalError> {
+    let expected_id = usage_evidence_id(receipt_id);
+    let record = journal
+        .evidence(operation_id)
+        .await?
+        .into_iter()
+        .find(|record| record.id == expected_id && record.kind == "usage")
+        .ok_or_else(|| {
+            JournalError::Corrupt(format!(
+                "operation {operation_id} is missing deterministic usage evidence"
+            ))
+        })?;
+    let evidence: DurableUsageEvidence = serde_json::from_value(record.detail)
+        .map_err(|error| JournalError::Corrupt(error.to_string()))?;
+    if evidence.receipt_id != receipt_id {
+        return Err(JournalError::Corrupt(format!(
+            "operation {operation_id} usage evidence has the wrong receipt"
+        )));
     }
+    Ok(evidence)
 }
 
 fn admitted_response_bytes(response: &axum::response::Response) -> Option<u64> {
@@ -2417,7 +2518,13 @@ async fn demo_process(
                 "Demo input exceeds 64 KiB",
             );
         }
-        canonical_records.push(crate::record::Record::new(canonical, bytes::Bytes::new()));
+        // Demo records are returned as independent values rather than one
+        // concatenated JSON document. Model that framing explicitly as JSONL
+        // while the pipeline runs, then strip the known separator below.
+        canonical_records.push(crate::record::Record::new(
+            canonical,
+            bytes::Bytes::from_static(b"\n"),
+        ));
     }
 
     let snapshot = match demo_pipeline(&state, mode) {
@@ -2435,8 +2542,8 @@ async fn demo_process(
         DemoMode::Join => Some(demo_request_stable_key()),
     };
     let session = s4_wasm_runtime::Session {
-        format: Format::Json.as_str().to_string(),
-        content_type: "application/json".to_string(),
+        format: Format::Jsonl.as_str().to_string(),
+        content_type: "application/x-ndjson".to_string(),
         policy_version: 0,
         operation: s4_wasm_runtime::Operation::Write,
         config_json: None,
@@ -2459,7 +2566,7 @@ async fn demo_process(
     let mut output_bytes = 0usize;
     let mut processed = Vec::with_capacity(output.len());
     for (index, record) in output.into_iter().enumerate() {
-        if !record.separator.is_empty() {
+        if record.separator.as_ref() != b"\n" {
             return demo_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "pipeline_failed",
@@ -2845,7 +2952,7 @@ async fn streaming_single_put(
     state: &AppState,
     mut authentication: HeaderAuthentication,
     backend: ResolvedBackend,
-    authorization: &UsageAuthorization,
+    usage: AuthorizedUsage<'_>,
     headers: &HeaderMap,
     mut body: axum::body::Body,
     key: &str,
@@ -2861,6 +2968,8 @@ async fn streaming_single_put(
 > {
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
+    let authorization = usage.authorization;
+    let receipt_id = usage.operation.receipt_id;
 
     if authentication.body_verifier.is_none() && headers.contains_key(header::CONTENT_ENCODING) {
         return Err(StreamingPutError::InvalidRequest(
@@ -2877,7 +2986,7 @@ async fn streaming_single_put(
             state,
             authentication,
             backend,
-            authorization,
+            usage,
             headers,
             body,
             key,
@@ -2891,6 +3000,7 @@ async fn streaming_single_put(
         AuthorizedOperation {
             auth: &authentication.auth,
             authorization,
+            receipt_id,
         },
         authorization.bucket(),
         key,
@@ -3023,6 +3133,25 @@ async fn streaming_single_put(
         let output_digest = hex::encode(output_hasher.finalize());
         let mut sink = sink.lock().await;
         sink.verify_output(output_bytes, &output_digest).await?;
+        let mut usage_event = UsageEvent::new(
+            receipt_id,
+            authorization.operation_id(),
+            authorization.bucket(),
+            authorization.kind(),
+            authorization.route(),
+            input_bytes,
+            output_bytes,
+        );
+        if let Some(evidence) = &pipeline_evidence {
+            usage_event = usage_event.with_pipeline_evidence(evidence.clone());
+        }
+        persist_transaction_usage_evidence(
+            state.operation_journal.as_ref(),
+            sink.durable_operation_id(),
+            &usage_event,
+        )
+        .await
+        .map_err(TransactionError::from)?;
         let stored = sink.complete().await?;
         Ok((stored, output_bytes, pipeline_evidence))
     }
@@ -3122,7 +3251,7 @@ async fn streaming_avro_single_put(
     state: &AppState,
     mut authentication: HeaderAuthentication,
     backend: ResolvedBackend,
-    authorization: &UsageAuthorization,
+    usage: AuthorizedUsage<'_>,
     headers: &HeaderMap,
     mut body: axum::body::Body,
     key: &str,
@@ -3138,6 +3267,8 @@ async fn streaming_avro_single_put(
 > {
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
+    let authorization = usage.authorization;
+    let receipt_id = usage.operation.receipt_id;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -3199,6 +3330,7 @@ async fn streaming_avro_single_put(
         AuthorizedOperation {
             auth: &authentication.auth,
             authorization,
+            receipt_id,
         },
         authorization.bucket(),
         key,
@@ -3211,6 +3343,22 @@ async fn streaming_avro_single_put(
         let mut sink = sink_guard.sink.lock().await;
         sink.write(bytes::Bytes::from(output)).await?;
         sink.verify_output(output_bytes, &digest).await?;
+        let usage_event = UsageEvent::new(
+            receipt_id,
+            authorization.operation_id(),
+            authorization.bucket(),
+            authorization.kind(),
+            authorization.route(),
+            input_bytes,
+            output_bytes,
+        );
+        persist_transaction_usage_evidence(
+            state.operation_journal.as_ref(),
+            sink.durable_operation_id(),
+            &usage_event,
+        )
+        .await
+        .map_err(TransactionError::from)?;
         sink.complete().await?
     };
     sink_guard.disarm();
@@ -3917,6 +4065,27 @@ async fn complete_staged_multipart(
         renew_and_fence_completion(staging, identity, lease).await?;
         sink.verify_output(output_bytes, &checksum_sha256).await?;
         renew_and_fence_completion(staging, identity, lease).await?;
+        let precommit_result = MultipartCompletionResult {
+            etag: None,
+            checksum_sha256: checksum_sha256.clone(),
+            version_id: None,
+            source_bytes: input_bytes,
+            size_bytes: output_bytes,
+            pipeline_evidence: pipeline_evidence.clone(),
+        };
+        persist_transaction_usage_evidence(
+            state.operation_journal.as_ref(),
+            sink.durable_operation_id(),
+            &multipart_completion_event(
+                operation.authorization,
+                &precommit_result,
+                operation.receipt_id,
+            ),
+        )
+        .await
+        .map_err(TransactionError::from)
+        .map_err(StreamingPutError::from)?;
+        renew_and_fence_completion(staging, identity, lease).await?;
         let stored = sink.complete().await?;
         let result = MultipartCompletionResult {
             etag: stored.etag,
@@ -4061,10 +4230,21 @@ async fn reconcile_existing_direct_completion(
     })
 }
 
-fn recovered_multipart_result(
+async fn recovered_multipart_result(
+    journal: Option<&Arc<dyn OperationJournal>>,
     operation: OperationRecord,
     lease: &CompletionLease,
+    receipt_id: Uuid,
 ) -> Result<MultipartCompletionResult, MultipartCompletionError> {
+    let journal = journal.ok_or_else(|| {
+        MultipartCompletionError::Invalid(
+            "committed direct operation has no durable journal".to_string(),
+        )
+    })?;
+    let durable = load_usage_evidence(journal, operation.id, receipt_id)
+        .await
+        .map_err(TransactionError::from)
+        .map_err(StreamingPutError::from)?;
     let stored = operation.committed.ok_or_else(|| {
         MultipartCompletionError::Invalid(
             "committed direct operation is missing destination metadata".to_string(),
@@ -4087,13 +4267,24 @@ fn recovered_multipart_result(
         .ok_or_else(|| {
             MultipartCompletionError::Invalid("multipart source size overflow".to_string())
         })?;
+    if durable.source_bytes != source_bytes
+        || durable.output_bytes != size_bytes
+        || durable.processed_bytes != source_bytes.max(size_bytes)
+        || durable.bucket != operation.destination.bucket
+        || durable.route != UsageRoute::CompleteMultipartUpload.as_str()
+        || durable.kind != RequestKind::Write.as_str()
+    {
+        return Err(MultipartCompletionError::Invalid(
+            "committed direct operation usage evidence does not match recovery state".to_string(),
+        ));
+    }
     Ok(MultipartCompletionResult {
         etag: stored.etag,
         checksum_sha256,
         version_id: stored.version_id,
         source_bytes,
         size_bytes,
-        pipeline_evidence: None,
+        pipeline_evidence: durable.pipeline_evidence,
     })
 }
 
@@ -4181,6 +4372,27 @@ async fn complete_staged_avro_multipart(
         renew_and_fence_completion(staging, identity, lease).await?;
         sink.write(bytes::Bytes::from(output)).await?;
         sink.verify_output(output_bytes, &output_digest).await?;
+        renew_and_fence_completion(staging, identity, lease).await?;
+        let precommit_result = MultipartCompletionResult {
+            etag: None,
+            checksum_sha256: output_digest.clone(),
+            version_id: None,
+            source_bytes: input_bytes,
+            size_bytes: output_bytes,
+            pipeline_evidence: None,
+        };
+        persist_transaction_usage_evidence(
+            state.operation_journal.as_ref(),
+            sink.durable_operation_id(),
+            &multipart_completion_event(
+                operation.authorization,
+                &precommit_result,
+                operation.receipt_id,
+            ),
+        )
+        .await
+        .map_err(TransactionError::from)
+        .map_err(StreamingPutError::from)?;
         renew_and_fence_completion(staging, identity, lease).await?;
         let stored = sink.complete().await?;
         let result = MultipartCompletionResult {
@@ -4618,7 +4830,10 @@ async fn s3_put(
         &state,
         header_auth,
         backend,
-        &authorization,
+        AuthorizedUsage {
+            operation,
+            authorization: &authorization,
+        },
         &parts.headers,
         request_body,
         &key,
@@ -4636,7 +4851,6 @@ async fn s3_put(
                 Some(evidence) => usage.event().with_pipeline_evidence(evidence),
                 None => usage.event(),
             };
-            persist_usage_evidence(state.operation_journal.as_ref(), &event).await;
             if let Err(response) =
                 record_operation_with_event(state.control.clone(), &auth.context, event, &key).await
             {
@@ -5071,7 +5285,7 @@ async fn process_transformed_source<F, Fut>(
     format: Format,
     max_source_frame_bytes: usize,
     mut emit: F,
-) -> Result<(), TransformedReadError>
+) -> Result<u64, TransformedReadError>
 where
     F: FnMut(bytes::Bytes) -> Fut,
     Fut: std::future::Future<Output = Result<(), TransformedReadError>>,
@@ -5119,7 +5333,8 @@ where
                 }
             }
         }
-        for record in pipeline.finish().await?.0 {
+        let (records, fuel_consumed) = pipeline.finish().await?;
+        for record in records {
             if !record.payload.is_empty() {
                 emit(record.payload).await?;
             }
@@ -5127,7 +5342,7 @@ where
                 emit(record.separator).await?;
             }
         }
-        Ok(())
+        Ok(fuel_consumed)
     }
     .await;
     if result.is_err() {
@@ -5141,7 +5356,23 @@ where
 enum DirectReadEvent {
     Data(bytes::Bytes),
     Failed(TransformedReadError),
-    Done,
+    Done {
+        fuel_consumed: u64,
+        duration_ms: u64,
+    },
+}
+
+fn direct_read_done_evidence(
+    snapshot: &PipelineSnapshot,
+    event: &DirectReadEvent,
+) -> Option<crate::control::PipelineEvidence> {
+    match event {
+        DirectReadEvent::Done {
+            fuel_consumed,
+            duration_ms,
+        } => snapshot.pipeline_evidence(*fuel_consumed, *duration_ms, "none"),
+        DirectReadEvent::Data(_) | DirectReadEvent::Failed(_) => None,
+    }
 }
 
 struct DirectReadBody {
@@ -5171,9 +5402,17 @@ impl http_body::Body for DirectReadBody {
                 self.done = true;
                 std::task::Poll::Ready(Some(Err(std::io::Error::other(error_to_log(&error)))))
             }
-            std::task::Poll::Ready(Some(DirectReadEvent::Done)) | std::task::Poll::Ready(None) => {
+            std::task::Poll::Ready(Some(DirectReadEvent::Done { .. })) => {
                 self.done = true;
                 std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                self.source_cancellation.cancel();
+                self.pipeline_cancellation.cancel();
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                    "transformed read worker terminated unexpectedly",
+                ))))
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
@@ -5199,6 +5438,22 @@ fn error_to_log(error: &TransformedReadError) -> String {
     }
 }
 
+fn direct_read_worker_terminated(
+    key: &str,
+    source_cancellation: &s4_wasm_runtime::CancellationToken,
+    pipeline_cancellation: &s4_wasm_runtime::CancellationToken,
+) -> axum::response::Response {
+    source_cancellation.cancel();
+    pipeline_cancellation.cancel();
+    transformed_read_error_response(
+        key,
+        TransformedReadError::Pipeline(s4_error::S4Error::new(
+            s4_error::codes::INTERNAL,
+            "transformed read worker terminated unexpectedly",
+        )),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn transformed_read_response(
     state: &AppState,
@@ -5212,7 +5467,7 @@ async fn transformed_read_response(
     pipeline_evidence: &mut Option<crate::control::PipelineEvidence>,
 ) -> (axum::response::Response, Option<u64>) {
     let (format, content_type) = preflight;
-    let pipeline_started = std::time::Instant::now();
+    *pipeline_evidence = None;
     let snapshot = match state
         .gateway
         .resolve_pipeline(
@@ -5230,10 +5485,7 @@ async fn transformed_read_response(
             );
         }
     };
-    if let Some(mut evidence) = snapshot.pipeline_evidence(0, 0, "none") {
-        evidence.duration_ms = pipeline_started.elapsed().as_millis() as u64;
-        *pipeline_evidence = Some(evidence);
-    }
+    let pipeline_started = std::time::Instant::now();
     let source_cancellation = object.cancellation.clone();
     let source_counters = object.counters.clone();
     let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
@@ -5253,6 +5505,9 @@ async fn transformed_read_response(
         .iter()
         .all(|capabilities| capabilities.prefix_safe_for_read);
     if direct {
+        // The response body continues executing after this function returns,
+        // so final fuel and duration are not yet knowable. Leave evidence
+        // absent rather than attaching fabricated zero-valued measurements.
         let max_source_frame_bytes = state.source_body_limits.max_frame_bytes;
         let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
         tokio::spawn(async move {
@@ -5277,7 +5532,10 @@ async fn transformed_read_response(
             )
             .await;
             let event = match result {
-                Ok(()) => DirectReadEvent::Done,
+                Ok(fuel_consumed) => DirectReadEvent::Done {
+                    fuel_consumed,
+                    duration_ms: pipeline_started.elapsed().as_millis() as u64,
+                },
                 Err(error) => DirectReadEvent::Failed(error),
             };
             let _ = sender.send(event).await;
@@ -5302,7 +5560,8 @@ async fn transformed_read_response(
                     None,
                 )
             }
-            Some(DirectReadEvent::Done) | None => {
+            Some(event @ DirectReadEvent::Done { .. }) => {
+                *pipeline_evidence = direct_read_done_evidence(&snapshot, &event);
                 let mut response = axum::response::Response::builder().status(StatusCode::OK);
                 response
                     .headers_mut()
@@ -5312,6 +5571,14 @@ async fn transformed_read_response(
                     response.body(axum::body::Body::empty()).unwrap(),
                     Some(source_counters.bytes()),
                 )
+            }
+            None => {
+                let response = direct_read_worker_terminated(
+                    key,
+                    &source_cancellation,
+                    &pipeline_cancellation,
+                );
+                (response, None)
             }
             Some(DirectReadEvent::Failed(error)) => {
                 (transformed_read_error_response(key, error), None)
@@ -5371,10 +5638,13 @@ async fn transformed_read_response(
     )
     .await;
     drop(spool_sender);
-    if let Err(error) = result {
-        let _ = spool_writer.await;
-        return (transformed_read_error_response(key, error), None);
-    }
+    let pipeline_fuel = match result {
+        Ok(fuel) => fuel,
+        Err(error) => {
+            let _ = spool_writer.await;
+            return (transformed_read_error_response(key, error), None);
+        }
+    };
     let spool = match spool_writer.await {
         Ok(Ok(spool)) => spool,
         Ok(Err(error)) => return (transformed_read_error_response(key, error), None),
@@ -5390,6 +5660,11 @@ async fn transformed_read_response(
             );
         }
     };
+    *pipeline_evidence = snapshot.pipeline_evidence(
+        pipeline_fuel,
+        pipeline_started.elapsed().as_millis() as u64,
+        "encrypted",
+    );
     let (body, content_length) = match spool.into_body(source_cancellation).await {
         Ok(result) => result,
         Err(error) => return (transformed_read_error_response(key, error.into()), None),
@@ -5893,6 +6168,25 @@ mod tests {
         assert!(validate_storage_boundary_startup(true, false, false).is_ok());
     }
 
+    async fn insert_test_usage_intent(journal: &Arc<dyn OperationJournal>, operation_id: Uuid) {
+        journal
+            .insert_intent(OperationRecord::direct_intent(
+                DirectOperationScope {
+                    operation_id,
+                    tenant_id: "workspace-test".to_string(),
+                },
+                ObjectDestination {
+                    backend_id: "test".to_string(),
+                    bucket: "bucket".to_string(),
+                    logical_key: "key".to_string(),
+                    physical_key: "key".to_string(),
+                },
+                ExpectedObject::default(),
+            ))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn persist_usage_evidence_writes_durable_journal_record() {
         let journal: Arc<dyn OperationJournal> =
@@ -5906,7 +6200,10 @@ mod tests {
             64,
             32,
         );
-        persist_usage_evidence(Some(&journal), &event).await;
+        insert_test_usage_intent(&journal, event.operation_id).await;
+        persist_usage_evidence(Some(&journal), &event)
+            .await
+            .unwrap();
 
         let evidence = journal.evidence(event.operation_id).await.unwrap();
         assert_eq!(evidence.len(), 1);
@@ -5921,6 +6218,156 @@ mod tests {
         assert_eq!(evidence[0].detail["route"].as_str(), Some("PutObject"));
         assert_eq!(evidence[0].detail["kind"].as_str(), Some("write"));
         assert_eq!(evidence[0].detail["bucket"].as_str(), Some("bucket"));
+    }
+
+    #[tokio::test]
+    async fn precommit_usage_evidence_failure_is_not_suppressed() {
+        let concrete = Arc::new(crate::transaction::InMemoryOperationJournal::new());
+        concrete.fail_next_evidence_appends(1);
+        let journal: Arc<dyn OperationJournal> = concrete;
+        let event = UsageEvent::new(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "bucket",
+            RequestKind::Write,
+            UsageRoute::PutObject,
+            8,
+            8,
+        );
+        insert_test_usage_intent(&journal, event.operation_id).await;
+
+        assert!(
+            persist_usage_evidence(Some(&journal), &event)
+                .await
+                .is_err()
+        );
+        assert!(
+            journal
+                .evidence(event.operation_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_journal_does_not_receive_evidence_for_dev_memory_sink() {
+        let concrete = Arc::new(crate::transaction::InMemoryOperationJournal::new());
+        // This models Postgres' evidence FK: any accidental append is a hard
+        // failure because a memory sink has no object_operations row.
+        concrete.fail_next_evidence_appends(1);
+        let journal: Arc<dyn OperationJournal> = concrete;
+        let sink = MemorySinkTransaction::new(
+            Arc::new(MemoryStore::new()),
+            "bucket",
+            "key",
+            "text/plain",
+            1024,
+        )
+        .unwrap();
+        let event = UsageEvent::new(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "bucket",
+            RequestKind::Write,
+            UsageRoute::PutObject,
+            8,
+            8,
+        );
+
+        persist_transaction_usage_evidence(Some(&journal), sink.durable_operation_id(), &event)
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .evidence(event.operation_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_crash_recovery_restores_exact_precommit_pipeline_evidence() {
+        let journal: Arc<dyn OperationJournal> =
+            Arc::new(crate::transaction::InMemoryOperationJournal::new());
+        let identity = multipart_completion_operation_identity("upload-a", "fingerprint-a");
+        let authorization = identity.authorization(
+            "bucket-a",
+            UsageRoute::CompleteMultipartUpload,
+            RequestKind::Write,
+            128,
+        );
+        let pipeline_evidence = crate::control::PipelineEvidence {
+            revision: "revision-a".to_string(),
+            fingerprint: "fingerprint-a".to_string(),
+            components: "component-a".to_string(),
+            fuel_consumed: 77,
+            duration_ms: 9,
+            spool_mode: "none".to_string(),
+        };
+        let precommit_result = MultipartCompletionResult {
+            etag: None,
+            checksum_sha256: "output-sha".to_string(),
+            version_id: None,
+            source_bytes: 32,
+            size_bytes: 24,
+            pipeline_evidence: Some(pipeline_evidence.clone()),
+        };
+        insert_test_usage_intent(&journal, identity.operation_id).await;
+        persist_usage_evidence(
+            Some(&journal),
+            &multipart_completion_event(&authorization, &precommit_result, identity.receipt_id),
+        )
+        .await
+        .unwrap();
+
+        let mut operation = OperationRecord::direct_intent(
+            DirectOperationScope {
+                operation_id: identity.operation_id,
+                tenant_id: "workspace-a".to_string(),
+            },
+            ObjectDestination {
+                backend_id: "S3".to_string(),
+                bucket: "bucket-a".to_string(),
+                logical_key: "key-a".to_string(),
+                physical_key: "key-a".to_string(),
+            },
+            ExpectedObject {
+                digest: Some("output-sha".to_string()),
+                size: Some(24),
+                metadata: Default::default(),
+            },
+        );
+        operation.state = OperationState::Committed;
+        operation.committed = Some(StoredObjectMeta {
+            etag: Some("\"etag-a\"".to_string()),
+            version_id: Some("version-a".to_string()),
+            ..StoredObjectMeta::default()
+        });
+        let lease = CompletionLease {
+            fencing_token: 1,
+            selected_parts: vec![MultipartPart {
+                upload_id: "upload-a".to_string(),
+                part_number: 1,
+                attempt: 1,
+                artifact_key: "artifact-a".to_string(),
+                etag: "\"part-a\"".to_string(),
+                checksum_sha256: "part-sha".to_string(),
+                size_bytes: 32,
+                created_at_ms: now_ms(),
+            }],
+            cleanup_parts: Vec::new(),
+        };
+
+        let recovered =
+            recovered_multipart_result(Some(&journal), operation, &lease, identity.receipt_id)
+                .await
+                .unwrap();
+        assert_eq!(recovered.pipeline_evidence, Some(pipeline_evidence));
+        assert_eq!(recovered.source_bytes, 32);
+        assert_eq!(recovered.size_bytes, 24);
+        assert_eq!(recovered.checksum_sha256, "output-sha");
     }
 
     #[tokio::test]
@@ -6116,6 +6563,7 @@ mod tests {
         let scope = direct_operation_scope(AuthorizedOperation {
             auth: &auth,
             authorization: &authorization,
+            receipt_id: operation.receipt_id,
         });
 
         assert_eq!(scope.operation_id, authorization.operation_id());
@@ -6125,6 +6573,8 @@ mod tests {
     #[tokio::test]
     async fn multipart_success_and_exact_replay_meter_with_one_stable_identity() {
         let control = Arc::new(RecordingControlPlane::default());
+        let journal: Arc<dyn OperationJournal> =
+            Arc::new(crate::transaction::InMemoryOperationJournal::new());
         let context = AuthenticatedRequestContext {
             user_id: "user-a".to_string(),
             workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
@@ -6136,29 +6586,45 @@ mod tests {
             RequestKind::Write,
             64,
         );
+        insert_test_usage_intent(&journal, operation.operation_id).await;
 
+        let result = MultipartCompletionResult {
+            etag: Some("\"etag\"".to_string()),
+            checksum_sha256: "sha".to_string(),
+            version_id: None,
+            source_bytes: 32,
+            size_bytes: 24,
+            pipeline_evidence: None,
+        };
         for _ in 0..2 {
-            record_operation(
+            record_durable_operation_with_event(
+                Some(&journal),
                 control.clone(),
                 &context,
-                OperationUsage {
-                    operation,
-                    authorization: &authorization,
-                    source_bytes: 32,
-                    output_bytes: 24,
-                },
+                multipart_completion_event(&authorization, &result, operation.receipt_id),
                 "key-a",
             )
             .await
             .unwrap();
         }
 
-        let calls = control.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], calls[1]);
-        assert_eq!(calls[0].event.operation_id, authorization.operation_id());
-        assert_eq!(calls[0].event.route, UsageRoute::CompleteMultipartUpload);
-        assert_eq!(calls[0].event.processed_bytes, 32);
+        {
+            let calls = control.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0], calls[1]);
+            assert_eq!(calls[0].event.operation_id, authorization.operation_id());
+            assert_eq!(calls[0].event.route, UsageRoute::CompleteMultipartUpload);
+            assert_eq!(calls[0].event.processed_bytes, 32);
+        }
+        let evidence = journal.evidence(operation.operation_id).await.unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence.iter().all(|record| record.kind == "usage"));
+        let receipt_id = operation.receipt_id.to_string();
+        assert!(
+            evidence
+                .iter()
+                .all(|record| record.detail["receipt_id"].as_str() == Some(receipt_id.as_str()))
+        );
     }
 
     #[tokio::test]
@@ -6374,18 +6840,146 @@ mod tests {
         assert!(!source_cancellation.is_cancelled());
         assert!(!pipeline_cancellation.is_cancelled());
 
+        let source_cancellation = s4_wasm_runtime::CancellationToken::new();
+        let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         drop(sender);
-        let body = DirectReadBody {
+        let mut body = DirectReadBody {
             first: None,
             receiver,
             source_cancellation: source_cancellation.clone(),
             pipeline_cancellation: pipeline_cancellation.clone(),
             done: false,
         };
-        drop(body);
+        let error = body.frame().await.unwrap().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "transformed read worker terminated unexpectedly"
+        );
         assert!(source_cancellation.is_cancelled());
         assert!(pipeline_cancellation.is_cancelled());
+
+        let source_cancellation = s4_wasm_runtime::CancellationToken::new();
+        let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
+        let response = direct_read_worker_terminated(
+            "private-key",
+            &source_cancellation,
+            &pipeline_cancellation,
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(header::ETAG).is_none());
+        assert!(source_cancellation.is_cancelled());
+        assert!(pipeline_cancellation.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transformed_source_returns_post_finish_fuel_for_spooled_evidence() {
+        let component = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/components/noop.component.wasm"),
+        )
+        .expect("noop.component.wasm; run just build-filters");
+        let registry = PluginRegistry::new();
+        registry.import("noop", &component).unwrap();
+        let pipeline = registry
+            .snapshot()
+            .start_streaming_session(
+                s4_wasm_runtime::Session {
+                    format: "text".to_string(),
+                    content_type: "text/plain".to_string(),
+                    policy_version: 0,
+                    operation: s4_wasm_runtime::Operation::Read,
+                    config_json: None,
+                    public_key_pem: None,
+                    stable_key: None,
+                    stable_fields: None,
+                },
+                s4_wasm_runtime::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let object = OpenedObject::new(
+            StatusCode::OK,
+            metadata(None, Some("\"source-a\""), "text/plain"),
+            Body::from("line\n"),
+            BodyLimits::default(),
+        );
+
+        let fuel =
+            process_transformed_source(object, pipeline, Format::Text, 1024, |_| async { Ok(()) })
+                .await
+                .unwrap();
+        assert!(
+            fuel > 0,
+            "completed pipeline evidence must use measured fuel"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_drop_all_direct_read_keeps_measured_finish_evidence() {
+        let component = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-components/test-filter.component.wasm"),
+        )
+        .expect("test-filter.component.wasm; run just build-filters");
+        let registry = Arc::new(PluginRegistry::new());
+        registry
+            .import_with_capabilities(
+                "dropper",
+                &component,
+                PluginCapabilities {
+                    prefix_safe_for_read: true,
+                },
+            )
+            .unwrap();
+        let resolver = crate::pipeline::StaticPipelineResolver::new(registry.clone());
+        let resolution = crate::pipeline::PipelineResolver::resolve(
+            &resolver,
+            "workspace-a",
+            "bucket-a",
+            crate::pipeline::PipelineDirection::Read,
+        )
+        .await
+        .unwrap();
+        let snapshot = registry
+            .snapshot_for(&resolution, registry.as_ref())
+            .await
+            .unwrap();
+        let mut pipeline = snapshot
+            .clone()
+            .start_streaming_session(
+                s4_wasm_runtime::Session {
+                    format: "text".to_string(),
+                    content_type: "text/plain".to_string(),
+                    policy_version: 0,
+                    operation: s4_wasm_runtime::Operation::Read,
+                    config_json: None,
+                    public_key_pem: None,
+                    stable_key: None,
+                    stable_fields: None,
+                },
+                s4_wasm_runtime::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            pipeline
+                .process(crate::record::Record::new("drop", "\n"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (_, fuel_consumed) = pipeline.finish().await.unwrap();
+        let event = DirectReadEvent::Done {
+            fuel_consumed,
+            duration_ms: 5,
+        };
+        let evidence = direct_read_done_evidence(&snapshot, &event).unwrap();
+        assert_eq!(evidence.fuel_consumed, fuel_consumed);
+        assert!(evidence.fuel_consumed > 0);
+        assert_eq!(evidence.duration_ms, 5);
+        assert_eq!(evidence.spool_mode, "none");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7071,7 +7665,8 @@ async fn s3_post(
             .await
         {
             Ok(CompletionAcquire::Replayed(result)) => {
-                if let Err(response) = record_operation_with_event(
+                if let Err(response) = record_durable_operation_with_event(
+                    state.operation_journal.as_ref(),
                     state.control.clone(),
                     &auth.context,
                     multipart_completion_event(&authorization, &result, operation.receipt_id),
@@ -7173,8 +7768,15 @@ async fn s3_post(
                 );
             }
         };
-        let result = if let Some(operation) = recovered {
-            let result = match recovered_multipart_result(operation, &lease) {
+        let result = if let Some(recovered_operation) = recovered {
+            let result = match recovered_multipart_result(
+                state.operation_journal.as_ref(),
+                recovered_operation,
+                &lease,
+                operation.receipt_id,
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(error) => return multipart_completion_error_response(&key, error),
             };
@@ -7201,6 +7803,7 @@ async fn s3_post(
                     AuthorizedOperation {
                         auth: &auth,
                         authorization: &authorization,
+                        receipt_id: operation.receipt_id,
                     },
                     backend,
                 ),
@@ -7227,7 +7830,8 @@ async fn s3_post(
             }
         };
         cleanup_staged_parts(&staging, upload_id, lease.cleanup_parts, "complete").await;
-        if let Err(response) = record_operation_with_event(
+        if let Err(response) = record_durable_operation_with_event(
+            state.operation_journal.as_ref(),
             state.control.clone(),
             &auth.context,
             multipart_completion_event(&authorization, &result, operation.receipt_id),
@@ -7292,6 +7896,24 @@ async fn s3_post(
         {
             return s3_error::multipart_not_supported(&key);
         }
+        // Freeze and serialize policy before creating managed multipart state.
+        // Resolver or serialization failures therefore cannot orphan a managed
+        // registration without a corresponding staging upload.
+        let plugin_snapshot = match state
+            .gateway
+            .resolve(
+                auth.workspace_id().as_str(),
+                &bucket,
+                crate::pipeline::PipelineDirection::Write,
+            )
+            .await
+        {
+            Ok(resolution) => match serde_json::to_value(&resolution) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+            },
+            Err(error) => return s3_error::invalid_request(&key, error.message()),
+        };
         let upload_id = Uuid::now_v7().to_string();
         let managed_registration = if let ResolvedBackend::Managed(storage) = &backend {
             match storage
@@ -7303,18 +7925,6 @@ async fn s3_post(
             }
         } else {
             None
-        };
-        let plugin_snapshot = match state
-            .gateway
-            .resolve(
-                auth.workspace_id().as_str(),
-                &bucket,
-                crate::pipeline::PipelineDirection::Write,
-            )
-            .await
-        {
-            Ok(resolution) => serde_json::to_value(&resolution).unwrap_or(serde_json::json!(null)),
-            Err(error) => return s3_error::invalid_request(&key, error.message()),
         };
         let now = now_ms();
         let upload = MultipartUpload {
@@ -8667,7 +9277,8 @@ pub async fn build_state(
             .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
     };
 
-    let component_bytes = std::fs::read(component_path())?;
+    let explicit_component_path = component_path();
+    let component_bytes = std::fs::read(&explicit_component_path)?;
     let pipeline_fuel = std::env::var("S4_WASM_FUEL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -8711,7 +9322,11 @@ pub async fn build_state(
     if let Ok(plugin_dir) = std::env::var("S4_PLUGINS_DIR") {
         let dir = std::path::Path::new(&plugin_dir);
         if dir.exists() {
-            plugins.load_from_dir_with_capabilities(dir, &prefix_safe_hashes)?;
+            plugins.load_from_dir_with_capabilities_excluding(
+                dir,
+                &prefix_safe_hashes,
+                Some(&explicit_component_path),
+            )?;
         }
     }
 

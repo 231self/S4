@@ -157,7 +157,7 @@ pub enum FilterWorldVersion {
 /// Which optional sensitive fields a specific component invocation may
 /// receive. Sensitive material is delivered per-grant, never to every plugin
 /// in a pipeline unconditionally.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SensitiveGrant {
     pub public_key_pem: bool,
     pub entropy_seed: bool,

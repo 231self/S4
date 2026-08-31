@@ -2807,6 +2807,20 @@ mod tests {
     use super::*;
     use crate::key_cipher::LocalKeyWrapping;
 
+    #[test]
+    fn legacy_completion_result_json_defaults_new_accounting_fields() {
+        let result: MultipartCompletionResult = serde_json::from_value(serde_json::json!({
+            "etag": "\"legacy\"",
+            "checksum_sha256": "legacy-sha",
+            "version_id": null
+        }))
+        .unwrap();
+
+        assert_eq!(result.source_bytes, 0);
+        assert_eq!(result.size_bytes, 0);
+        assert!(result.pipeline_evidence.is_none());
+    }
+
     fn identity() -> MultipartIdentity {
         MultipartIdentity {
             tenant_id: "tenant-a".to_string(),

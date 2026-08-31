@@ -503,6 +503,11 @@ impl SinkCommitState {
 #[async_trait]
 pub trait ObjectSinkTransaction: Send {
     fn commit_state(&self) -> SinkCommitState;
+    /// Durable journal operation backing this sink, if any. Development
+    /// memory and compatibility sinks deliberately return `None`.
+    fn durable_operation_id(&self) -> Option<Uuid> {
+        None
+    }
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError>;
     async fn verify_output(
         &mut self,

@@ -460,47 +460,90 @@ fn validate_utf8(input: &[u8], code: &'static str) -> Result<(), S4Error> {
         .map_err(|error| S4Error::new(code, error.to_string()))
 }
 
-/// Validates a complete set of output records against the selected record
-/// format before they are committed downstream.
-///
-/// Custom filter components are untrusted: their `Emit` and `finish` output
-/// must still form a well-formed record stream in the target format. Re-decoding
-/// the output with a fresh [`RecordDecoder`] proves structure and encoding
-/// (UTF-8, JSON documents, CSV fields, line/TSV framing) without ever
-/// committing malformed data.
+/// Stateful validator for the aggregate byte stream emitted by an untrusted
+/// pipeline. One instance spans every transform and finish record so framing
+/// errors that cross record boundaries cannot be hidden by per-record parsing.
+#[derive(Debug)]
+pub struct OutputValidator {
+    format: Format,
+    decoder: RecordDecoder,
+    max_frame_bytes: usize,
+    input_seen: bool,
+    finished: bool,
+}
+
+impl OutputValidator {
+    pub fn new(format: Format, limits: DecoderLimits) -> Result<Self, S4Error> {
+        let decoder = RecordDecoder::new(format, limits)?;
+        Ok(Self {
+            format,
+            decoder,
+            max_frame_bytes: limits.max_source_frame_bytes,
+            input_seen: false,
+            finished: false,
+        })
+    }
+
+    pub fn push_record(&mut self, record: &Record) -> Result<(), S4Error> {
+        if self.finished {
+            return Err(S4Error::new(
+                codes::INTERNAL,
+                "cannot validate output after finish",
+            ));
+        }
+        self.push_bytes(&record.payload)?;
+        self.push_bytes(&record.separator)
+    }
+
+    pub fn finish(&mut self) -> Result<(), S4Error> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        // A pipeline may legitimately drop every record. In particular, an
+        // empty CSV output is valid even though an empty CSV source is not.
+        if !self.input_seen {
+            return Ok(());
+        }
+        self.decoder.finish()?;
+        self.drain_records()
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), S4Error> {
+        self.input_seen |= !bytes.is_empty();
+        // `max_source_frame_bytes` bounds transport chunks, not complete
+        // records. Feed large final records incrementally while retaining the
+        // independent record/document limits inside RecordDecoder.
+        for chunk in bytes.chunks(self.max_frame_bytes) {
+            self.decoder.push(chunk)?;
+            self.drain_records()?;
+        }
+        Ok(())
+    }
+
+    fn drain_records(&mut self) -> Result<(), S4Error> {
+        while let Some(record) = self.decoder.next_record()? {
+            if self.format == Format::Jsonl {
+                validate_utf8(&record.payload, codes::DECODE_ENCODING)?;
+                serde_json::from_slice::<serde_json::Value>(&record.payload)
+                    .map_err(|error| S4Error::new(codes::DECODE_JSONL, error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validates a complete set of output records as one aggregate output stream.
 pub fn validate_output_records(
     format: Format,
     records: &[Record],
     limits: DecoderLimits,
 ) -> Result<(), S4Error> {
-    // A pipeline may legitimately drop every record (e.g. PII redaction on an
-    // empty or all-sensitive stream); empty output is always well-formed.
-    if records.is_empty() {
-        return Ok(());
-    }
-    let mut decoder = RecordDecoder::new(format, limits)?;
+    let mut validator = OutputValidator::new(format, limits)?;
     for record in records {
-        if !record.payload.is_empty() {
-            decoder.push(&record.payload)?;
-            while decoder.next_record()?.is_some() {}
-        }
-        if !record.separator.is_empty() {
-            decoder.push(&record.separator)?;
-            while decoder.next_record()?.is_some() {}
-        }
+        validator.push_record(record)?;
     }
-    decoder.finish()?;
-    while decoder.next_record()?.is_some() {}
-    // The line decoder validates framing and UTF-8 but not per-line JSON
-    // structure; prove JSONL/JSON documents parse before commit.
-    if format == Format::Jsonl {
-        for record in records {
-            validate_utf8(&record.payload, codes::DECODE_ENCODING)?;
-            serde_json::from_slice::<serde_json::Value>(&record.payload)
-                .map_err(|error| S4Error::new(codes::DECODE_JSONL, error.to_string()))?;
-        }
-    }
-    Ok(())
+    validator.finish()
 }
 
 fn limit_error(code: &'static str, kind: &str, actual: usize, limit: usize) -> S4Error {
@@ -593,6 +636,81 @@ mod tests {
                 .unwrap_err()
                 .code(),
             codes::DECODE_JSON
+        );
+    }
+
+    #[test]
+    fn output_validator_accepts_complete_records_larger_than_transport_frames() {
+        let limits = DecoderLimits::default();
+        let payload = vec![b'x'; DEFAULT_MAX_RECORD_BYTES];
+        validate_output_records(
+            Format::Text,
+            &[Record::new(payload, Bytes::from_static(b"\n"))],
+            limits,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn output_validator_enforces_aggregate_json_framing() {
+        let records = [
+            Record::new(br#"{"transform":true}"#.to_vec(), Bytes::new()),
+            Record::new(br#"{"finish":true}"#.to_vec(), Bytes::new()),
+        ];
+        assert_eq!(
+            validate_output_records(Format::Json, &records, DecoderLimits::default())
+                .unwrap_err()
+                .code(),
+            codes::DECODE_JSON
+        );
+    }
+
+    #[test]
+    fn output_validator_tracks_jsonl_and_csv_framing_across_records() {
+        validate_output_records(
+            Format::Jsonl,
+            &[
+                Record::new(br#"{"split":"#.to_vec(), Bytes::new()),
+                Record::new(br#"true}"#.to_vec(), Bytes::from_static(b"\n")),
+            ],
+            DecoderLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_output_records(
+                Format::Jsonl,
+                &[
+                    Record::new(br#"{"first":true}"#.to_vec(), Bytes::new()),
+                    Record::new(br#"{"second":true}"#.to_vec(), Bytes::from_static(b"\n"),),
+                ],
+                DecoderLimits::default(),
+            )
+            .unwrap_err()
+            .code(),
+            codes::DECODE_JSONL
+        );
+
+        validate_output_records(
+            Format::Csv,
+            &[
+                Record::new(b"\"quoted".to_vec(), Bytes::new()),
+                Record::new(b"\nfield\",tail".to_vec(), Bytes::from_static(b"\n")),
+            ],
+            DecoderLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_output_records(
+                Format::Csv,
+                &[
+                    Record::new(b"\"closed\"".to_vec(), Bytes::new()),
+                    Record::new(b"garbage".to_vec(), Bytes::from_static(b"\n")),
+                ],
+                DecoderLimits::default(),
+            )
+            .unwrap_err()
+            .code(),
+            codes::DECODE_CSV
         );
     }
 }

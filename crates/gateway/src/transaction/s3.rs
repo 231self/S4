@@ -857,6 +857,10 @@ impl ObjectSinkTransaction for DirectS3Sink {
         }
     }
 
+    fn durable_operation_id(&self) -> Option<uuid::Uuid> {
+        Some(self.operation.id)
+    }
+
     async fn write(&mut self, mut chunk: Bytes) -> Result<(), TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);

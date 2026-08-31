@@ -10,14 +10,15 @@ GATEWAY_PID=""
 # Isolate the local-mode key store from the user's real config directory so a
 # stale `~/Library/Application Support/s4/keys.json` (DEK wrapped by an earlier
 # ephemeral/secret key) can never abort gateway startup.
-KEYS_FILE="/tmp/s4-sdkgen-keys-$$.json"
+KEYS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s4-sdkgen-keys.XXXXXX")"
+KEYS_FILE="$KEYS_DIR/keys.json"
 
 cleanup() {
     if [ -n "$GATEWAY_PID" ]; then
         kill "$GATEWAY_PID" 2>/dev/null || true
         wait "$GATEWAY_PID" 2>/dev/null || true
     fi
-    rm -f "$KEYS_FILE"
+    rm -rf "$KEYS_DIR"
 }
 trap cleanup EXIT
 

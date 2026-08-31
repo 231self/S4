@@ -635,6 +635,23 @@ fn postgres_operation_journal_persists_canonical_ambiguous_completion() {
 }
 
 #[test]
+fn postgres_evidence_foreign_key_requires_a_matching_operation_intent() {
+    with_pool(|pool| async move {
+        let journal = PostgresOperationJournal::new(pool);
+        let missing_operation_id = uuid::Uuid::now_v7();
+        let error = journal
+            .append_evidence(EvidenceRecord::new(
+                missing_operation_id,
+                "usage",
+                serde_json::json!({"source": "memory-sink-regression"}),
+            ))
+            .await
+            .expect_err("evidence without an operation intent must violate the FK");
+        assert!(error.to_string().contains("journal persistence failed"));
+    });
+}
+
+#[test]
 fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());

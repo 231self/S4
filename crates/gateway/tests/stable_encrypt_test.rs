@@ -152,12 +152,21 @@ fn no_key_no_encryption() {
 }
 
 #[test]
-fn non_json_records_pass_through() {
+fn non_json_records_are_rejected_for_jsonl_output() {
     let registry = registry();
     let key = stable_key("s4s_testsecret");
     let input = b"plain text line\nanother line\n";
-    let out = run(&registry, input, Some(&key), Some("email"));
-    assert_eq!(out, input);
+    let error = common::stream_process(
+        &registry,
+        input,
+        Format::Jsonl,
+        "application/x-ndjson",
+        None,
+        Some(&key),
+        Some("email"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), s4_error::codes::DECODE_INVALID_OUTPUT);
 }
 
 #[test]

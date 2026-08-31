@@ -1,7 +1,6 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -11,24 +10,28 @@ use tracing::{info, warn};
 
 use crate::managed::{
     BackendVersioningCapability, BackendVersioningMode, CopyStatus, DurablePhysicalWriteIntent,
-    LogicalObjectKey, ManagedError, ManagedRepository, ManagedStreamingMode, NamespacePurgeRequest,
-    NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget,
-    PhysicalWriteIntent, Placement, RepairKind, RepairRecord, RepairTargetRole,
-    generation_physical_key, rendezvous_placement,
+    LogicalObjectKey, ManagedError, ManagedLogicalOperationState, ManagedMutationKind,
+    ManagedRepository, ManagedStreamingMode, NamespacePurgeRequest, NamespacePurgeStatus,
+    ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget, PhysicalWriteIntent, Placement,
+    ProviderStorageIdentity, RepairKind, RepairRecord, RepairTargetRole, generation_physical_key,
+    rendezvous_placement,
 };
 use crate::s3_safety::{
     record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, DirectS3Sink, ExpectedObject,
-    ManagedOperationScope, ObjectDestination, ObjectSinkTransaction, OperationJournal,
-    OperationReconciler, OperationState, StoredObjectMeta, TransactionBackend, TransactionError,
-    VersioningCapability,
+    ManagedChildRole, ManagedOperationScope, ObjectDestination, ObjectSinkTransaction,
+    OperationJournal, OperationReconciler, OperationState, StoredObjectMeta, TransactionBackend,
+    TransactionError, VersioningCapability,
 };
 
 #[derive(Debug, Clone)]
 pub struct ServiceBackend {
     pub provider: String,
+    pub provider_instance_id: Option<String>,
+    pub provider_account_id: Option<String>,
+    pub credential_epoch: Option<u64>,
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
@@ -37,16 +40,52 @@ pub struct ServiceBackend {
 }
 
 impl ServiceBackend {
-    pub fn id(&self) -> String {
-        format!("{}:{}", self.provider, self.bucket)
+    pub fn provider_kind(&self) -> &str {
+        &self.provider
     }
 
-    pub fn fingerprint(&self) -> String {
-        let identity = format!(
-            "{}\n{}\n{}\n{}\n{}",
-            self.provider, self.endpoint, self.region, self.bucket, self.access_key
-        );
-        hex::encode(Sha256::digest(identity.as_bytes()))
+    pub fn provider_instance_id(&self) -> Option<&str> {
+        self.provider_instance_id.as_deref()
+    }
+
+    pub fn provider_account_id(&self) -> Option<&str> {
+        self.provider_account_id.as_deref()
+    }
+
+    pub fn credential_epoch(&self) -> Option<u64> {
+        self.credential_epoch
+    }
+
+    pub fn is_b2(&self) -> bool {
+        self.provider_kind().eq_ignore_ascii_case("b2")
+    }
+
+    pub fn id(&self) -> String {
+        self.provider_instance_id().map_or_else(
+            || format!("{}:{}", self.provider, self.bucket),
+            |instance_id| format!("{}:{instance_id}", self.provider),
+        )
+    }
+
+    pub fn storage_identity(&self) -> Option<ProviderStorageIdentity> {
+        Some(ProviderStorageIdentity {
+            provider_kind: self.provider.clone(),
+            provider_instance_id: self.provider_instance_id.clone()?,
+            provider_account_id: self.provider_account_id.clone()?,
+            canonical_endpoint: canonical_provider_endpoint(&self.endpoint)?,
+            region: self.region.clone(),
+        })
+    }
+
+    fn matches_persisted_identity(
+        &self,
+        identity: &ProviderStorageIdentity,
+        credential_epoch: u64,
+    ) -> bool {
+        self.storage_identity().as_ref() == Some(identity)
+            && self
+                .credential_epoch()
+                .is_some_and(|current| current >= credential_epoch)
     }
 
     pub async fn build_client(&self) -> Option<Client> {
@@ -69,6 +108,23 @@ impl ServiceBackend {
                 .build(),
         ))
     }
+}
+
+fn canonical_provider_endpoint(endpoint: &str) -> Option<String> {
+    let mut endpoint = reqwest::Url::parse(endpoint).ok()?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return None;
+    }
+    if endpoint.path().is_empty() {
+        endpoint.set_path("/");
+    }
+    Some(endpoint.to_string())
 }
 
 #[derive(Debug)]
@@ -145,6 +201,42 @@ impl ServiceStorage {
 
     pub fn authority_repository(&self) -> Option<&Arc<dyn ManagedRepository>> {
         self.authority.as_ref()
+    }
+
+    /// Validate the launch topology before enabling transactional managed
+    /// mutations. Observe/off modes retain the legacy multi-provider topology.
+    pub fn validate_managed_launch_configuration(&self) -> Result<(), String> {
+        if self.managed_mode != ManagedStreamingMode::Enforce {
+            return Ok(());
+        }
+        let [backend] = self.backends.as_slice() else {
+            return Err(
+                "transactional managed mode requires exactly one managed B2 backend at launch"
+                    .to_string(),
+            );
+        };
+        if !backend.is_b2() {
+            return Err(
+                "transactional managed mode requires the launch backend provider to be B2"
+                    .to_string(),
+            );
+        }
+        if reqwest::Url::parse(&backend.endpoint)
+            .ok()
+            .is_none_or(|endpoint| endpoint.scheme() != "https")
+        {
+            return Err("transactional managed B2 requires an HTTPS provider endpoint".to_string());
+        }
+        if backend.storage_identity().is_none()
+            || backend.provider_account_id().is_none()
+            || !backend.credential_epoch().is_some_and(|epoch| epoch > 0)
+        {
+            return Err(
+                "transactional managed B2 requires explicit provider instance/account identity and a positive credential epoch"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     pub async fn assert_namespace_active(&self, tenant_id: &str) -> Result<(), ManagedError> {
@@ -290,10 +382,11 @@ impl ServiceStorage {
         let index = self
             .index_for_id(&target.backend_id)
             .ok_or_else(|| format!("unknown managed backend {}", target.backend_id))?;
-        let current_fingerprint = self.backends[index].fingerprint();
-        if current_fingerprint != target.backend_fingerprint {
+        if !self.backends[index]
+            .matches_persisted_identity(&target.storage_identity, target.credential_epoch)
+        {
             return Err(format!(
-                "managed backend {} identity changed since the physical version was written",
+                "managed backend {} storage identity changed or its credential epoch moved backwards since the physical version was written",
                 target.backend_id
             ));
         }
@@ -469,9 +562,11 @@ impl ServiceStorage {
         let index = self
             .index_for_id(&intent.backend_id)
             .ok_or_else(|| format!("unknown managed backend {}", intent.backend_id))?;
-        if self.backends[index].fingerprint() != intent.backend_fingerprint {
+        if !self.backends[index]
+            .matches_persisted_identity(&intent.storage_identity, intent.credential_epoch)
+        {
             return Err(format!(
-                "managed backend {} identity changed while a write intent was unresolved",
+                "managed backend {} storage identity changed or its credential epoch moved backwards while a write intent was unresolved",
                 intent.backend_id
             ));
         }
@@ -568,8 +663,14 @@ impl ServiceStorage {
                         intent.backend_id
                     ))
                 })?;
-                let backend: Arc<dyn TransactionBackend> =
-                    Arc::new(AwsS3TransactionBackend::new(client, capabilities));
+                let backend: Arc<dyn TransactionBackend> = if self.backends[index].is_b2() {
+                    Arc::new(AwsS3TransactionBackend::new_managed_b2(
+                        client,
+                        capabilities,
+                    ))
+                } else {
+                    Arc::new(AwsS3TransactionBackend::new(client, capabilities))
+                };
                 let reconciler = OperationReconciler::new(
                     journal.clone(),
                     backend,
@@ -884,10 +985,14 @@ impl ServiceStorage {
     ) -> Option<aws_sdk_s3::operation::get_object::GetObjectOutput> {
         let index = self.index_for_id(backend_id)?;
         let client = self.client_for(index).await?;
+        let version_id = (backend_id == authority.primary_backend_id)
+            .then(|| authority.primary_version_id.clone())
+            .flatten();
         let mut request = client
             .get_object()
             .bucket(&self.backends[index].bucket)
-            .key(physical_key);
+            .key(physical_key)
+            .set_version_id(version_id);
         if let Some(range) = range {
             request = request.range(range);
         }
@@ -978,10 +1083,14 @@ impl ServiceStorage {
     ) -> Option<aws_sdk_s3::operation::head_object::HeadObjectOutput> {
         let index = self.index_for_id(backend_id)?;
         let client = self.client_for(index).await?;
+        let version_id = (backend_id == authority.primary_backend_id)
+            .then(|| authority.primary_version_id.clone())
+            .flatten();
         let output = match client
             .head_object()
             .bucket(&self.backends[index].bucket)
             .key(physical_key)
+            .set_version_id(version_id)
             .send()
             .await
         {
@@ -1070,30 +1179,68 @@ impl ServiceStorage {
         Ok(())
     }
 
-    pub async fn begin_authoritative_sink(
+    /// Start a managed generation with the exact physical child identity
+    /// persisted by its logical parent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn begin_authoritative_sink_for_operation(
         self: &Arc<Self>,
         journal: Arc<dyn OperationJournal>,
         capabilities: BackendCapabilities,
         logical: LogicalObjectKey,
         content_type: &str,
+        logical_operation_id: uuid::Uuid,
+        child_scope: ManagedOperationScope,
+        generation: uuid::Uuid,
     ) -> Result<Box<dyn ObjectSinkTransaction>, TransactionError> {
+        if child_scope.tenant_id != logical.tenant_id {
+            return Err(TransactionError::Publication(
+                "managed child scope belongs to a different tenant".to_string(),
+            ));
+        }
         if self.managed_mode != ManagedStreamingMode::Enforce {
             return Err(TransactionError::Publication(
                 ManagedError::MutationDisabled(self.managed_mode).to_string(),
             ));
         }
+        self.validate_managed_launch_configuration()
+            .map_err(TransactionError::Publication)?;
         let repository = self
             .authority_repository_required()
-            .map_err(|error| TransactionError::Publication(error.to_string()))?;
-        let existing = repository
-            .get(&logical)
-            .await
             .map_err(|error| TransactionError::Publication(error.to_string()))?;
         let placement = self.placement(&logical).ok_or_else(|| {
             TransactionError::Publication("managed storage has no backends".to_string())
         })?;
-        let generation = uuid::Uuid::now_v7();
         let physical_key = generation_physical_key(&logical, generation);
+        let parent = repository
+            .logical_operation(logical_operation_id)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?
+            .ok_or_else(|| {
+                TransactionError::Publication(
+                    "managed logical parent operation was not found".to_string(),
+                )
+            })?;
+        let usage = repository
+            .workspace_usage(&logical.tenant_id)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        if parent.intent.kind != ManagedMutationKind::Put
+            || parent.state != ManagedLogicalOperationState::Open
+            || usage
+                .as_ref()
+                .is_none_or(|usage| usage.active_operation_id != Some(logical_operation_id))
+            || parent.intent.logical != logical
+            || parent.intent.generation != generation
+            || parent.intent.primary_child_operation_id != child_scope.operation_id
+            || parent.intent.fence.namespace_epoch != child_scope.namespace_epoch
+            || parent.intent.backend_id != placement.primary_backend_id
+            || parent.intent.provider_bucket != self.backends[0].bucket
+            || parent.intent.physical_key != physical_key
+        {
+            return Err(TransactionError::Publication(
+                "managed logical parent does not match its reserved physical child".to_string(),
+            ));
+        }
         let mut metadata = BTreeMap::from([
             ("content-type".to_string(), content_type.to_string()),
             ("s4-generation".to_string(), generation.to_string()),
@@ -1106,44 +1253,26 @@ impl ServiceStorage {
                 &logical,
                 &physical_key,
                 metadata.clone(),
+                ManagedChildIdentity::Supplied(child_scope),
             )
             .await?;
-        let replica = if let Some(replica_id) = &placement.replica_backend_id {
-            match self
-                .direct_sink_for(
-                    &journal,
-                    capabilities,
-                    replica_id,
-                    &logical,
-                    &physical_key,
-                    metadata.clone(),
-                )
-                .await
-            {
-                Ok(replica) => Some(replica),
-                Err(error) => {
-                    warn!("managed replica transaction initialization failed: {error}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
         metadata.remove("s4-generation");
         Ok(Box::new(ManagedReplicatedSink {
             repository,
             logical,
             generation,
             placement,
-            expected_cas: existing.map(|authority| authority.cas_version),
+            logical_operation_id: Some(logical_operation_id),
+            expected_cas: None,
             metadata,
             primary,
-            replica,
+            replica: None,
             output: None,
             finished: false,
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn direct_sink_for(
         &self,
         journal: &Arc<dyn OperationJournal>,
@@ -1151,7 +1280,8 @@ impl ServiceStorage {
         backend_id: &str,
         logical: &LogicalObjectKey,
         physical_key: &str,
-        metadata: BTreeMap<String, String>,
+        mut metadata: BTreeMap<String, String>,
+        child_identity: ManagedChildIdentity,
     ) -> Result<Box<dyn ManagedDestination>, TransactionError> {
         let index = self.index_for_id(backend_id).ok_or_else(|| {
             TransactionError::Publication(format!("unknown managed backend {backend_id}"))
@@ -1159,20 +1289,70 @@ impl ServiceStorage {
         let client = self.client_for(index).await.ok_or_else(|| {
             TransactionError::Publication(format!("managed backend {backend_id} is unavailable"))
         })?;
-        let backend: Arc<dyn TransactionBackend> =
-            Arc::new(AwsS3TransactionBackend::new(client, capabilities));
-        let operation_id = uuid::Uuid::now_v7();
+        let backend: Arc<dyn TransactionBackend> = if self.backends[index].is_b2() {
+            Arc::new(AwsS3TransactionBackend::new_managed_b2(
+                client,
+                capabilities,
+            ))
+        } else {
+            Arc::new(AwsS3TransactionBackend::new(client, capabilities))
+        };
+        if let Some(instance_id) = self.backends[index].provider_instance_id() {
+            metadata.insert("s4-provider-instance".to_string(), instance_id.to_string());
+        }
+        if let Some(account_id) = self.backends[index].provider_account_id() {
+            metadata.insert("s4-provider-account".to_string(), account_id.to_string());
+        }
+        if let Some(credential_epoch) = self.backends[index].credential_epoch() {
+            metadata.insert(
+                "s4-credential-epoch".to_string(),
+                credential_epoch.to_string(),
+            );
+        }
+        let destination = ObjectDestination {
+            backend_id: backend_id.to_string(),
+            bucket: self.backends[index].bucket.clone(),
+            logical_key: logical.object_key(),
+            physical_key: physical_key.to_string(),
+        };
+        let (operation_id, expected_namespace_epoch) = match child_identity {
+            ManagedChildIdentity::Supplied(scope) => {
+                (scope.operation_id, Some(scope.namespace_epoch))
+            }
+            ManagedChildIdentity::Deterministic { parent, role } => (
+                ManagedOperationScope::deterministic_child(
+                    parent,
+                    logical.tenant_id.clone(),
+                    0,
+                    &destination,
+                    role,
+                )
+                .operation_id,
+                None,
+            ),
+        };
         let repository = self
             .authority_repository_required()
             .map_err(|error| TransactionError::Publication(error.to_string()))?;
         let versioning_mode = self.versioning_mode(index).await;
+        let storage_identity = self.backends[index].storage_identity().ok_or_else(|| {
+            TransactionError::Publication(format!(
+                "managed backend {backend_id} has no immutable storage identity"
+            ))
+        })?;
+        let credential_epoch = self.backends[index].credential_epoch().ok_or_else(|| {
+            TransactionError::Publication(format!(
+                "managed backend {backend_id} has no credential epoch"
+            ))
+        })?;
         let writer_owner = format!("managed-writer-{}", uuid::Uuid::now_v7());
         let lease = repository
             .begin_physical_write(PhysicalWriteIntent {
                 intent_id: operation_id,
                 tenant_id: logical.tenant_id.clone(),
                 backend_id: backend_id.to_string(),
-                backend_fingerprint: self.backends[index].fingerprint(),
+                storage_identity,
+                credential_epoch,
                 provider_bucket: self.backends[index].bucket.clone(),
                 physical_key: physical_key.to_string(),
                 versioning_mode,
@@ -1185,12 +1365,15 @@ impl ServiceStorage {
             })
             .await
             .map_err(|error| TransactionError::Publication(error.to_string()))?;
-        let destination = ObjectDestination {
-            backend_id: backend_id.to_string(),
-            bucket: self.backends[index].bucket.clone(),
-            logical_key: logical.object_key(),
-            physical_key: physical_key.to_string(),
-        };
+        if expected_namespace_epoch.is_some_and(|expected| expected != lease.namespace_epoch) {
+            repository
+                .abort_physical_write(&lease)
+                .await
+                .map_err(|error| TransactionError::Publication(error.to_string()))?;
+            return Err(TransactionError::Publication(
+                "managed child scope namespace epoch is stale".to_string(),
+            ));
+        }
         let (abort_signal, mut abort_receiver) = AbortSignal::channel(1);
         let reconciler = OperationReconciler::new(
             journal.clone(),
@@ -1362,6 +1545,7 @@ impl ServiceStorage {
             metadata: repair.metadata.clone(),
             placement_version: repair.placement_version,
             primary_backend_id: source_id.to_string(),
+            primary_version_id: output.version_id().map(ToOwned::to_owned),
             replica_backend_id: None,
             primary_status: CopyStatus::Ready,
             replica_status: CopyStatus::Absent,
@@ -1388,6 +1572,10 @@ impl ServiceStorage {
                 &repair.logical,
                 &repair.physical_key,
                 metadata,
+                ManagedChildIdentity::Deterministic {
+                    parent: repair.id,
+                    role: ManagedChildRole::Repair,
+                },
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -1438,6 +1626,15 @@ impl ServiceStorage {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug)]
+enum ManagedChildIdentity {
+    Supplied(ManagedOperationScope),
+    Deterministic {
+        parent: uuid::Uuid,
+        role: ManagedChildRole,
+    },
 }
 
 struct ManagedDirectSink {
@@ -1663,6 +1860,7 @@ struct ManagedReplicatedSink {
     logical: LogicalObjectKey,
     generation: uuid::Uuid,
     placement: Placement,
+    logical_operation_id: Option<uuid::Uuid>,
     expected_cas: Option<u64>,
     metadata: BTreeMap<String, String>,
     primary: Box<dyn ManagedDestination>,
@@ -1753,6 +1951,7 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
             metadata: self.metadata.clone(),
             placement_version: self.placement.version,
             primary_backend_id: self.placement.primary_backend_id.clone(),
+            primary_version_id: primary.version_id.clone(),
             replica_backend_id: self.placement.replica_backend_id.clone(),
             primary_status: CopyStatus::Ready,
             replica_status,
@@ -1761,7 +1960,19 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        if let Err(error) = self
+        if let Some(logical_operation_id) = self.logical_operation_id {
+            let physical_version_count = u64::try_from(primary.superseded_version_ids.len())
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or(TransactionError::CapacityExceeded)?;
+            let physical_allocated_bytes = size
+                .checked_mul(physical_version_count)
+                .ok_or(TransactionError::CapacityExceeded)?;
+            self.repository
+                .commit_logical_put(logical_operation_id, authority, physical_allocated_bytes)
+                .await
+                .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        } else if let Err(error) = self
             .repository
             .publish(authority.clone(), self.expected_cas)
             .await
@@ -1814,10 +2025,54 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
     for (index, definition) in env_value.split(';').enumerate() {
         let entry = index + 1;
         let parts: Vec<&str> = definition.split('|').collect();
-        let [provider, endpoint, region, bucket, access_key, secret_key] = parts.as_slice() else {
-            return Err(format!(
-                "invalid S4_SERVICE_BUCKETS entry {entry}: expected exactly six fields"
-            ));
+        let (
+            provider,
+            instance,
+            account,
+            credential_epoch,
+            endpoint,
+            region,
+            bucket,
+            access_key,
+            secret_key,
+        ) = match parts.as_slice() {
+            [provider, endpoint, region, bucket, access_key, secret_key] => (
+                *provider,
+                None,
+                None,
+                None,
+                *endpoint,
+                *region,
+                *bucket,
+                *access_key,
+                *secret_key,
+            ),
+            [
+                provider,
+                instance,
+                account,
+                credential_epoch,
+                endpoint,
+                region,
+                bucket,
+                access_key,
+                secret_key,
+            ] => (
+                *provider,
+                Some(*instance),
+                Some(*account),
+                Some(*credential_epoch),
+                *endpoint,
+                *region,
+                *bucket,
+                *access_key,
+                *secret_key,
+            ),
+            _ => {
+                return Err(format!(
+                    "invalid S4_SERVICE_BUCKETS entry {entry}: expected six legacy fields or nine managed identity fields"
+                ));
+            }
         };
         if parts.iter().any(|part| part.trim().is_empty()) {
             return Err(format!(
@@ -1829,6 +2084,33 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
                 "invalid S4_SERVICE_BUCKETS entry {entry}: malformed provider"
             ));
         }
+        let explicit_identity = instance
+            .zip(account)
+            .zip(credential_epoch)
+            .map(|((instance, account), credential_epoch)| {
+                if !valid_identifier(instance, 128) {
+                    return Err(format!(
+                        "invalid S4_SERVICE_BUCKETS entry {entry}: malformed provider instance ID"
+                    ));
+                }
+                if !valid_identifier(account, 256) {
+                    return Err(format!(
+                        "invalid S4_SERVICE_BUCKETS entry {entry}: malformed provider account ID"
+                    ));
+                }
+                let credential_epoch = credential_epoch.parse::<u64>().map_err(|_| {
+                    format!(
+                        "invalid S4_SERVICE_BUCKETS entry {entry}: malformed credential epoch"
+                    )
+                })?;
+                if credential_epoch == 0 {
+                    return Err(format!(
+                        "invalid S4_SERVICE_BUCKETS entry {entry}: credential epoch must be positive"
+                    ));
+                }
+                Ok((instance, account, credential_epoch))
+            })
+            .transpose()?;
         let endpoint_url = reqwest::Url::parse(endpoint)
             .map_err(|_| format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint"))?;
         if endpoint.len() > 2048
@@ -1844,6 +2126,9 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
                 "invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint"
             ));
         }
+        let canonical_endpoint = canonical_provider_endpoint(endpoint).ok_or_else(|| {
+            format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint")
+        })?;
         if !valid_identifier(region, 128) {
             return Err(format!(
                 "invalid S4_SERVICE_BUCKETS entry {entry}: malformed region"
@@ -1865,12 +2150,19 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
             ));
         }
         backends.push(ServiceBackend {
-            provider: (*provider).to_string(),
-            endpoint: (*endpoint).to_string(),
-            region: (*region).to_string(),
-            bucket: (*bucket).to_string(),
-            access_key: (*access_key).to_string(),
-            secret_key: (*secret_key).to_string(),
+            provider: provider.to_string(),
+            provider_instance_id: explicit_identity
+                .as_ref()
+                .map(|(instance, _, _)| (*instance).to_string()),
+            provider_account_id: explicit_identity
+                .as_ref()
+                .map(|(_, account, _)| (*account).to_string()),
+            credential_epoch: explicit_identity.map(|(_, _, epoch)| epoch),
+            endpoint: canonical_endpoint,
+            region: region.to_string(),
+            bucket: bucket.to_string(),
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
         });
     }
     Ok(backends)
@@ -1900,6 +2192,73 @@ mod tests {
         assert_eq!(backends.len(), 2);
         assert_eq!(backends[0].provider, "aws");
         assert_eq!(backends[1].bucket, "bucket-two");
+
+        let managed = parse_service_backends(
+            "b2|managed-primary|account-123|2|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|rotated-key|rotated-secret",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!(managed.provider_kind(), "b2");
+        assert_eq!(managed.provider_instance_id(), Some("managed-primary"));
+        assert_eq!(managed.provider_account_id(), Some("account-123"));
+        assert_eq!(managed.credential_epoch(), Some(2));
+        assert_eq!(managed.id(), "b2:managed-primary");
+        assert_eq!(
+            managed.storage_identity().unwrap().canonical_endpoint,
+            "https://s3.us-east-005.backblazeb2.com/"
+        );
+        assert!(
+            parse_service_backends(
+                "b2|managed-primary|2|https://s3.example|us-east-1|bucket|key|secret"
+            )
+            .unwrap_err()
+            .contains("nine managed identity fields")
+        );
+    }
+
+    #[test]
+    fn transactional_managed_launch_requires_one_identified_b2_backend() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let managed = parse_service_backends(
+            "b2|managed-primary|account-123|1|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|key|secret",
+        )
+        .unwrap();
+        let storage = ServiceStorage::with_management(
+            managed,
+            repository.clone(),
+            ManagedStreamingMode::Enforce,
+            PLACEMENT_VERSION_V1,
+        );
+        assert!(storage.validate_managed_launch_configuration().is_ok());
+
+        for invalid in [
+            Vec::new(),
+            parse_service_backends(
+                "aws|provider-one|account-123|1|https://s3.example|us-east-1|bucket|key|secret",
+            )
+            .unwrap(),
+            parse_service_backends(
+                "b2|https://s3.example|us-east-1|bucket|key|secret",
+            )
+            .unwrap(),
+            parse_service_backends(
+                "b2|managed-primary|account-123|1|http://s3.example|us-east-1|bucket|key|secret",
+            )
+            .unwrap(),
+            parse_service_backends(
+                "b2|one|account-1|1|https://s3.example|us-east-1|bucket-one|key|secret;b2|two|account-2|1|https://s3.example|us-east-1|bucket-two|key|secret",
+            )
+            .unwrap(),
+        ] {
+            let storage = ServiceStorage::with_management(
+                invalid,
+                repository.clone(),
+                ManagedStreamingMode::Enforce,
+                PLACEMENT_VERSION_V1,
+            );
+            assert!(storage.validate_managed_launch_configuration().is_err());
+        }
     }
 
     #[test]
@@ -1990,6 +2349,7 @@ mod tests {
             metadata: BTreeMap::new(),
             placement_version: 1,
             primary_backend_id: "primary".to_string(),
+            primary_version_id: None,
             replica_backend_id: Some("replica".to_string()),
             primary_status: CopyStatus::Ready,
             replica_status: CopyStatus::Ready,
@@ -2021,6 +2381,16 @@ mod tests {
             multipart_responses: crate::transaction::MultipartResponseCapability::Standard,
             completion_reconciliation:
                 crate::transaction::CompletionReconciliation::HeadWithOperationIdentity,
+        }
+    }
+
+    fn test_storage_identity() -> ProviderStorageIdentity {
+        ProviderStorageIdentity {
+            provider_kind: "test".to_string(),
+            provider_instance_id: "managed-primary".to_string(),
+            provider_account_id: "test-account".to_string(),
+            canonical_endpoint: "https://provider.example/".to_string(),
+            region: "test-region-1".to_string(),
         }
     }
 
@@ -2095,22 +2465,21 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let provider = ServiceBackend {
-            provider: "mock".to_string(),
-            endpoint,
-            region: "us-east-1".to_string(),
-            bucket: "bucket".to_string(),
-            access_key: "key".to_string(),
-            secret_key: "secret".to_string(),
-        };
+        let provider = parse_service_backends(&format!(
+            "b2|managed-primary|account-123|1|{endpoint}|us-east-005|bucket|key-one|secret-one"
+        ))
+        .unwrap()
+        .pop()
+        .unwrap();
         let repository = Arc::new(InMemoryManagedRepository::new());
         let intent_id = uuid::Uuid::now_v7();
         let lease = repository
             .begin_physical_write(PhysicalWriteIntent {
                 intent_id,
                 tenant_id: "tenant".to_string(),
-                backend_id: "mock:bucket".to_string(),
-                backend_fingerprint: provider.fingerprint(),
+                backend_id: provider.id(),
+                storage_identity: provider.storage_identity().unwrap(),
+                credential_epoch: provider.credential_epoch().unwrap(),
                 provider_bucket: "bucket".to_string(),
                 physical_key: "managed/physical".to_string(),
                 versioning_mode: BackendVersioningMode::Unversioned,
@@ -2123,8 +2492,27 @@ mod tests {
             .commit_physical_write(&lease, &[], Some("version-1"))
             .await
             .unwrap();
+        let rotated_provider = parse_service_backends(&format!(
+            "b2|managed-primary|account-123|2|{endpoint}|us-east-005|bucket|key-two|secret-two"
+        ))
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!(provider.id(), rotated_provider.id());
+        assert_eq!(
+            provider.storage_identity(),
+            rotated_provider.storage_identity()
+        );
+        assert!(rotated_provider.matches_persisted_identity(
+            &provider.storage_identity().unwrap(),
+            provider.credential_epoch().unwrap()
+        ));
+        assert!(!provider.matches_persisted_identity(
+            &rotated_provider.storage_identity().unwrap(),
+            rotated_provider.credential_epoch().unwrap()
+        ));
         let storage = ServiceStorage::with_management(
-            vec![provider],
+            vec![rotated_provider],
             repository,
             ManagedStreamingMode::Enforce,
             PLACEMENT_VERSION_V1,
@@ -2149,11 +2537,16 @@ mod tests {
                     && uri.contains("versionId=version-1")
             }));
         }
+        let request_count_after_valid_deletion = requests.lock().unwrap().len();
         let mismatched_identity = PhysicalVersionTarget {
             tenant_id: "tenant".to_string(),
             namespace_epoch: 1,
-            backend_id: "mock:bucket".to_string(),
-            backend_fingerprint: "different-account-or-endpoint".to_string(),
+            backend_id: "b2:managed-primary".to_string(),
+            storage_identity: ProviderStorageIdentity {
+                provider_account_id: "different-account".to_string(),
+                ..storage.backends[0].storage_identity().unwrap()
+            },
+            credential_epoch: storage.backends[0].credential_epoch().unwrap(),
             provider_bucket: "bucket".to_string(),
             physical_key: "managed/physical".to_string(),
             version_id: Some("version-2".to_string()),
@@ -2168,8 +2561,27 @@ mod tests {
                 .unwrap_err()
                 .contains("identity changed")
         );
+        let mismatched_endpoint = PhysicalVersionTarget {
+            storage_identity: ProviderStorageIdentity {
+                canonical_endpoint: "https://other-location.example/".to_string(),
+                ..storage.backends[0].storage_identity().unwrap()
+            },
+            ..mismatched_identity.clone()
+        };
+        assert!(
+            storage
+                .delete_and_verify_purge_target(&mismatched_endpoint)
+                .await
+                .unwrap_err()
+                .contains("identity changed")
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            request_count_after_valid_deletion,
+            "account or endpoint rotation must fail before issuing deletion"
+        );
         let changed_versioning = PhysicalVersionTarget {
-            backend_fingerprint: storage.backends[0].fingerprint(),
+            storage_identity: storage.backends[0].storage_identity().unwrap(),
             version_id: None,
             versioning_mode: BackendVersioningMode::Enabled,
             ..mismatched_identity
@@ -2204,7 +2616,8 @@ mod tests {
                 intent_id,
                 tenant_id: "tenant".to_string(),
                 backend_id: "missing:bucket".to_string(),
-                backend_fingerprint: "missing-fingerprint".to_string(),
+                storage_identity: test_storage_identity(),
+                credential_epoch: 1,
                 provider_bucket: "bucket".to_string(),
                 physical_key: "managed/physical".to_string(),
                 versioning_mode: BackendVersioningMode::Enabled,
@@ -2239,7 +2652,8 @@ mod tests {
                 intent_id: operation_id,
                 tenant_id: "tenant".to_string(),
                 backend_id: "mock:bucket".to_string(),
-                backend_fingerprint: "fingerprint".to_string(),
+                storage_identity: test_storage_identity(),
+                credential_epoch: 1,
                 provider_bucket: "bucket".to_string(),
                 physical_key: "managed/physical".to_string(),
                 versioning_mode: BackendVersioningMode::Enabled,
@@ -2320,6 +2734,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let provider = ServiceBackend {
             provider: "mock".to_string(),
+            provider_instance_id: Some("managed-primary".to_string()),
+            provider_account_id: Some("test-account".to_string()),
+            credential_epoch: Some(1),
             endpoint: format!("http://{}", listener.local_addr().unwrap()),
             region: "us-east-1".to_string(),
             bucket: "bucket".to_string(),
@@ -2334,7 +2751,8 @@ mod tests {
                 intent_id: operation_id,
                 tenant_id: "tenant".to_string(),
                 backend_id: provider.id(),
-                backend_fingerprint: provider.fingerprint(),
+                storage_identity: provider.storage_identity().unwrap(),
+                credential_epoch: provider.credential_epoch().unwrap(),
                 provider_bucket: provider.bucket.clone(),
                 physical_key: "managed/physical".to_string(),
                 versioning_mode: BackendVersioningMode::Unversioned,
@@ -2436,7 +2854,12 @@ mod tests {
         );
         assert_eq!(
             repository
-                .physical_versions("tenant", "mock:bucket", "bucket", "managed/physical")
+                .physical_versions(
+                    "tenant",
+                    &storage.backends[0].id(),
+                    "bucket",
+                    "managed/physical",
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -2615,6 +3038,7 @@ mod tests {
                     primary_backend_id: "primary".to_string(),
                     replica_backend_id: Some("replica".to_string()),
                 },
+                logical_operation_id: None,
                 expected_cas,
                 metadata: BTreeMap::from([("content-type".to_string(), "text/plain".to_string())]),
                 primary: Box::new(primary),

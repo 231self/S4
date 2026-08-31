@@ -15,6 +15,7 @@ pub struct Model {
     pub metadata: Json,
     pub placement_version: i64,
     pub primary_backend_id: String,
+    pub primary_version_id: Option<String>,
     pub replica_backend_id: Option<String>,
     pub primary_status: String,
     pub replica_status: String,

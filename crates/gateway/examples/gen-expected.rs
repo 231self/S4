@@ -97,6 +97,8 @@ fn stream_process(
                 format: format.as_str().to_string(),
                 content_type: content_type.to_string(),
                 policy_version: 0,
+                operation: s4_wasm_runtime::Operation::Write,
+                config_json: None,
                 public_key_pem: None,
                 stable_key: None,
                 stable_fields: None,
@@ -128,7 +130,7 @@ fn stream_process(
                     output.extend_from_slice(&record.separator);
                 }
             }
-            for record in pipeline.finish().await? {
+            for record in pipeline.finish().await?.0 {
                 output.extend_from_slice(&record.payload);
                 output.extend_from_slice(&record.separator);
             }

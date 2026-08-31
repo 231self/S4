@@ -111,3 +111,44 @@ The default local setup preloads `pii-default` via `S4_FILTER_COMPONENT`.
 - Filters shipped in-tree: `noop` (pass-through baseline), `pii-default`,
   `email-detect`, `ssn-detect`, `card-detect`, `envelope-encrypt`, `stable-encrypt`.
 - The original WIT design is recorded in `docs/adr/0001-component-model-wit.md`.
+
+## Hosted workspaces (`s4ctl hosted`)
+
+Self-hosted/local gateways load plugins with the `s4ctl plugin` commands above and a
+directory (`S4_PLUGINS_DIR`) at startup. Hosted S4 workspaces instead manage plugins as
+first-class relational configuration owned by the workspace owner — the `s4ctl plugin`
+commands and directory auto-enable **do not** apply there and are not available on hosted
+S4. Hosted management authenticates with a **Supabase access token**
+(`S4_ACCESS_TOKEN` or `--token`) and a workspace ID (`S4_WORKSPACE_ID` or
+`--workspace`); an S4 data-plane API key is never accepted for hosted mutations.
+
+```bash
+export S4_ACCESS_TOKEN=<supabase-jwt>
+export S4_WORKSPACE_ID=<workspace-uuid>
+s4ctl hosted catalog                  # catalog + versions + capability grants
+s4ctl hosted upload ./my-filter.component.wasm \
+  --slug my-filter --display-name "My Filter" --version 1.0.0 \
+  --world s4-filter@0.2.0 --wit-version 0.2.0 --capability stable_fields
+s4ctl hosted validation <version-id>  # poll the secret-free validation run
+s4ctl hosted grant --installation-id <id> --capability stable_fields --version-id <version-id>
+s4ctl hosted pipelines create --direction write --name "redact"
+s4ctl hosted pipelines draft --pipeline-id <id> --step <install-id>:<version-id>:config.json
+s4ctl hosted pipelines publish --pipeline-id <id>
+s4ctl hosted assign-default write --pipeline-id <id>
+s4ctl hosted assign-bucket write ingest --pipeline-id <id>
+s4ctl hosted audit
+```
+
+- **Worlds.** Components implement `s4-filter@0.1.0` (no config) or `s4-filter@0.2.0`
+  (`operation` + optional `config-json`). Config is only valid for v0.2 components.
+- **Ordering.** Draft steps run in the order given (`installation_id:version_id[:config]`);
+  the fingerprint covers ordered versions, enabled flags, configs, and grants.
+- **Capability grants.** A component only receives sensitive context (for example
+  `stable_fields`) after the owner explicitly grants it per installation/version.
+- **Pass-through.** An empty chain is only publishable when `--passthrough` is set; a
+  missing bucket assignment inherits the workspace default, and an exact bucket
+  assignment replaces the chain entirely.
+- **Read spooling.** Custom read filters are spooled to encrypted storage and never
+  disclosed as a raw fallback on failure.
+- **Ownership.** Only workspace owners mutate plugins, grants, pipelines, or assignments;
+  members may inspect the effective configuration and audit trail.

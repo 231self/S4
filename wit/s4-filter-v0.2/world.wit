@@ -1,0 +1,30 @@
+package s4:filter@0.2.0;
+
+world filter {
+  enum operation {
+    write,
+    read,
+  }
+
+  record context {
+    format: string,
+    content-type: string,
+    operation: operation,
+    policy-version: u64,
+    config-json: option<string>,
+    public-key-pem: option<string>,
+    entropy-seed: option<list<u8>>,
+    stable-key: option<list<u8>>,
+    stable-fields: option<string>,
+  }
+
+  variant decision {
+    emit(list<u8>),
+    drop,
+    reject(string),
+  }
+
+  export begin: func(context: context) -> result<_, string>;
+  export transform: func(payload: list<u8>) -> result<decision, string>;
+  export finish: func() -> result<list<u8>, string>;
+}

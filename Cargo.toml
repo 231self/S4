@@ -16,6 +16,7 @@ members = [
   "filters/envelope-encrypt",
   "filters/stable-encrypt",
   "filters/test-filter",
+  "filters/test-filter-v02",
   "filters/test-binary-reductor",
 ]
 

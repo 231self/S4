@@ -310,7 +310,36 @@ async fn record_operation(
     key: &str,
 ) -> Result<(), axum::response::Response> {
     let event = usage.event();
+    record_operation_with_event(control, context, event, key).await
+}
+
+async fn record_operation_with_event(
+    control: Arc<dyn ControlPlane>,
+    context: &AuthenticatedRequestContext,
+    event: UsageEvent,
+    key: &str,
+) -> Result<(), axum::response::Response> {
     record_usage(control, context, &event, key).await
+}
+
+fn multipart_completion_event(
+    authorization: &UsageAuthorization,
+    result: &MultipartCompletionResult,
+    receipt_id: Uuid,
+) -> UsageEvent {
+    let event = UsageEvent::new(
+        receipt_id,
+        authorization.operation_id(),
+        authorization.bucket(),
+        authorization.kind(),
+        authorization.route(),
+        result.source_bytes,
+        result.size_bytes,
+    );
+    match &result.pipeline_evidence {
+        Some(evidence) => event.with_pipeline_evidence(evidence.clone()),
+        None => event,
+    }
 }
 
 /// Persist the canonical usage event as durable journal evidence before the
@@ -332,6 +361,16 @@ async fn persist_usage_evidence(journal: Option<&Arc<dyn OperationJournal>>, eve
             "route": event.route.as_str(),
             "kind": event.kind.as_str(),
             "bucket": &event.bucket,
+            "pipeline_evidence": event.pipeline_evidence.as_ref().map(|evidence| {
+                serde_json::json!({
+                    "revision": evidence.revision,
+                    "fingerprint": evidence.fingerprint,
+                    "components": evidence.components,
+                    "fuel_consumed": evidence.fuel_consumed,
+                    "duration_ms": evidence.duration_ms,
+                    "spool_mode": evidence.spool_mode,
+                })
+            }),
         }),
     );
     if let Err(error) = journal.append_evidence(evidence).await {
@@ -366,6 +405,7 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 /// Launch policy: persist the admitted representation size before releasing a
 /// streaming body. This intentionally never relies on body drop or background
 /// best effort. Responses without a trustworthy size fail closed.
+#[allow(clippy::too_many_arguments)]
 async fn metered_read_response(
     control: Arc<dyn ControlPlane>,
     auth: &Auth,
@@ -374,6 +414,7 @@ async fn metered_read_response(
     key: &str,
     source_bytes: Option<u64>,
     response: axum::response::Response,
+    pipeline_evidence: Option<crate::control::PipelineEvidence>,
 ) -> axum::response::Response {
     if !response.status().is_success() {
         return release_failure(
@@ -419,6 +460,10 @@ async fn metered_read_response(
         source_bytes,
         bytes,
     );
+    let event = match pipeline_evidence {
+        Some(evidence) => event.with_pipeline_evidence(evidence),
+        None => event,
+    };
     if let Err(response) = record_usage(control, &auth.context, &event, key).await {
         return response;
     }
@@ -2220,7 +2265,7 @@ async fn execute_demo_records(
             }
         }
     }
-    let trailing = pipeline.finish().await?;
+    let (trailing, _fuel) = pipeline.finish().await?;
     Ok((output, trailing))
 }
 
@@ -2292,6 +2337,8 @@ async fn demo_redact(
         format: Format::Text.as_str().to_string(),
         content_type: "text/plain".to_string(),
         policy_version: 0,
+        operation: s4_wasm_runtime::Operation::Write,
+        config_json: None,
         public_key_pem: None,
         stable_key: None,
         stable_fields: None,
@@ -2391,6 +2438,8 @@ async fn demo_process(
         format: Format::Json.as_str().to_string(),
         content_type: "application/json".to_string(),
         policy_version: 0,
+        operation: s4_wasm_runtime::Operation::Write,
+        config_json: None,
         public_key_pem: None,
         stable_key: stable_key.as_ref().map(|key| key.as_slice().to_vec()),
         stable_fields: matches!(mode, DemoMode::Join).then(|| "email".to_string()),
@@ -2800,7 +2849,16 @@ async fn streaming_single_put(
     headers: &HeaderMap,
     mut body: axum::body::Body,
     key: &str,
-) -> Result<(Auth, StoredObjectMeta, u64, u64), StreamingPutError> {
+) -> Result<
+    (
+        Auth,
+        StoredObjectMeta,
+        u64,
+        u64,
+        Option<crate::control::PipelineEvidence>,
+    ),
+    StreamingPutError,
+> {
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
 
@@ -2849,15 +2907,24 @@ async fn streaming_single_put(
         format: format.as_str().to_string(),
         content_type: content_type.clone(),
         policy_version: 0,
+        operation: s4_wasm_runtime::Operation::Write,
+        config_json: None,
         public_key_pem: authentication.auth.public_key_pem.clone(),
         stable_key: authentication.auth.stable_key.clone(),
         stable_fields,
     };
     let cancellation = s4_wasm_runtime::CancellationToken::new();
-    let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
-        StreamingPutError::Unsupported("streaming requires a plugin registry".to_string())
-    })?;
+    let snapshot = state
+        .gateway
+        .resolve_pipeline(
+            authentication.auth.workspace_id().as_str(),
+            authorization.bucket(),
+            crate::pipeline::PipelineDirection::Write,
+        )
+        .await?;
+    let pipeline_started = std::time::Instant::now();
     let mut pipeline = match snapshot
+        .clone()
         .start_streaming_session(session, cancellation.clone())
         .await
     {
@@ -2944,21 +3011,33 @@ async fn streaming_single_put(
         let finishing = pipeline
             .take()
             .expect("pipeline remains available until finish");
-        for record in finishing.finish().await? {
+        let (records, pipeline_fuel) = finishing.finish().await?;
+        for record in records {
             write_stream_record(&sink, record, &mut output_hasher, &mut output_bytes).await?;
         }
+        let pipeline_evidence = snapshot.pipeline_evidence(
+            pipeline_fuel,
+            pipeline_started.elapsed().as_millis() as u64,
+            "none",
+        );
         let output_digest = hex::encode(output_hasher.finalize());
         let mut sink = sink.lock().await;
         sink.verify_output(output_bytes, &output_digest).await?;
         let stored = sink.complete().await?;
-        Ok((stored, output_bytes))
+        Ok((stored, output_bytes, pipeline_evidence))
     }
     .await;
 
     match processing {
-        Ok((stored, output_bytes)) => {
+        Ok((stored, output_bytes, pipeline_evidence)) => {
             sink_guard.disarm();
-            Ok((authentication.auth, stored, input_bytes, output_bytes))
+            Ok((
+                authentication.auth,
+                stored,
+                input_bytes,
+                output_bytes,
+                pipeline_evidence,
+            ))
         }
         Err(error) => {
             cancellation.cancel();
@@ -3047,7 +3126,16 @@ async fn streaming_avro_single_put(
     headers: &HeaderMap,
     mut body: axum::body::Body,
     key: &str,
-) -> Result<(Auth, StoredObjectMeta, u64, u64), StreamingPutError> {
+) -> Result<
+    (
+        Auth,
+        StoredObjectMeta,
+        u64,
+        u64,
+        Option<crate::control::PipelineEvidence>,
+    ),
+    StreamingPutError,
+> {
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
 
@@ -3126,7 +3214,7 @@ async fn streaming_avro_single_put(
         sink.complete().await?
     };
     sink_guard.disarm();
-    Ok((authentication.auth, stored, input_bytes, output_bytes))
+    Ok((authentication.auth, stored, input_bytes, output_bytes, None))
 }
 
 #[derive(Debug)]
@@ -3204,7 +3292,7 @@ fn staged_multipart(state: &AppState) -> Option<&Arc<MultipartStaging>> {
 fn multipart_snapshot(
     headers: &HeaderMap,
     backend: &ResolvedBackend,
-    plugins: &PluginRegistry,
+    plugin_snapshot: serde_json::Value,
     max_bytes: u64,
 ) -> MultipartSnapshot {
     let mut metadata: std::collections::BTreeMap<String, String> = headers
@@ -3248,8 +3336,7 @@ fn multipart_snapshot(
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned),
         destination,
-        plugin_snapshot: serde_json::to_value(plugins.list())
-            .unwrap_or_else(|_| serde_json::json!([])),
+        plugin_snapshot,
         max_staged_bytes: max_bytes,
     }
 }
@@ -3608,16 +3695,33 @@ async fn complete_staged_multipart(
             "multipart destination changed since initiation".to_string(),
         ));
     }
-    // The Phase 10 snapshot records the ordered plugin identities. Until
-    // component snapshots are independently persisted, reject a changed
-    // registry rather than silently transforming with a different policy.
-    if serde_json::to_value(state.plugins.list()).ok()
-        != Some(upload.snapshot.plugin_snapshot.clone())
-    {
-        return Err(MultipartCompletionError::Invalid(
-            "multipart plugin snapshot is no longer available".to_string(),
-        ));
-    }
+    // Phase 2: the snapshot persists the immutable pipeline resolution. The
+    // exact revision is resolved at completion — never the current assignment.
+    // Legacy self-hosted snapshots stored a raw plugin identity list; keep
+    // them working through a static resolution when the registry is unchanged.
+    let snapshot = match serde_json::from_value::<crate::pipeline::PipelineResolution>(
+        upload.snapshot.plugin_snapshot.clone(),
+    ) {
+        Ok(resolution) => state.gateway.snapshot_for(&resolution).await?,
+        Err(_) => {
+            if serde_json::to_value(state.plugins.list()).ok()
+                != Some(upload.snapshot.plugin_snapshot.clone())
+            {
+                return Err(MultipartCompletionError::Invalid(
+                    "multipart plugin snapshot is no longer available".to_string(),
+                ));
+            }
+            state
+                .gateway
+                .resolve_pipeline(
+                    operation.auth.workspace_id().as_str(),
+                    &identity.bucket,
+                    crate::pipeline::PipelineDirection::Write,
+                )
+                .await?
+        }
+    };
+    let pipeline_started = std::time::Instant::now();
     let content_type = upload
         .snapshot
         .metadata
@@ -3661,15 +3765,15 @@ async fn complete_staged_multipart(
         format: format.as_str().to_string(),
         content_type,
         policy_version: 0,
+        operation: s4_wasm_runtime::Operation::Write,
+        config_json: None,
         public_key_pem: operation.auth.public_key_pem.clone(),
         stable_key: operation.auth.stable_key.clone(),
         stable_fields: None,
     };
-    let snapshot = state.gateway.pipeline_snapshot().ok_or_else(|| {
-        MultipartCompletionError::Invalid("streaming pipeline is unavailable".to_string())
-    })?;
     let mut pipeline = Some(
         snapshot
+            .clone()
             .start_streaming_session(session, cancellation.clone())
             .await?,
     );
@@ -3791,7 +3895,8 @@ async fn complete_staged_multipart(
             }
         }
         let finishing = pipeline.take().expect("pipeline is present until finish");
-        for record in finishing.finish().await? {
+        let (records, pipeline_fuel) = finishing.finish().await?;
+        for record in records {
             write_completed_record(
                 staging,
                 identity,
@@ -3803,6 +3908,11 @@ async fn complete_staged_multipart(
             )
             .await?;
         }
+        let pipeline_evidence = snapshot.pipeline_evidence(
+            pipeline_fuel,
+            pipeline_started.elapsed().as_millis() as u64,
+            "none",
+        );
         let checksum_sha256 = hex::encode(output_hasher.finalize());
         renew_and_fence_completion(staging, identity, lease).await?;
         sink.verify_output(output_bytes, &checksum_sha256).await?;
@@ -3814,6 +3924,7 @@ async fn complete_staged_multipart(
             version_id: stored.version_id,
             source_bytes: input_bytes,
             size_bytes: output_bytes,
+            pipeline_evidence,
         };
         renew_and_fence_completion(staging, identity, lease).await?;
         staging
@@ -3982,6 +4093,7 @@ fn recovered_multipart_result(
         version_id: stored.version_id,
         source_bytes,
         size_bytes,
+        pipeline_evidence: None,
     })
 }
 
@@ -4077,6 +4189,7 @@ async fn complete_staged_avro_multipart(
             version_id: stored.version_id,
             source_bytes: input_bytes,
             size_bytes: output_bytes,
+            pipeline_evidence: None,
         };
         renew_and_fence_completion(staging, identity, lease).await?;
         staging
@@ -4512,16 +4625,20 @@ async fn s3_put(
     )
     .await
     {
-        Ok((auth, stored, source_bytes, output_bytes)) => {
+        Ok((auth, stored, source_bytes, output_bytes, pipeline_evidence)) => {
             let usage = OperationUsage {
                 operation,
                 authorization: &authorization,
                 source_bytes,
                 output_bytes,
             };
-            persist_usage_evidence(state.operation_journal.as_ref(), &usage.event()).await;
+            let event = match pipeline_evidence {
+                Some(evidence) => usage.event().with_pipeline_evidence(evidence),
+                None => usage.event(),
+            };
+            persist_usage_evidence(state.operation_journal.as_ref(), &event).await;
             if let Err(response) =
-                record_operation(state.control.clone(), &auth.context, usage, &key).await
+                record_operation_with_event(state.control.clone(), &auth.context, event, &key).await
             {
                 return response;
             }
@@ -4825,6 +4942,8 @@ fn transformed_session(
         format: format.as_str().to_string(),
         content_type,
         policy_version: 0,
+        operation: s4_wasm_runtime::Operation::Read,
+        config_json: None,
         public_key_pem: auth.public_key_pem.clone(),
         stable_key: auth.stable_key.clone(),
         stable_fields: headers
@@ -5000,7 +5119,7 @@ where
                 }
             }
         }
-        for record in pipeline.finish().await? {
+        for record in pipeline.finish().await?.0 {
             if !record.payload.is_empty() {
                 emit(record.payload).await?;
             }
@@ -5080,6 +5199,7 @@ fn error_to_log(error: &TransformedReadError) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn transformed_read_response(
     state: &AppState,
     auth: &Auth,
@@ -5088,22 +5208,32 @@ async fn transformed_read_response(
     response_metadata: ObjectMetadata,
     object: OpenedObject,
     key: &str,
+    bucket: &str,
+    pipeline_evidence: &mut Option<crate::control::PipelineEvidence>,
 ) -> (axum::response::Response, Option<u64>) {
     let (format, content_type) = preflight;
-    let snapshot = match state.gateway.pipeline_snapshot() {
-        Some(snapshot) => snapshot,
-        None => {
+    let pipeline_started = std::time::Instant::now();
+    let snapshot = match state
+        .gateway
+        .resolve_pipeline(
+            auth.workspace_id().as_str(),
+            bucket,
+            crate::pipeline::PipelineDirection::Read,
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
             return (
-                transformed_read_error_response(
-                    key,
-                    TransformedReadError::Capacity(
-                        "transformed reads require a plugin registry".to_string(),
-                    ),
-                ),
+                transformed_read_error_response(key, TransformedReadError::Pipeline(error)),
                 None,
             );
         }
     };
+    if let Some(mut evidence) = snapshot.pipeline_evidence(0, 0, "none") {
+        evidence.duration_ms = pipeline_started.elapsed().as_millis() as u64;
+        *pipeline_evidence = Some(evidence);
+    }
     let source_cancellation = object.cancellation.clone();
     let source_counters = object.counters.clone();
     let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
@@ -5463,6 +5593,7 @@ async fn s3_get(
                 &key,
                 source_bytes.or(completed_source_bytes),
                 response,
+                None,
             )
             .await;
         }
@@ -5541,6 +5672,7 @@ async fn s3_get(
         }
         let source_bytes = content_length(&object.metadata.headers);
         let response_metadata = object.metadata.clone();
+        let mut pipeline_evidence = None;
         let (response, completed_source_bytes) = transformed_read_response(
             &state,
             &auth,
@@ -5549,6 +5681,8 @@ async fn s3_get(
             response_metadata,
             object,
             &key,
+            &bucket,
+            &mut pipeline_evidence,
         )
         .await;
         return metered_read_response(
@@ -5559,6 +5693,7 @@ async fn s3_get(
             &key,
             source_bytes.or(completed_source_bytes),
             response,
+            pipeline_evidence,
         )
         .await;
     }
@@ -5597,6 +5732,7 @@ async fn s3_get(
             &key,
             None,
             object.into_response(),
+            None,
         )
         .await;
     }
@@ -5845,6 +5981,7 @@ mod tests {
             "key-a",
             None,
             axum::response::Response::new(Body::from("range")),
+            None,
         )
         .await;
         assert_eq!(
@@ -5898,6 +6035,7 @@ mod tests {
             "key-a",
             None,
             axum::response::Response::new(Body::from("range")),
+            None,
         )
         .await;
 
@@ -6268,6 +6406,8 @@ mod tests {
                     format: "text".to_string(),
                     content_type: "text/plain".to_string(),
                     policy_version: 0,
+                    operation: s4_wasm_runtime::Operation::Write,
+                    config_json: None,
                     public_key_pem: None,
                     stable_key: None,
                     stable_fields: None,
@@ -6931,15 +7071,10 @@ async fn s3_post(
             .await
         {
             Ok(CompletionAcquire::Replayed(result)) => {
-                if let Err(response) = record_operation(
+                if let Err(response) = record_operation_with_event(
                     state.control.clone(),
                     &auth.context,
-                    OperationUsage {
-                        operation,
-                        authorization: &authorization,
-                        source_bytes: result.source_bytes,
-                        output_bytes: result.size_bytes,
-                    },
+                    multipart_completion_event(&authorization, &result, operation.receipt_id),
                     &key,
                 )
                 .await
@@ -7092,15 +7227,10 @@ async fn s3_post(
             }
         };
         cleanup_staged_parts(&staging, upload_id, lease.cleanup_parts, "complete").await;
-        if let Err(response) = record_operation(
+        if let Err(response) = record_operation_with_event(
             state.control.clone(),
             &auth.context,
-            OperationUsage {
-                operation,
-                authorization: &authorization,
-                source_bytes: result.source_bytes,
-                output_bytes: result.size_bytes,
-            },
+            multipart_completion_event(&authorization, &result, operation.receipt_id),
             &key,
         )
         .await
@@ -7174,6 +7304,18 @@ async fn s3_post(
         } else {
             None
         };
+        let plugin_snapshot = match state
+            .gateway
+            .resolve(
+                auth.workspace_id().as_str(),
+                &bucket,
+                crate::pipeline::PipelineDirection::Write,
+            )
+            .await
+        {
+            Ok(resolution) => serde_json::to_value(&resolution).unwrap_or(serde_json::json!(null)),
+            Err(error) => return s3_error::invalid_request(&key, error.message()),
+        };
         let now = now_ms();
         let upload = MultipartUpload {
             identity: multipart_identity(&auth, &bucket, &key, &upload_id),
@@ -7181,7 +7323,7 @@ async fn s3_post(
             snapshot: multipart_snapshot(
                 &parts.headers,
                 &backend,
-                &state.plugins,
+                plugin_snapshot,
                 state.source_body_limits.max_bytes,
             ),
             lifecycle: MultipartLifecycle::Open,

@@ -736,6 +736,7 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
                     version_id: Some("version".to_string()),
                     source_bytes: 24,
                     size_bytes: 42,
+                    pipeline_evidence: None,
                 },
                 now + 12,
             )

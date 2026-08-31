@@ -91,6 +91,34 @@ pub struct PipelineSnapshot {
     plugins: Vec<SnapshotPlugin>,
     limits: PipelineLimits,
     executor: Arc<WasmExecutor>,
+    /// Canonical fingerprint of the resolved chain, when produced by a
+    /// resolution-aware builder. `None` for the legacy global snapshot.
+    fingerprint: Option<String>,
+    /// Immutable revision identifier of the resolved chain.
+    revision: Option<String>,
+}
+
+impl PipelineSnapshot {
+    /// COGS evidence for the executed pipeline, if a revision was resolved.
+    pub fn pipeline_evidence(
+        &self,
+        fuel_consumed: u64,
+        duration_ms: u64,
+        spool_mode: &str,
+    ) -> Option<crate::control::PipelineEvidence> {
+        let fingerprint = self.fingerprint.as_ref()?;
+        let revision = self.revision.as_deref()?;
+        let mut hashes: Vec<&str> = self.component_hashes().into_iter().collect();
+        hashes.sort_unstable();
+        Some(crate::control::PipelineEvidence {
+            revision: revision.to_string(),
+            fingerprint: fingerprint.clone(),
+            components: hashes.join(","),
+            fuel_consumed,
+            duration_ms,
+            spool_mode: spool_mode.to_string(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -182,7 +210,7 @@ pub struct PipelineSession {
 
 enum PipelineCommand {
     Process(Record, oneshot::Sender<Result<Option<Record>, S4Error>>),
-    Finish(oneshot::Sender<Result<Vec<Record>, S4Error>>),
+    Finish(oneshot::Sender<Result<(Vec<Record>, u64), S4Error>>),
     Cancel,
 }
 
@@ -508,6 +536,8 @@ impl PluginRegistry {
             plugins,
             limits,
             executor: Arc::clone(&self.executor),
+            fingerprint: Some(resolution.locator.fingerprint.clone()),
+            revision: Some(resolution.locator.revision.clone()),
         })
     }
 
@@ -599,6 +629,8 @@ impl PluginRegistry {
             plugins,
             limits: self.pipeline_limits,
             executor: Arc::clone(&self.executor),
+            fingerprint: None,
+            revision: None,
         }
     }
 
@@ -854,7 +886,9 @@ impl PipelineSnapshot {
                                 }
                             }
                             PipelineCommand::Finish(response) => {
-                                let _ = response.send(pipeline.finish());
+                                let fuel = pipeline.fuel_consumed();
+                                let _ =
+                                    response.send(pipeline.finish().map(|records| (records, fuel)));
                                 break;
                             }
                             PipelineCommand::Cancel => break,
@@ -939,7 +973,7 @@ impl StreamingPipelineSession {
         result
     }
 
-    pub async fn finish(mut self) -> Result<Vec<Record>, S4Error> {
+    pub async fn finish(mut self) -> Result<(Vec<Record>, u64), S4Error> {
         let (response_sender, response_receiver) = oneshot::channel();
         let Some(sender) = self.sender.take() else {
             let _ = self.abort_and_wait().await;
@@ -1107,6 +1141,11 @@ impl PipelineSession {
 
     pub fn output_bytes(&self) -> u64 {
         self.output_bytes
+    }
+
+    /// Total guest fuel accounted across the session (COGS evidence).
+    pub fn fuel_consumed(&self) -> u64 {
+        self.fuel_consumed
     }
 
     fn route_from(&mut self, start: usize, mut record: Record) -> Result<Option<Record>, S4Error> {

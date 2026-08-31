@@ -130,7 +130,7 @@ fn stream_process(
                     output.extend_from_slice(&record.separator);
                 }
             }
-            for record in pipeline.finish().await? {
+            for record in pipeline.finish().await?.0 {
                 output.extend_from_slice(&record.payload);
                 output.extend_from_slice(&record.separator);
             }

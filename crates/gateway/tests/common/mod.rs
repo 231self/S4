@@ -121,7 +121,7 @@ pub async fn stream_chunked_counted_async(
             extend(record);
         }
     }
-    for record in pipeline.finish().await? {
+    for record in pipeline.finish().await?.0 {
         extend(record);
     }
     Ok((output, records))

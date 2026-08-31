@@ -170,6 +170,9 @@ pub struct MultipartCompletionResult {
     pub source_bytes: u64,
     #[serde(default)]
     pub size_bytes: u64,
+    /// Immutable pipeline COGS evidence for the exact completed revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_evidence: Option<crate::control::PipelineEvidence>,
 }
 
 #[derive(Clone, Debug)]
@@ -3228,6 +3231,7 @@ mod tests {
                 version_id: Some("version-a".to_string()),
                 source_bytes: 24,
                 size_bytes: 42,
+                pipeline_evidence: None,
             },
             1,
         )
@@ -3236,7 +3240,7 @@ mod tests {
         assert!(matches!(
             repo.acquire_completion(&identity(), "fingerprint", &request, "worker-b", 200, 2)
                 .await,
-            Ok(CompletionAcquire::Replayed(MultipartCompletionResult { ref etag, ref checksum_sha256, ref version_id, source_bytes: 24, size_bytes: 42 }))
+            Ok(CompletionAcquire::Replayed(MultipartCompletionResult { ref etag, ref checksum_sha256, ref version_id, source_bytes: 24, size_bytes: 42, pipeline_evidence: None }))
                 if etag.as_deref() == Some("\"output\"")
                     && checksum_sha256 == "output-sha"
                     && version_id.as_deref() == Some("version-a")

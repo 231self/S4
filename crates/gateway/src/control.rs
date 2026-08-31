@@ -122,6 +122,27 @@ pub struct UsageEvent {
     pub source_bytes: u64,
     pub output_bytes: u64,
     pub processed_bytes: u64,
+    /// Immutable pipeline evidence for COGS accounting (revision, fingerprint,
+    /// measured fuel and duration). `None` for operations without a filter
+    /// pipeline.
+    pub pipeline_evidence: Option<PipelineEvidence>,
+}
+
+/// COGS evidence for one operation's pipeline execution.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PipelineEvidence {
+    /// Immutable revision identifier (relational revision UUID or `static`).
+    pub revision: String,
+    /// Canonical fingerprint of the executed chain.
+    pub fingerprint: String,
+    /// Component count/digests fingerprint for caching cost attribution.
+    pub components: String,
+    /// Measured guest fuel consumed, if the pipeline reported it.
+    pub fuel_consumed: u64,
+    /// Measured execution duration in milliseconds.
+    pub duration_ms: u64,
+    /// Spool mode (`none` or `encrypted`) for unsafe-read evidence.
+    pub spool_mode: String,
 }
 
 impl UsageEvent {
@@ -143,7 +164,14 @@ impl UsageEvent {
             source_bytes,
             output_bytes,
             processed_bytes: source_bytes.max(output_bytes),
+            pipeline_evidence: None,
         }
+    }
+
+    /// Attach the immutable pipeline COGS evidence for this operation.
+    pub fn with_pipeline_evidence(mut self, evidence: PipelineEvidence) -> Self {
+        self.pipeline_evidence = Some(evidence);
+        self
     }
 }
 

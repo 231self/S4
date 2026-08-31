@@ -1241,6 +1241,7 @@ mod tests {
         let backend = Arc::new(ScriptBackend::default());
         let authorization = crate::control::UsageAuthorization::new(
             uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
             "bucket",
             crate::control::UsageRoute::PutObject,
             crate::control::RequestKind::Write,

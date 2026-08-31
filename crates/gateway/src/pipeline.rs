@@ -37,16 +37,29 @@ pub struct PipelineLocator {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PipelineStep {
     pub component_hash: String,
+    /// Disabled steps remain part of the immutable revision fingerprint but
+    /// are not loaded or executed. Older persisted resolutions predate this
+    /// field and contained only enabled steps.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// Bounded canonical JSON configuration (v0.2 steps only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_json: Option<String>,
     pub capabilities: PluginCapabilities,
+    /// Sensitive request context is denied unless the resolver explicitly
+    /// grants individual fields to this exact step.
+    #[serde(default)]
+    pub sensitive_grant: s4_wasm_runtime::SensitiveGrant,
+}
+
+const fn enabled_by_default() -> bool {
+    true
 }
 
 /// Fully-resolved, immutable pipeline for one workspace/bucket/direction.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PipelineResolution {
     pub locator: PipelineLocator,
     pub steps: Vec<PipelineStep>,
@@ -54,6 +67,60 @@ pub struct PipelineResolution {
     #[serde(default)]
     pub explicit_passthrough: bool,
     pub limits: PipelineLimits,
+}
+
+#[derive(serde::Deserialize)]
+struct PersistedPipelineResolution {
+    locator: PipelineLocator,
+    steps: Vec<PersistedPipelineStep>,
+    #[serde(default)]
+    explicit_passthrough: bool,
+    limits: PipelineLimits,
+}
+
+#[derive(serde::Deserialize)]
+struct PersistedPipelineStep {
+    component_hash: String,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    config_json: Option<String>,
+    capabilities: PluginCapabilities,
+    #[serde(default)]
+    sensitive_grant: Option<s4_wasm_runtime::SensitiveGrant>,
+}
+
+impl<'de> serde::Deserialize<'de> for PipelineResolution {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let persisted = PersistedPipelineResolution::deserialize(deserializer)?;
+        let static_revision = persisted.locator.revision == "static";
+        Ok(Self {
+            locator: persisted.locator,
+            steps: persisted
+                .steps
+                .into_iter()
+                .map(|step| PipelineStep {
+                    component_hash: step.component_hash,
+                    enabled: step.enabled,
+                    version: step.version,
+                    config_json: step.config_json,
+                    capabilities: step.capabilities,
+                    sensitive_grant: step.sensitive_grant.unwrap_or(if static_revision {
+                        s4_wasm_runtime::SensitiveGrant::ALL
+                    } else {
+                        s4_wasm_runtime::SensitiveGrant::NONE
+                    }),
+                })
+                .collect(),
+            explicit_passthrough: persisted.explicit_passthrough,
+            limits: persisted.limits,
+        })
+    }
 }
 
 /// Resolves the effective pipeline for a workspace + exact bucket + direction.
@@ -94,9 +161,13 @@ impl StaticPipelineResolver {
             .into_iter()
             .map(|(info, component_hash, capabilities)| PipelineStep {
                 component_hash,
+                enabled: true,
                 version: Some(info.version),
                 config_json: None,
                 capabilities,
+                // Preserve the historical self-hosted contract explicitly;
+                // hosted resolutions default to no sensitive grants.
+                sensitive_grant: s4_wasm_runtime::SensitiveGrant::ALL,
             })
             .collect();
         let explicit_passthrough = steps.is_empty();
@@ -154,13 +225,13 @@ pub(crate) fn plugin_step_info(step: &PipelineStep) -> PluginInfo {
             .clone()
             .unwrap_or_else(|| step.component_hash.chars().take(8).collect()),
         version: step.version.clone().unwrap_or_else(|| "0.1.0".to_string()),
-        enabled: true,
+        enabled: step.enabled,
         description: String::new(),
     }
 }
 
 pub(crate) fn pipeline_requires_passthrough(resolution: &PipelineResolution) -> bool {
-    resolution.steps.is_empty() && !resolution.explicit_passthrough
+    !resolution.steps.iter().any(|step| step.enabled) && !resolution.explicit_passthrough
 }
 
 pub(crate) fn missing_component_error(component_hash: &str) -> S4Error {
@@ -168,4 +239,59 @@ pub(crate) fn missing_component_error(component_hash: &str) -> S4Error {
         codes::WASM_INIT,
         format!("component {component_hash} is not available from its component source"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_pre_grant_steps_default_enabled_and_deny_sensitive_context() {
+        let step: PipelineStep = serde_json::from_value(serde_json::json!({
+            "component_hash": "a".repeat(64),
+            "version": "0.2.0",
+            "config_json": "{\"mode\":\"redact\"}",
+            "capabilities": { "prefix_safe_for_read": false }
+        }))
+        .unwrap();
+
+        assert!(step.enabled);
+        assert_eq!(step.sensitive_grant, s4_wasm_runtime::SensitiveGrant::NONE);
+        assert_eq!(step.config_json.as_deref(), Some("{\"mode\":\"redact\"}"));
+    }
+
+    fn persisted_resolution_without_grant(revision: &str) -> serde_json::Value {
+        serde_json::json!({
+            "locator": {
+                "revision": revision,
+                "fingerprint": "legacy-fingerprint"
+            },
+            "steps": [{
+                "component_hash": "b".repeat(64),
+                "version": "0.1.0",
+                "config_json": null,
+                "capabilities": { "prefix_safe_for_read": false }
+            }],
+            "explicit_passthrough": false,
+            "limits": serde_json::to_value(PipelineLimits::default()).unwrap()
+        })
+    }
+
+    #[test]
+    fn old_static_multipart_resolution_restores_legacy_grants_only_for_static_revision() {
+        let static_resolution: PipelineResolution =
+            serde_json::from_value(persisted_resolution_without_grant("static")).unwrap();
+        assert_eq!(
+            static_resolution.steps[0].sensitive_grant,
+            s4_wasm_runtime::SensitiveGrant::ALL
+        );
+
+        let hosted_resolution: PipelineResolution =
+            serde_json::from_value(persisted_resolution_without_grant("relational-revision-id"))
+                .unwrap();
+        assert_eq!(
+            hosted_resolution.steps[0].sensitive_grant,
+            s4_wasm_runtime::SensitiveGrant::NONE
+        );
+    }
 }

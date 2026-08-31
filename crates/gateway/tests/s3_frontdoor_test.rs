@@ -5393,6 +5393,15 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
             .collect::<Vec<_>>(),
         vec![(RequestKind::Read, UsageRoute::GetObject, 0, 0)]
     );
+    let events = control.events.lock().unwrap();
+    let evidence = events[0]
+        .event
+        .pipeline_evidence
+        .as_ref()
+        .expect("completed empty direct read must retain measured evidence");
+    assert_eq!(evidence.revision, "static");
+    assert_eq!(evidence.fuel_consumed, 0);
+    assert_eq!(evidence.spool_mode, "none");
     task.abort();
 }
 

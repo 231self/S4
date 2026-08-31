@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, SqlxPostgresConnector,
@@ -369,16 +369,35 @@ impl OperationJournal for PostgresOperationJournal {
     }
 
     async fn append_evidence(&self, evidence: EvidenceRecord) -> Result<(), JournalError> {
-        object_operation_evidence::ActiveModel {
+        let expected = evidence.clone();
+        object_operation_evidence::Entity::insert(object_operation_evidence::ActiveModel {
             id: Set(evidence.id),
             operation_id: Set(evidence.operation_id),
             kind: Set(evidence.kind),
             detail: Set(evidence.detail),
             created_at_ms: Set(evidence.created_at_ms),
-        }
-        .insert(&self.db)
+        })
+        .on_conflict(
+            OnConflict::column(object_operation_evidence::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(&self.db)
         .await
         .map_err(persistence)?;
+        let stored = object_operation_evidence::Entity::find_by_id(expected.id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .ok_or_else(|| JournalError::Persistence("evidence insert disappeared".to_string()))?;
+        if stored.operation_id != expected.operation_id
+            || stored.kind != expected.kind
+            || stored.detail != expected.detail
+        {
+            return Err(JournalError::Conflict(
+                "evidence id conflicts with an existing record".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -513,6 +532,7 @@ struct MemoryState {
 pub struct InMemoryOperationJournal {
     state: Arc<Mutex<MemoryState>>,
     fail_committed_transitions: Arc<AtomicUsize>,
+    fail_evidence_appends: Arc<AtomicUsize>,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -524,6 +544,10 @@ impl InMemoryOperationJournal {
     pub fn fail_next_committed_transitions(&self, count: usize) {
         self.fail_committed_transitions
             .store(count, Ordering::Release);
+    }
+
+    pub fn fail_next_evidence_appends(&self, count: usize) {
+        self.fail_evidence_appends.store(count, Ordering::Release);
     }
 }
 
@@ -685,7 +709,35 @@ impl OperationJournal for InMemoryOperationJournal {
     }
 
     async fn append_evidence(&self, evidence: EvidenceRecord) -> Result<(), JournalError> {
-        self.state.lock().await.evidence.push(evidence);
+        if self
+            .fail_evidence_appends
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(JournalError::Persistence(
+                "injected evidence append failure".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().await;
+        if let Some(existing) = state
+            .evidence
+            .iter()
+            .find(|record| record.id == evidence.id)
+        {
+            return if existing.operation_id == evidence.operation_id
+                && existing.kind == evidence.kind
+                && existing.detail == evidence.detail
+            {
+                Ok(())
+            } else {
+                Err(JournalError::Conflict(
+                    "evidence id conflicts with an existing record".to_string(),
+                ))
+            };
+        }
+        state.evidence.push(evidence);
         Ok(())
     }
 

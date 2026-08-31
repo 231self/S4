@@ -15,6 +15,15 @@ mod guest {
             if context.content_type == "test/begin-reject" {
                 return Err("begin rejected".to_string());
             }
+            if context.content_type == "test/require-step-context"
+                && (!matches!(context.operation, Operation::Read)
+                    || context.config_json.as_deref() != Some(r#"{"region":"eu"}"#)
+                    || context.public_key_pem.is_some()
+                    || context.stable_key.is_some()
+                    || context.stable_fields.is_some())
+            {
+                return Err("per-step context mismatch".to_string());
+            }
             Ok(())
         }
 

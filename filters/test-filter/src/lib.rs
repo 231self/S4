@@ -35,6 +35,16 @@ mod guest {
             if context.content_type == "test/begin-trap" {
                 panic!("begin trapped");
             }
+            if context.content_type == "test/print-to-stdout" {
+                println!("PRINTED_SECRET_OUT");
+            }
+            if context.content_type == "test/print-to-stderr" {
+                eprintln!("PRINTED_SECRET_ERR");
+            }
+            if context.content_type == "test/print-to-both" {
+                println!("PRINTED_SECRET_OUT");
+                eprintln!("PRINTED_SECRET_ERR");
+            }
             Ok(())
         }
 
@@ -44,6 +54,10 @@ mod guest {
                 payload if payload.starts_with(b"reject") => {
                     Ok(Decision::Reject("record rejected".to_string()))
                 }
+                payload if payload.starts_with(b"reject-oversize") => {
+                    Ok(Decision::Reject("R".repeat(64 * 1024)))
+                }
+                payload if payload.starts_with(b"err-oversize") => Err("E".repeat(64 * 1024)),
                 payload if payload.starts_with(b"trap") => panic!("transform trapped"),
                 payload if payload.starts_with(b"loop") => loop {
                     std::hint::black_box(());
@@ -56,6 +70,15 @@ mod guest {
                 b"state" => {
                     let value = RECORDS.fetch_add(1, Ordering::SeqCst) + 1;
                     Ok(Decision::Emit(value.to_string().into_bytes()))
+                }
+                b"env" => {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    Ok(Decision::Emit(format!("HOME={home}").into_bytes()))
+                }
+                b"fs" => {
+                    let content = std::fs::read_to_string("/etc/hostname")
+                        .unwrap_or_else(|_| "NO_FILE_ACCESS".to_string());
+                    Ok(Decision::Emit(content.into_bytes()))
                 }
                 _ => Ok(Decision::Emit(payload)),
             }

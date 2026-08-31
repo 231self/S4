@@ -150,6 +150,8 @@ struct PluginSession {
 pub struct PipelineSession {
     plugins: Vec<Option<PluginSession>>,
     limits: PipelineLimits,
+    output_format: crate::Format,
+    decoder_limits: crate::record::DecoderLimits,
     input_bytes: u64,
     output_bytes: u64,
     stage_output_bytes: Vec<u64>,
@@ -529,6 +531,8 @@ impl PipelineSnapshot {
             stage_output_bytes: vec![0; plugins.len()],
             plugins,
             limits: self.limits,
+            output_format: crate::Format::parse(&session.format).unwrap_or(crate::Format::Text),
+            decoder_limits: crate::record::DecoderLimits::default(),
             input_bytes: 0,
             output_bytes: 0,
             fuel_consumed,
@@ -833,6 +837,12 @@ impl PipelineSession {
                 output.push(record);
             }
         }
+        // A custom filter's output must still form a well-formed record
+        // stream in the target format before it is committed downstream.
+        crate::record::validate_output_records(self.output_format, &output, self.decoder_limits)
+            .map_err(|error| {
+                S4Error::new(codes::DECODE_INVALID_OUTPUT, error.message().to_string())
+            })?;
         Ok(output)
     }
 
@@ -1014,6 +1024,8 @@ mod tests {
             format: "text".to_string(),
             content_type: "text/plain".to_string(),
             policy_version: 1,
+            operation: s4_wasm_runtime::Operation::Write,
+            config_json: None,
             public_key_pem: None,
             stable_key: None,
             stable_fields: None,
@@ -1080,6 +1092,8 @@ mod tests {
             stage_output_bytes: vec![0; plugins.len()],
             plugins,
             limits,
+            output_format: crate::Format::Text,
+            decoder_limits: crate::record::DecoderLimits::default(),
             input_bytes: 0,
             output_bytes: 0,
             fuel_consumed: 0,

@@ -460,6 +460,49 @@ fn validate_utf8(input: &[u8], code: &'static str) -> Result<(), S4Error> {
         .map_err(|error| S4Error::new(code, error.to_string()))
 }
 
+/// Validates a complete set of output records against the selected record
+/// format before they are committed downstream.
+///
+/// Custom filter components are untrusted: their `Emit` and `finish` output
+/// must still form a well-formed record stream in the target format. Re-decoding
+/// the output with a fresh [`RecordDecoder`] proves structure and encoding
+/// (UTF-8, JSON documents, CSV fields, line/TSV framing) without ever
+/// committing malformed data.
+pub fn validate_output_records(
+    format: Format,
+    records: &[Record],
+    limits: DecoderLimits,
+) -> Result<(), S4Error> {
+    // A pipeline may legitimately drop every record (e.g. PII redaction on an
+    // empty or all-sensitive stream); empty output is always well-formed.
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut decoder = RecordDecoder::new(format, limits)?;
+    for record in records {
+        if !record.payload.is_empty() {
+            decoder.push(&record.payload)?;
+            while decoder.next_record()?.is_some() {}
+        }
+        if !record.separator.is_empty() {
+            decoder.push(&record.separator)?;
+            while decoder.next_record()?.is_some() {}
+        }
+    }
+    decoder.finish()?;
+    while decoder.next_record()?.is_some() {}
+    // The line decoder validates framing and UTF-8 but not per-line JSON
+    // structure; prove JSONL/JSON documents parse before commit.
+    if format == Format::Jsonl {
+        for record in records {
+            validate_utf8(&record.payload, codes::DECODE_ENCODING)?;
+            serde_json::from_slice::<serde_json::Value>(&record.payload)
+                .map_err(|error| S4Error::new(codes::DECODE_JSONL, error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 fn limit_error(code: &'static str, kind: &str, actual: usize, limit: usize) -> S4Error {
     S4Error::new(code, format!("{kind} size {actual} exceeds limit {limit}"))
 }
@@ -506,5 +549,50 @@ mod tests {
         let mut decoder = RecordDecoder::new(Format::Json, DecoderLimits::default()).unwrap();
         decoder.finish().unwrap();
         assert!(decoder.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn validate_output_accepts_well_formed_records_per_format() {
+        let limits = DecoderLimits::default();
+        let text = vec![Record::new("first", "\n"), Record::new("second", "\n")];
+        validate_output_records(Format::Text, &text, limits).unwrap();
+
+        let jsonl = vec![
+            Record::new(r#"{"a":1}"#, "\n"),
+            Record::new(r#"{"b":2}"#, "\n"),
+        ];
+        validate_output_records(Format::Jsonl, &jsonl, limits).unwrap();
+
+        let json_doc = vec![Record::new(b"{\"a\":1}".to_vec(), "")];
+        validate_output_records(Format::Json, &json_doc, limits).unwrap();
+    }
+
+    #[test]
+    fn validate_output_rejects_malformed_structured_records() {
+        let limits = DecoderLimits::default();
+
+        let bad_utf8 = vec![Record::new(vec![0xff, 0xfe, 0x01], "\n")];
+        assert_eq!(
+            validate_output_records(Format::Text, &bad_utf8, limits)
+                .unwrap_err()
+                .code(),
+            codes::DECODE_ENCODING
+        );
+
+        let bad_jsonl = vec![Record::new(b"{\"a\":".to_vec(), "\n")];
+        assert_eq!(
+            validate_output_records(Format::Jsonl, &bad_jsonl, limits)
+                .unwrap_err()
+                .code(),
+            codes::DECODE_JSONL
+        );
+
+        let bad_json = vec![Record::new(b"{\"a\":1".to_vec(), "")];
+        assert_eq!(
+            validate_output_records(Format::Json, &bad_json, limits)
+                .unwrap_err()
+                .code(),
+            codes::DECODE_JSON
+        );
     }
 }

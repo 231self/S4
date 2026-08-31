@@ -83,6 +83,8 @@ pub async fn stream_chunked_counted_async(
         format: format.as_str().to_string(),
         content_type: content_type.to_string(),
         policy_version: 0,
+        operation: s4_wasm_runtime::Operation::Write,
+        config_json: None,
         public_key_pem: public_key_pem.map(str::to_string),
         stable_key: stable_key.map(<[u8]>::to_vec),
         stable_fields: stable_fields.map(str::to_string),

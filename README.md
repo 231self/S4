@@ -81,6 +81,10 @@ Opt-in Avro OCF processing (`S4_ENABLE_AVRO=true`) and its supported subset are
 documented in [docs/avro.md](docs/avro.md). A runnable PUT/read example is in
 [examples/avro-demo.py](examples/avro-demo.py).
 
+The local stdio MCP server exposes put, get, list, and delete tools to agent
+clients while preserving the gateway's normal auth, pipeline, and metering path.
+See [docs/mcp.md](docs/mcp.md).
+
 ## Usage examples
 
 Everything below is copy-paste runnable.

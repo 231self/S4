@@ -5,6 +5,7 @@ members = [
   "crates/policy",
   "crates/wasm-runtime",
   "crates/gateway",
+  "crates/s4-mcp",
   "crates/s4ctl",
   "filters/pii-default",
   "filters/pii-shared",

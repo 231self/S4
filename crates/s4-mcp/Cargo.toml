@@ -19,6 +19,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rmcp = { version = "3.1", features = ["server", "macros", "schemars", "transport-io"] }
 schemars = "1"
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -27,4 +28,5 @@ url = "2"
 [dev-dependencies]
 axum.workspace = true
 http-body-util = "0.1"
-serde_json.workspace = true
+s4-gateway = { path = "../gateway" }
+uuid.workspace = true

@@ -197,9 +197,14 @@ impl BinaryReductorEngine {
         object_deadline: Instant,
     ) -> Result<BinaryReductorSession, S4Error> {
         let initial_fuel = self.runtime.limits.cumulative_fuel;
-        let (mut runtime, instance) =
-            self.runtime
-                .instantiate(cancellation, object_deadline, initial_fuel)?;
+        let (mut runtime, instance) = self.runtime.instantiate(
+            cancellation,
+            object_deadline,
+            initial_fuel,
+            // NoHostImports: no WASI linker is registered, so the WasiCtx is
+            // never used. Build the hardened empty context for symmetry.
+            wasmtime_wasi::WasiCtxBuilder::new().build(),
+        )?;
         let funcs = BinaryReductor::new(&mut runtime.store, &instance).map_err(|error| {
             super::startup_error(
                 codes::WIT_INVALID,

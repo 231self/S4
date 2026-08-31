@@ -9,6 +9,7 @@ pub mod codes {
     pub const DECODE_CSV: &str = "decode.csv";
     pub const DECODE_JSONL: &str = "decode.jsonl";
     pub const DECODE_ENCODING: &str = "decode.encoding";
+    pub const DECODE_INVALID_OUTPUT: &str = "decode.invalid_output";
     pub const CONFIG_INVALID: &str = "config.invalid";
     pub const LIMIT_INPUT_BYTES: &str = "limit.input_bytes";
     pub const LIMIT_OUTPUT_BYTES: &str = "limit.output_bytes";

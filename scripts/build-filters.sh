@@ -88,6 +88,13 @@ wasm-tools component new \
   --adapt "wasi_snapshot_preview1=${ADAPTER}" \
   -o "${TEST_OUT_DIR}/test-filter.component.wasm"
 
+# v0.2 world fixture: exercises `operation` and `config-json` context delivery.
+cargo build --release -p test-filter-v02 --target "$TARGET"
+wasm-tools component new \
+  "${BIN_DIR}/test_filter_v02.wasm" \
+  --adapt "wasi_snapshot_preview1=${ADAPTER}" \
+  -o "${TEST_OUT_DIR}/test-filter-v02.component.wasm"
+
 # Binary reductors receive no host imports. Build this fixture for the bare Wasm
 # target and componentize it without a WASI adapter.
 cargo build --release -p test-binary-reductor --target "$NO_WASI_TARGET"

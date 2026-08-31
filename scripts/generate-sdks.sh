@@ -7,12 +7,17 @@ SDK_DIR="$PROJECT_DIR/sdks"
 GATEWAY_PORT=19001
 GATEWAY_URL="http://127.0.0.1:$GATEWAY_PORT"
 GATEWAY_PID=""
+# Isolate the local-mode key store from the user's real config directory so a
+# stale `~/Library/Application Support/s4/keys.json` (DEK wrapped by an earlier
+# ephemeral/secret key) can never abort gateway startup.
+KEYS_FILE="/tmp/s4-sdkgen-keys-$$.json"
 
 cleanup() {
     if [ -n "$GATEWAY_PID" ]; then
         kill "$GATEWAY_PID" 2>/dev/null || true
         wait "$GATEWAY_PID" 2>/dev/null || true
     fi
+    rm -f "$KEYS_FILE"
 }
 trap cleanup EXIT
 
@@ -26,7 +31,7 @@ echo "→ Building gateway..."
 (cd "$PROJECT_DIR" && cargo build -p s4-gateway)
 
 echo "→ Starting gateway on port $GATEWAY_PORT..."
-(cd "$PROJECT_DIR" && AUTH_DISABLED=true LISTEN_ADDR="127.0.0.1:$GATEWAY_PORT" cargo run -p s4-gateway) &
+(cd "$PROJECT_DIR" && AUTH_DISABLED=true S4_KEYS_FILE="$KEYS_FILE" LISTEN_ADDR="127.0.0.1:$GATEWAY_PORT" cargo run -p s4-gateway) &
 GATEWAY_PID=$!
 
 # Wait for gateway to be ready

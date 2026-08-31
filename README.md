@@ -77,8 +77,9 @@ Typed binary codecs use a separate schema-aware reductor contract, not the
 byte-oriented plugin pipeline. See [docs/binary-adapters.md](docs/binary-adapters.md)
 when adding a custom logical-type adapter.
 
-The in-progress Avro OCF boundary and its supported subset are documented in
-[docs/avro.md](docs/avro.md).
+Opt-in Avro OCF processing (`S4_ENABLE_AVRO=true`) and its supported subset are
+documented in [docs/avro.md](docs/avro.md). A runnable PUT/read example is in
+[examples/avro-demo.py](examples/avro-demo.py).
 
 ## Usage examples
 

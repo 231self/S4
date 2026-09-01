@@ -19,6 +19,10 @@ use s4_gateway::control::{
 };
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
 use s4_gateway::object::BodyLimits;
+use s4_gateway::pipeline::{
+    ComponentSource, PipelineDirection, PipelineResolution, PipelineResolver,
+    StaticPipelineResolver,
+};
 use s4_gateway::plugin_registry::{PipelineLimits, PluginRegistry};
 use s4_gateway::server::{
     AppState, StatePipelineTemplate, StreamingReadMode, build_router,
@@ -66,6 +70,10 @@ struct FrameSequenceBody {
     frames: VecDeque<Result<Frame<Bytes>, std::io::Error>>,
 }
 
+struct ChannelBody {
+    receiver: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
 impl FrameSequenceBody {
     fn data(frames: impl IntoIterator<Item = Bytes>) -> Self {
         Self {
@@ -86,6 +94,20 @@ impl http_body::Body for FrameSequenceBody {
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         Poll::Ready(self.frames.pop_front())
+    }
+}
+
+impl http_body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.receiver
+            .poll_recv(cx)
+            .map(|value| value.map(|bytes| Ok(Frame::data(bytes))))
     }
 }
 
@@ -137,11 +159,145 @@ struct RecordedUsage {
 #[derive(Debug, Default)]
 struct RecordingMeteringControl {
     events: Mutex<Vec<RecordedUsage>>,
+    attempts: Mutex<Vec<s4_gateway::control::PipelineAttempt>>,
     authorizations: Mutex<Vec<(AuthenticatedRequestContext, UsageAuthorization)>>,
     releases: Mutex<Vec<(AuthenticatedRequestContext, uuid::Uuid)>>,
     authorization_failure: Option<AuthorizationError>,
     block_reason: Option<BlockReason>,
     failure: Option<MeteringError>,
+}
+
+#[derive(Debug, Default)]
+struct PipelineAttemptControl {
+    resolved: Arc<std::sync::atomic::AtomicBool>,
+    authorizations: AtomicUsize,
+    releases: AtomicUsize,
+    usage: AtomicUsize,
+    attempts: Mutex<Vec<s4_gateway::control::PipelineAttempt>>,
+}
+
+#[async_trait::async_trait]
+impl ControlPlane for PipelineAttemptControl {
+    async fn authorize(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        authorization: &UsageAuthorization,
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
+        assert!(
+            self.resolved.load(Ordering::Acquire),
+            "pipeline resolution must precede authorization"
+        );
+        self.authorizations.fetch_add(1, Ordering::Relaxed);
+        Ok(AuthorizationDecision::Granted(test_authorization_grant(
+            authorization,
+        )))
+    }
+
+    async fn release(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _operation_id: uuid::Uuid,
+    ) -> Result<(), AuthorizationError> {
+        self.releases.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn record(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _event: &UsageEvent,
+    ) -> Result<(), MeteringError> {
+        self.usage.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn record_pipeline_attempt(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        attempt: &s4_gateway::control::PipelineAttempt,
+    ) -> Result<(), MeteringError> {
+        self.attempts.lock().unwrap().push(attempt.clone());
+        Ok(())
+    }
+}
+
+struct TestPipelineResolver {
+    resolution: PipelineResolution,
+    calls: Mutex<Vec<(String, String, PipelineDirection)>>,
+    resolved: Arc<std::sync::atomic::AtomicBool>,
+    failure_code: Option<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl PipelineResolver for TestPipelineResolver {
+    async fn resolve(
+        &self,
+        workspace_id: &str,
+        bucket: &str,
+        direction: PipelineDirection,
+    ) -> Result<PipelineResolution, s4_error::S4Error> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((workspace_id.to_string(), bucket.to_string(), direction));
+        self.resolved.store(true, Ordering::Release);
+        if let Some(code) = self.failure_code {
+            return Err(s4_error::S4Error::new(code, "private resolver detail"));
+        }
+        let mut resolution = self.resolution.clone();
+        resolution.locator.fingerprint = s4_gateway::pipeline::resolution_fingerprint(
+            direction,
+            &resolution.steps,
+            resolution.explicit_passthrough,
+            resolution.limits,
+        );
+        Ok(resolution)
+    }
+}
+
+struct CorruptComponentSource;
+
+#[async_trait::async_trait]
+impl ComponentSource for CorruptComponentSource {
+    async fn load(&self, _component_hash: &str) -> Result<Bytes, s4_error::S4Error> {
+        Ok(Bytes::from_static(b"corrupt artifact bytes"))
+    }
+}
+
+struct FixedComponentSource(Bytes);
+
+#[async_trait::async_trait]
+impl ComponentSource for FixedComponentSource {
+    async fn load(&self, _component_hash: &str) -> Result<Bytes, s4_error::S4Error> {
+        Ok(self.0.clone())
+    }
+}
+
+struct SwitchingResolver {
+    current: Mutex<PipelineResolution>,
+    first_resolved: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+#[async_trait::async_trait]
+impl PipelineResolver for SwitchingResolver {
+    async fn resolve(
+        &self,
+        _workspace_id: &str,
+        _bucket: &str,
+        direction: PipelineDirection,
+    ) -> Result<PipelineResolution, s4_error::S4Error> {
+        let mut resolution = self.current.lock().unwrap().clone();
+        resolution.locator.fingerprint = s4_gateway::pipeline::resolution_fingerprint(
+            direction,
+            &resolution.steps,
+            resolution.explicit_passthrough,
+            resolution.limits,
+        );
+        if let Some(sender) = self.first_resolved.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        Ok(resolution)
+    }
 }
 
 #[async_trait::async_trait]
@@ -188,6 +344,57 @@ impl ControlPlane for RecordingMeteringControl {
             event: event.clone(),
         });
         self.failure.map_or(Ok(()), Err)
+    }
+
+    async fn record_pipeline_attempt(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        attempt: &s4_gateway::control::PipelineAttempt,
+    ) -> Result<(), MeteringError> {
+        self.attempts.lock().unwrap().push(attempt.clone());
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RetryMeteringControl {
+    failures_remaining: AtomicUsize,
+    calls: Mutex<Vec<UsageEvent>>,
+    releases: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ControlPlane for RetryMeteringControl {
+    async fn authorize(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        authorization: &UsageAuthorization,
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
+        Ok(AuthorizationDecision::Granted(test_authorization_grant(
+            authorization,
+        )))
+    }
+
+    async fn release(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _operation_id: uuid::Uuid,
+    ) -> Result<(), AuthorizationError> {
+        self.releases.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn record(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        event: &UsageEvent,
+    ) -> Result<(), MeteringError> {
+        self.calls.lock().unwrap().push(event.clone());
+        self.failures_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map_or(Ok(()), |_| Err(MeteringError::Unavailable))
     }
 }
 
@@ -730,6 +937,27 @@ async fn unsafe_transformed_test_state(later_filter: bool) -> Arc<AppState> {
         .plugins
         .import("test-failure", &test_filter_component())
         .unwrap();
+    state
+}
+
+async fn direct_passthrough_test_state(control: Arc<dyn ControlPlane>) -> Arc<AppState> {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = false;
+    state_mut.control = control;
+    for plugin in state_mut.plugins.list() {
+        state_mut.plugins.set_enabled(&plugin.id, false);
+    }
+    state_mut.store.put(
+        "direct",
+        "records.txt",
+        Bytes::from_static(b"first\nsecond\n"),
+        "text/plain",
+    );
+    state_mut
+        .store
+        .put("direct", "empty.txt", Bytes::new(), "text/plain");
     state
 }
 
@@ -2177,6 +2405,9 @@ async fn launch_contract_billable_handlers_generate_distinct_server_usage_event_
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
 
     let response = app
         .clone()
@@ -2289,6 +2520,11 @@ async fn launch_contract_billable_handlers_generate_distinct_server_usage_event_
         .expect("PUT records the resolved pipeline");
     assert_eq!(write_pipeline.revision, "static");
     assert!(!write_pipeline.fingerprint.is_empty());
+    let component_parts = write_pipeline.components.split(':').collect::<Vec<_>>();
+    assert_eq!(component_parts.len(), 3);
+    assert_eq!(component_parts[0], "v1");
+    assert!(component_parts[1].parse::<usize>().is_ok());
+    assert_eq!(component_parts[2].len(), 64);
     assert!(
         events[1..]
             .iter()
@@ -2304,6 +2540,16 @@ async fn launch_contract_billable_handlers_generate_distinct_server_usage_event_
         assert_eq!(authorization.kind(), event.event.kind());
         assert_eq!(authorization.route(), event.event.route());
     }
+    assert_eq!(authorizations[0].1.pipeline_revision(), Some("static"));
+    assert_eq!(
+        authorizations[0].1.pipeline_fingerprint(),
+        Some(write_pipeline.fingerprint.as_str())
+    );
+    assert!(
+        authorizations[1..]
+            .iter()
+            .all(|(_, authorization)| authorization.pipeline_revision().is_none())
+    );
     assert_eq!(
         authorizations
             .iter()
@@ -3339,7 +3585,7 @@ async fn presigned_transport_failure_never_discloses_signed_url_material() {
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("presigned backend request failed"), "{body}");
+    assert!(body.contains("We encountered an internal error."), "{body}");
     let address = address.to_string();
     for sensitive in [
         signed_url.as_str(),
@@ -5371,11 +5617,13 @@ async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
     let spool_dir =
         std::env::temp_dir().join(format!("s4-read-spool-router-{}", uuid::Uuid::now_v7()));
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    let control = Arc::new(RecordingMeteringControl::default());
     state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = true;
     state_mut.spool_config.directory = spool_dir.clone();
     state_mut.spool_config.max_object_bytes = 1024;
     state_mut.spool_quota = Arc::new(SpoolQuota::new(2048));
+    state_mut.control = control.clone();
     state.store.put(
         "read",
         "raw.txt",
@@ -5416,6 +5664,16 @@ async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
     assert!(
         std::fs::read_dir(&spool_dir).unwrap().next().is_none(),
         "staged ciphertext must be removed after replay"
+    );
+    let events = control.events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]
+            .event
+            .pipeline_evidence()
+            .expect("unsafe read records pipeline evidence")
+            .spool_mode,
+        "encrypted"
     );
 }
 
@@ -5468,6 +5726,242 @@ async fn transformed_read_rejects_range_part_head_encoding_and_unknown_format() 
             assert!(String::from_utf8_lossy(&body).contains("<Code>InvalidRequest</Code>"));
         }
         assert!(!String::from_utf8_lossy(&body).contains("alice@example.com"));
+    }
+}
+
+#[tokio::test]
+async fn resolver_precedes_authorization_and_isolates_workspace_bucket_and_direction() {
+    let mut state = test_state().await;
+    let baseline = StaticPipelineResolver::new(state.plugins.clone())
+        .resolve("seed", "seed", PipelineDirection::Write)
+        .await
+        .unwrap();
+    let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resolver = Arc::new(TestPipelineResolver {
+        resolution: baseline,
+        calls: Mutex::default(),
+        resolved: resolved.clone(),
+        failure_code: None,
+    });
+    let control = Arc::new(PipelineAttemptControl {
+        resolved,
+        ..PipelineAttemptControl::default()
+    });
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = true;
+    state_mut.control = control.clone();
+    state_mut.gateway = Arc::new(
+        state_mut
+            .gateway
+            .as_ref()
+            .clone()
+            .with_resolver(resolver.clone(), state_mut.plugins.clone()),
+    );
+    let first = make_key_for(&state, "workspace-a").await;
+    let second = make_key_for(&state, "workspace-b").await;
+    let app = build_router(state);
+
+    for (credentials, key) in [(&first, "a.txt"), (&second, "b.txt")] {
+        control.resolved.store(false, Ordering::Release);
+        let response = app
+            .clone()
+            .oneshot(add_headers(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/same-bucket/{key}"))
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from("alice@example.com"))
+                    .unwrap(),
+                &auth_headers(&credentials.0, &credentials.1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    control.resolved.store(false, Ordering::Release);
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/same-bucket/a.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&first.0, &first.1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let calls = resolver.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            (
+                "workspace-a".to_string(),
+                "same-bucket".to_string(),
+                PipelineDirection::Write,
+            ),
+            (
+                "workspace-b".to_string(),
+                "same-bucket".to_string(),
+                PipelineDirection::Write,
+            ),
+            (
+                "workspace-a".to_string(),
+                "same-bucket".to_string(),
+                PipelineDirection::Read,
+            ),
+        ]
+    );
+    assert_eq!(control.authorizations.load(Ordering::Relaxed), 3);
+    assert_eq!(control.usage.load(Ordering::Relaxed), 3);
+    assert!(control.attempts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn in_flight_put_keeps_the_assignment_frozen_before_body_polling() {
+    let mut state = test_state().await;
+    let frozen = StaticPipelineResolver::new(state.plugins.clone())
+        .resolve("seed", "seed", PipelineDirection::Write)
+        .await
+        .unwrap();
+    let mut replacement = frozen.clone();
+    replacement.locator.revision = "replacement".to_string();
+    replacement.steps.clear();
+    replacement.explicit_passthrough = true;
+    let (resolved_sender, resolved_receiver) = tokio::sync::oneshot::channel();
+    let resolver = Arc::new(SwitchingResolver {
+        current: Mutex::new(frozen),
+        first_resolved: Mutex::new(Some(resolved_sender)),
+    });
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.gateway = Arc::new(
+        state_mut
+            .gateway
+            .as_ref()
+            .clone()
+            .with_resolver(resolver.clone(), state_mut.plugins.clone()),
+    );
+    let credentials = make_key(&state).await;
+    let app = build_router(state);
+    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/freeze/object.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::new(ChannelBody {
+                receiver: body_receiver,
+            }))
+            .unwrap(),
+        &auth_headers(&credentials.0, &credentials.1),
+    );
+    let request_task = tokio::spawn(app.clone().oneshot(request));
+    resolved_receiver
+        .await
+        .expect("request resolves before polling the body");
+    *resolver.current.lock().unwrap() = replacement;
+    body_sender
+        .send(Bytes::from_static(b"alice@example.com"))
+        .await
+        .unwrap();
+    drop(body_sender);
+    let response = request_task.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/freeze/object.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&credentials.0, &credentials.1),
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body, "[REDACTED_EMAIL]");
+}
+
+#[tokio::test]
+async fn resolver_outage_and_artifact_corruption_fail_closed_without_body_or_charge() {
+    for artifact_corruption in [false, true] {
+        let mut state = test_state().await;
+        let mut resolution = StaticPipelineResolver::new(state.plugins.clone())
+            .resolve("seed", "seed", PipelineDirection::Write)
+            .await
+            .unwrap();
+        if artifact_corruption {
+            resolution.steps[0].component_hash = "a".repeat(64);
+        }
+        let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resolver = Arc::new(TestPipelineResolver {
+            resolution,
+            calls: Mutex::default(),
+            resolved: resolved.clone(),
+            failure_code: (!artifact_corruption).then_some(s4_error::codes::INTERNAL),
+        });
+        let control = Arc::new(PipelineAttemptControl {
+            resolved,
+            ..PipelineAttemptControl::default()
+        });
+        let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+        state_mut.control = control.clone();
+        let source: Arc<dyn ComponentSource> = if artifact_corruption {
+            Arc::new(CorruptComponentSource)
+        } else {
+            state_mut.plugins.clone()
+        };
+        state_mut.gateway = Arc::new(
+            state_mut
+                .gateway
+                .as_ref()
+                .clone()
+                .with_resolver(resolver, source),
+        );
+        let credentials = make_key(&state).await;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let response = build_router(state)
+            .oneshot(add_headers(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/failure/object.txt")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::new(PollTrackingBody {
+                        polls: polls.clone(),
+                        data: Some(Bytes::from_static(b"must-not-be-polled")),
+                    }))
+                    .unwrap(),
+                &auth_headers(&credentials.0, &credentials.1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("<Code>InternalError</Code>"));
+        assert!(!body.contains("private resolver detail"));
+        assert!(!body.contains("corrupt artifact bytes"));
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        assert_eq!(control.usage.load(Ordering::Relaxed), 0);
+        assert_eq!(control.attempts.lock().unwrap().len(), 1);
+        if artifact_corruption {
+            assert_eq!(control.authorizations.load(Ordering::Relaxed), 1);
+            assert_eq!(control.releases.load(Ordering::Relaxed), 1);
+        } else {
+            assert_eq!(control.authorizations.load(Ordering::Relaxed), 0);
+            assert_eq!(control.releases.load(Ordering::Relaxed), 0);
+        }
     }
 }
 
@@ -5600,7 +6094,7 @@ async fn unsafe_transformed_source_limit_has_no_disclosure() {
 }
 
 #[tokio::test]
-async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
+async fn nonempty_prefix_safe_reads_stream_and_settle_without_spool() {
     async fn unknown_length_source(
         method: axum::http::Method,
         uri: axum::http::Uri,
@@ -5634,8 +6128,14 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
     let mut state = test_state().await;
     let control = Arc::new(RecordingMeteringControl::default());
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    let spool_dir =
+        std::env::temp_dir().join(format!("s4-direct-read-no-spool-{}", uuid::Uuid::now_v7()));
+    let spool_quota = Arc::new(SpoolQuota::new(2048));
     state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = false;
+    state_mut.spool_config.directory = spool_dir.clone();
+    state_mut.spool_config.max_object_bytes = 1024;
+    state_mut.spool_quota = spool_quota.clone();
     state_mut.control = control.clone();
     state_mut.s3_client = Some(aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::Config::builder()
@@ -5695,7 +6195,14 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "one\ntwo\n"
+    );
 
     assert_eq!(
         control
@@ -5712,17 +6219,247 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
                 )
             })
             .collect::<Vec<_>>(),
-        vec![(RequestKind::Read, UsageRoute::GetObject, 0, 0)]
+        vec![
+            (RequestKind::Read, UsageRoute::GetObject, 0, 0),
+            (RequestKind::Read, UsageRoute::GetObject, 8, 8),
+        ]
     );
     let events = control.events.lock().unwrap();
-    let evidence = events[0]
-        .event
-        .pipeline_evidence()
-        .expect("completed empty direct read must retain measured evidence");
-    assert_eq!(evidence.revision, "static");
-    assert_eq!(evidence.fuel_consumed, 0);
-    assert_eq!(evidence.spool_mode, "none");
+    for event in events.iter() {
+        let evidence = event
+            .event
+            .pipeline_evidence()
+            .expect("completed prefix-safe read must retain measured evidence");
+        assert_eq!(evidence.revision, "static");
+        assert_eq!(evidence.fuel_consumed, 0);
+        assert_eq!(evidence.spool_mode, "none");
+        assert!(evidence.components.starts_with("v1:0:"));
+    }
+    assert_eq!(spool_quota.reserved_bytes(), 0);
+    assert!(
+        std::fs::read_dir(&spool_dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true),
+        "direct reads must not create encrypted spool files"
+    );
     task.abort();
+}
+
+#[tokio::test]
+async fn direct_read_retries_the_exact_terminal_event_before_eof() {
+    let control = Arc::new(RetryMeteringControl {
+        failures_remaining: AtomicUsize::new(2),
+        calls: Mutex::default(),
+        releases: AtomicUsize::new(0),
+    });
+    let state = direct_passthrough_test_state(control.clone()).await;
+    let credentials = make_key(&state).await;
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/direct/records.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&credentials.0, &credentials.1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        "first\nsecond\n"
+    );
+    let calls = control.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert!(calls.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(
+        calls[0]
+            .pipeline_evidence()
+            .expect("direct settlement includes evidence")
+            .spool_mode,
+        "none"
+    );
+    assert_eq!(control.releases.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn direct_read_settlement_exhaustion_errors_after_disclosure_and_preserves_reservation() {
+    let control = Arc::new(RetryMeteringControl {
+        failures_remaining: AtomicUsize::new(usize::MAX),
+        calls: Mutex::default(),
+        releases: AtomicUsize::new(0),
+    });
+    let state = direct_passthrough_test_state(control.clone()).await;
+    let credentials = make_key(&state).await;
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/direct/records.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&credentials.0, &credentials.1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = http_body_util::BodyExt::frame(&mut body)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert!(
+        !first.is_empty(),
+        "transformed output is disclosed before settlement"
+    );
+    let mut terminal_error = None;
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        if let Err(error) = frame {
+            terminal_error = Some(error);
+            break;
+        }
+    }
+    assert!(terminal_error.is_some());
+    assert_eq!(control.calls.lock().unwrap().len(), 3);
+    assert_eq!(control.releases.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn direct_read_client_cancellation_after_disclosure_preserves_recoverable_reservation() {
+    let control = Arc::new(RecordingMeteringControl::default());
+    let state = direct_passthrough_test_state(control.clone()).await;
+    let credentials = make_key(&state).await;
+    let app = build_router(state);
+    let response = app
+        .clone()
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/direct/records.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&credentials.0, &credentials.1),
+        ))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    let first = http_body_util::BodyExt::frame(&mut body)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert!(!first.is_empty());
+    drop(body);
+    tokio::task::yield_now().await;
+    assert!(control.events.lock().unwrap().is_empty());
+    assert!(control.releases.lock().unwrap().is_empty());
+
+    let response = app
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/direct/empty.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&credentials.0, &credentials.1),
+        ))
+        .await
+        .unwrap();
+    drop(response.into_body());
+    tokio::task::yield_now().await;
+    assert_eq!(control.releases.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn direct_read_terminal_plugin_error_never_settles_customer_usage() {
+    let component = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-components/test-filter.component.wasm"),
+    )
+    .expect("test-filter.component.wasm; run just build-filters");
+    let registry = Arc::new(PluginRegistry::new());
+    registry.import("prefix-safe-test", &component).unwrap();
+    let mut resolution = StaticPipelineResolver::new(registry.clone())
+        .resolve("seed", "seed", PipelineDirection::Read)
+        .await
+        .unwrap();
+    resolution.steps[0].capabilities.prefix_safe_for_read = true;
+    let resolver = Arc::new(TestPipelineResolver {
+        resolution,
+        calls: Mutex::default(),
+        resolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        failure_code: None,
+    });
+    let execution_registry = Arc::new(PluginRegistry::new());
+    let mut state = test_state().await;
+    let control = Arc::new(RecordingMeteringControl::default());
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = false;
+    state_mut.control = control.clone();
+    state_mut.plugins = execution_registry.clone();
+    state_mut.gateway = Arc::new(
+        Gateway::with_registry(
+            s4_wasm_runtime::FilterEngine::new(&component).unwrap(),
+            execution_registry,
+        )
+        .with_resolver(resolver, Arc::new(FixedComponentSource(component.into()))),
+    );
+    state_mut.store.put(
+        "direct",
+        "failure.txt",
+        Bytes::from_static(b"safe\ntrap\n"),
+        "text/plain",
+    );
+    let credentials = make_key(&state).await;
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/direct/failure.txt")
+                .header("x-s4-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&credentials.0, &credentials.1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = http_body_util::BodyExt::frame(&mut body)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first, "safe");
+    let mut disclosed = first.to_vec();
+    let mut terminal_error = false;
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        match frame {
+            Ok(frame) => disclosed.extend_from_slice(&frame.into_data().unwrap()),
+            Err(_) => {
+                terminal_error = true;
+                break;
+            }
+        }
+    }
+    assert!(terminal_error);
+    assert_eq!(disclosed, b"safe\n");
+    tokio::task::yield_now().await;
+    assert!(control.events.lock().unwrap().is_empty());
+    assert!(control.releases.lock().unwrap().is_empty());
+    assert_eq!(control.attempts.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

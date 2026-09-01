@@ -48,32 +48,32 @@ const DEFAULT_MAX_MEMORIES: usize = 4;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 
-/// Maximum length of a guest-supplied diagnostic or reject reason after
-/// sanitization. Guest messages are untrusted input; they must never be
-/// forwarded verbatim into logs, HTTP responses, or operator surfaces.
-pub const MAX_GUEST_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+/// Maximum length of the irreversible guest-diagnostic correlation token.
+/// Guest messages are untrusted and never appear in the returned value.
+pub const MAX_GUEST_DIAGNOSTIC_BYTES: usize = 96;
 
-/// Sanitizes an untrusted guest diagnostic (trap message, `reject` reason, or
-/// `result::<_, string>` error) before it is recorded in an `S4Error`.
-///
-/// The value is bounded to [`MAX_GUEST_DIAGNOSTIC_BYTES`] and control
-/// characters (including embedded newlines and ANSI escape sequences) are
-/// replaced with spaces so a hostile filter cannot forge log lines, inject
-/// terminal escapes, or embed secret payloads in operator-visible output.
+/// Converts an untrusted guest diagnostic into an irreversible, bounded token
+/// suitable only for correlating identical validation failures. Runtime errors
+/// remain generic, and neither printable text nor control characters survive.
 pub fn sanitize_guest_diagnostic(raw: &str) -> String {
-    const MAX: usize = MAX_GUEST_DIAGNOSTIC_BYTES;
-    let mut out = String::with_capacity(raw.len().min(MAX));
-    for ch in raw.chars() {
-        if out.len() >= MAX {
-            break;
-        }
-        if ch.is_control() || ch == '\u{7f}' {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
-    }
-    out
+    use sha2::{Digest as _, Sha256};
+
+    format!(
+        "guest-diagnostic-sha256:{}",
+        hex::encode(Sha256::digest(raw.as_bytes()))
+    )
+}
+
+fn guest_failure(code: &'static str, stage: &'static str) -> S4Error {
+    let message = match code {
+        codes::WASM_REJECT => "filter rejected the input",
+        codes::WASM_INIT => "filter initialization failed",
+        _ => match stage {
+            "finish" => "filter finalization failed",
+            _ => "filter execution failed",
+        },
+    };
+    S4Error::new(code, message)
 }
 
 #[derive(Debug)]
@@ -307,15 +307,11 @@ impl FilterSession {
         let decision = self
             .runtime
             .complete_call(window, result, "transform", codes::WASM_TRAP)?;
-        let decision = decision
-            .map_err(|error| S4Error::new(codes::WASM_TRAP, sanitize_guest_diagnostic(&error)))?;
+        let decision = decision.map_err(|_| guest_failure(codes::WASM_TRAP, "transform"))?;
         match decision {
             Decision::Emit(data) => Ok(TransformOutcome::Emit(data)),
             Decision::Drop => Ok(TransformOutcome::Drop),
-            Decision::Reject(reason) => Err(S4Error::new(
-                codes::WASM_REJECT,
-                sanitize_guest_diagnostic(&reason),
-            )),
+            Decision::Reject(_) => Err(guest_failure(codes::WASM_REJECT, "transform")),
         }
     }
 
@@ -330,7 +326,7 @@ impl FilterSession {
         let output = self
             .runtime
             .complete_call(window, result, "finish", codes::WASM_TRAP)?
-            .map_err(|error| S4Error::new(codes::WASM_TRAP, sanitize_guest_diagnostic(&error)))?;
+            .map_err(|_| guest_failure(codes::WASM_TRAP, "finish"))?;
         Ok((output, self.runtime.fuel_consumed))
     }
 
@@ -371,7 +367,7 @@ impl FilterSession {
         let result = funcs.call_begin(&mut self.runtime.store, context);
         self.runtime
             .complete_call(window, result, "begin", codes::WASM_INIT)?
-            .map_err(|error| S4Error::new(codes::WASM_INIT, sanitize_guest_diagnostic(&error)))
+            .map_err(|_| guest_failure(codes::WASM_INIT, "begin"))
     }
 
     fn call_begin_v02(
@@ -386,7 +382,7 @@ impl FilterSession {
         let result = funcs.call_begin(&mut self.runtime.store, context);
         self.runtime
             .complete_call(window, result, "begin", codes::WASM_INIT)?
-            .map_err(|error| S4Error::new(codes::WASM_INIT, sanitize_guest_diagnostic(&error)))
+            .map_err(|_| guest_failure(codes::WASM_INIT, "begin"))
     }
 }
 
@@ -451,9 +447,14 @@ impl RuntimeSession {
             } else {
                 default_code
             };
-            S4Error::new(
+            let _ = error;
+            guest_failure(
                 code,
-                format!("{stage}: {}", sanitize_guest_diagnostic(&error.to_string())),
+                match stage {
+                    "begin" => "begin",
+                    "finish" => "finish",
+                    _ => "transform",
+                },
             )
         })
     }
@@ -464,6 +465,10 @@ const DEFAULT_FUEL: u64 = 10_000_000;
 impl FilterEngine {
     pub fn new(component_bytes: &[u8]) -> anyhow::Result<Self> {
         Self::with_fuel(component_bytes, DEFAULT_FUEL)
+    }
+
+    pub fn world_version(&self) -> FilterWorldVersion {
+        self.runtime.world_version
     }
 
     pub fn with_fuel(component_bytes: &[u8], fuel: u64) -> anyhow::Result<Self> {
@@ -832,7 +837,8 @@ impl RuntimeComponent {
                 } else {
                     instantiation_code
                 };
-                S4Error::new(code, sanitize_guest_diagnostic(&error.to_string()))
+                let _ = error;
+                guest_failure(code, "begin")
             })?;
         let remaining_after_start = store
             .get_fuel()
@@ -940,7 +946,8 @@ fn startup_error(
     } else {
         default_code
     };
-    S4Error::new(code, sanitize_guest_diagnostic(&error.to_string()))
+    let _ = error;
+    guest_failure(code, "begin")
 }
 
 fn register_epoch_engine(engine: &Arc<EpochEngine>) {
@@ -1367,19 +1374,100 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_guest_diagnostic_strips_control_characters() {
+    fn guest_diagnostic_correlation_token_is_irreversible_stable_and_bounded() {
         let raw = "secret\u{1b}[31mred\u{0a}next\u{07}";
         let sanitized = sanitize_guest_diagnostic(raw);
-        assert_eq!(sanitized, "secret [31mred next ");
-        assert!(!sanitized.contains('\u{1b}'));
-        assert!(!sanitized.contains('\n'));
-        assert!(!sanitized.contains('\u{07}'));
-        assert_eq!(sanitize_guest_diagnostic("plain"), "plain");
+        assert!(sanitized.starts_with("guest-diagnostic-sha256:"));
+        assert!(!sanitized.contains("secret"));
+        assert_eq!(sanitized, sanitize_guest_diagnostic(raw));
+        assert_ne!(sanitized, sanitize_guest_diagnostic("different"));
         let big = "x".repeat(MAX_GUEST_DIAGNOSTIC_BYTES + 10_000);
-        assert_eq!(
-            sanitize_guest_diagnostic(&big).len(),
-            MAX_GUEST_DIAGNOSTIC_BYTES
-        );
+        assert!(sanitize_guest_diagnostic(&big).len() <= MAX_GUEST_DIAGNOSTIC_BYTES);
+    }
+
+    fn granted_secret_session(action: Option<String>) -> Session {
+        let mut configured = session();
+        configured.config_json = action;
+        configured.public_key_pem = Some("PRINTABLE_PUBLIC_KEY_SECRET".to_string());
+        configured.stable_key = Some(b"PRINTABLE_STABLE_KEY_SECRET".to_vec());
+        configured.stable_fields = Some("PRINTABLE_STABLE_FIELDS_SECRET".to_string());
+        configured
+    }
+
+    fn assert_opaque_guest_error(error: &S4Error, expected_code: &'static str) {
+        assert_eq!(error.code(), expected_code);
+        assert!(error.message().len() <= MAX_GUEST_DIAGNOSTIC_BYTES);
+        for forbidden in [
+            "SECRET=",
+            "PRINTABLE_PUBLIC_KEY_SECRET",
+            "PRINTABLE_STABLE_KEY_SECRET",
+            "PRINTABLE_STABLE_FIELDS_SECRET",
+        ] {
+            assert!(
+                !error.to_string().contains(forbidden),
+                "guest diagnostic exposed {forbidden}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_granted_secret_is_opaque_across_guest_reject_error_and_trap_paths() {
+        let engine = FilterEngine::new(&test_component_v02()).unwrap();
+        let fields = ["public-key", "entropy", "stable-key", "stable-fields"];
+
+        for field in fields {
+            for (action, code) in [
+                (format!("begin-error:{field}"), codes::WASM_INIT),
+                (format!("begin-trap:{field}"), codes::WASM_INIT),
+            ] {
+                let error = engine
+                    .start_session_with_control_and_grant(
+                        &granted_secret_session(Some(action)),
+                        CancellationToken::new(),
+                        u64::MAX,
+                        Instant::now() + Duration::from_secs(5),
+                        SensitiveGrant::ALL,
+                    )
+                    .err()
+                    .expect("guest begin must fail");
+                assert_opaque_guest_error(&error, code);
+            }
+
+            for (action, code) in [
+                (format!("reject:{field}"), codes::WASM_REJECT),
+                (format!("error:{field}"), codes::WASM_TRAP),
+                (format!("trap:{field}"), codes::WASM_TRAP),
+            ] {
+                let mut filter = engine
+                    .start_session_with_control_and_grant(
+                        &granted_secret_session(None),
+                        CancellationToken::new(),
+                        u64::MAX,
+                        Instant::now() + Duration::from_secs(5),
+                        SensitiveGrant::ALL,
+                    )
+                    .unwrap();
+                let error = filter.transform(action.as_bytes()).unwrap_err();
+                assert_opaque_guest_error(&error, code);
+            }
+
+            for action in [
+                format!("finish-error:{field}"),
+                format!("finish-trap:{field}"),
+            ] {
+                let filter = engine
+                    .start_session_with_control_and_grant(
+                        &granted_secret_session(Some(action)),
+                        CancellationToken::new(),
+                        u64::MAX,
+                        Instant::now() + Duration::from_secs(5),
+                        SensitiveGrant::ALL,
+                    )
+                    .unwrap();
+                let error = filter.finish().unwrap_err();
+                assert_opaque_guest_error(&error, codes::WASM_TRAP);
+            }
+        }
     }
 
     #[test]

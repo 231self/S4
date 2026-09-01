@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use s4_error::{S4Error, codes};
 use s4_wasm_runtime::{
-    CancellationToken, ExecutorConfig, FilterEngine, FilterSession, SensitiveGrant,
-    TransformOutcome, WasmExecutor,
+    CancellationToken, ExecutorConfig, FilterEngine, FilterSession, FilterWorldVersion,
+    SensitiveGrant, TransformOutcome, WasmExecutor,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -16,8 +16,8 @@ use uuid::Uuid;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::pipeline::{
-    ComponentSource, PipelineResolution, PipelineStep, pipeline_requires_passthrough,
-    plugin_step_info,
+    ComponentSource, PipelineResolution, PipelineStep, component_digest_evidence,
+    pipeline_requires_passthrough, plugin_step_info,
 };
 use crate::record::{OutputValidator, Record};
 
@@ -151,12 +151,23 @@ impl PipelineSnapshot {
     ) -> Option<crate::control::PipelineEvidence> {
         let fingerprint = self.fingerprint.as_ref()?;
         let revision = self.revision.as_deref()?;
-        let mut hashes: Vec<&str> = self.component_hashes().into_iter().collect();
-        hashes.sort_unstable();
+        let steps = self
+            .plugins
+            .iter()
+            .map(|plugin| PipelineStep {
+                component_hash: plugin.component_hash.clone(),
+                plugin_version_id: None,
+                enabled: plugin.enabled,
+                version: None,
+                config_json: None,
+                capabilities: plugin.capabilities,
+                sensitive_grant: SensitiveGrant::NONE,
+            })
+            .collect::<Vec<_>>();
         Some(crate::control::PipelineEvidence {
             revision: revision.to_string(),
             fingerprint: fingerprint.clone(),
-            components: hashes.join(","),
+            components: component_digest_evidence(&steps),
             fuel_consumed,
             duration_ms,
             spool_mode: spool_mode.to_string(),
@@ -582,7 +593,14 @@ impl PluginRegistry {
         let mut plugins = Vec::with_capacity(resolution.steps.len());
         for step in &resolution.steps {
             let engine = if step.enabled {
-                Some(self.engine_for(step, source).await?)
+                let engine = self.engine_for(step, source).await?;
+                if step.config_json.is_some() && engine.world_version() == FilterWorldVersion::V01 {
+                    return Err(S4Error::new(
+                        codes::CONFIG_INVALID,
+                        "v0.1 components cannot carry step configuration",
+                    ));
+                }
+                Some(engine)
             } else {
                 None
             };
@@ -2344,6 +2362,7 @@ mod tests {
                 fingerprint: "deadbeef".to_string(),
             },
             steps: Vec::new(),
+            policy_generation: None,
             explicit_passthrough: false,
             limits: PipelineLimits::default(),
         };
@@ -2365,12 +2384,14 @@ mod tests {
             },
             steps: vec![PipelineStep {
                 component_hash: "unavailable-disabled-component".to_string(),
+                plugin_version_id: None,
                 enabled: false,
                 version: None,
                 config_json: None,
                 capabilities: PluginCapabilities::default(),
                 sensitive_grant: SensitiveGrant::NONE,
             }],
+            policy_generation: None,
             explicit_passthrough: false,
             limits: PipelineLimits::default(),
         };
@@ -2391,6 +2412,7 @@ mod tests {
                 fingerprint: "deadbeef".to_string(),
             },
             steps: Vec::new(),
+            policy_generation: None,
             explicit_passthrough: true,
             limits: PipelineLimits::default(),
         };
@@ -2420,6 +2442,7 @@ mod tests {
                 fingerprint: "deadbeef".to_string(),
             },
             steps: Vec::new(),
+            policy_generation: None,
             explicit_passthrough: true,
             limits: PipelineLimits::default(),
         };
@@ -2434,6 +2457,7 @@ mod tests {
         let registry = PluginRegistry::new();
         let step = PipelineStep {
             component_hash: "bogus-not-a-real-sha256".to_string(),
+            plugin_version_id: None,
             enabled: true,
             version: None,
             config_json: None,
@@ -2446,6 +2470,7 @@ mod tests {
                 fingerprint: "deadbeef".to_string(),
             },
             steps: vec![step],
+            policy_generation: None,
             explicit_passthrough: false,
             limits: PipelineLimits::default(),
         };
@@ -2496,6 +2521,7 @@ mod tests {
         let digest = hex::encode(Sha256::digest(&bytes));
         let step = PipelineStep {
             component_hash: digest,
+            plugin_version_id: None,
             enabled: true,
             version: Some("1.0.0".to_string()),
             config_json: None,
@@ -2508,6 +2534,7 @@ mod tests {
                 fingerprint: "deadbeef".to_string(),
             },
             steps: vec![step],
+            policy_generation: None,
             explicit_passthrough: false,
             limits: PipelineLimits::default(),
         };
@@ -2538,12 +2565,14 @@ mod tests {
             },
             steps: vec![PipelineStep {
                 component_hash: digest,
+                plugin_version_id: None,
                 enabled: true,
                 version: Some("0.2.0".to_string()),
                 config_json: Some(r#"{"region":"eu"}"#.to_string()),
                 capabilities: PluginCapabilities::default(),
                 sensitive_grant: SensitiveGrant::NONE,
             }],
+            policy_generation: None,
             explicit_passthrough: false,
             limits: PipelineLimits::default(),
         };
@@ -2564,6 +2593,43 @@ mod tests {
         assert_eq!(
             pipeline.process(Record::new("payload", "")).unwrap(),
             Some(Record::new("payload", ""))
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_publicly_rejects_config_on_v01_component() {
+        let bytes = component();
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let registry = PluginRegistry::new();
+        registry.import("v01", &bytes).unwrap();
+        let resolution = PipelineResolution {
+            locator: crate::pipeline::PipelineLocator {
+                revision: "configured-v01".to_string(),
+                fingerprint: "fingerprint".to_string(),
+            },
+            steps: vec![PipelineStep {
+                component_hash: digest,
+                plugin_version_id: None,
+                enabled: true,
+                version: Some("0.1.0".to_string()),
+                config_json: Some(r#"{"forbidden":true}"#.to_string()),
+                capabilities: PluginCapabilities::default(),
+                sensitive_grant: SensitiveGrant::NONE,
+            }],
+            policy_generation: None,
+            explicit_passthrough: false,
+            limits: PipelineLimits::default(),
+        };
+
+        let error = registry
+            .snapshot_for(&resolution, &registry)
+            .await
+            .err()
+            .expect("configured v0.1 step must be rejected");
+        assert_eq!(error.code(), codes::CONFIG_INVALID);
+        assert_eq!(
+            error.message(),
+            "v0.1 components cannot carry step configuration"
         );
     }
 

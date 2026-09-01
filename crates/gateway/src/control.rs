@@ -71,6 +71,8 @@ pub struct UsageAuthorization {
     route: UsageRoute,
     kind: RequestKind,
     max_processed_bytes: u64,
+    pipeline_revision: Option<String>,
+    pipeline_fingerprint: Option<String>,
 }
 
 impl UsageAuthorization {
@@ -89,7 +91,15 @@ impl UsageAuthorization {
             route,
             kind,
             max_processed_bytes,
+            pipeline_revision: None,
+            pipeline_fingerprint: None,
         }
+    }
+
+    pub(crate) fn with_pipeline(mut self, locator: &crate::pipeline::PipelineLocator) -> Self {
+        self.pipeline_revision = Some(locator.revision.clone());
+        self.pipeline_fingerprint = Some(locator.fingerprint.clone());
+        self
     }
 
     pub fn operation_id(&self) -> Uuid {
@@ -115,6 +125,14 @@ impl UsageAuthorization {
     pub fn max_processed_bytes(&self) -> u64 {
         self.max_processed_bytes
     }
+
+    pub fn pipeline_revision(&self) -> Option<&str> {
+        self.pipeline_revision.as_deref()
+    }
+
+    pub fn pipeline_fingerprint(&self) -> Option<&str> {
+        self.pipeline_fingerprint.as_deref()
+    }
 }
 
 /// Immutable authorization facts selected before an operation can begin.
@@ -131,6 +149,8 @@ pub struct AuthorizationGrant {
     route: UsageRoute,
     kind: RequestKind,
     max_processed_bytes: u64,
+    pipeline_revision: Option<String>,
+    pipeline_fingerprint: Option<String>,
 }
 
 impl AuthorizationGrant {
@@ -149,6 +169,8 @@ impl AuthorizationGrant {
             route: authorization.route,
             kind: authorization.kind,
             max_processed_bytes: authorization.max_processed_bytes,
+            pipeline_revision: authorization.pipeline_revision.clone(),
+            pipeline_fingerprint: authorization.pipeline_fingerprint.clone(),
         }
     }
 
@@ -184,6 +206,14 @@ impl AuthorizationGrant {
         self.max_processed_bytes
     }
 
+    pub fn pipeline_revision(&self) -> Option<&str> {
+        self.pipeline_revision.as_deref()
+    }
+
+    pub fn pipeline_fingerprint(&self) -> Option<&str> {
+        self.pipeline_fingerprint.as_deref()
+    }
+
     pub(crate) fn matches(&self, authorization: &UsageAuthorization) -> bool {
         self.operation_id == authorization.operation_id
             && self.receipt_id == authorization.receipt_id
@@ -191,6 +221,8 @@ impl AuthorizationGrant {
             && self.route == authorization.route
             && self.kind == authorization.kind
             && self.max_processed_bytes == authorization.max_processed_bytes
+            && self.pipeline_revision == authorization.pipeline_revision
+            && self.pipeline_fingerprint == authorization.pipeline_fingerprint
     }
 }
 
@@ -237,6 +269,84 @@ pub struct PipelineEvidence {
     pub duration_ms: u64,
     /// Spool mode (`none` or `encrypted`) for unsafe-read evidence.
     pub spool_mode: String,
+}
+
+/// Internal execution-attempt evidence. This is deliberately separate from
+/// [`UsageEvent`]: failed work contributes to platform COGS but never creates a
+/// customer usage receipt or charge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PipelineAttempt {
+    operation_id: Uuid,
+    bucket: String,
+    direction: crate::pipeline::PipelineDirection,
+    revision: Option<String>,
+    fingerprint: Option<String>,
+    components: Option<String>,
+    error_code: &'static str,
+    fuel_consumed: u64,
+    duration_ms: u64,
+}
+
+impl PipelineAttempt {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn failed(
+        operation_id: Uuid,
+        bucket: impl Into<String>,
+        direction: crate::pipeline::PipelineDirection,
+        resolution: Option<&crate::pipeline::PipelineResolution>,
+        components: Option<String>,
+        error_code: &'static str,
+        fuel_consumed: u64,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            operation_id,
+            bucket: bucket.into(),
+            direction,
+            revision: resolution.map(|value| value.locator.revision.clone()),
+            fingerprint: resolution.map(|value| value.locator.fingerprint.clone()),
+            components,
+            error_code,
+            fuel_consumed,
+            duration_ms,
+        }
+    }
+
+    pub fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn direction(&self) -> crate::pipeline::PipelineDirection {
+        self.direction
+    }
+
+    pub fn revision(&self) -> Option<&str> {
+        self.revision.as_deref()
+    }
+
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
+    }
+
+    pub fn components(&self) -> Option<&str> {
+        self.components.as_deref()
+    }
+
+    pub fn error_code(&self) -> &'static str {
+        self.error_code
+    }
+
+    pub fn fuel_consumed(&self) -> u64 {
+        self.fuel_consumed
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
 }
 
 impl UsageEvent {
@@ -379,6 +489,17 @@ pub trait ControlPlane: Send + Sync + 'static {
         context: &AuthenticatedRequestContext,
         event: &UsageEvent,
     ) -> Result<(), MeteringError>;
+
+    /// Record internal failed-attempt COGS. The default preserves compatibility
+    /// for existing control planes; hosted implementations may persist it in a
+    /// ledger that is not connected to customer settlement.
+    async fn record_pipeline_attempt(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _attempt: &PipelineAttempt,
+    ) -> Result<(), MeteringError> {
+        Ok(())
+    }
 
     /// Optional tenant ceiling. `None` inherits the deployment ceiling; a
     /// tenant can only lower, never raise, the configured mode.
@@ -591,6 +712,42 @@ mod tests {
         ] {
             assert!(!grant.matches(&mismatch));
         }
+    }
+
+    #[test]
+    fn grant_validation_binds_pipeline_revision_and_fingerprint() {
+        let authorization = UsageAuthorization::new(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "bucket",
+            UsageRoute::PutObject,
+            RequestKind::Write,
+            64,
+        )
+        .with_pipeline(&crate::pipeline::PipelineLocator {
+            revision: "revision-a".to_string(),
+            fingerprint: "a".repeat(64),
+        });
+        let grant = AuthorizationGrant::new(&authorization, Utc::now(), 1);
+        assert_eq!(grant.pipeline_revision(), Some("revision-a"));
+        assert_eq!(
+            grant.pipeline_fingerprint(),
+            authorization.pipeline_fingerprint()
+        );
+
+        let changed = UsageAuthorization::new(
+            authorization.operation_id(),
+            authorization.receipt_id(),
+            "bucket",
+            UsageRoute::PutObject,
+            RequestKind::Write,
+            64,
+        )
+        .with_pipeline(&crate::pipeline::PipelineLocator {
+            revision: "revision-b".to_string(),
+            fingerprint: "b".repeat(64),
+        });
+        assert!(!grant.matches(&changed));
     }
 
     #[test]

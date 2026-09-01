@@ -2655,6 +2655,8 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             std::env::set_var("S4_MULTIPART_STAGING_ACCESS_KEY_ID", "test-access");
             std::env::set_var("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY", "test-secret");
             std::env::set_var("S4_MULTIPART_STAGING_REGION", "us-east-1");
+            std::env::set_var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES", "67108864");
+            std::env::set_var("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES", "268435456");
         }
 
         let control = Arc::new(MultipartBillingControl::default());
@@ -2733,6 +2735,18 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             "{list_xml}"
         );
 
+        // Rebuild a fully independent gateway process against the same
+        // Postgres and staging backend. Completion must use the persisted
+        // immutable resolution rather than process-local plugin identities.
+        let restarted_state = build_state(
+            control.clone(),
+            Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
+            Arc::new(s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
+        )
+        .await
+        .expect("restart gateway with durable staged multipart");
+        let restarted_app = build_router(restarted_state);
+
         // CompleteMultipartUpload with the strict sorted XML document.
         let complete_xml = format!(
             "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
@@ -2748,7 +2762,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         mock_state
             .block_destination_put
             .store(true, Ordering::Release);
-        let first_completion = tokio::spawn(app.clone().oneshot(complete));
+        let first_completion = tokio::spawn(restarted_app.clone().oneshot(complete));
         tokio::time::timeout(
             Duration::from_secs(5),
             mock_state.destination_put_started.notified(),
@@ -2763,7 +2777,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
                 .unwrap(),
             &hdrs,
         );
-        let busy_response = app.clone().oneshot(busy).await.unwrap();
+        let busy_response = restarted_app.clone().oneshot(busy).await.unwrap();
         assert_eq!(
             busy_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,

@@ -19,7 +19,8 @@ use crate::entity::{object_operation, object_operation_evidence, object_operatio
 
 use super::{
     EvidenceRecord, ExpectedObject, JournalError, ObjectDestination, OperationJournal,
-    OperationRecord, OperationState, PartRecord, StoredObjectMeta, unix_time_ms,
+    OperationRecord, OperationState, PartRecord, StoredObjectMeta, WorkspaceDestinationBinding,
+    unix_time_ms,
 };
 
 #[derive(Clone, Debug)]
@@ -78,6 +79,33 @@ fn operation_from_model(model: object_operation::Model) -> Result<OperationRecor
             bucket: model.bucket,
             logical_key: model.logical_key,
             physical_key: model.physical_key,
+            workspace_binding: match (
+                model.backend_config_version,
+                model.capability_attestation_id,
+                model.routing_epoch,
+                model.routing_lease_id,
+                model.routing_fencing_token,
+            ) {
+                (None, None, None, None, None) => None,
+                (Some(config), Some(attestation), Some(epoch), Some(lease_id), Some(token)) => {
+                    Some(WorkspaceDestinationBinding {
+                        backend_config_version: config,
+                        capability_attestation_id: attestation,
+                        routing_epoch: u64::try_from(epoch).map_err(|_| {
+                            JournalError::Corrupt("negative routing epoch".to_string())
+                        })?,
+                        routing_lease_id: lease_id,
+                        routing_fencing_token: u64::try_from(token).map_err(|_| {
+                            JournalError::Corrupt("negative routing fencing token".to_string())
+                        })?,
+                    })
+                }
+                _ => {
+                    return Err(JournalError::Corrupt(
+                        "partial workspace destination binding".to_string(),
+                    ));
+                }
+            },
         },
         expected: ExpectedObject {
             digest: model.expected_digest,
@@ -138,6 +166,7 @@ impl OperationJournal for PostgresOperationJournal {
             .transpose()?;
         let expected_metadata = serde_json::to_value(&operation.expected.metadata)
             .map_err(|error| JournalError::Corrupt(error.to_string()))?;
+        let workspace_binding = operation.destination.workspace_binding;
         object_operation::ActiveModel {
             id: Set(operation.id),
             state: Set(OperationState::Intent.as_str().to_string()),
@@ -152,6 +181,27 @@ impl OperationJournal for PostgresOperationJournal {
                 .transpose()
                 .map_err(|_| {
                     JournalError::Conflict("namespace epoch exceeds BIGINT".to_string())
+                })?),
+            backend_config_version: Set(workspace_binding
+                .as_ref()
+                .map(|binding| binding.backend_config_version.clone())),
+            capability_attestation_id: Set(workspace_binding
+                .as_ref()
+                .map(|binding| binding.capability_attestation_id.clone())),
+            routing_epoch: Set(workspace_binding
+                .as_ref()
+                .map(|binding| i64::try_from(binding.routing_epoch))
+                .transpose()
+                .map_err(|_| JournalError::Corrupt("routing epoch exceeds BIGINT".to_string()))?),
+            routing_lease_id: Set(workspace_binding
+                .as_ref()
+                .map(|binding| binding.routing_lease_id)),
+            routing_fencing_token: Set(workspace_binding
+                .as_ref()
+                .map(|binding| i64::try_from(binding.routing_fencing_token))
+                .transpose()
+                .map_err(|_| {
+                    JournalError::Corrupt("routing fencing token exceeds BIGINT".to_string())
                 })?),
             expected_digest: Set(operation.expected.digest),
             expected_size: Set(expected_size),
@@ -824,6 +874,7 @@ mod tests {
                 bucket: "bucket".to_string(),
                 logical_key: "logical".to_string(),
                 physical_key: "physical".to_string(),
+                workspace_binding: None,
             },
             ExpectedObject::default(),
         )

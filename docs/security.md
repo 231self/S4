@@ -429,6 +429,34 @@ Persisted S3-compatible workspace endpoints use a separate
   invalid.
 - Public builds provide no common-provider allowlist defaults. Deployments must
   choose the provider domains they trust.
+- Endpoint-family recognition and streaming authority are separate. The public
+  engine recognizes only canonical AWS S3 data-plane, GCS XML/HMAC, B2 S3, R2,
+  DigitalOcean Spaces, and Wasabi origin grammars; AWS website, control,
+  Object Lambda, Outposts, accelerate, access-point, and virtual-hosted bucket
+  forms are not accepted. Recognition never grants capabilities.
+- Hosted direct streaming requires an adapter-supplied immutable config version
+  and operator capability/permission attestation. B2 additionally requires
+  version listing/deletion and exact-version recovery. Missing attestations or
+  legacy repository implementations fail closed.
+- Before body polling or provider mutation, the adapter must atomically acquire
+  a database routing lease bound to operation ID, config version, attestation,
+  and routing epoch. Writes renew it, completion rechecks it, and only committed
+  or proven-aborted operations release it. Config transitions and version
+  retirement must conflict while a lease or nonterminal journal row is open.
+- Journal rows store only opaque version/attestation IDs and routing lease/fence
+  values, never credentials. Startup and periodic reconcilers call
+  `reconcile_workspace_streaming_operation`, which reloads historical encrypted
+  credentials by exact version and reconstructs the same client. There is no
+  fallback to current credentials.
+- **Private implementation boundary:** the SaaS repository owns encrypted,
+  immutable config-version retention, provider conformance attestation, atomic
+  lease/config-transition transactions, lease recovery, and scheduling the
+  public reconciliation hook. Until it implements every new repository method,
+  hosted PerUserS3 direct streaming remains disabled by rejecting defaults.
+- Process-global `S3_ENDPOINT` storage still requires explicit
+  `MASKURA_STREAMING_S3_PROVIDER`. A non-durable journal is accepted only in a
+  debug build with both auth disabled and explicit single-tenant mode; release
+  and hosted/global production paths require a durable journal.
 
 ## 11. Cancellation and cleanup
 
@@ -442,8 +470,8 @@ Persisted S3-compatible workspace endpoints use a separate
   compatibility spool files, orphaned encrypted multipart spool files,
   reconcile pending staging outboxes against the artifact store, reap expired
   multipart uploads, and reconcile managed repairs. Direct `COMMIT_UNKNOWN`
-  operations require exact-operation reconciliation with the backend and
-  credentials originally bound to the request.
+  operations require exact-operation reconciliation with the immutable backend
+  config version and routing fence originally bound to the request.
 
 ## 12. Bounded parsing and memory
 

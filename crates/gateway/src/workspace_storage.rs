@@ -1,9 +1,13 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::transaction::{BackendCapabilities, VersioningCapability};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct WorkspaceId(String);
@@ -128,6 +132,151 @@ impl RuntimeBackendConfig {
     }
 }
 
+fn validate_opaque_identity(kind: &str, value: String) -> Result<String, WorkspaceStorageError> {
+    if !(1..=160).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(WorkspaceStorageError::InvalidConfig(format!(
+            "{kind} must be 1-160 ASCII characters from [A-Za-z0-9._:-]"
+        )));
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct BackendConfigVersionId(String);
+
+impl BackendConfigVersionId {
+    pub fn new(value: impl Into<String>) -> Result<Self, WorkspaceStorageError> {
+        validate_opaque_identity("backend config version", value.into()).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CapabilityAttestationId(String);
+
+impl CapabilityAttestationId {
+    pub fn new(value: impl Into<String>) -> Result<Self, WorkspaceStorageError> {
+        validate_opaque_identity("capability attestation id", value.into()).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum S3ProviderFamily {
+    Aws,
+    Gcs,
+    B2,
+    R2,
+    DigitalOcean,
+    Wasabi,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct S3StreamingPermissions {
+    pub put_object: bool,
+    pub create_multipart_upload: bool,
+    pub upload_part: bool,
+    pub complete_multipart_upload: bool,
+    pub abort_multipart_upload: bool,
+    pub list_multipart_uploads: bool,
+    pub list_parts: bool,
+    pub head_object: bool,
+    pub read_operation_metadata: bool,
+    pub list_object_versions: bool,
+    pub delete_object_version: bool,
+}
+
+impl S3StreamingPermissions {
+    fn validates_streaming(self, exact_version_recovery: bool) -> bool {
+        self.put_object
+            && self.create_multipart_upload
+            && self.upload_part
+            && self.complete_multipart_upload
+            && self.abort_multipart_upload
+            && self.list_multipart_uploads
+            && self.list_parts
+            && self.head_object
+            && self.read_operation_metadata
+            && (!exact_version_recovery
+                || (self.list_object_versions && self.delete_object_version))
+    }
+}
+
+/// Operator-issued statement about one immutable backend configuration.
+///
+/// The public engine never manufactures this from an endpoint. Hosted adapters
+/// must persist it only after provider conformance and credential-permission
+/// checks have succeeded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct S3CapabilityAttestation {
+    pub id: CapabilityAttestationId,
+    pub provider: S3ProviderFamily,
+    pub capabilities: BackendCapabilities,
+    pub permissions: S3StreamingPermissions,
+    pub exact_version_recovery: bool,
+}
+
+impl S3CapabilityAttestation {
+    pub fn validate(&self) -> Result<(), WorkspaceStorageError> {
+        self.capabilities.streaming_eligibility().map_err(|_| {
+            WorkspaceStorageError::UnsupportedConfig(
+                "provider capability attestation is not streaming-eligible".to_string(),
+            )
+        })?;
+        if !self
+            .permissions
+            .validates_streaming(self.exact_version_recovery)
+        {
+            return Err(WorkspaceStorageError::UnsupportedConfig(
+                "provider permission attestation is incomplete".to_string(),
+            ));
+        }
+        if self.provider == S3ProviderFamily::B2
+            && (!self.exact_version_recovery
+                || self.capabilities.versioning == VersioningCapability::Unsupported)
+        {
+            return Err(WorkspaceStorageError::UnsupportedConfig(
+                "B2 streaming requires exact version recovery attestation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceStreamingBackendIdentity {
+    pub config_version: BackendConfigVersionId,
+    pub attestation: S3CapabilityAttestation,
+}
+
+/// Durable routing authority held for the lifetime of one provider mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceOperationLease {
+    pub operation_id: Uuid,
+    pub lease_id: Uuid,
+    pub config_version: BackendConfigVersionId,
+    pub attestation_id: CapabilityAttestationId,
+    pub routing_epoch: u64,
+    pub fencing_token: u64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceOperationOutcome {
+    Committed,
+    ProvenAborted,
+}
+
 /// Persisted state of a workspace storage-mode transition.
 ///
 /// Managed mutations may only commit against a `Stable` routing epoch. The
@@ -177,6 +326,7 @@ impl WorkspaceStorageRouting {
 pub struct WorkspaceStorageResolution {
     pub config: Option<RuntimeBackendConfig>,
     pub routing: WorkspaceStorageRouting,
+    pub streaming: Option<WorkspaceStreamingBackendIdentity>,
 }
 
 impl WorkspaceStorageResolution {
@@ -184,6 +334,7 @@ impl WorkspaceStorageResolution {
         Self {
             config,
             routing: WorkspaceStorageRouting::Unfenced,
+            streaming: None,
         }
     }
 
@@ -198,6 +349,22 @@ impl WorkspaceStorageResolution {
                 routing_epoch,
                 transition_state,
             },
+            streaming: None,
+        }
+    }
+
+    pub fn persisted_attested(
+        config: RuntimeBackendConfig,
+        routing_epoch: u64,
+        streaming: WorkspaceStreamingBackendIdentity,
+    ) -> Self {
+        Self {
+            config: Some(config),
+            routing: WorkspaceStorageRouting::Persisted {
+                routing_epoch,
+                transition_state: WorkspaceStorageTransitionState::Stable,
+            },
+            streaming: Some(streaming),
         }
     }
 }
@@ -303,6 +470,84 @@ pub trait WorkspaceStorageRepository: Send + Sync + 'static {
         ))
     }
 
+    /// Loads an immutable historical config version, including credentials.
+    /// Implementations must retain versions while any operation lease or
+    /// nonterminal journal row references them.
+    async fn get_runtime_resolution_by_version(
+        &self,
+        _workspace_id: &WorkspaceId,
+        _config_version: &BackendConfigVersionId,
+    ) -> Result<WorkspaceStorageResolution, WorkspaceStorageError> {
+        Err(WorkspaceStorageError::UnsupportedConfig(
+            "historical workspace backend resolution is not implemented".to_string(),
+        ))
+    }
+
+    /// Atomically verifies the active config/attestation/epoch and records an
+    /// open operation. Config transition or retirement must conflict while any
+    /// such lease is nonterminal.
+    async fn acquire_streaming_operation_lease(
+        &self,
+        _workspace_id: &WorkspaceId,
+        _operation_id: Uuid,
+        _config_version: &BackendConfigVersionId,
+        _attestation_id: &CapabilityAttestationId,
+        _routing_epoch: u64,
+        _ttl: Duration,
+    ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
+        Err(WorkspaceStorageError::UnsupportedConfig(
+            "durable workspace streaming operation leases are not implemented".to_string(),
+        ))
+    }
+
+    async fn renew_streaming_operation_lease(
+        &self,
+        _workspace_id: &WorkspaceId,
+        _lease: &WorkspaceOperationLease,
+        _ttl: Duration,
+    ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
+        Err(WorkspaceStorageError::UnsupportedConfig(
+            "durable workspace streaming operation leases are not implemented".to_string(),
+        ))
+    }
+
+    async fn assert_streaming_operation_lease(
+        &self,
+        _workspace_id: &WorkspaceId,
+        _lease: &WorkspaceOperationLease,
+    ) -> Result<(), WorkspaceStorageError> {
+        Err(WorkspaceStorageError::UnsupportedConfig(
+            "durable workspace streaming operation leases are not implemented".to_string(),
+        ))
+    }
+
+    /// Reclaims the exact durable lease after process loss. It must never
+    /// substitute the current config for the operation's historical version.
+    async fn recover_streaming_operation_lease(
+        &self,
+        _workspace_id: &WorkspaceId,
+        _operation_id: Uuid,
+        _config_version: &BackendConfigVersionId,
+        _attestation_id: &CapabilityAttestationId,
+        _routing_epoch: u64,
+        _ttl: Duration,
+    ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
+        Err(WorkspaceStorageError::UnsupportedConfig(
+            "durable workspace streaming operation recovery is not implemented".to_string(),
+        ))
+    }
+
+    async fn release_streaming_operation_lease(
+        &self,
+        _workspace_id: &WorkspaceId,
+        _lease: &WorkspaceOperationLease,
+        _outcome: WorkspaceOperationOutcome,
+    ) -> Result<(), WorkspaceStorageError> {
+        Err(WorkspaceStorageError::UnsupportedConfig(
+            "durable workspace streaming operation leases are not implemented".to_string(),
+        ))
+    }
+
     async fn get_public_config(
         &self,
         workspace_id: &WorkspaceId,
@@ -369,7 +614,413 @@ impl WorkspaceStorageRepository for InMemoryWorkspaceStorageRepository {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    use crate::transaction::{
+        CompletionReconciliation, ConditionalReadCapability, IncompleteUploadDiscovery,
+        ListCapability, MultipartResponseCapability, ResponseChecksumCapability,
+    };
+
+    fn attested_identity(
+        provider: S3ProviderFamily,
+        version: &str,
+    ) -> WorkspaceStreamingBackendIdentity {
+        WorkspaceStreamingBackendIdentity {
+            config_version: BackendConfigVersionId::new(version).unwrap(),
+            attestation: S3CapabilityAttestation {
+                id: CapabilityAttestationId::new(format!("attestation-{version}")).unwrap(),
+                provider,
+                capabilities: BackendCapabilities {
+                    incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
+                    abort_incomplete_upload: true,
+                    cleanup_sla: Some(Duration::from_secs(60)),
+                    lifecycle_rule: false,
+                    versioning: VersioningCapability::Optional,
+                    conditional_reads: ConditionalReadCapability::Etag,
+                    response_checksums: ResponseChecksumCapability::Unsupported,
+                    list_operations: ListCapability::V1AndV2,
+                    multipart_responses: MultipartResponseCapability::Standard,
+                    completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
+                },
+                permissions: S3StreamingPermissions {
+                    put_object: true,
+                    create_multipart_upload: true,
+                    upload_part: true,
+                    complete_multipart_upload: true,
+                    abort_multipart_upload: true,
+                    list_multipart_uploads: true,
+                    list_parts: true,
+                    head_object: true,
+                    read_operation_metadata: true,
+                    list_object_versions: true,
+                    delete_object_version: true,
+                },
+                exact_version_recovery: provider == S3ProviderFamily::B2,
+            },
+        }
+    }
+
+    fn attested_resolution(version: &str, epoch: u64) -> WorkspaceStorageResolution {
+        WorkspaceStorageResolution::persisted_attested(
+            RuntimeBackendConfig::S3Compatible {
+                endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+                access_key: format!("access-{version}"),
+                secret_key: format!("secret-{version}"),
+                region: "us-east-1".to_string(),
+            },
+            epoch,
+            attested_identity(S3ProviderFamily::Aws, version),
+        )
+    }
+
+    #[derive(Default)]
+    struct DurableContractRepository {
+        versions: RwLock<HashMap<String, WorkspaceStorageResolution>>,
+        active: RwLock<Option<(String, u64)>>,
+        leases: RwLock<HashMap<Uuid, WorkspaceOperationLease>>,
+        fence: AtomicU64,
+    }
+
+    impl DurableContractRepository {
+        async fn install(&self, version: &str, epoch: u64) {
+            self.versions
+                .write()
+                .await
+                .insert(version.to_string(), attested_resolution(version, epoch));
+            if self.active.read().await.is_none() {
+                *self.active.write().await = Some((version.to_string(), epoch));
+            }
+        }
+
+        async fn activate(&self, version: &str, epoch: u64) -> Result<(), WorkspaceStorageError> {
+            if !self.leases.read().await.is_empty() {
+                return Err(WorkspaceStorageError::Repository(
+                    "open operations fence config transition".to_string(),
+                ));
+            }
+            if !self.versions.read().await.contains_key(version) {
+                return Err(WorkspaceStorageError::Repository(
+                    "config version does not exist".to_string(),
+                ));
+            }
+            *self.active.write().await = Some((version.to_string(), epoch));
+            Ok(())
+        }
+
+        async fn force_active_for_test(&self, version: &str, epoch: u64) {
+            *self.active.write().await = Some((version.to_string(), epoch));
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceStorageRepository for DurableContractRepository {
+        async fn resolve_workspace(
+            &self,
+            user_id: &str,
+        ) -> Result<WorkspaceId, WorkspaceStorageError> {
+            WorkspaceId::new(user_id)
+        }
+
+        async fn get_runtime_config(
+            &self,
+            workspace_id: &WorkspaceId,
+        ) -> Result<Option<RuntimeBackendConfig>, WorkspaceStorageError> {
+            Ok(self.get_runtime_resolution(workspace_id).await?.config)
+        }
+
+        async fn get_runtime_resolution(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<WorkspaceStorageResolution, WorkspaceStorageError> {
+            let (version, _) =
+                self.active.read().await.clone().ok_or_else(|| {
+                    WorkspaceStorageError::Repository("no active config".to_string())
+                })?;
+            self.versions
+                .read()
+                .await
+                .get(&version)
+                .cloned()
+                .ok_or_else(|| WorkspaceStorageError::Repository("missing config".to_string()))
+        }
+
+        async fn get_runtime_resolution_by_version(
+            &self,
+            _workspace_id: &WorkspaceId,
+            config_version: &BackendConfigVersionId,
+        ) -> Result<WorkspaceStorageResolution, WorkspaceStorageError> {
+            self.versions
+                .read()
+                .await
+                .get(config_version.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    WorkspaceStorageError::Repository("historical config missing".to_string())
+                })
+        }
+
+        async fn acquire_streaming_operation_lease(
+            &self,
+            _workspace_id: &WorkspaceId,
+            operation_id: Uuid,
+            config_version: &BackendConfigVersionId,
+            attestation_id: &CapabilityAttestationId,
+            routing_epoch: u64,
+            ttl: Duration,
+        ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
+            let active = self.active.read().await.clone();
+            if active.as_ref() != Some(&(config_version.as_str().to_string(), routing_epoch)) {
+                return Err(WorkspaceStorageError::Repository(
+                    "routing identity changed".to_string(),
+                ));
+            }
+            let resolution = self
+                .versions
+                .read()
+                .await
+                .get(config_version.as_str())
+                .cloned()
+                .ok_or_else(|| WorkspaceStorageError::Repository("missing config".to_string()))?;
+            if resolution
+                .streaming
+                .as_ref()
+                .map(|value| &value.attestation.id)
+                != Some(attestation_id)
+            {
+                return Err(WorkspaceStorageError::Repository(
+                    "attestation changed".to_string(),
+                ));
+            }
+            let lease = WorkspaceOperationLease {
+                operation_id,
+                lease_id: Uuid::now_v7(),
+                config_version: config_version.clone(),
+                attestation_id: attestation_id.clone(),
+                routing_epoch,
+                fencing_token: self.fence.fetch_add(1, Ordering::SeqCst) + 1,
+                expires_at_ms: i64::try_from(ttl.as_millis()).unwrap(),
+            };
+            self.leases
+                .write()
+                .await
+                .insert(operation_id, lease.clone());
+            Ok(lease)
+        }
+
+        async fn renew_streaming_operation_lease(
+            &self,
+            _workspace_id: &WorkspaceId,
+            lease: &WorkspaceOperationLease,
+            ttl: Duration,
+        ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
+            let active = self.active.read().await.clone();
+            if active.as_ref()
+                != Some(&(
+                    lease.config_version.as_str().to_string(),
+                    lease.routing_epoch,
+                ))
+            {
+                return Err(WorkspaceStorageError::Repository(
+                    "routing epoch advanced".to_string(),
+                ));
+            }
+            let mut leases = self.leases.write().await;
+            let stored = leases.get_mut(&lease.operation_id).ok_or_else(|| {
+                WorkspaceStorageError::Repository("operation lease missing".to_string())
+            })?;
+            if stored.lease_id != lease.lease_id || stored.fencing_token != lease.fencing_token {
+                return Err(WorkspaceStorageError::Repository(
+                    "operation lease was fenced".to_string(),
+                ));
+            }
+            stored.expires_at_ms = stored
+                .expires_at_ms
+                .saturating_add(i64::try_from(ttl.as_millis()).unwrap());
+            Ok(stored.clone())
+        }
+
+        async fn assert_streaming_operation_lease(
+            &self,
+            workspace_id: &WorkspaceId,
+            lease: &WorkspaceOperationLease,
+        ) -> Result<(), WorkspaceStorageError> {
+            self.renew_streaming_operation_lease(workspace_id, lease, Duration::ZERO)
+                .await
+                .map(|_| ())
+        }
+
+        async fn recover_streaming_operation_lease(
+            &self,
+            _workspace_id: &WorkspaceId,
+            operation_id: Uuid,
+            config_version: &BackendConfigVersionId,
+            attestation_id: &CapabilityAttestationId,
+            routing_epoch: u64,
+            _ttl: Duration,
+        ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
+            let mut leases = self.leases.write().await;
+            let lease = leases.get_mut(&operation_id).ok_or_else(|| {
+                WorkspaceStorageError::Repository("operation lease missing".to_string())
+            })?;
+            if &lease.config_version != config_version
+                || &lease.attestation_id != attestation_id
+                || lease.routing_epoch != routing_epoch
+            {
+                return Err(WorkspaceStorageError::Repository(
+                    "historical operation identity changed".to_string(),
+                ));
+            }
+            lease.fencing_token = self.fence.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(lease.clone())
+        }
+
+        async fn release_streaming_operation_lease(
+            &self,
+            _workspace_id: &WorkspaceId,
+            lease: &WorkspaceOperationLease,
+            _outcome: WorkspaceOperationOutcome,
+        ) -> Result<(), WorkspaceStorageError> {
+            let removed = self.leases.write().await.remove(&lease.operation_id);
+            if removed.as_ref().map(|value| value.lease_id) != Some(lease.lease_id) {
+                return Err(WorkspaceStorageError::Repository(
+                    "operation lease was fenced".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn get_public_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<BackendConfigResponse, WorkspaceStorageError> {
+            Ok(BackendConfigResponse::unconfigured())
+        }
+
+        async fn put_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+            _request: BackendConfigRequest,
+        ) -> Result<BackendConfigResponse, WorkspaceStorageError> {
+            Err(WorkspaceStorageError::UnsupportedConfig(
+                "test repository mutation uses install".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_streaming_contract_fences_versions_and_recovers_exact_history() {
+        let repository = DurableContractRepository::default();
+        repository.install("config-v1", 1).await;
+        repository.install("config-v2", 2).await;
+        let workspace = WorkspaceId::new("workspace-a").unwrap();
+        let identity = attested_identity(S3ProviderFamily::Aws, "config-v1");
+        let operation_id = Uuid::now_v7();
+        let lease = repository
+            .acquire_streaming_operation_lease(
+                &workspace,
+                operation_id,
+                &identity.config_version,
+                &identity.attestation.id,
+                1,
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
+        assert!(repository.activate("config-v2", 2).await.is_err());
+        assert_eq!(
+            repository
+                .get_runtime_resolution_by_version(&workspace, &identity.config_version)
+                .await
+                .unwrap()
+                .streaming
+                .unwrap(),
+            identity
+        );
+        let recovered = repository
+            .recover_streaming_operation_lease(
+                &workspace,
+                operation_id,
+                &lease.config_version,
+                &lease.attestation_id,
+                lease.routing_epoch,
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.lease_id, lease.lease_id);
+        assert!(recovered.fencing_token > lease.fencing_token);
+
+        repository.force_active_for_test("config-v2", 2).await;
+        assert!(
+            repository
+                .renew_streaming_operation_lease(&workspace, &recovered, Duration::from_secs(30))
+                .await
+                .is_err()
+        );
+        repository.force_active_for_test("config-v1", 1).await;
+        let restored = repository
+            .renew_streaming_operation_lease(&workspace, &recovered, Duration::from_secs(30))
+            .await
+            .unwrap();
+        repository
+            .release_streaming_operation_lease(
+                &workspace,
+                &restored,
+                WorkspaceOperationOutcome::Committed,
+            )
+            .await
+            .unwrap();
+        repository.activate("config-v2", 2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_repository_defaults_keep_per_user_streaming_fail_closed() {
+        let repository = InMemoryWorkspaceStorageRepository::new();
+        let workspace = WorkspaceId::new("workspace-a").unwrap();
+        let version = BackendConfigVersionId::new("config-v1").unwrap();
+        let attestation = CapabilityAttestationId::new("attestation-v1").unwrap();
+        assert!(
+            repository
+                .acquire_streaming_operation_lease(
+                    &workspace,
+                    Uuid::now_v7(),
+                    &version,
+                    &attestation,
+                    1,
+                    Duration::from_secs(30),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .get_runtime_resolution_by_version(&workspace, &version)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn b2_attestation_requires_exact_version_and_limited_key_permissions() {
+        let mut identity = attested_identity(S3ProviderFamily::B2, "b2-v1");
+        assert!(identity.attestation.validate().is_ok());
+        assert_eq!(
+            identity.attestation.capabilities.response_checksums,
+            ResponseChecksumCapability::Unsupported,
+            "B2 attestation must not claim unsupported response checksum semantics"
+        );
+        identity.attestation.permissions.list_object_versions = false;
+        assert!(identity.attestation.validate().is_err());
+        identity.attestation.permissions.list_object_versions = true;
+        identity.attestation.permissions.delete_object_version = false;
+        assert!(identity.attestation.validate().is_err());
+        identity.attestation.permissions.delete_object_version = true;
+        identity.attestation.exact_version_recovery = false;
+        assert!(identity.attestation.validate().is_err());
+    }
 
     #[test]
     fn workspace_ids_are_bounded_canonical_ascii() {

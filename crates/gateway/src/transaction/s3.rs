@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, ServerSideEncryption};
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::{Buf, Bytes, BytesMut};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -63,6 +64,12 @@ impl AwsS3TransactionBackend {
         Self::new(client, capabilities)
             .with_server_side_encryption(S3ServerSideEncryption::Aes256)
             .with_exact_version_recovery()
+    }
+
+    /// BYO B2 uses exact version recovery but must not inherit managed-storage
+    /// SSE requirements; customer buckets may not grant that capability.
+    pub fn new_b2(client: Client, capabilities: BackendCapabilities) -> Self {
+        Self::new(client, capabilities).with_exact_version_recovery()
     }
 
     fn with_exact_version_recovery(mut self) -> Self {
@@ -398,8 +405,32 @@ fn copy_source(operation: &OperationRecord, version_id: Option<&str>) -> String 
 fn ambiguous<E, R>(
     operation: &'static str,
     error: &aws_smithy_runtime_api::client::result::SdkError<E, R>,
-) -> BackendError {
-    BackendError::ambiguous(record_s3_failure(operation, error).to_string())
+) -> BackendError
+where
+    E: ProvideErrorMetadata,
+{
+    let failure = record_s3_failure(operation, error);
+    let definitive = match error {
+        aws_smithy_runtime_api::client::result::SdkError::ConstructionFailure(_) => true,
+        aws_smithy_runtime_api::client::result::SdkError::ServiceError(context) => {
+            context.err().code().is_some_and(|code| {
+                !matches!(
+                    code,
+                    "InternalError"
+                        | "RequestTimeout"
+                        | "RequestTimeoutException"
+                        | "ServiceUnavailable"
+                        | "SlowDown"
+                )
+            })
+        }
+        _ => false,
+    };
+    if definitive {
+        BackendError::definitive(failure.to_string())
+    } else {
+        BackendError::ambiguous(failure.to_string())
+    }
 }
 
 #[async_trait]
@@ -978,7 +1009,13 @@ impl DirectS3Sink {
                     self.parts.push(UploadedPart { part_number, etag });
                     return Ok(());
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    let definitive = error.kind == super::BackendErrorKind::Definitive;
+                    last_error = Some(error);
+                    if definitive {
+                        break;
+                    }
+                }
             }
         }
         Err(last_error
@@ -1049,12 +1086,30 @@ impl DirectS3Sink {
                     return Ok(meta);
                 }
                 Err(error) => {
+                    let definitive = error.kind == super::BackendErrorKind::Definitive;
                     let _ = self
                         .evidence(
-                            "put_object_attempt_ambiguous",
+                            if definitive {
+                                "put_object_attempt_definitive"
+                            } else {
+                                "put_object_attempt_ambiguous"
+                            },
                             json!({"attempt": attempt, "kind": format!("{:?}", error.kind)}),
                         )
                         .await;
+                    if definitive {
+                        self.journal
+                            .transition(
+                                self.operation.id,
+                                OperationState::Completing,
+                                OperationState::ProvenAborted,
+                                None,
+                            )
+                            .await?;
+                        self.operation.state = OperationState::ProvenAborted;
+                        self.finished = true;
+                        return Err(error.into());
+                    }
                     last_error = Some(error);
                 }
             }
@@ -1139,12 +1194,36 @@ impl DirectS3Sink {
                     return Ok(meta);
                 }
                 Err(error) => {
+                    let definitive = error.kind == super::BackendErrorKind::Definitive;
                     let _ = self
                         .evidence(
-                            "complete_multipart_attempt_ambiguous",
+                            if definitive {
+                                "complete_multipart_attempt_definitive"
+                            } else {
+                                "complete_multipart_attempt_ambiguous"
+                            },
                             json!({"attempt": attempt, "kind": format!("{:?}", error.kind)}),
                         )
                         .await;
+                    if definitive {
+                        if let Some(upload_id) = &self.upload_id {
+                            self.backend
+                                .abort_multipart(&self.operation, upload_id)
+                                .await?;
+                        }
+                        self.abort_discovered().await?;
+                        self.journal
+                            .transition(
+                                self.operation.id,
+                                OperationState::Completing,
+                                OperationState::ProvenAborted,
+                                None,
+                            )
+                            .await?;
+                        self.operation.state = OperationState::ProvenAborted;
+                        self.finished = true;
+                        return Err(error.into());
+                    }
                     last_error = Some(error);
                 }
             }
@@ -1573,6 +1652,39 @@ mod tests {
         (client, requests, server)
     }
 
+    async fn error_client(
+        status: StatusCode,
+        code: &'static str,
+    ) -> (Client, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(move || async move {
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/xml")
+                .body(Body::from(format!(
+                    "<Error><Code>{code}</Code><Message>provider detail</Message></Error>"
+                )))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("key", "secret", None, None, "test"))
+            .retry_config(crate::s3_safety::s3_retry_config())
+            .load()
+            .await;
+        (
+            Client::from_conf(
+                aws_sdk_s3::config::Builder::from(&config)
+                    .force_path_style(true)
+                    .build(),
+            ),
+            server,
+        )
+    }
+
     #[derive(Default)]
     struct ScriptState {
         events: Vec<String>,
@@ -1597,15 +1709,23 @@ mod tests {
                 .push_back(event.to_string());
         }
 
+        fn fail_next_definitive(&self, event: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .failures
+                .push_back(format!("definitive:{event}"));
+        }
+
         fn event(&self, event: &str) -> Result<(), BackendError> {
             let mut state = self.state.lock().unwrap();
             state.events.push(event.to_string());
-            if state
-                .failures
-                .front()
-                .is_some_and(|failure| failure == event)
-            {
-                state.failures.pop_front();
+            if let Some(failure) = state.failures.pop_front_if(|failure| {
+                failure == event || failure == &format!("definitive:{event}")
+            }) {
+                if failure.starts_with("definitive:") {
+                    return Err(BackendError::definitive(format!("scripted {event}")));
+                }
                 return Err(BackendError::ambiguous(format!("scripted {event}")));
             }
             Ok(())
@@ -1778,6 +1898,7 @@ mod tests {
             bucket: "bucket".to_string(),
             logical_key: "key".to_string(),
             physical_key: "key".to_string(),
+            workspace_binding: None,
         }
     }
 
@@ -1883,6 +2004,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn byo_b2_exact_recovery_does_not_assume_managed_sse() {
+        let (client, requests, server) = provider_client().await;
+        let capabilities = ScriptBackend::default().capabilities();
+        let backend = AwsS3TransactionBackend::new_b2(client, capabilities);
+        assert!(backend.exact_version_recovery);
+        assert_eq!(backend.server_side_encryption, None);
+
+        let operation = OperationRecord::intent(destination(), ExpectedObject::default());
+        backend.create_multipart(&operation).await.unwrap();
+        let recorded = requests.lock().unwrap();
+        let create = recorded
+            .iter()
+            .find(|(method, uri, _)| *method == Method::POST && uri.contains("uploads"))
+            .unwrap();
+        assert!(!create.2.contains_key("x-amz-server-side-encryption"));
+        assert_eq!(backend.capabilities(), capabilities);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn provider_put_accepts_a_zero_byte_object() {
         let (client, requests, server) = provider_client().await;
         let operation = OperationRecord::intent(destination(), ExpectedObject::default());
@@ -1911,7 +2052,7 @@ mod tests {
     async fn b2_recovery_enumerates_versions_inspects_mpu_and_deletes_exact_version() {
         let (client, requests, server) = provider_client().await;
         let capabilities = ScriptBackend::default().capabilities();
-        let backend = AwsS3TransactionBackend::new_managed_b2(client, capabilities);
+        let backend = AwsS3TransactionBackend::new_b2(client, capabilities);
         let mut exact_destination = destination();
         exact_destination.physical_key = "physical".to_string();
         let mut operation = OperationRecord::scoped_intent(
@@ -1953,6 +2094,18 @@ mod tests {
             "unexpected managed PUT error: {}",
             error.message
         );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, uri, headers)| {
+                    *method == Method::PUT
+                        && !uri.contains("uploadId")
+                        && !headers.contains_key("x-amz-server-side-encryption")
+                        && headers.contains_key("x-amz-meta-s4-operation-id")
+                })
+        );
         assert_eq!(
             backend.probe_completion(&operation).await.unwrap(),
             CompletionProbe::Committed(StoredObjectMeta {
@@ -1968,6 +2121,14 @@ mod tests {
         assert_eq!(uploads[0].upload.upload_id, "incomplete-upload");
         assert_eq!(uploads[0].parts.len(), 1);
         assert_eq!(uploads[0].parts[0].part_number, 1);
+
+        backend
+            .abort_multipart(&operation, "incomplete-upload")
+            .await
+            .unwrap();
+        assert!(requests.lock().unwrap().iter().any(|(method, uri, _)| {
+            *method == Method::DELETE && uri.contains("uploadId=incomplete-upload")
+        }));
 
         backend
             .delete_object_version(&operation, "version-1")
@@ -2133,6 +2294,59 @@ mod tests {
                     .state,
                 OperationState::Committed
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn definitive_put_failure_is_not_retried_and_is_proven_aborted() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        let backend = Arc::new(ScriptBackend::default());
+        backend.fail_next_definitive("put");
+        let (mut sink, _) = sink(journal.clone(), backend.clone(), 3).await;
+        let operation_id = sink.operation_id();
+        sink.write(Bytes::from_static(b"body")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+
+        let error = sink.complete().await.unwrap_err();
+        let TransactionError::Backend(error) = error else {
+            panic!("expected definitive backend error, got {error:?}");
+        };
+        assert_eq!(error.kind, super::super::BackendErrorKind::Definitive);
+        assert_eq!(backend.bodies("put").len(), 1);
+        assert_eq!(
+            journal.get(operation_id).await.unwrap().unwrap().state,
+            OperationState::ProvenAborted
+        );
+        assert_eq!(sink.commit_state(), SinkCommitState::PreCommit);
+    }
+
+    #[tokio::test]
+    async fn provider_4xx_is_definitive_while_5xx_is_ambiguous_and_opaque() {
+        let capabilities = ScriptBackend::default().capabilities();
+        for (status, code, expected) in [
+            (
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                super::super::BackendErrorKind::Definitive,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                super::super::BackendErrorKind::Ambiguous,
+            ),
+        ] {
+            let (client, server) = error_client(status, code).await;
+            let error = AwsS3TransactionBackend::new(client, capabilities)
+                .put_object(
+                    &OperationRecord::intent(destination(), ExpectedObject::default()),
+                    Bytes::from_static(b"body"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, expected);
+            assert!(!error.to_string().contains("provider detail"));
+            assert!(!error.to_string().contains("AccessDenied"));
+            server.abort();
         }
     }
 

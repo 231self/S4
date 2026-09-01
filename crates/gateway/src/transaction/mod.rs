@@ -81,7 +81,10 @@ impl OperationState {
             (self, next),
             (Self::Intent, Self::Open | Self::Aborting)
                 | (Self::Open, Self::Completing | Self::Aborting)
-                | (Self::Completing, Self::Committed | Self::CommitUnknown)
+                | (
+                    Self::Completing,
+                    Self::Committed | Self::CommitUnknown | Self::ProvenAborted
+                )
                 | (Self::CommitUnknown, Self::Committed | Self::ProvenAborted)
                 | (Self::Aborting, Self::ProvenAborted)
         )
@@ -99,11 +102,21 @@ impl fmt::Display for OperationState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceDestinationBinding {
+    pub backend_config_version: String,
+    pub capability_attestation_id: String,
+    pub routing_epoch: u64,
+    pub routing_lease_id: Uuid,
+    pub routing_fencing_token: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectDestination {
     pub backend_id: String,
     pub bucket: String,
     pub logical_key: String,
     pub physical_key: String,
+    pub workspace_binding: Option<WorkspaceDestinationBinding>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -876,6 +889,7 @@ mod tests {
             (OperationState::Open, OperationState::Aborting),
             (OperationState::Completing, OperationState::Committed),
             (OperationState::Completing, OperationState::CommitUnknown),
+            (OperationState::Completing, OperationState::ProvenAborted),
             (OperationState::CommitUnknown, OperationState::Committed),
             (OperationState::CommitUnknown, OperationState::ProvenAborted),
             (OperationState::Aborting, OperationState::ProvenAborted),
@@ -967,6 +981,7 @@ mod tests {
             bucket: "provider-bucket".to_string(),
             logical_key: "logical/key".to_string(),
             physical_key: "managed/generation/key".to_string(),
+            workspace_binding: None,
         };
         let first = ManagedOperationScope::deterministic_child(
             parent,

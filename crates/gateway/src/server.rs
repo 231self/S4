@@ -80,17 +80,17 @@ use crate::store::{
     validate_credential_ttl,
 };
 use crate::transaction::{
-    AbortSignal, AwsS3TransactionBackend, BackendCapabilities, CompatibilitySpoolConfig,
-    CompatibilitySpoolTransaction, CompletionReconciliation, ConditionalReadCapability,
-    DirectOperationScope, DirectS3Sink, EvidenceRecord, ExpectedObject, IncompleteUploadDiscovery,
-    JournalError, ListCapability, MemorySinkTransaction, MultipartResponseCapability,
-    ObjectDestination, ObjectSinkTransaction, OperationJournal, OperationReconciler,
-    OperationRecord, OperationState, ResponseChecksumCapability, SpoolQuota, StoredObjectMeta,
-    TransactionError, VersioningCapability,
+    AbortSignal, AwsS3TransactionBackend, BackendCapabilities, BackendErrorKind,
+    CompatibilitySpoolConfig, CompatibilitySpoolTransaction, CompletionReconciliation,
+    ConditionalReadCapability, DirectOperationScope, DirectS3Sink, EvidenceRecord, ExpectedObject,
+    IncompleteUploadDiscovery, JournalError, ListCapability, MemorySinkTransaction,
+    MultipartResponseCapability, ObjectDestination, ObjectSinkTransaction, OperationJournal,
+    OperationReconciler, OperationRecord, OperationState, ResponseChecksumCapability, SpoolQuota,
+    StoredObjectMeta, TransactionError, VersioningCapability, WorkspaceDestinationBinding,
 };
 use crate::workspace_storage::{
-    BackendConfigRequest, BackendConfigResponse, BackendType, WorkspaceId, WorkspaceStorageError,
-    WorkspaceStorageRepository,
+    BackendConfigRequest, BackendConfigResponse, BackendType, WorkspaceId, WorkspaceOperationLease,
+    WorkspaceOperationOutcome, WorkspaceStorageError, WorkspaceStorageRepository,
 };
 use crate::{Format, Gateway};
 
@@ -619,6 +619,7 @@ struct MultipartStaging {
 }
 
 const LEGACY_MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
+const WORKSPACE_OPERATION_LEASE_TTL: Duration = Duration::from_secs(30);
 const DEMO_MAX_RECORDS: usize = 10;
 const DEMO_MAX_INPUT_BYTES: usize = 64 * 1024;
 const DEMO_MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -2849,6 +2850,11 @@ fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::re
         StreamingPutError::Transaction(TransactionError::Spool(detail)) => {
             s3_error::internal_error(key, &detail)
         }
+        StreamingPutError::Transaction(TransactionError::Backend(error))
+            if error.kind == BackendErrorKind::Definitive =>
+        {
+            s3_error::service_unavailable(key, "The destination rejected the write request.")
+        }
         StreamingPutError::Transaction(error) => s3_error::internal_error(key, &error.to_string()),
         StreamingPutError::InputTooLarge | StreamingPutError::SourceFrameTooLarge => {
             s3_error::entity_too_large(key)
@@ -2937,6 +2943,102 @@ fn streaming_format_content_type(
     Ok((format, media_type))
 }
 
+struct WorkspaceLeasedSink {
+    inner: DirectS3Sink,
+    repository: Arc<dyn WorkspaceStorageRepository>,
+    workspace_id: WorkspaceId,
+    lease: WorkspaceOperationLease,
+}
+
+impl WorkspaceLeasedSink {
+    async fn renew(&mut self) -> Result<(), TransactionError> {
+        self.lease = self
+            .repository
+            .renew_streaming_operation_lease(
+                &self.workspace_id,
+                &self.lease,
+                WORKSPACE_OPERATION_LEASE_TTL,
+            )
+            .await
+            .map_err(|_| {
+                TransactionError::Publication("workspace routing lease was lost".to_string())
+            })?;
+        Ok(())
+    }
+
+    async fn release(&self, outcome: WorkspaceOperationOutcome) -> Result<(), TransactionError> {
+        self.repository
+            .release_streaming_operation_lease(&self.workspace_id, &self.lease, outcome)
+            .await
+            .map_err(|_| {
+                TransactionError::Publication(
+                    "workspace routing lease terminal update failed".to_string(),
+                )
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectSinkTransaction for WorkspaceLeasedSink {
+    fn commit_state(&self) -> crate::transaction::SinkCommitState {
+        self.inner.commit_state()
+    }
+
+    fn durable_operation_id(&self) -> Option<Uuid> {
+        self.inner.durable_operation_id()
+    }
+
+    async fn write(&mut self, chunk: bytes::Bytes) -> Result<(), TransactionError> {
+        self.renew().await?;
+        self.inner.write(chunk).await
+    }
+
+    async fn verify_output(
+        &mut self,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<(), TransactionError> {
+        self.renew().await?;
+        self.inner
+            .verify_output(expected_size, expected_sha256)
+            .await
+    }
+
+    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+        self.renew().await?;
+        self.repository
+            .assert_streaming_operation_lease(&self.workspace_id, &self.lease)
+            .await
+            .map_err(|_| {
+                TransactionError::Publication("workspace routing fence changed".to_string())
+            })?;
+        let stored = self.inner.complete().await?;
+        self.release(WorkspaceOperationOutcome::Committed).await?;
+        Ok(stored)
+    }
+
+    async fn abort(&mut self) -> Result<(), TransactionError> {
+        self.renew().await?;
+        self.inner.abort().await?;
+        self.release(WorkspaceOperationOutcome::ProvenAborted).await
+    }
+}
+
+fn direct_journal_allowed(
+    kind: BackendKind,
+    journal: Option<&Arc<dyn OperationJournal>>,
+    auth_disabled: bool,
+    explicit_single_tenant: bool,
+) -> bool {
+    journal.is_some_and(|journal| {
+        journal.is_durable()
+            || (kind == BackendKind::GlobalS3
+                && cfg!(debug_assertions)
+                && auth_disabled
+                && explicit_single_tenant)
+    })
+}
+
 async fn begin_streaming_sink(
     state: &AppState,
     backend: ResolvedBackend,
@@ -2947,22 +3049,96 @@ async fn begin_streaming_sink(
 ) -> Result<Box<dyn ObjectSinkTransaction>, StreamingPutError> {
     validate_streaming_backend(state, &backend)?;
     match backend {
-        ResolvedBackend::S3 { kind, client } => {
-            let capabilities = state.s3_streaming_capabilities.ok_or_else(|| {
-                StreamingPutError::Unsupported(
-                    "direct S3 streaming needs MASKURA_STREAMING_S3_PROVIDER".to_string(),
-                )
-            })?;
+        ResolvedBackend::S3 {
+            kind,
+            client,
+            workspace_streaming,
+        } => {
+            let (capabilities, backend_id, workspace_lease) = match kind {
+                BackendKind::PerUserS3 => {
+                    let binding = workspace_streaming.ok_or_else(|| {
+                        StreamingPutError::Unsupported(
+                            "workspace S3 streaming needs an immutable operator attestation and durable routing lease contract"
+                                .to_string(),
+                        )
+                    })?;
+                    let workspace_id = operation.auth.workspace_id().clone();
+                    let lease = state
+                        .workspace_storage
+                        .acquire_streaming_operation_lease(
+                            &workspace_id,
+                            operation.grant.operation_id(),
+                            &binding.identity.config_version,
+                            &binding.identity.attestation.id,
+                            binding.routing_epoch,
+                            WORKSPACE_OPERATION_LEASE_TTL,
+                        )
+                        .await
+                        .map_err(|_| {
+                            StreamingPutError::Unsupported(
+                                "workspace S3 streaming routing lease is unavailable".to_string(),
+                            )
+                        })?;
+                    (
+                        binding.identity.attestation.capabilities,
+                        "PerUserS3".to_string(),
+                        Some((binding, workspace_id, lease)),
+                    )
+                }
+                BackendKind::GlobalS3 => (
+                    state.s3_streaming_capabilities.ok_or_else(|| {
+                        StreamingPutError::Unsupported(
+                            "direct global S3 streaming needs MASKURA_STREAMING_S3_PROVIDER"
+                                .to_string(),
+                        )
+                    })?,
+                    format!("{kind:?}"),
+                    None,
+                ),
+                _ => {
+                    return Err(StreamingPutError::Unsupported(
+                        "direct S3 streaming backend kind is unsupported".to_string(),
+                    ));
+                }
+            };
             let journal = state.operation_journal.clone().ok_or_else(|| {
                 StreamingPutError::Unsupported(
                     "direct S3 streaming needs a durable operation journal".to_string(),
                 )
             })?;
+            if !direct_journal_allowed(
+                kind,
+                Some(&journal),
+                state.auth_disabled,
+                state.explicit_single_tenant,
+            ) {
+                return Err(StreamingPutError::Unsupported(
+                    "direct S3 streaming needs a durable operation journal".to_string(),
+                ));
+            }
             let destination = ObjectDestination {
-                backend_id: format!("{kind:?}"),
+                backend_id,
                 bucket: bucket.to_string(),
                 logical_key: key.to_string(),
                 physical_key: key.to_string(),
+                workspace_binding: workspace_lease.as_ref().map(|(binding, _, lease)| {
+                    WorkspaceDestinationBinding {
+                        backend_config_version: binding
+                            .identity
+                            .config_version
+                            .as_str()
+                            .to_string(),
+                        capability_attestation_id: binding
+                            .identity
+                            .attestation
+                            .id
+                            .as_str()
+                            .to_string(),
+                        routing_epoch: lease.routing_epoch,
+                        routing_lease_id: lease.lease_id,
+                        routing_fencing_token: lease.fencing_token,
+                    }
+                }),
             };
             let expected = ExpectedObject {
                 metadata: std::collections::BTreeMap::from([(
@@ -2971,7 +3147,15 @@ async fn begin_streaming_sink(
                 )]),
                 ..ExpectedObject::default()
             };
-            let backend = Arc::new(AwsS3TransactionBackend::new(client, capabilities));
+            let exact_b2 = workspace_lease.as_ref().is_some_and(|(binding, _, _)| {
+                binding.provider == crate::backend::WorkspaceS3Provider::B2
+                    && binding.identity.attestation.exact_version_recovery
+            });
+            let backend = Arc::new(if exact_b2 {
+                AwsS3TransactionBackend::new_b2(client, capabilities)
+            } else {
+                AwsS3TransactionBackend::new(client, capabilities)
+            });
             let (abort_signal, mut abort_receiver) = AbortSignal::channel(1);
             let reconciler = OperationReconciler::new(
                 journal.clone(),
@@ -2990,18 +3174,37 @@ async fn begin_streaming_sink(
                     }
                 }
             });
-            Ok(Box::new(
-                DirectS3Sink::new_direct(
-                    journal,
-                    backend,
-                    direct_operation_scope(operation),
-                    destination,
-                    expected,
-                    3,
-                    abort_signal,
-                )
-                .await?,
-            ))
+            let sink = DirectS3Sink::new_direct(
+                journal,
+                backend,
+                direct_operation_scope(operation),
+                destination,
+                expected,
+                3,
+                abort_signal,
+            )
+            .await;
+            match (sink, workspace_lease) {
+                (Ok(inner), Some((_, workspace_id, lease))) => Ok(Box::new(WorkspaceLeasedSink {
+                    inner,
+                    repository: state.workspace_storage.clone(),
+                    workspace_id,
+                    lease,
+                })),
+                (Ok(inner), None) => Ok(Box::new(inner)),
+                (Err(error), Some((_, workspace_id, lease))) => {
+                    let _ = state
+                        .workspace_storage
+                        .release_streaming_operation_lease(
+                            &workspace_id,
+                            &lease,
+                            WorkspaceOperationOutcome::ProvenAborted,
+                        )
+                        .await;
+                    Err(error.into())
+                }
+                (Err(error), None) => Err(error.into()),
+            }
         }
         ResolvedBackend::PresignedHttp(_) => Err(StreamingPutError::Unsupported(
             "presigned streaming cannot durably align the authorization and transaction journals"
@@ -3038,13 +3241,35 @@ fn validate_streaming_backend(
     backend: &ResolvedBackend,
 ) -> Result<(), StreamingPutError> {
     match backend {
-        ResolvedBackend::S3 { .. }
-            if state.s3_streaming_capabilities.is_some() && state.operation_journal.is_some() =>
-        {
-            Ok(())
-        }
+        ResolvedBackend::S3 {
+            kind: BackendKind::PerUserS3,
+            workspace_streaming: Some(_),
+            ..
+        } if direct_journal_allowed(
+            BackendKind::PerUserS3,
+            state.operation_journal.as_ref(),
+            state.auth_disabled,
+            state.explicit_single_tenant,
+        ) => Ok(()),
+        ResolvedBackend::S3 {
+            kind: BackendKind::GlobalS3,
+            ..
+        } if state.s3_streaming_capabilities.is_some()
+            && direct_journal_allowed(
+                BackendKind::GlobalS3,
+                state.operation_journal.as_ref(),
+                state.auth_disabled,
+                state.explicit_single_tenant,
+            ) => Ok(()),
+        ResolvedBackend::S3 {
+            kind: BackendKind::PerUserS3,
+            ..
+        } => Err(StreamingPutError::Unsupported(
+            "workspace S3 streaming needs a trusted provider capability profile, stable routing fence, and durable operation journal"
+                .to_string(),
+        )),
         ResolvedBackend::S3 { .. } => Err(StreamingPutError::Unsupported(
-            "direct S3 streaming needs configured capabilities and a durable operation journal"
+            "direct global S3 streaming needs configured capabilities and a durable operation journal"
                 .to_string(),
         )),
         ResolvedBackend::Memory(_) if state.dev_memory_streaming_enabled => Ok(()),
@@ -4300,6 +4525,7 @@ enum ExistingDirectCompletion {
     Committed(Box<OperationRecord>),
     ProvenAborted,
     Pending,
+    Conflict,
 }
 
 async fn reconcile_existing_direct_completion(
@@ -4310,45 +4536,109 @@ async fn reconcile_existing_direct_completion(
     bucket: &str,
     key: &str,
 ) -> Result<ExistingDirectCompletion, TransactionError> {
-    let ResolvedBackend::S3 { kind, client } = backend else {
-        return Ok(ExistingDirectCompletion::New);
-    };
     let Some(journal) = state.operation_journal.clone() else {
         return Ok(ExistingDirectCompletion::New);
     };
     let Some(mut operation) = journal.get(operation_id).await? else {
         return Ok(ExistingDirectCompletion::New);
     };
+    let (client, capabilities, backend_id, recovered_lease, exact_b2) = match backend {
+        ResolvedBackend::S3 {
+            kind: BackendKind::PerUserS3,
+            ..
+        } => {
+            let Some(binding) = operation.destination.workspace_binding.as_ref() else {
+                return Ok(ExistingDirectCompletion::Conflict);
+            };
+            let workspace = WorkspaceId::new(workspace_id.to_string()).map_err(|_| {
+                TransactionError::Publication("workspace recovery identity is invalid".to_string())
+            })?;
+            let (historical, lease) = backend_resolver(state)
+                .recover_workspace_operation(
+                    &workspace,
+                    operation_id,
+                    binding,
+                    WORKSPACE_OPERATION_LEASE_TTL,
+                )
+                .await
+                .map_err(TransactionError::Publication)?;
+            let ResolvedBackend::S3 {
+                client,
+                workspace_streaming: Some(streaming),
+                ..
+            } = historical
+            else {
+                return Ok(ExistingDirectCompletion::Conflict);
+            };
+            (
+                client,
+                streaming.identity.attestation.capabilities,
+                "PerUserS3",
+                Some((workspace, lease)),
+                streaming.provider == crate::backend::WorkspaceS3Provider::B2
+                    && streaming.identity.attestation.exact_version_recovery,
+            )
+        }
+        ResolvedBackend::S3 {
+            kind: BackendKind::GlobalS3,
+            client,
+            ..
+        } => {
+            let Some(capabilities) = state.s3_streaming_capabilities else {
+                return Ok(ExistingDirectCompletion::Conflict);
+            };
+            (client.clone(), capabilities, "GlobalS3", None, false)
+        }
+        _ => return Ok(ExistingDirectCompletion::Conflict),
+    };
     if operation.tenant_id.as_deref() != Some(workspace_id)
-        || operation.destination.backend_id != format!("{kind:?}")
+        || operation.destination.backend_id != backend_id
         || operation.destination.bucket != bucket
         || operation.destination.logical_key != key
         || operation.destination.physical_key != key
     {
-        return Ok(ExistingDirectCompletion::Pending);
+        return Ok(ExistingDirectCompletion::Conflict);
     }
     if !operation.state.is_terminal() {
-        if *kind == BackendKind::PerUserS3 {
-            return Ok(ExistingDirectCompletion::Pending);
-        }
-        let capabilities = state.s3_streaming_capabilities.ok_or_else(|| {
-            TransactionError::Publication(
-                "direct completion reconciliation capabilities are unavailable".to_string(),
-            )
-        })?;
+        let transaction_backend = if exact_b2 {
+            AwsS3TransactionBackend::new_b2(client, capabilities)
+        } else {
+            AwsS3TransactionBackend::new(client, capabilities)
+        };
         let reconciler = OperationReconciler::new(
             journal.clone(),
-            Arc::new(AwsS3TransactionBackend::new(client.clone(), capabilities)),
+            Arc::new(transaction_backend),
             format!("multipart-retry-{}", Uuid::now_v7()),
         )?;
+        // The caller already owns the durable multipart completion lease. A
+        // prior worker therefore cannot still publish this operation, so the
+        // exact retry may claim its journal row without another stale delay.
         reconciler
-            .reconcile_operation(operation_id, COMPLETION_LEASE)
+            .reconcile_operation(operation_id, Duration::ZERO)
             .await?;
         operation = journal.get(operation_id).await?.ok_or_else(|| {
             TransactionError::Publication(
                 "direct completion journal row disappeared during reconciliation".to_string(),
             )
         })?;
+    }
+    if operation.state.is_terminal()
+        && let Some((workspace, lease)) = recovered_lease
+    {
+        let outcome = if operation.state == OperationState::Committed {
+            WorkspaceOperationOutcome::Committed
+        } else {
+            WorkspaceOperationOutcome::ProvenAborted
+        };
+        state
+            .workspace_storage
+            .release_streaming_operation_lease(&workspace, &lease, outcome)
+            .await
+            .map_err(|_| {
+                TransactionError::Publication(
+                    "workspace recovery lease terminal update failed".to_string(),
+                )
+            })?;
     }
     Ok(match operation.state {
         OperationState::Committed => ExistingDirectCompletion::Committed(Box::new(operation)),
@@ -4359,6 +4649,63 @@ async fn reconcile_existing_direct_completion(
         | OperationState::CommitUnknown
         | OperationState::Aborting => ExistingDirectCompletion::Pending,
     })
+}
+
+/// Startup/periodic hook for private adapters to reconcile one durable BYO
+/// operation after process loss. The operation's historical config version is
+/// loaded before any provider request; current credentials are never used as a
+/// fallback.
+pub async fn reconcile_workspace_streaming_operation(
+    state: &AppState,
+    operation_id: Uuid,
+) -> Result<bool, String> {
+    let journal = state
+        .operation_journal
+        .as_ref()
+        .ok_or_else(|| "durable operation journal is unavailable".to_string())?;
+    let operation = journal
+        .get(operation_id)
+        .await
+        .map_err(|_| "durable operation lookup failed".to_string())?
+        .ok_or_else(|| "durable operation was not found".to_string())?;
+    if operation.state.is_terminal() {
+        return Ok(true);
+    }
+    let workspace_id = operation
+        .tenant_id
+        .as_deref()
+        .ok_or_else(|| "workspace operation has no tenant identity".to_string())?;
+    let workspace = WorkspaceId::new(workspace_id.to_string())
+        .map_err(|_| "workspace operation identity is invalid".to_string())?;
+    let binding = operation
+        .destination
+        .workspace_binding
+        .as_ref()
+        .ok_or_else(|| "workspace operation has no versioned destination binding".to_string())?;
+    let backend = backend_resolver(state)
+        .resolve_historical_workspace_s3(&workspace, binding)
+        .await?;
+    let bucket = operation.destination.bucket.clone();
+    let key = operation.destination.logical_key.clone();
+    match reconcile_existing_direct_completion(
+        state,
+        &backend,
+        operation_id,
+        workspace_id,
+        &bucket,
+        &key,
+    )
+    .await
+    .map_err(|_| "workspace operation reconciliation failed".to_string())?
+    {
+        ExistingDirectCompletion::Committed(_) | ExistingDirectCompletion::ProvenAborted => {
+            Ok(true)
+        }
+        ExistingDirectCompletion::Pending => Ok(false),
+        ExistingDirectCompletion::New | ExistingDirectCompletion::Conflict => {
+            Err("workspace operation reconciliation identity conflict".to_string())
+        }
+    }
 }
 
 async fn recovered_multipart_result(
@@ -6563,6 +6910,34 @@ mod tests {
         assert!(validate_storage_boundary_startup(true, false, false).is_ok());
     }
 
+    #[test]
+    fn non_durable_journal_is_global_local_debug_only() {
+        let journal: Arc<dyn OperationJournal> =
+            Arc::new(crate::transaction::InMemoryOperationJournal::new());
+        assert_eq!(
+            direct_journal_allowed(BackendKind::GlobalS3, Some(&journal), true, true),
+            cfg!(debug_assertions)
+        );
+        assert!(!direct_journal_allowed(
+            BackendKind::GlobalS3,
+            Some(&journal),
+            false,
+            true
+        ));
+        assert!(!direct_journal_allowed(
+            BackendKind::GlobalS3,
+            Some(&journal),
+            true,
+            false
+        ));
+        assert!(!direct_journal_allowed(
+            BackendKind::PerUserS3,
+            Some(&journal),
+            true,
+            true
+        ));
+    }
+
     async fn insert_test_usage_intent(journal: &Arc<dyn OperationJournal>, operation_id: Uuid) {
         journal
             .insert_intent(OperationRecord::direct_intent(
@@ -6575,6 +6950,7 @@ mod tests {
                     bucket: "bucket".to_string(),
                     logical_key: "key".to_string(),
                     physical_key: "key".to_string(),
+                    workspace_binding: None,
                 },
                 ExpectedObject::default(),
             ))
@@ -6753,6 +7129,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 logical_key: "key-a".to_string(),
                 physical_key: "key-a".to_string(),
+                workspace_binding: None,
             },
             ExpectedObject {
                 digest: Some("output-sha".to_string()),
@@ -7109,6 +7486,25 @@ mod tests {
             assert!(body.contains(&format!("<Code>{s3_code}</Code>")));
             assert!(!body.contains("PRINTABLE_GRANTED_SECRET"));
         }
+    }
+
+    #[tokio::test]
+    async fn definitive_provider_failure_has_stable_opaque_s3_response() {
+        let response = streaming_put_error_response(
+            "key",
+            StreamingPutError::Transaction(TransactionError::Backend(
+                crate::transaction::BackendError::definitive(
+                    "PRINTABLE_PROVIDER_AUTHORIZATION_DETAIL",
+                ),
+            )),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(!body.contains("PRINTABLE_PROVIDER_AUTHORIZATION_DETAIL"));
     }
 
     #[test]
@@ -8210,6 +8606,12 @@ async fn s3_post(
                 return s3_error::service_unavailable(
                     &key,
                     "The previous multipart completion outcome is still being reconciled.",
+                );
+            }
+            Ok(ExistingDirectCompletion::Conflict) => {
+                return s3_error::invalid_request(
+                    &key,
+                    "The multipart completion backend or routing identity changed.",
                 );
             }
         };

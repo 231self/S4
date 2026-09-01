@@ -14,7 +14,7 @@ pub use journal::InMemoryOperationJournal;
 pub use journal::PostgresOperationJournal;
 pub use memory::MemorySinkTransaction;
 pub use presign::{MultipartPresignContract, PresignedOperation};
-pub use s3::{AwsS3TransactionBackend, DirectS3Sink};
+pub use s3::{AwsS3TransactionBackend, DirectS3Sink, S3ServerSideEncryption};
 pub(crate) use spool::READ_FILE_PREFIX;
 pub use spool::{
     CompatibilitySpoolConfig, CompatibilitySpoolTransaction, CompatibilitySpoolUploader, SpoolQuota,
@@ -134,6 +134,57 @@ pub struct ManagedOperationScope {
     pub operation_id: Uuid,
     pub tenant_id: String,
     pub namespace_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedChildRole {
+    Primary,
+    Replica,
+    Repair,
+}
+
+impl ManagedChildRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Replica => "replica",
+            Self::Repair => "repair",
+        }
+    }
+}
+
+impl ManagedOperationScope {
+    /// Derive a stable physical child identity from the durable logical parent
+    /// and its exact destination. The physical key carries the generation.
+    pub fn deterministic_child(
+        parent_operation_id: Uuid,
+        tenant_id: String,
+        namespace_epoch: u64,
+        destination: &ObjectDestination,
+        role: ManagedChildRole,
+    ) -> Self {
+        const CHILD_OPERATION_NAMESPACE: Uuid = Uuid::from_bytes([
+            0x36, 0x66, 0x5f, 0x7a, 0x4b, 0x54, 0x52, 0xd3, 0xa8, 0xd0, 0xca, 0xf2, 0x13, 0x0e,
+            0x1e, 0xb2,
+        ]);
+        let mut identity = Vec::new();
+        for field in [
+            parent_operation_id.as_bytes().as_slice(),
+            destination.backend_id.as_bytes(),
+            destination.bucket.as_bytes(),
+            destination.logical_key.as_bytes(),
+            destination.physical_key.as_bytes(),
+            role.as_str().as_bytes(),
+        ] {
+            identity.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            identity.extend_from_slice(field);
+        }
+        Self {
+            operation_id: Uuid::new_v5(&CHILD_OPERATION_NAMESPACE, &identity),
+            tenant_id,
+            namespace_epoch,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -420,15 +471,46 @@ pub struct DiscoveredUpload {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredObjectVersion {
+    pub version_id: String,
+    pub etag: Option<String>,
+    pub size: Option<u64>,
+    pub is_latest: bool,
+    pub last_modified_ms: Option<i64>,
+    pub delete_marker: bool,
+    pub operation_matches: bool,
+    pub expected_metadata_matches: bool,
+    pub encryption_matches: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredMultipartPart {
+    pub part_number: i32,
+    pub etag: Option<String>,
+    pub size: Option<u64>,
+    pub last_modified_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultipartUploadInspection {
+    pub upload: DiscoveredUpload,
+    pub parts: Vec<DiscoveredMultipartPart>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompletionProbe {
     Committed(StoredObjectMeta),
     ProvenAbsent,
+    ProvenAbsentExact,
     Inconclusive,
 }
 
 #[async_trait]
 pub trait TransactionBackend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities;
+    fn has_exact_version_recovery(&self) -> bool {
+        false
+    }
     async fn put_object(
         &self,
         operation: &OperationRecord,
@@ -457,6 +539,31 @@ pub trait TransactionBackend: Send + Sync {
         &self,
         operation: &OperationRecord,
     ) -> Result<Vec<DiscoveredUpload>, BackendError>;
+    async fn inspect_object_versions(
+        &self,
+        _operation: &OperationRecord,
+    ) -> Result<Vec<DiscoveredObjectVersion>, BackendError> {
+        Err(BackendError::definitive(
+            "backend does not support exact object-version inspection",
+        ))
+    }
+    async fn delete_object_version(
+        &self,
+        _operation: &OperationRecord,
+        _version_id: &str,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::definitive(
+            "backend does not support exact object-version deletion",
+        ))
+    }
+    async fn inspect_multipart_uploads(
+        &self,
+        _operation: &OperationRecord,
+    ) -> Result<Vec<MultipartUploadInspection>, BackendError> {
+        Err(BackendError::definitive(
+            "backend does not support multipart inspection",
+        ))
+    }
     async fn probe_completion(
         &self,
         operation: &OperationRecord,
@@ -652,8 +759,27 @@ impl OperationReconciler {
         match self.backend.probe_completion(operation).await? {
             CompletionProbe::Committed(mut meta) => {
                 // A completion discovered after an ambiguous response cannot
-                // prove that no earlier provider version was also created.
-                meta.version_history_complete = false;
+                // prove that no earlier provider version was also created
+                // unless the backend enumerated exact operation versions.
+                if !self.backend.has_exact_version_recovery() {
+                    meta.version_history_complete = false;
+                }
+                let evidence_kind = if meta.version_history_complete {
+                    "provider_version_history_complete"
+                } else {
+                    "provider_version_history_ambiguous"
+                };
+                self.journal
+                    .append_evidence(EvidenceRecord::new(
+                        operation.id,
+                        evidence_kind,
+                        serde_json::json!({
+                            "version_id": meta.version_id.as_deref(),
+                            "superseded_version_ids": &meta.superseded_version_ids,
+                            "reconciled": true,
+                        }),
+                    ))
+                    .await?;
                 self.journal
                     .transition(
                         operation.id,
@@ -673,6 +799,24 @@ impl OperationReconciler {
                         "completion_absent_inconclusive",
                         serde_json::json!({}),
                     ))
+                    .await?;
+            }
+            CompletionProbe::ProvenAbsentExact => {
+                self.abort_discovered(operation).await?;
+                self.journal
+                    .append_evidence(EvidenceRecord::new(
+                        operation.id,
+                        "completion_exactly_absent",
+                        serde_json::json!({}),
+                    ))
+                    .await?;
+                self.journal
+                    .transition(
+                        operation.id,
+                        OperationState::CommitUnknown,
+                        OperationState::ProvenAborted,
+                        None,
+                    )
                     .await?;
             }
             CompletionProbe::Inconclusive => {}
@@ -813,5 +957,51 @@ mod tests {
         let memory: Arc<dyn OperationJournal> = Arc::new(InMemoryOperationJournal::new());
         assert!(validate_production_journal(true, Some(&memory)).is_err());
         assert!(validate_production_journal(false, None).is_ok());
+    }
+
+    #[test]
+    fn managed_child_operation_identity_is_stable_and_destination_bound() {
+        let parent = Uuid::parse_str("018f0000-0000-7000-8000-000000000001").unwrap();
+        let destination = ObjectDestination {
+            backend_id: "b2:managed-primary".to_string(),
+            bucket: "provider-bucket".to_string(),
+            logical_key: "logical/key".to_string(),
+            physical_key: "managed/generation/key".to_string(),
+        };
+        let first = ManagedOperationScope::deterministic_child(
+            parent,
+            "workspace".to_string(),
+            7,
+            &destination,
+            ManagedChildRole::Primary,
+        );
+        let retry = ManagedOperationScope::deterministic_child(
+            parent,
+            "workspace".to_string(),
+            7,
+            &destination,
+            ManagedChildRole::Primary,
+        );
+        assert_eq!(first.operation_id, retry.operation_id);
+
+        let replica = ManagedOperationScope::deterministic_child(
+            parent,
+            "workspace".to_string(),
+            7,
+            &destination,
+            ManagedChildRole::Replica,
+        );
+        assert_ne!(first.operation_id, replica.operation_id);
+
+        let mut next_generation = destination;
+        next_generation.physical_key.push_str("-next");
+        let next = ManagedOperationScope::deterministic_child(
+            parent,
+            "workspace".to_string(),
+            7,
+            &next_generation,
+            ManagedChildRole::Primary,
+        );
+        assert_ne!(first.operation_id, next.operation_id);
     }
 }

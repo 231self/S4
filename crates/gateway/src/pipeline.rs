@@ -37,6 +37,10 @@ pub struct PipelineLocator {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PipelineStep {
     pub component_hash: String,
+    /// Exact immutable hosted plugin-version identity. Static catalogs omit
+    /// this so their serialized snapshots and fingerprints stay compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_version_id: Option<String>,
     /// Disabled steps remain part of the immutable revision fingerprint but
     /// are not loaded or executed. Older persisted resolutions predate this
     /// field and contained only enabled steps.
@@ -63,6 +67,11 @@ const fn enabled_by_default() -> bool {
 pub struct PipelineResolution {
     pub locator: PipelineLocator,
     pub steps: Vec<PipelineStep>,
+    /// Monotonic hosted publication generation. Static and legacy resolutions
+    /// omit it; a republish can therefore freeze a distinct policy identity
+    /// even when every step is otherwise byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_generation: Option<u64>,
     /// An empty chain is legal only when this is true.
     #[serde(default)]
     pub explicit_passthrough: bool,
@@ -74,6 +83,8 @@ struct PersistedPipelineResolution {
     locator: PipelineLocator,
     steps: Vec<PersistedPipelineStep>,
     #[serde(default)]
+    policy_generation: Option<u64>,
+    #[serde(default)]
     explicit_passthrough: bool,
     limits: PipelineLimits,
 }
@@ -81,6 +92,8 @@ struct PersistedPipelineResolution {
 #[derive(serde::Deserialize)]
 struct PersistedPipelineStep {
     component_hash: String,
+    #[serde(default)]
+    plugin_version_id: Option<String>,
     #[serde(default = "enabled_by_default")]
     enabled: bool,
     #[serde(default)]
@@ -106,6 +119,7 @@ impl<'de> serde::Deserialize<'de> for PipelineResolution {
                 .into_iter()
                 .map(|step| PipelineStep {
                     component_hash: step.component_hash,
+                    plugin_version_id: step.plugin_version_id,
                     enabled: step.enabled,
                     version: step.version,
                     config_json: step.config_json,
@@ -117,9 +131,31 @@ impl<'de> serde::Deserialize<'de> for PipelineResolution {
                     }),
                 })
                 .collect(),
+            policy_generation: persisted.policy_generation,
             explicit_passthrough: persisted.explicit_passthrough,
             limits: persisted.limits,
         })
+    }
+}
+
+impl PipelineResolution {
+    /// Verify persisted or externally resolved policy against the canonical
+    /// public fingerprint for this request direction.
+    pub fn verify_fingerprint(&self, direction: PipelineDirection) -> Result<(), S4Error> {
+        let recomputed = resolution_fingerprint_with_generation(
+            direction,
+            &self.steps,
+            self.explicit_passthrough,
+            self.limits,
+            self.policy_generation,
+        );
+        if recomputed != self.locator.fingerprint {
+            return Err(S4Error::new(
+                codes::CONFIG_INVALID,
+                "pipeline fingerprint does not match its immutable resolution",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -161,6 +197,7 @@ impl StaticPipelineResolver {
             .into_iter()
             .map(|(info, component_hash, capabilities)| PipelineStep {
                 component_hash,
+                plugin_version_id: None,
                 enabled: true,
                 version: Some(info.version),
                 config_json: None,
@@ -179,6 +216,7 @@ impl StaticPipelineResolver {
                 fingerprint,
             },
             steps,
+            policy_generation: None,
             explicit_passthrough,
             limits,
         }
@@ -215,6 +253,49 @@ pub fn resolution_fingerprint(
     let encoded = serde_json::to_vec(&canonical)
         .expect("canonical fingerprint encoding is always serializable");
     hex::encode(Sha256::digest(&encoded))
+}
+
+/// Canonical hosted fingerprint extension. Omitting the generation delegates
+/// to the original byte contract exactly, preserving every static fingerprint.
+pub fn resolution_fingerprint_with_generation(
+    direction: PipelineDirection,
+    steps: &[PipelineStep],
+    explicit_passthrough: bool,
+    limits: PipelineLimits,
+    policy_generation: Option<u64>,
+) -> String {
+    let Some(policy_generation) = policy_generation else {
+        return resolution_fingerprint(direction, steps, explicit_passthrough, limits);
+    };
+    let canonical = serde_json::json!({
+        "direction": format!("{direction:?}").to_ascii_lowercase(),
+        "steps": steps,
+        "explicit_passthrough": explicit_passthrough,
+        "limits": limits,
+        "policy_generation": policy_generation,
+    });
+    let encoded = serde_json::to_vec(&canonical)
+        .expect("canonical fingerprint encoding is always serializable");
+    hex::encode(Sha256::digest(&encoded))
+}
+
+/// Stable count plus digest fingerprint for the enabled component set. Digest
+/// order is canonicalized because compilation COGS is content-addressed, not
+/// execution-position-addressed.
+pub fn component_digest_evidence(steps: &[PipelineStep]) -> String {
+    let mut hashes: Vec<&str> = steps
+        .iter()
+        .filter(|step| step.enabled)
+        .map(|step| step.component_hash.as_str())
+        .collect();
+    hashes.sort_unstable();
+    let canonical =
+        serde_json::to_vec(&hashes).expect("component digest evidence is always serializable");
+    format!(
+        "v1:{}:{}",
+        hashes.len(),
+        hex::encode(Sha256::digest(canonical))
+    )
 }
 
 pub(crate) fn plugin_step_info(step: &PipelineStep) -> PluginInfo {
@@ -292,6 +373,137 @@ mod tests {
         assert_eq!(
             hosted_resolution.steps[0].sensitive_grant,
             s4_wasm_runtime::SensitiveGrant::NONE
+        );
+    }
+
+    #[test]
+    fn canonical_fingerprint_round_trips_and_rejects_persisted_tampering() {
+        let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
+        let resolution = resolver.resolution(PipelineDirection::Write);
+        resolution
+            .verify_fingerprint(PipelineDirection::Write)
+            .unwrap();
+        assert_eq!(
+            resolution
+                .verify_fingerprint(PipelineDirection::Read)
+                .unwrap_err()
+                .code(),
+            codes::CONFIG_INVALID
+        );
+
+        let mut persisted: serde_json::Value = serde_json::to_value(&resolution).unwrap();
+        persisted["explicit_passthrough"] = serde_json::Value::Bool(false);
+        let tampered: PipelineResolution = serde_json::from_value(persisted).unwrap();
+        assert_eq!(
+            tampered
+                .verify_fingerprint(PipelineDirection::Write)
+                .unwrap_err()
+                .code(),
+            codes::CONFIG_INVALID
+        );
+    }
+
+    #[test]
+    fn component_evidence_has_explicit_count_and_order_independent_digest() {
+        let step = |hash: &str| PipelineStep {
+            component_hash: hash.to_string(),
+            plugin_version_id: None,
+            enabled: true,
+            version: None,
+            config_json: None,
+            capabilities: PluginCapabilities::default(),
+            sensitive_grant: s4_wasm_runtime::SensitiveGrant::NONE,
+        };
+        let first = component_digest_evidence(&[step("b"), step("a")]);
+        let second = component_digest_evidence(&[step("a"), step("b")]);
+        assert_eq!(first, second);
+        assert!(first.starts_with("v1:2:"));
+        assert_eq!(first.len(), 69);
+    }
+
+    #[test]
+    fn exact_plugin_version_identity_and_policy_generation_are_fingerprint_inputs() {
+        let step = |plugin_version_id: &str| PipelineStep {
+            component_hash: "a".repeat(64),
+            plugin_version_id: Some(plugin_version_id.to_string()),
+            enabled: true,
+            version: Some("same-label".to_string()),
+            config_json: None,
+            capabilities: PluginCapabilities::default(),
+            sensitive_grant: s4_wasm_runtime::SensitiveGrant::NONE,
+        };
+        let limits = PipelineLimits::default();
+        let first = resolution_fingerprint(
+            PipelineDirection::Write,
+            &[step("version-a")],
+            false,
+            limits,
+        );
+        let second = resolution_fingerprint(
+            PipelineDirection::Write,
+            &[step("version-b")],
+            false,
+            limits,
+        );
+        assert_ne!(
+            first, second,
+            "exact version identity must distinguish identical bytes and labels"
+        );
+
+        let steps = [step("version-a")];
+        let generation_one = resolution_fingerprint_with_generation(
+            PipelineDirection::Write,
+            &steps,
+            false,
+            limits,
+            Some(1),
+        );
+        let generation_two = resolution_fingerprint_with_generation(
+            PipelineDirection::Write,
+            &steps,
+            false,
+            limits,
+            Some(2),
+        );
+        assert_ne!(
+            generation_one, generation_two,
+            "republishing must advance policy identity"
+        );
+    }
+
+    #[test]
+    fn absent_hosted_identity_fields_preserve_static_serialization_and_fingerprint() {
+        let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
+        let resolution = resolver.resolution(PipelineDirection::Write);
+        let serialized = serde_json::to_value(&resolution).unwrap();
+        assert!(serialized.get("policy_generation").is_none());
+        assert!(
+            serialized["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|step| step.get("plugin_version_id").is_none())
+        );
+
+        let legacy_canonical = serde_json::json!({
+            "direction": "write",
+            "steps": resolution.steps,
+            "explicit_passthrough": resolution.explicit_passthrough,
+            "limits": resolution.limits,
+        });
+        let legacy = hex::encode(Sha256::digest(
+            serde_json::to_vec(&legacy_canonical).unwrap(),
+        ));
+        assert_eq!(resolution.locator.fingerprint, legacy);
+        assert_eq!(
+            resolution_fingerprint_with_generation(
+                PipelineDirection::Write,
+                &resolution.steps,
+                resolution.explicit_passthrough,
+                resolution.limits,
+                None,
+            ),
+            legacy
         );
     }
 }

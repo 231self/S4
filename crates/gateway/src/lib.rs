@@ -107,7 +107,9 @@ impl Gateway {
                 "no pipeline resolver is configured",
             )
         })?;
-        resolver.resolve(workspace_id, bucket, direction).await
+        let resolution = resolver.resolve(workspace_id, bucket, direction).await?;
+        resolution.verify_fingerprint(direction)?;
+        Ok(resolution)
     }
 
     /// Resolve the effective pipeline after authentication, before

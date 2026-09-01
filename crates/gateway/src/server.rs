@@ -44,8 +44,8 @@ use crate::backend::{
 };
 use crate::control::{
     AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
-    ControlPlane, MeteringError, RequestKind, StreamingWriteMode, UsageAuthorization, UsageEvent,
-    UsageRoute,
+    ControlPlane, MeteringError, PipelineAttempt, RequestKind, StreamingWriteMode,
+    UsageAuthorization, UsageEvent, UsageRoute,
 };
 use crate::customer_headers;
 use crate::integrity::{BodyVerifier, IntegrityError};
@@ -210,6 +210,18 @@ impl OperationIdentity {
             max_processed_bytes,
         )
     }
+
+    fn pipeline_authorization(
+        self,
+        bucket: &str,
+        route: UsageRoute,
+        kind: RequestKind,
+        max_processed_bytes: u64,
+        resolution: &crate::pipeline::PipelineResolution,
+    ) -> UsageAuthorization {
+        self.authorization(bucket, route, kind, max_processed_bytes)
+            .with_pipeline(&resolution.locator)
+    }
 }
 
 fn object_max_processed_bytes(state: &AppState) -> u64 {
@@ -320,6 +332,50 @@ async fn record_usage(
         warn!(event_id = %event.receipt_id(), ?error, "usage event was not recorded");
         metering_error_response(key, error)
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_failed_pipeline_attempt(
+    control: &dyn ControlPlane,
+    context: &AuthenticatedRequestContext,
+    operation_id: Uuid,
+    bucket: &str,
+    direction: crate::pipeline::PipelineDirection,
+    resolution: Option<&crate::pipeline::PipelineResolution>,
+    error_code: &'static str,
+    duration_ms: u64,
+) {
+    let components =
+        resolution.map(|value| crate::pipeline::component_digest_evidence(&value.steps));
+    let attempt = PipelineAttempt::failed(
+        operation_id,
+        bucket,
+        direction,
+        resolution,
+        components,
+        error_code,
+        0,
+        duration_ms,
+    );
+    warn!(
+        operation_id = %attempt.operation_id(),
+        bucket = attempt.bucket(),
+        direction = ?attempt.direction(),
+        revision = attempt.revision(),
+        fingerprint = attempt.fingerprint(),
+        components = attempt.components(),
+        error_code = attempt.error_code(),
+        fuel_consumed = attempt.fuel_consumed(),
+        duration_ms = attempt.duration_ms(),
+        "pipeline attempt failed without customer usage"
+    );
+    if control
+        .record_pipeline_attempt(context, &attempt)
+        .await
+        .is_err()
+    {
+        warn!(operation_id = %operation_id, error_code, "pipeline attempt evidence was not recorded");
+    }
 }
 
 async fn record_operation(
@@ -2786,45 +2842,14 @@ fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::re
             | IntegrityError::DecodedLengthMismatch),
         ) => s3_error::bad_digest(key, &error.to_string()),
         StreamingPutError::Integrity(error) => s3_error::invalid_request(key, &error.to_string()),
-        StreamingPutError::Pipeline(error)
-            if matches!(
-                error.code(),
-                s4_error::codes::LIMIT_INPUT_BYTES
-                    | s4_error::codes::LIMIT_OUTPUT_BYTES
-                    | s4_error::codes::LIMIT_EXPANSION
-                    | s4_error::codes::LIMIT_INTERMEDIATE_BYTES
-                    | s4_error::codes::LIMIT_FINISH_BYTES
-                    | s4_error::codes::RECORD_TOO_LARGE
-            ) =>
-        {
-            s3_error::entity_too_large(key)
-        }
-        StreamingPutError::Pipeline(error) if error.code() == s4_error::codes::WASM_ADMISSION => {
-            s3_error::slow_down(key)
-        }
-        StreamingPutError::Pipeline(error)
-            if matches!(
-                error.code(),
-                s4_error::codes::DECODE_JSON
-                    | s4_error::codes::DECODE_JSONL
-                    | s4_error::codes::DECODE_CSV
-                    | s4_error::codes::DECODE_ENCODING
-                    | s4_error::codes::WASM_REJECT
-                    | s4_error::codes::UNSUPPORTED_FORMAT
-            ) =>
-        {
-            s3_error::invalid_request(key, error.message())
-        }
-        StreamingPutError::Pipeline(error) => s3_error::internal_error(key, error.message()),
+        StreamingPutError::Pipeline(error) => pipeline_error_response(key, &error),
         StreamingPutError::Transaction(
             TransactionError::CapacityExceeded | TransactionError::TooManyParts,
         ) => s3_error::entity_too_large(key),
         StreamingPutError::Transaction(TransactionError::Spool(detail)) => {
-            s3_error::service_unavailable(key, &detail)
+            s3_error::internal_error(key, &detail)
         }
-        StreamingPutError::Transaction(error) => {
-            s3_error::service_unavailable(key, &error.to_string())
-        }
+        StreamingPutError::Transaction(error) => s3_error::internal_error(key, &error.to_string()),
         StreamingPutError::InputTooLarge | StreamingPutError::SourceFrameTooLarge => {
             s3_error::entity_too_large(key)
         }
@@ -2836,6 +2861,30 @@ fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::re
             warn!("streaming PUT rejected for {key}: {detail}");
             s3_error::not_implemented(key)
         }
+    }
+}
+
+fn pipeline_error_response(key: &str, error: &s4_error::S4Error) -> axum::response::Response {
+    match error.code() {
+        s4_error::codes::WASM_ADMISSION => s3_error::slow_down(key),
+        s4_error::codes::LIMIT_INPUT_BYTES
+        | s4_error::codes::LIMIT_OUTPUT_BYTES
+        | s4_error::codes::LIMIT_EXPANSION
+        | s4_error::codes::LIMIT_INTERMEDIATE_BYTES
+        | s4_error::codes::LIMIT_FINISH_BYTES
+        | s4_error::codes::RECORD_TOO_LARGE => s3_error::entity_too_large(key),
+        s4_error::codes::DECODE_JSON
+        | s4_error::codes::DECODE_JSONL
+        | s4_error::codes::DECODE_CSV
+        | s4_error::codes::DECODE_ENCODING
+        | s4_error::codes::WASM_REJECT
+        | s4_error::codes::UNSUPPORTED_FORMAT
+        | s4_error::codes::CONFIG_INVALID
+        | s4_error::codes::POLICY_EXPIRED
+        | s4_error::codes::POLICY_TAMPERED => {
+            s3_error::invalid_request(key, "The processing pipeline rejected the request.")
+        }
+        _ => s3_error::internal_error(key, error.code()),
     }
 }
 
@@ -3064,11 +3113,13 @@ impl Drop for SinkAbortGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn streaming_single_put(
     state: &AppState,
     mut authentication: HeaderAuthentication,
     backend: ResolvedBackend,
     usage: AuthorizedUsage<'_>,
+    snapshot: PipelineSnapshot,
     headers: &HeaderMap,
     mut body: axum::body::Body,
     key: &str,
@@ -3137,14 +3188,6 @@ async fn streaming_single_put(
         stable_fields,
     };
     let cancellation = s4_wasm_runtime::CancellationToken::new();
-    let snapshot = state
-        .gateway
-        .resolve_pipeline(
-            authentication.auth.workspace_id().as_str(),
-            grant.bucket(),
-            crate::pipeline::PipelineDirection::Write,
-        )
-        .await?;
     let pipeline_started = std::time::Instant::now();
     let mut pipeline = match snapshot
         .clone()
@@ -3583,6 +3626,24 @@ fn multipart_snapshot(
     }
 }
 
+#[derive(Debug)]
+enum MultipartPipelineRestoreError {
+    LegacyRawSnapshot,
+    Invalid(s4_error::S4Error),
+}
+
+fn restore_multipart_pipeline(
+    snapshot: &serde_json::Value,
+) -> Result<crate::pipeline::PipelineResolution, MultipartPipelineRestoreError> {
+    let resolution =
+        serde_json::from_value::<crate::pipeline::PipelineResolution>(snapshot.clone())
+            .map_err(|_| MultipartPipelineRestoreError::LegacyRawSnapshot)?;
+    resolution
+        .verify_fingerprint(crate::pipeline::PipelineDirection::Write)
+        .map_err(MultipartPipelineRestoreError::Invalid)?;
+    Ok(resolution)
+}
+
 fn staged_part_reservation(headers: &HeaderMap) -> Result<u64, StagingError> {
     // SigV4 streaming carries the decoded length separately; reserving the
     // HTTP framing length would under/over-account the persisted plaintext.
@@ -3909,6 +3970,7 @@ async fn write_completed_record(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_staged_multipart(
     state: &AppState,
     staging: &MultipartStaging,
@@ -3917,6 +3979,7 @@ async fn complete_staged_multipart(
     lease: &CompletionLease,
     operation: AuthorizedOperation<'_>,
     backend: ResolvedBackend,
+    resolution: &crate::pipeline::PipelineResolution,
 ) -> Result<MultipartCompletionResult, MultipartCompletionError> {
     use sha2::Digest as _;
 
@@ -3937,32 +4000,10 @@ async fn complete_staged_multipart(
             "multipart destination changed since initiation".to_string(),
         ));
     }
-    // Phase 2: the snapshot persists the immutable pipeline resolution. The
-    // exact revision is resolved at completion — never the current assignment.
-    // Legacy self-hosted snapshots stored a raw plugin identity list; keep
-    // them working through a static resolution when the registry is unchanged.
-    let snapshot = match serde_json::from_value::<crate::pipeline::PipelineResolution>(
-        upload.snapshot.plugin_snapshot.clone(),
-    ) {
-        Ok(resolution) => state.gateway.snapshot_for(&resolution).await?,
-        Err(_) => {
-            if serde_json::to_value(state.plugins.list()).ok()
-                != Some(upload.snapshot.plugin_snapshot.clone())
-            {
-                return Err(MultipartCompletionError::Invalid(
-                    "multipart plugin snapshot is no longer available".to_string(),
-                ));
-            }
-            state
-                .gateway
-                .resolve_pipeline(
-                    operation.auth.workspace_id().as_str(),
-                    &identity.bucket,
-                    crate::pipeline::PipelineDirection::Write,
-                )
-                .await?
-        }
-    };
+    // Completion executes the exact persisted resolution, never the current
+    // assignment. Legacy raw PluginInfo snapshots are rejected explicitly:
+    // their process-local UUID identities cannot be proven restart-safe.
+    let snapshot = state.gateway.snapshot_for(resolution).await?;
     let pipeline_started = std::time::Instant::now();
     let content_type = upload
         .snapshot
@@ -4829,17 +4870,68 @@ async fn s3_put(
         return response;
     }
     let operation = request_operation_identity();
-    let authorization = operation.authorization(
+    let resolution_started = Instant::now();
+    let resolution = match state
+        .gateway
+        .resolve(
+            auth.workspace_id().as_str(),
+            &bucket,
+            crate::pipeline::PipelineDirection::Write,
+        )
+        .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            record_failed_pipeline_attempt(
+                state.control.as_ref(),
+                &auth.context,
+                operation.operation_id,
+                &bucket,
+                crate::pipeline::PipelineDirection::Write,
+                None,
+                error.code(),
+                resolution_started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return pipeline_error_response(&key, &error);
+        }
+    };
+    let authorization = operation.pipeline_authorization(
         &bucket,
         UsageRoute::PutObject,
         RequestKind::Write,
         object_max_processed_bytes(&state),
+        &resolution,
     );
     let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
         .await
     {
         Ok(grant) => grant,
         Err(response) => return response,
+    };
+    let snapshot = match state.gateway.snapshot_for(&resolution).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            record_failed_pipeline_attempt(
+                state.control.as_ref(),
+                &auth.context,
+                operation.operation_id,
+                &bucket,
+                crate::pipeline::PipelineDirection::Write,
+                Some(&resolution),
+                error.code(),
+                resolution_started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                pipeline_error_response(&key, &error),
+            )
+            .await;
+        }
     };
     let tenant_write_mode = state
         .control
@@ -4918,6 +5010,7 @@ async fn s3_put(
         header_auth,
         backend,
         AuthorizedUsage { grant: &grant },
+        snapshot,
         &parts.headers,
         request_body,
         &key,
@@ -4953,6 +5046,25 @@ async fn s3_put(
             response.body(axum::body::Body::empty()).unwrap()
         }
         Err(error) => {
+            let error_code = match &error {
+                StreamingPutError::Pipeline(error) => error.code(),
+                StreamingPutError::PreserveReservation(error) => match error.as_ref() {
+                    StreamingPutError::Pipeline(error) => error.code(),
+                    _ => s4_error::codes::INTERNAL,
+                },
+                _ => s4_error::codes::INTERNAL,
+            };
+            record_failed_pipeline_attempt(
+                state.control.as_ref(),
+                &auth_context,
+                operation.operation_id,
+                &bucket,
+                crate::pipeline::PipelineDirection::Write,
+                Some(&resolution),
+                error_code,
+                resolution_started.elapsed().as_millis() as u64,
+            )
+            .await;
             streaming_put_failure_response(
                 state.control.as_ref(),
                 &auth_context,
@@ -5000,36 +5112,8 @@ fn transformed_read_error_response(
                 "encrypted transformed-read staging capacity is unavailable",
             )
         }
-        TransformedReadError::Spool(error) => {
-            s3_error::service_unavailable(key, &error.to_string())
-        }
-        TransformedReadError::Pipeline(error)
-            if matches!(
-                error.code(),
-                s4_error::codes::LIMIT_INPUT_BYTES
-                    | s4_error::codes::LIMIT_OUTPUT_BYTES
-                    | s4_error::codes::LIMIT_EXPANSION
-                    | s4_error::codes::LIMIT_INTERMEDIATE_BYTES
-                    | s4_error::codes::LIMIT_FINISH_BYTES
-                    | s4_error::codes::RECORD_TOO_LARGE
-            ) =>
-        {
-            s3_error::entity_too_large(key)
-        }
-        TransformedReadError::Pipeline(error)
-            if matches!(
-                error.code(),
-                s4_error::codes::DECODE_JSON
-                    | s4_error::codes::DECODE_JSONL
-                    | s4_error::codes::DECODE_CSV
-                    | s4_error::codes::DECODE_ENCODING
-                    | s4_error::codes::WASM_REJECT
-                    | s4_error::codes::UNSUPPORTED_FORMAT
-            ) =>
-        {
-            s3_error::invalid_request(key, error.message())
-        }
-        TransformedReadError::Pipeline(error) => s3_error::internal_error(key, error.message()),
+        TransformedReadError::Spool(error) => s3_error::internal_error(key, &error.to_string()),
+        TransformedReadError::Pipeline(error) => pipeline_error_response(key, &error),
     }
 }
 
@@ -5439,22 +5523,41 @@ enum DirectReadEvent {
     Data(bytes::Bytes),
     Failed(TransformedReadError),
     Done {
-        fuel_consumed: u64,
-        duration_ms: u64,
+        source_bytes: u64,
+        output_bytes: u64,
+        evidence: Option<crate::control::PipelineEvidence>,
     },
 }
 
-fn direct_read_done_evidence(
-    snapshot: &PipelineSnapshot,
-    event: &DirectReadEvent,
-) -> Option<crate::control::PipelineEvidence> {
-    match event {
-        DirectReadEvent::Done {
-            fuel_consumed,
-            duration_ms,
-        } => snapshot.pipeline_evidence(*fuel_consumed, *duration_ms, "none"),
-        DirectReadEvent::Data(_) | DirectReadEvent::Failed(_) => None,
-    }
+const DIRECT_READ_SETTLEMENT_ATTEMPTS: usize = 3;
+
+type DirectSettlementFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), MeteringError>> + Send + 'static>,
+>;
+
+fn direct_settlement_future(
+    control: Arc<dyn ControlPlane>,
+    context: AuthenticatedRequestContext,
+    event: UsageEvent,
+) -> DirectSettlementFuture {
+    Box::pin(async move {
+        let mut last_error = MeteringError::Unavailable;
+        for attempt in 1..=DIRECT_READ_SETTLEMENT_ATTEMPTS {
+            match control.record(&context, &event).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = error;
+                    warn!(
+                        operation_id = %event.operation_id(),
+                        receipt_id = %event.receipt_id(),
+                        attempt,
+                        "direct transformed-read settlement retry failed"
+                    );
+                }
+            }
+        }
+        Err(last_error)
+    })
 }
 
 struct DirectReadBody {
@@ -5462,6 +5565,15 @@ struct DirectReadBody {
     receiver: tokio::sync::mpsc::Receiver<DirectReadEvent>,
     source_cancellation: s4_wasm_runtime::CancellationToken,
     pipeline_cancellation: s4_wasm_runtime::CancellationToken,
+    control: Arc<dyn ControlPlane>,
+    context: AuthenticatedRequestContext,
+    grant: AuthorizationGrant,
+    failure_operation: OperationIdentity,
+    failure_bucket: String,
+    failure_resolution: crate::pipeline::PipelineResolution,
+    settlement: Option<DirectSettlementFuture>,
+    disclosed: bool,
+    reservation_owned: bool,
     done: bool,
 }
 
@@ -5473,20 +5585,92 @@ impl http_body::Body for DirectReadBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(settlement) = &mut self.settlement {
+            return match settlement.as_mut().poll(cx) {
+                std::task::Poll::Ready(Ok(())) => {
+                    self.settlement = None;
+                    self.reservation_owned = false;
+                    self.done = true;
+                    std::task::Poll::Ready(None)
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    self.settlement = None;
+                    self.done = true;
+                    std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                        "direct transformed-read usage settlement failed",
+                    ))))
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            };
+        }
         if let Some(bytes) = self.first.take() {
+            self.disclosed = true;
             return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes))));
         }
         match self.receiver.poll_recv(cx) {
             std::task::Poll::Ready(Some(DirectReadEvent::Data(bytes))) => {
+                self.disclosed = true;
                 std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
             }
             std::task::Poll::Ready(Some(DirectReadEvent::Failed(error))) => {
                 self.done = true;
-                std::task::Poll::Ready(Some(Err(std::io::Error::other(error_to_log(&error)))))
+                let control = self.control.clone();
+                let context = self.context.clone();
+                let operation = self.failure_operation;
+                let bucket = self.failure_bucket.clone();
+                let resolution = self.failure_resolution.clone();
+                let error_code = match &error {
+                    TransformedReadError::Pipeline(error) => error.code(),
+                    _ => s4_error::codes::INTERNAL,
+                };
+                tokio::spawn(async move {
+                    record_failed_pipeline_attempt(
+                        control.as_ref(),
+                        &context,
+                        operation.operation_id,
+                        &bucket,
+                        crate::pipeline::PipelineDirection::Read,
+                        Some(&resolution),
+                        error_code,
+                        0,
+                    )
+                    .await;
+                });
+                if !self.disclosed {
+                    let control = self.control.clone();
+                    let context = self.context.clone();
+                    let operation_id = self.grant.operation_id();
+                    tokio::spawn(async move {
+                        let _ = control.release(&context, operation_id).await;
+                    });
+                    self.reservation_owned = false;
+                }
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                    "direct transformed-read pipeline failed",
+                ))))
             }
-            std::task::Poll::Ready(Some(DirectReadEvent::Done { .. })) => {
-                self.done = true;
-                std::task::Poll::Ready(None)
+            std::task::Poll::Ready(Some(DirectReadEvent::Done {
+                source_bytes,
+                output_bytes,
+                evidence,
+            })) => {
+                if source_bytes.max(output_bytes) > self.grant.max_processed_bytes() {
+                    self.done = true;
+                    return std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                        "direct transformed-read exceeded its authorized size",
+                    ))));
+                }
+                let event = UsageEvent::from_grant(&self.grant, source_bytes, output_bytes);
+                let event = match evidence {
+                    Some(evidence) => event.with_pipeline_evidence(evidence),
+                    None => event,
+                };
+                self.settlement = Some(direct_settlement_future(
+                    self.control.clone(),
+                    self.context.clone(),
+                    event,
+                ));
+                self.poll_frame(cx)
             }
             std::task::Poll::Ready(None) => {
                 self.done = true;
@@ -5506,67 +5690,38 @@ impl Drop for DirectReadBody {
         if !self.done {
             self.source_cancellation.cancel();
             self.pipeline_cancellation.cancel();
+            if self.reservation_owned && !self.disclosed {
+                let control = self.control.clone();
+                let context = self.context.clone();
+                let operation_id = self.grant.operation_id();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let _ = control.release(&context, operation_id).await;
+                    });
+                }
+                self.reservation_owned = false;
+            }
         }
     }
-}
-
-fn error_to_log(error: &TransformedReadError) -> String {
-    match error {
-        TransformedReadError::InvalidRequest(detail)
-        | TransformedReadError::Capacity(detail)
-        | TransformedReadError::Source(detail) => detail.clone(),
-        TransformedReadError::Pipeline(error) => error.to_string(),
-        TransformedReadError::Spool(error) => error.to_string(),
-    }
-}
-
-fn direct_read_worker_terminated(
-    key: &str,
-    source_cancellation: &s4_wasm_runtime::CancellationToken,
-    pipeline_cancellation: &s4_wasm_runtime::CancellationToken,
-) -> axum::response::Response {
-    source_cancellation.cancel();
-    pipeline_cancellation.cancel();
-    transformed_read_error_response(
-        key,
-        TransformedReadError::Pipeline(s4_error::S4Error::new(
-            s4_error::codes::INTERNAL,
-            "transformed read worker terminated unexpectedly",
-        )),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn transformed_read_response(
     state: &AppState,
     auth: &Auth,
+    operation: OperationIdentity,
+    grant: &AuthorizationGrant,
+    resolution: &crate::pipeline::PipelineResolution,
     headers: &HeaderMap,
+    snapshot: PipelineSnapshot,
     preflight: (Format, String),
     response_metadata: ObjectMetadata,
     object: OpenedObject,
     key: &str,
-    bucket: &str,
     pipeline_evidence: &mut Option<crate::control::PipelineEvidence>,
-) -> (axum::response::Response, Option<u64>) {
+) -> (axum::response::Response, Option<u64>, bool) {
     let (format, content_type) = preflight;
     *pipeline_evidence = None;
-    let snapshot = match state
-        .gateway
-        .resolve_pipeline(
-            auth.workspace_id().as_str(),
-            bucket,
-            crate::pipeline::PipelineDirection::Read,
-        )
-        .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return (
-                transformed_read_error_response(key, TransformedReadError::Pipeline(error)),
-                None,
-            );
-        }
-    };
     let pipeline_started = std::time::Instant::now();
     let source_cancellation = object.cancellation.clone();
     let source_counters = object.counters.clone();
@@ -5580,17 +5735,24 @@ async fn transformed_read_response(
         .await
     {
         Ok(pipeline) => pipeline,
-        Err(error) => return (transformed_read_error_response(key, error.into()), None),
+        Err(error) => {
+            return (
+                transformed_read_error_response(key, error.into()),
+                None,
+                false,
+            );
+        }
     };
     let direct = snapshot
         .capabilities()
         .iter()
         .all(|capabilities| capabilities.prefix_safe_for_read);
     if direct {
-        // The response body continues executing after this function returns,
-        // so final fuel and duration are not yet knowable. Leave evidence
-        // absent rather than attaching fabricated zero-valued measurements.
         let max_source_frame_bytes = state.source_body_limits.max_frame_bytes;
+        let output_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_output_bytes = output_bytes.clone();
+        let worker_source_counters = source_counters.clone();
+        let worker_snapshot = snapshot.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
         tokio::spawn(async move {
             let result = process_transformed_source(
@@ -5600,7 +5762,10 @@ async fn transformed_read_response(
                 max_source_frame_bytes,
                 |bytes| {
                     let sender = sender.clone();
+                    let output_bytes = worker_output_bytes.clone();
                     async move {
+                        output_bytes
+                            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         sender
                             .send(DirectReadEvent::Data(bytes))
                             .await
@@ -5615,57 +5780,91 @@ async fn transformed_read_response(
             .await;
             let event = match result {
                 Ok(fuel_consumed) => DirectReadEvent::Done {
-                    fuel_consumed,
-                    duration_ms: pipeline_started.elapsed().as_millis() as u64,
+                    source_bytes: worker_source_counters.bytes(),
+                    output_bytes: worker_output_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    evidence: worker_snapshot.pipeline_evidence(
+                        fuel_consumed,
+                        pipeline_started.elapsed().as_millis() as u64,
+                        "none",
+                    ),
                 },
                 Err(error) => DirectReadEvent::Failed(error),
             };
             let _ = sender.send(event).await;
         });
-        return match receiver.recv().await {
-            Some(DirectReadEvent::Data(first)) => {
-                let mut response = axum::response::Response::builder().status(StatusCode::OK);
-                response
-                    .headers_mut()
-                    .unwrap()
-                    .extend(transformed_response_headers(&response_metadata, None));
-                (
-                    response
-                        .body(axum::body::Body::new(DirectReadBody {
-                            first: Some(first),
-                            receiver,
-                            source_cancellation,
-                            pipeline_cancellation,
-                            done: false,
-                        }))
-                        .unwrap(),
-                    None,
-                )
-            }
-            Some(event @ DirectReadEvent::Done { .. }) => {
-                *pipeline_evidence = direct_read_done_evidence(&snapshot, &event);
-                let mut response = axum::response::Response::builder().status(StatusCode::OK);
-                response
-                    .headers_mut()
-                    .unwrap()
-                    .extend(transformed_response_headers(&response_metadata, Some(0)));
-                (
-                    response.body(axum::body::Body::empty()).unwrap(),
-                    Some(source_counters.bytes()),
-                )
-            }
-            None => {
-                let response = direct_read_worker_terminated(
+        let first_event = receiver.recv().await;
+        if let Some(DirectReadEvent::Failed(error)) = first_event {
+            return (transformed_read_error_response(key, error), None, false);
+        }
+        if first_event.is_none() {
+            source_cancellation.cancel();
+            pipeline_cancellation.cancel();
+            return (
+                transformed_read_error_response(
                     key,
-                    &source_cancellation,
-                    &pipeline_cancellation,
-                );
-                (response, None)
+                    TransformedReadError::Pipeline(s4_error::S4Error::new(
+                        s4_error::codes::INTERNAL,
+                        "transformed read worker terminated unexpectedly",
+                    )),
+                ),
+                None,
+                false,
+            );
+        }
+        let (first, content_length, settlement) = match first_event {
+            Some(DirectReadEvent::Data(bytes)) => (Some(bytes), None, None),
+            Some(DirectReadEvent::Done {
+                source_bytes,
+                output_bytes,
+                evidence,
+            }) => {
+                let event = UsageEvent::from_grant(grant, source_bytes, output_bytes);
+                let event = match evidence {
+                    Some(evidence) => event.with_pipeline_evidence(evidence),
+                    None => event,
+                };
+                (
+                    None,
+                    Some(output_bytes),
+                    Some(direct_settlement_future(
+                        state.control.clone(),
+                        auth.context.clone(),
+                        event,
+                    )),
+                )
             }
-            Some(DirectReadEvent::Failed(error)) => {
-                (transformed_read_error_response(key, error), None)
-            }
+            Some(DirectReadEvent::Failed(_)) | None => unreachable!("handled above"),
         };
+        let mut response = axum::response::Response::builder().status(StatusCode::OK);
+        response
+            .headers_mut()
+            .unwrap()
+            .extend(transformed_response_headers(
+                &response_metadata,
+                content_length,
+            ));
+        return (
+            response
+                .body(axum::body::Body::new(DirectReadBody {
+                    first,
+                    receiver,
+                    source_cancellation,
+                    pipeline_cancellation,
+                    control: state.control.clone(),
+                    context: auth.context.clone(),
+                    grant: grant.clone(),
+                    failure_operation: operation,
+                    failure_bucket: grant.bucket().to_string(),
+                    failure_resolution: resolution.clone(),
+                    settlement,
+                    disclosed: false,
+                    reservation_owned: true,
+                    done: false,
+                }))
+                .unwrap(),
+            None,
+            true,
+        );
     }
     if !state.transformed_read_spool_enabled {
         source_cancellation.cancel();
@@ -5678,6 +5877,7 @@ async fn transformed_read_response(
                 ),
             ),
             None,
+            false,
         );
     }
     let spool = match EncryptedReadSpool::begin(
@@ -5688,7 +5888,13 @@ async fn transformed_read_response(
     .await
     {
         Ok(spool) => spool,
-        Err(error) => return (transformed_read_error_response(key, error.into()), None),
+        Err(error) => {
+            return (
+                transformed_read_error_response(key, error.into()),
+                None,
+                false,
+            );
+        }
     };
     let (spool_sender, mut spool_receiver) = tokio::sync::mpsc::channel(2);
     let spool_writer = tokio::spawn(async move {
@@ -5724,12 +5930,12 @@ async fn transformed_read_response(
         Ok(fuel) => fuel,
         Err(error) => {
             let _ = spool_writer.await;
-            return (transformed_read_error_response(key, error), None);
+            return (transformed_read_error_response(key, error), None, false);
         }
     };
     let spool = match spool_writer.await {
         Ok(Ok(spool)) => spool,
-        Ok(Err(error)) => return (transformed_read_error_response(key, error), None),
+        Ok(Err(error)) => return (transformed_read_error_response(key, error), None, false),
         Err(error) => {
             return (
                 transformed_read_error_response(
@@ -5739,6 +5945,7 @@ async fn transformed_read_response(
                     )),
                 ),
                 None,
+                false,
             );
         }
     };
@@ -5749,7 +5956,13 @@ async fn transformed_read_response(
     );
     let (body, content_length) = match spool.into_body(source_cancellation).await {
         Ok(result) => result,
-        Err(error) => return (transformed_read_error_response(key, error.into()), None),
+        Err(error) => {
+            return (
+                transformed_read_error_response(key, error.into()),
+                None,
+                false,
+            );
+        }
     };
     let mut response = axum::response::Response::builder().status(StatusCode::OK);
     response
@@ -5759,7 +5972,11 @@ async fn transformed_read_response(
             &response_metadata,
             Some(content_length),
         ));
-    (response.body(body).unwrap(), Some(source_counters.bytes()))
+    (
+        response.body(body).unwrap(),
+        Some(source_counters.bytes()),
+        false,
+    )
 }
 
 async fn s3_get(
@@ -5835,17 +6052,84 @@ async fn s3_get(
         };
     }
     let operation = request_operation_identity();
-    let authorization = operation.authorization(
-        &bucket,
-        UsageRoute::GetObject,
-        RequestKind::Read,
-        object_max_processed_bytes(&state),
-    );
+    let resolution_started = Instant::now();
+    let resolution = if transformed_read {
+        match state
+            .gateway
+            .resolve(
+                auth.workspace_id().as_str(),
+                &bucket,
+                crate::pipeline::PipelineDirection::Read,
+            )
+            .await
+        {
+            Ok(resolution) => Some(resolution),
+            Err(error) => {
+                record_failed_pipeline_attempt(
+                    state.control.as_ref(),
+                    &auth.context,
+                    operation.operation_id,
+                    &bucket,
+                    crate::pipeline::PipelineDirection::Read,
+                    None,
+                    error.code(),
+                    resolution_started.elapsed().as_millis() as u64,
+                )
+                .await;
+                return pipeline_error_response(&key, &error);
+            }
+        }
+    } else {
+        None
+    };
+    let authorization = match &resolution {
+        Some(resolution) => operation.pipeline_authorization(
+            &bucket,
+            UsageRoute::GetObject,
+            RequestKind::Read,
+            object_max_processed_bytes(&state),
+            resolution,
+        ),
+        None => operation.authorization(
+            &bucket,
+            UsageRoute::GetObject,
+            RequestKind::Read,
+            object_max_processed_bytes(&state),
+        ),
+    };
     let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
         .await
     {
         Ok(grant) => grant,
         Err(response) => return response,
+    };
+    let pipeline_snapshot = if let Some(resolution) = &resolution {
+        match state.gateway.snapshot_for(resolution).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                record_failed_pipeline_attempt(
+                    state.control.as_ref(),
+                    &auth.context,
+                    operation.operation_id,
+                    &bucket,
+                    crate::pipeline::PipelineDirection::Read,
+                    Some(resolution),
+                    error.code(),
+                    resolution_started.elapsed().as_millis() as u64,
+                )
+                .await;
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &grant,
+                    &key,
+                    pipeline_error_response(&key, &error),
+                )
+                .await;
+            }
+        }
+    } else {
+        None
     };
     if transformed_read && state.streaming_read_mode != StreamingReadMode::Transformed {
         return release_failure(
@@ -6030,18 +6314,39 @@ async fn s3_get(
         let source_bytes = content_length(&object.metadata.headers);
         let response_metadata = object.metadata.clone();
         let mut pipeline_evidence = None;
-        let (response, completed_source_bytes) = transformed_read_response(
+        let (response, completed_source_bytes, direct) = transformed_read_response(
             &state,
             &auth,
+            operation,
+            &grant,
+            resolution
+                .as_ref()
+                .expect("transformed reads resolve an immutable pipeline"),
             &headers,
+            pipeline_snapshot.expect("transformed reads resolve a pipeline snapshot"),
             preflight,
             response_metadata,
             object,
             &key,
-            &bucket,
             &mut pipeline_evidence,
         )
         .await;
+        if direct {
+            return response;
+        }
+        if !response.status().is_success() {
+            record_failed_pipeline_attempt(
+                state.control.as_ref(),
+                &auth.context,
+                operation.operation_id,
+                &bucket,
+                crate::pipeline::PipelineDirection::Read,
+                resolution.as_ref(),
+                s4_error::codes::INTERNAL,
+                resolution_started.elapsed().as_millis() as u64,
+            )
+            .await;
+        }
         return metered_read_response(
             state.control.clone(),
             &auth,
@@ -6759,8 +7064,92 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(control.releases.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pipeline_failure_taxonomy_is_stable_bounded_and_opaque() {
+        for (code, status, s3_code) in [
+            (
+                s4_error::codes::WASM_ADMISSION,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SlowDown",
+            ),
+            (
+                s4_error::codes::CONFIG_INVALID,
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+            ),
+            (
+                s4_error::codes::POLICY_TAMPERED,
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+            ),
+            (
+                s4_error::codes::COMPONENT_LOAD,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+            ),
+            (
+                s4_error::codes::INTERNAL,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+            ),
+        ] {
+            let response = pipeline_error_response(
+                "key",
+                &s4_error::S4Error::new(code, "PRINTABLE_GRANTED_SECRET"),
+            );
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains(&format!("<Code>{s3_code}</Code>")));
+            assert!(!body.contains("PRINTABLE_GRANTED_SECRET"));
+        }
+    }
+
+    #[test]
+    fn multipart_pipeline_restore_accepts_new_static_and_rejects_legacy_or_tampered_state() {
+        let limits = PipelineLimits::default();
+        let resolution = crate::pipeline::PipelineResolution {
+            locator: crate::pipeline::PipelineLocator {
+                revision: "static".to_string(),
+                fingerprint: crate::pipeline::resolution_fingerprint(
+                    crate::pipeline::PipelineDirection::Write,
+                    &[],
+                    true,
+                    limits,
+                ),
+            },
+            steps: Vec::new(),
+            policy_generation: None,
+            explicit_passthrough: true,
+            limits,
+        };
+        let snapshot = serde_json::to_value(&resolution).unwrap();
+        assert_eq!(restore_multipart_pipeline(&snapshot).unwrap(), resolution);
+
+        let legacy = serde_json::json!([{
+            "id": Uuid::new_v4(),
+            "name": "legacy",
+            "version": "0.1.0",
+            "enabled": true,
+            "description": ""
+        }]);
+        assert!(matches!(
+            restore_multipart_pipeline(&legacy),
+            Err(MultipartPipelineRestoreError::LegacyRawSnapshot)
+        ));
+
+        let mut tampered = snapshot;
+        tampered["explicit_passthrough"] = serde_json::Value::Bool(false);
+        assert!(matches!(
+            restore_multipart_pipeline(&tampered),
+            Err(MultipartPipelineRestoreError::Invalid(_))
+        ));
     }
 
     #[tokio::test]
@@ -6922,67 +7311,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn direct_body_truncates_after_a_late_pipeline_failure_and_cancels_on_drop() {
-        let source_cancellation = s4_wasm_runtime::CancellationToken::new();
-        let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
-        sender
-            .send(DirectReadEvent::Data(Bytes::from_static(b"safe-prefix")))
-            .await
-            .unwrap();
-        sender
-            .send(DirectReadEvent::Failed(TransformedReadError::Source(
-                "injected late failure".to_string(),
-            )))
-            .await
-            .unwrap();
-        let mut body = DirectReadBody {
-            first: None,
-            receiver,
-            source_cancellation: source_cancellation.clone(),
-            pipeline_cancellation: pipeline_cancellation.clone(),
-            done: false,
-        };
-        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
-        assert_eq!(first, Bytes::from_static(b"safe-prefix"));
-        assert!(body.frame().await.unwrap().is_err());
-        drop(body);
-        assert!(!source_cancellation.is_cancelled());
-        assert!(!pipeline_cancellation.is_cancelled());
-
-        let source_cancellation = s4_wasm_runtime::CancellationToken::new();
-        let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        drop(sender);
-        let mut body = DirectReadBody {
-            first: None,
-            receiver,
-            source_cancellation: source_cancellation.clone(),
-            pipeline_cancellation: pipeline_cancellation.clone(),
-            done: false,
-        };
-        let error = body.frame().await.unwrap().unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "transformed read worker terminated unexpectedly"
-        );
-        assert!(source_cancellation.is_cancelled());
-        assert!(pipeline_cancellation.is_cancelled());
-
-        let source_cancellation = s4_wasm_runtime::CancellationToken::new();
-        let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
-        let response = direct_read_worker_terminated(
-            "private-key",
-            &source_cancellation,
-            &pipeline_cancellation,
-        );
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(response.headers().get(header::ETAG).is_none());
-        assert!(source_cancellation.is_cancelled());
-        assert!(pipeline_cancellation.is_cancelled());
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn transformed_source_returns_post_finish_fuel_for_spooled_evidence() {
         let component = std::fs::read(
@@ -7082,11 +7410,9 @@ mod tests {
                 .is_none()
         );
         let (_, fuel_consumed) = pipeline.finish().await.unwrap();
-        let event = DirectReadEvent::Done {
-            fuel_consumed,
-            duration_ms: 5,
-        };
-        let evidence = direct_read_done_evidence(&snapshot, &event).unwrap();
+        let evidence = snapshot
+            .pipeline_evidence(fuel_consumed, 5, "none")
+            .unwrap();
         assert_eq!(evidence.fuel_consumed, fuel_consumed);
         assert!(evidence.fuel_consumed > 0);
         assert_eq!(evidence.duration_ms, 5);
@@ -7660,6 +7986,29 @@ async fn s3_post(
         if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
             return response;
         }
+        let Some(staging) = staged_multipart(&state).cloned() else {
+            return s3_error::multipart_not_supported(&key);
+        };
+        let identity = multipart_identity(&authentication.auth, &bucket, &key, upload_id);
+        let upload = match staging.repository.get_authorized(&identity).await {
+            Ok(upload) => upload,
+            Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+        };
+        let persisted_resolution = match restore_multipart_pipeline(
+            &upload.snapshot.plugin_snapshot,
+        ) {
+            Ok(resolution) => resolution,
+            Err(MultipartPipelineRestoreError::LegacyRawSnapshot) => {
+                return s3_error::invalid_request(
+                    &key,
+                    "Legacy multipart pipeline snapshots cannot be resumed safely; abort and restart the upload.",
+                );
+            }
+            Err(MultipartPipelineRestoreError::Invalid(error)) => {
+                return pipeline_error_response(&key, &error);
+            }
+        };
         let backend = match resolve_backend(
             &state,
             &authentication.auth,
@@ -7711,19 +8060,6 @@ async fn s3_post(
                 return s3_error::invalid_request(&key, &error);
             }
         };
-        let Some(staging) = staged_multipart(&state).cloned() else {
-            return s3_error::multipart_not_supported(&key);
-        };
-        let identity = multipart_identity(&auth, &bucket, &key, upload_id);
-        let upload = match staging.repository.get_authorized(&identity).await {
-            Ok(upload) => upload,
-            Err(StagingError::NotFound) => {
-                return s3_error::no_such_upload(&key);
-            }
-            Err(error) => {
-                return s3_error::internal_error(&key, &error.to_string());
-            }
-        };
         if let ResolvedBackend::Managed(storage) = &backend {
             let Some(epoch) = upload.namespace_epoch else {
                 let response = s3_error::service_unavailable(
@@ -7747,11 +8083,12 @@ async fn s3_post(
         };
         // Exact retries share an operation; conflicting canonical requests do not.
         let operation = multipart_completion_operation_identity(upload_id, &fingerprint);
-        let authorization = operation.authorization(
+        let authorization = operation.pipeline_authorization(
             &bucket,
             UsageRoute::CompleteMultipartUpload,
             RequestKind::Write,
             object_max_processed_bytes(&state),
+            &persisted_resolution,
         );
         let grant =
             match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
@@ -7913,6 +8250,7 @@ async fn s3_post(
                         grant: &grant,
                     },
                     backend,
+                    &persisted_resolution,
                 ),
             )
             .await;
@@ -7975,6 +8313,33 @@ async fn s3_post(
     info!("POST /{bucket}/{key} user={}", auth.user_id());
 
     if params.uploads.is_some() {
+        let resolution_started = Instant::now();
+        let resolution = match state
+            .gateway
+            .resolve(
+                auth.workspace_id().as_str(),
+                &bucket,
+                crate::pipeline::PipelineDirection::Write,
+            )
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                let operation = request_operation_identity();
+                record_failed_pipeline_attempt(
+                    state.control.as_ref(),
+                    &auth.context,
+                    operation.operation_id,
+                    &bucket,
+                    crate::pipeline::PipelineDirection::Write,
+                    None,
+                    error.code(),
+                    resolution_started.elapsed().as_millis() as u64,
+                )
+                .await;
+                return pipeline_error_response(&key, &error);
+            }
+        };
         let backend =
             match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
             {
@@ -8006,20 +8371,9 @@ async fn s3_post(
         // Freeze and serialize policy before creating managed multipart state.
         // Resolver or serialization failures therefore cannot orphan a managed
         // registration without a corresponding staging upload.
-        let plugin_snapshot = match state
-            .gateway
-            .resolve(
-                auth.workspace_id().as_str(),
-                &bucket,
-                crate::pipeline::PipelineDirection::Write,
-            )
-            .await
-        {
-            Ok(resolution) => match serde_json::to_value(&resolution) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return s3_error::internal_error(&key, &error.to_string()),
-            },
-            Err(error) => return s3_error::invalid_request(&key, error.message()),
+        let plugin_snapshot = match serde_json::to_value(&resolution) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
         };
         let upload_id = Uuid::now_v7().to_string();
         let managed_registration = if let ResolvedBackend::Managed(storage) = &backend {
@@ -9358,6 +9712,119 @@ fn validate_storage_boundary_startup(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct MultipartStartupDependencies {
+    durable_wrapping: bool,
+    database: bool,
+    endpoint: bool,
+    bucket: bool,
+    access_key: bool,
+    secret_key: bool,
+    region: bool,
+    directory: bool,
+    tenant_quota: bool,
+    global_quota: bool,
+    streaming_all: bool,
+}
+
+fn validate_multipart_startup(
+    mode: MultipartMode,
+    dependencies: MultipartStartupDependencies,
+) -> anyhow::Result<()> {
+    if mode != MultipartMode::Staged {
+        return Ok(());
+    }
+    let checks = [
+        (dependencies.durable_wrapping, "durable key wrapping"),
+        (dependencies.database, "DATABASE_URL"),
+        (dependencies.endpoint, "S4_MULTIPART_STAGING_ENDPOINT"),
+        (dependencies.bucket, "S4_MULTIPART_STAGING_BUCKET"),
+        (
+            dependencies.access_key,
+            "S4_MULTIPART_STAGING_ACCESS_KEY_ID",
+        ),
+        (
+            dependencies.secret_key,
+            "S4_MULTIPART_STAGING_SECRET_ACCESS_KEY",
+        ),
+        (dependencies.region, "S4_MULTIPART_STAGING_REGION"),
+        (dependencies.directory, "S4_MULTIPART_STAGING_DIR"),
+        (
+            dependencies.tenant_quota,
+            "S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES",
+        ),
+        (
+            dependencies.global_quota,
+            "S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES",
+        ),
+        (
+            dependencies.streaming_all,
+            "MASKURA_STREAMING_WRITE_MODE=all",
+        ),
+    ];
+    let missing = checks
+        .into_iter()
+        .filter_map(|(configured, name)| (!configured).then_some(name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "staged multipart requires complete durable startup dependencies: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn staged_multipart_startup_requires_every_production_dependency() {
+    let complete = MultipartStartupDependencies {
+        durable_wrapping: true,
+        database: true,
+        endpoint: true,
+        bucket: true,
+        access_key: true,
+        secret_key: true,
+        region: true,
+        directory: true,
+        tenant_quota: true,
+        global_quota: true,
+        streaming_all: true,
+    };
+    validate_multipart_startup(MultipartMode::Staged, complete).unwrap();
+    validate_multipart_startup(
+        MultipartMode::Reject,
+        MultipartStartupDependencies {
+            durable_wrapping: false,
+            ..complete
+        },
+    )
+    .unwrap();
+
+    let missing_one: [fn(&mut MultipartStartupDependencies); 11] = [
+        |value| value.durable_wrapping = false,
+        |value| value.database = false,
+        |value| value.endpoint = false,
+        |value| value.bucket = false,
+        |value| value.access_key = false,
+        |value| value.secret_key = false,
+        |value| value.region = false,
+        |value| value.directory = false,
+        |value| value.tenant_quota = false,
+        |value| value.global_quota = false,
+        |value| value.streaming_all = false,
+    ];
+    for remove in missing_one {
+        let mut incomplete = complete;
+        remove(&mut incomplete);
+        assert!(validate_multipart_startup(MultipartMode::Staged, incomplete).is_err());
+    }
+}
+
+fn nonempty_env(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
+}
+
 fn source_body_limits_from_env() -> anyhow::Result<BodyLimits> {
     Ok(BodyLimits {
         max_frame_bytes: resolve_customer_env(customer_env::SOURCE_MAX_FRAME_BYTES)?
@@ -9504,6 +9971,22 @@ pub async fn build_state_with_pipeline_template(
         })
         .transpose()?;
     let streaming_write_mode = streaming_write_mode()?;
+    validate_multipart_startup(
+        multipart_mode,
+        MultipartStartupDependencies {
+            durable_wrapping: wrapping.is_durable(),
+            database: nonempty_env("DATABASE_URL"),
+            endpoint: nonempty_env("S4_MULTIPART_STAGING_ENDPOINT"),
+            bucket: nonempty_env("S4_MULTIPART_STAGING_BUCKET"),
+            access_key: nonempty_env("S4_MULTIPART_STAGING_ACCESS_KEY_ID"),
+            secret_key: nonempty_env("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY"),
+            region: nonempty_env("S4_MULTIPART_STAGING_REGION"),
+            directory: nonempty_env("S4_MULTIPART_STAGING_DIR"),
+            tenant_quota: nonempty_env("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES"),
+            global_quota: nonempty_env("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES"),
+            streaming_all: streaming_write_mode >= StreamingWriteMode::All,
+        },
+    )?;
     let s3_streaming_capabilities = configured_s3_streaming_capabilities()?;
     let managed_streaming_capabilities = configured_managed_streaming_capabilities();
     let spool_max_object_bytes = resolve_customer_env(customer_env::SPOOL_MAX_OBJECT_BYTES)?

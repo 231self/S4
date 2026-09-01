@@ -37,7 +37,8 @@ fn s3_internal_error_returns_500_xml() {
     assert_eq!(status_of(&resp), StatusCode::INTERNAL_SERVER_ERROR);
     let body = body_of(resp);
     assert!(body.contains("<Code>InternalError</Code>"));
-    assert!(body.contains("something broke"));
+    assert!(body.contains("We encountered an internal error."));
+    assert!(!body.contains("something broke"));
 }
 
 #[test]

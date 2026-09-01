@@ -3,6 +3,19 @@ use uuid::Uuid;
 
 use crate::object::harden_object_response_headers;
 
+const MAX_S3_ERROR_FIELD_BYTES: usize = 1024;
+
+fn bounded_field(value: &str) -> String {
+    let mut output = String::with_capacity(value.len().min(MAX_S3_ERROR_FIELD_BYTES));
+    for character in value.chars() {
+        if output.len() + character.len_utf8() > MAX_S3_ERROR_FIELD_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
 fn push_xml_text(output: &mut String, value: &str) {
     for character in value.chars() {
         match character {
@@ -34,9 +47,9 @@ fn push_xml_element(output: &mut String, name: &'static str, value: &str) {
 
 fn s3_error_body(code: &str, message: &str, resource: &str, request_id: &str) -> String {
     let mut body = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n");
-    push_xml_element(&mut body, "Code", code);
-    push_xml_element(&mut body, "Message", message);
-    push_xml_element(&mut body, "Key", resource);
+    push_xml_element(&mut body, "Code", &bounded_field(code));
+    push_xml_element(&mut body, "Message", &bounded_field(message));
+    push_xml_element(&mut body, "Key", &bounded_field(resource));
     push_xml_element(&mut body, "RequestId", request_id);
     body.push_str("</Error>");
     body
@@ -69,12 +82,10 @@ pub fn no_such_key(key: &str) -> axum::response::Response {
     )
 }
 
-pub fn internal_error(key: &str, detail: &str) -> axum::response::Response {
-    let mut message = String::from("We encountered an internal error: ");
-    message.push_str(detail);
+pub fn internal_error(key: &str, _detail: &str) -> axum::response::Response {
     s3_error_xml(
         "InternalError",
-        &message,
+        "We encountered an internal error.",
         key,
         StatusCode::INTERNAL_SERVER_ERROR,
     )
@@ -205,7 +216,8 @@ pub fn bucket_not_allowed(bucket: &str) -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
-    use super::s3_error_body;
+    use super::{MAX_S3_ERROR_FIELD_BYTES, internal_error, s3_error_body};
+    use http_body_util::BodyExt as _;
 
     #[test]
     fn every_dynamic_error_field_is_xml_text_not_markup() {
@@ -231,5 +243,16 @@ mod tests {
             body.contains("bucket/&lt;Injected&gt;resource&lt;/Injected&gt;&amp;&quot;&apos;�")
         );
         assert!(body.contains("request&lt;/RequestId&gt;&lt;Injected request=&quot;1&quot;&gt;"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_fields_are_globally_bounded_and_internal_detail_is_opaque() {
+        let secret = "PRINTABLE_GRANTED_SECRET";
+        let response = internal_error(&"k".repeat(4096), &format!("{secret}{}", "x".repeat(4096)));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains(secret));
+        assert!(body.contains("We encountered an internal error."));
+        assert!(body.len() < MAX_S3_ERROR_FIELD_BYTES + 512);
     }
 }

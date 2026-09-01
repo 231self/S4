@@ -47,8 +47,8 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request, StatusCode, header};
 use s4_gateway::control::{
-    AuthenticatedRequestContext, AuthorizationError, ControlPlane, MeteringError,
-    UsageAuthorization, UsageEvent, UsageRoute,
+    AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
+    ControlPlane, MeteringError, UsageAuthorization, UsageEvent, UsageRoute,
 };
 use s4_gateway::server::{build_router, build_state};
 use tower::ServiceExt;
@@ -61,6 +61,7 @@ static DB_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Default)]
 struct MultipartBillingControl {
     authorizations: Mutex<Vec<(AuthenticatedRequestContext, UsageAuthorization)>>,
+    grants: Mutex<HashMap<uuid::Uuid, AuthorizationGrant>>,
     releases: Mutex<Vec<(AuthenticatedRequestContext, uuid::Uuid)>>,
     events: Mutex<Vec<(AuthenticatedRequestContext, UsageEvent)>>,
 }
@@ -71,12 +72,19 @@ impl ControlPlane for MultipartBillingControl {
         &self,
         context: &AuthenticatedRequestContext,
         authorization: &UsageAuthorization,
-    ) -> Result<Option<s4_gateway::control::BlockReason>, AuthorizationError> {
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
         self.authorizations
             .lock()
             .unwrap()
             .push((context.clone(), authorization.clone()));
-        Ok(None)
+        let grant = self
+            .grants
+            .lock()
+            .unwrap()
+            .entry(authorization.operation_id())
+            .or_insert_with(|| AuthorizationGrant::new(authorization, chrono::Utc::now(), 1))
+            .clone();
+        Ok(AuthorizationDecision::Granted(grant))
     }
 
     async fn release(
@@ -1908,7 +1916,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, event)| event.route == UsageRoute::CompleteMultipartUpload)
+            .filter(|(_, event)| event.route() == UsageRoute::CompleteMultipartUpload)
             .cloned()
             .collect();
         assert_eq!(completion_authorizations.len(), 4);
@@ -1918,7 +1926,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         assert_eq!(completion_events[0], completion_events[1]);
         assert_eq!(
             completion_authorizations[0].1.operation_id(),
-            completion_events[0].1.operation_id
+            completion_events[0].1.operation_id()
         );
         let journal_operation =
             object_operation::Entity::find_by_id(completion_authorizations[0].1.operation_id())

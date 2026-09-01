@@ -42,8 +42,9 @@ use crate::backend::{
     WorkspaceEndpointPolicy,
 };
 use crate::control::{
-    AuthenticatedRequestContext, AuthorizationError, ControlPlane, MeteringError, RequestKind,
-    StreamingWriteMode, UsageAuthorization, UsageEvent, UsageRoute,
+    AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
+    ControlPlane, MeteringError, RequestKind, StreamingWriteMode, UsageAuthorization, UsageEvent,
+    UsageRoute,
 };
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
@@ -156,8 +157,7 @@ struct OperationIdentity {
 }
 
 struct OperationUsage<'a> {
-    operation: OperationIdentity,
-    authorization: &'a UsageAuthorization,
+    grant: &'a AuthorizationGrant,
     source_bytes: u64,
     output_bytes: u64,
 }
@@ -165,27 +165,17 @@ struct OperationUsage<'a> {
 #[derive(Clone, Copy)]
 struct AuthorizedOperation<'a> {
     auth: &'a Auth,
-    authorization: &'a UsageAuthorization,
-    receipt_id: Uuid,
+    grant: &'a AuthorizationGrant,
 }
 
 #[derive(Clone, Copy)]
 struct AuthorizedUsage<'a> {
-    operation: OperationIdentity,
-    authorization: &'a UsageAuthorization,
+    grant: &'a AuthorizationGrant,
 }
 
 impl OperationUsage<'_> {
     fn event(&self) -> UsageEvent {
-        UsageEvent::new(
-            self.operation.receipt_id,
-            self.authorization.operation_id(),
-            self.authorization.bucket(),
-            self.authorization.kind(),
-            self.authorization.route(),
-            self.source_bytes,
-            self.output_bytes,
-        )
+        UsageEvent::from_grant(self.grant, self.source_bytes, self.output_bytes)
     }
 }
 
@@ -209,7 +199,14 @@ impl OperationIdentity {
         kind: RequestKind,
         max_processed_bytes: u64,
     ) -> UsageAuthorization {
-        UsageAuthorization::new(self.operation_id, bucket, route, kind, max_processed_bytes)
+        UsageAuthorization::new(
+            self.operation_id,
+            self.receipt_id,
+            bucket,
+            route,
+            kind,
+            max_processed_bytes,
+        )
     }
 }
 
@@ -265,10 +262,16 @@ async fn authorize_request(
     context: &AuthenticatedRequestContext,
     authorization: &UsageAuthorization,
     key: &str,
-) -> Result<(), axum::response::Response> {
+) -> Result<AuthorizationGrant, axum::response::Response> {
     match control.authorize(context, authorization).await {
-        Ok(None) => Ok(()),
-        Ok(Some(reason)) => Err(s3_error::payment_required(key, reason.message)),
+        Ok(AuthorizationDecision::Granted(grant)) if grant.matches(authorization) => Ok(grant),
+        Ok(AuthorizationDecision::Granted(_)) => Err(s3_error::service_unavailable(
+            key,
+            "Authorization returned an invalid grant.",
+        )),
+        Ok(AuthorizationDecision::Blocked(reason)) => {
+            Err(s3_error::payment_required(key, reason.message))
+        }
         Err(AuthorizationError::Unavailable) => Err(s3_error::service_unavailable(
             key,
             "Authorization is temporarily unavailable.",
@@ -279,15 +282,15 @@ async fn authorize_request(
 async fn release_failure(
     control: &dyn ControlPlane,
     context: &AuthenticatedRequestContext,
-    authorization: &UsageAuthorization,
+    grant: &AuthorizationGrant,
     key: &str,
     response: axum::response::Response,
 ) -> axum::response::Response {
-    match control.release(context, authorization.operation_id()).await {
+    match control.release(context, grant.operation_id()).await {
         Ok(()) => response,
         Err(AuthorizationError::Unavailable) => {
             warn!(
-                operation_id = %authorization.operation_id(),
+                operation_id = %grant.operation_id(),
                 "usage reservation was not released"
             );
             s3_error::service_unavailable(
@@ -305,7 +308,7 @@ async fn record_usage(
     key: &str,
 ) -> Result<(), axum::response::Response> {
     control.record(context, event).await.map_err(|error| {
-        warn!(event_id = %event.id, ?error, "usage event was not recorded");
+        warn!(event_id = %event.receipt_id(), ?error, "usage event was not recorded");
         metering_error_response(key, error)
     })
 }
@@ -340,7 +343,7 @@ async fn record_durable_operation_with_event(
         .await
         .map_err(|error| {
             warn!(
-                operation_id = %event.operation_id,
+                operation_id = %event.operation_id(),
                 error = %error,
                 "failed to persist usage evidence"
             );
@@ -350,19 +353,10 @@ async fn record_durable_operation_with_event(
 }
 
 fn multipart_completion_event(
-    authorization: &UsageAuthorization,
+    grant: &AuthorizationGrant,
     result: &MultipartCompletionResult,
-    receipt_id: Uuid,
 ) -> UsageEvent {
-    let event = UsageEvent::new(
-        receipt_id,
-        authorization.operation_id(),
-        authorization.bucket(),
-        authorization.kind(),
-        authorization.route(),
-        result.source_bytes,
-        result.size_bytes,
-    );
+    let event = UsageEvent::from_grant(grant, result.source_bytes, result.size_bytes);
     match &result.pipeline_evidence {
         Some(evidence) => event.with_pipeline_evidence(evidence.clone()),
         None => event,
@@ -372,6 +366,8 @@ fn multipart_completion_event(
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct DurableUsageEvidence {
     receipt_id: Uuid,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    rate_version: i32,
     source_bytes: u64,
     output_bytes: u64,
     processed_bytes: u64,
@@ -385,14 +381,16 @@ struct DurableUsageEvidence {
 impl From<&UsageEvent> for DurableUsageEvidence {
     fn from(event: &UsageEvent) -> Self {
         Self {
-            receipt_id: event.id,
-            source_bytes: event.source_bytes,
-            output_bytes: event.output_bytes,
-            processed_bytes: event.processed_bytes,
-            route: event.route.as_str().to_string(),
-            kind: event.kind.as_str().to_string(),
-            bucket: event.bucket.clone(),
-            pipeline_evidence: event.pipeline_evidence.clone(),
+            receipt_id: event.receipt_id(),
+            occurred_at: event.occurred_at(),
+            rate_version: event.rate_version(),
+            source_bytes: event.source_bytes(),
+            output_bytes: event.output_bytes(),
+            processed_bytes: event.processed_bytes(),
+            route: event.route().as_str().to_string(),
+            kind: event.kind().as_str().to_string(),
+            bucket: event.bucket().to_string(),
+            pipeline_evidence: event.pipeline_evidence().cloned(),
         }
     }
 }
@@ -413,7 +411,7 @@ async fn persist_usage_evidence(
     // A process may have a Postgres journal because DATABASE_URL is set while
     // writing to the development memory sink. That sink has no operation row;
     // skip evidence rather than violating the evidence foreign key.
-    if journal.get(event.operation_id).await?.is_none() {
+    if journal.get(event.operation_id()).await?.is_none() {
         return Ok(());
     }
     append_usage_evidence(journal, event).await
@@ -427,7 +425,7 @@ async fn persist_transaction_usage_evidence(
     let Some(durable_operation_id) = durable_operation_id else {
         return Ok(());
     };
-    if durable_operation_id != event.operation_id {
+    if durable_operation_id != event.operation_id() {
         return Err(JournalError::Corrupt(
             "sink operation does not match usage evidence operation".to_string(),
         ));
@@ -448,12 +446,12 @@ async fn append_usage_evidence(
     event: &UsageEvent,
 ) -> Result<(), JournalError> {
     let mut evidence = EvidenceRecord::new(
-        event.operation_id,
+        event.operation_id(),
         "usage",
         serde_json::to_value(DurableUsageEvidence::from(event))
             .map_err(|error| JournalError::Persistence(error.to_string()))?,
     );
-    evidence.id = usage_evidence_id(event.id);
+    evidence.id = usage_evidence_id(event.receipt_id());
     journal.append_evidence(evidence).await
 }
 
@@ -510,57 +508,34 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 async fn metered_read_response(
     control: Arc<dyn ControlPlane>,
     auth: &Auth,
-    operation: OperationIdentity,
-    authorization: &UsageAuthorization,
+    grant: &AuthorizationGrant,
     key: &str,
     source_bytes: Option<u64>,
     response: axum::response::Response,
     pipeline_evidence: Option<crate::control::PipelineEvidence>,
 ) -> axum::response::Response {
     if !response.status().is_success() {
-        return release_failure(
-            control.as_ref(),
-            &auth.context,
-            authorization,
-            key,
-            response,
-        )
-        .await;
+        return release_failure(control.as_ref(), &auth.context, grant, key, response).await;
     }
     let Some(bytes) = admitted_response_bytes(&response) else {
         let response = s3_error::service_unavailable(
             key,
             "The response size is unavailable for usage metering.",
         );
-        return release_failure(
-            control.as_ref(),
-            &auth.context,
-            authorization,
-            key,
-            response,
-        )
-        .await;
+        return release_failure(control.as_ref(), &auth.context, grant, key, response).await;
     };
     let source_bytes = source_bytes.unwrap_or(bytes);
-    if source_bytes.max(bytes) > authorization.max_processed_bytes() {
+    if source_bytes.max(bytes) > grant.max_processed_bytes() {
         return release_failure(
             control.as_ref(),
             &auth.context,
-            authorization,
+            grant,
             key,
             s3_error::entity_too_large(key),
         )
         .await;
     }
-    let event = UsageEvent::new(
-        operation.receipt_id,
-        authorization.operation_id(),
-        authorization.bucket(),
-        authorization.kind(),
-        authorization.route(),
-        source_bytes,
-        bytes,
-    );
+    let event = UsageEvent::from_grant(grant, source_bytes, bytes);
     let event = match pipeline_evidence {
         Some(evidence) => event.with_pipeline_evidence(evidence),
         None => event,
@@ -2726,7 +2701,7 @@ fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::re
 async fn streaming_put_failure_response(
     control: &dyn ControlPlane,
     context: &AuthenticatedRequestContext,
-    authorization: &UsageAuthorization,
+    grant: &AuthorizationGrant,
     key: &str,
     error: StreamingPutError,
 ) -> axum::response::Response {
@@ -2735,7 +2710,7 @@ async fn streaming_put_failure_response(
     if preserve_reservation {
         response
     } else {
-        release_failure(control, context, authorization, key, response).await
+        release_failure(control, context, grant, key, response).await
     }
 }
 
@@ -2863,7 +2838,7 @@ async fn begin_streaming_sink(
 
 fn direct_operation_scope(operation: AuthorizedOperation<'_>) -> DirectOperationScope {
     DirectOperationScope {
-        operation_id: operation.authorization.operation_id(),
+        operation_id: operation.grant.operation_id(),
         tenant_id: operation.auth.workspace_id().as_str().to_string(),
     }
 }
@@ -2968,8 +2943,7 @@ async fn streaming_single_put(
 > {
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
-    let authorization = usage.authorization;
-    let receipt_id = usage.operation.receipt_id;
+    let grant = usage.grant;
 
     if authentication.body_verifier.is_none() && headers.contains_key(header::CONTENT_ENCODING) {
         return Err(StreamingPutError::InvalidRequest(
@@ -2999,10 +2973,9 @@ async fn streaming_single_put(
         backend,
         AuthorizedOperation {
             auth: &authentication.auth,
-            authorization,
-            receipt_id,
+            grant,
         },
-        authorization.bucket(),
+        grant.bucket(),
         key,
         &content_type,
     )
@@ -3028,7 +3001,7 @@ async fn streaming_single_put(
         .gateway
         .resolve_pipeline(
             authentication.auth.workspace_id().as_str(),
-            authorization.bucket(),
+            grant.bucket(),
             crate::pipeline::PipelineDirection::Write,
         )
         .await?;
@@ -3133,15 +3106,7 @@ async fn streaming_single_put(
         let output_digest = hex::encode(output_hasher.finalize());
         let mut sink = sink.lock().await;
         sink.verify_output(output_bytes, &output_digest).await?;
-        let mut usage_event = UsageEvent::new(
-            receipt_id,
-            authorization.operation_id(),
-            authorization.bucket(),
-            authorization.kind(),
-            authorization.route(),
-            input_bytes,
-            output_bytes,
-        );
+        let mut usage_event = UsageEvent::from_grant(grant, input_bytes, output_bytes);
         if let Some(evidence) = &pipeline_evidence {
             usage_event = usage_event.with_pipeline_evidence(evidence.clone());
         }
@@ -3177,7 +3142,7 @@ async fn streaming_single_put(
             if !preserve_reservation && let Err(abort_error) = sink.lock().await.abort().await {
                 warn!(
                     "streaming sink abort failed for /{}/{key}: {abort_error}",
-                    authorization.bucket()
+                    grant.bucket()
                 );
             }
             sink_guard.disarm();
@@ -3267,8 +3232,7 @@ async fn streaming_avro_single_put(
 > {
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
-    let authorization = usage.authorization;
-    let receipt_id = usage.operation.receipt_id;
+    let grant = usage.grant;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -3329,10 +3293,9 @@ async fn streaming_avro_single_put(
         backend,
         AuthorizedOperation {
             auth: &authentication.auth,
-            authorization,
-            receipt_id,
+            grant,
         },
-        authorization.bucket(),
+        grant.bucket(),
         key,
         &content_type,
     )
@@ -3343,15 +3306,7 @@ async fn streaming_avro_single_put(
         let mut sink = sink_guard.sink.lock().await;
         sink.write(bytes::Bytes::from(output)).await?;
         sink.verify_output(output_bytes, &digest).await?;
-        let usage_event = UsageEvent::new(
-            receipt_id,
-            authorization.operation_id(),
-            authorization.bucket(),
-            authorization.kind(),
-            authorization.route(),
-            input_bytes,
-            output_bytes,
-        );
+        let usage_event = UsageEvent::from_grant(grant, input_bytes, output_bytes);
         persist_transaction_usage_evidence(
             state.operation_journal.as_ref(),
             sink.durable_operation_id(),
@@ -4076,11 +4031,7 @@ async fn complete_staged_multipart(
         persist_transaction_usage_evidence(
             state.operation_journal.as_ref(),
             sink.durable_operation_id(),
-            &multipart_completion_event(
-                operation.authorization,
-                &precommit_result,
-                operation.receipt_id,
-            ),
+            &multipart_completion_event(operation.grant, &precommit_result),
         )
         .await
         .map_err(TransactionError::from)
@@ -4151,7 +4102,7 @@ fn multipart_completion_error_response(
 async fn multipart_completion_failure_response(
     control: &dyn ControlPlane,
     context: &AuthenticatedRequestContext,
-    authorization: &UsageAuthorization,
+    grant: &AuthorizationGrant,
     key: &str,
     error: MultipartCompletionError,
 ) -> axum::response::Response {
@@ -4160,7 +4111,7 @@ async fn multipart_completion_failure_response(
     if preserve_reservation {
         response
     } else {
-        release_failure(control, context, authorization, key, response).await
+        release_failure(control, context, grant, key, response).await
     }
 }
 
@@ -4384,11 +4335,7 @@ async fn complete_staged_avro_multipart(
         persist_transaction_usage_evidence(
             state.operation_journal.as_ref(),
             sink.durable_operation_id(),
-            &multipart_completion_event(
-                operation.authorization,
-                &precommit_result,
-                operation.receipt_id,
-            ),
+            &multipart_completion_event(operation.grant, &precommit_result),
         )
         .await
         .map_err(TransactionError::from)
@@ -4749,11 +4696,12 @@ async fn s3_put(
         RequestKind::Write,
         object_max_processed_bytes(&state),
     );
-    if let Err(response) =
-        authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
+    let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
+        .await
     {
-        return response;
-    }
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
     let tenant_write_mode = state
         .control
         .streaming_write_mode(&auth.context)
@@ -4766,7 +4714,7 @@ async fn s3_put(
             return release_failure(
                 state.control.as_ref(),
                 &auth_context,
-                &authorization,
+                &grant,
                 &key,
                 backend_resolution_error_response(&key),
             )
@@ -4778,7 +4726,7 @@ async fn s3_put(
         return release_failure(
             state.control.as_ref(),
             &auth.context,
-            &authorization,
+            &grant,
             &key,
             response,
         )
@@ -4794,7 +4742,7 @@ async fn s3_put(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     response,
                 )
@@ -4804,7 +4752,7 @@ async fn s3_put(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::not_implemented(&key),
                 )
@@ -4820,7 +4768,7 @@ async fn s3_put(
         return release_failure(
             state.control.as_ref(),
             &auth.context,
-            &authorization,
+            &grant,
             &key,
             s3_error::not_implemented(&key),
         )
@@ -4830,10 +4778,7 @@ async fn s3_put(
         &state,
         header_auth,
         backend,
-        AuthorizedUsage {
-            operation,
-            authorization: &authorization,
-        },
+        AuthorizedUsage { grant: &grant },
         &parts.headers,
         request_body,
         &key,
@@ -4842,8 +4787,7 @@ async fn s3_put(
     {
         Ok((auth, stored, source_bytes, output_bytes, pipeline_evidence)) => {
             let usage = OperationUsage {
-                operation,
-                authorization: &authorization,
+                grant: &grant,
                 source_bytes,
                 output_bytes,
             };
@@ -4873,7 +4817,7 @@ async fn s3_put(
             streaming_put_failure_response(
                 state.control.as_ref(),
                 &auth_context,
-                &authorization,
+                &grant,
                 &key,
                 error,
             )
@@ -5759,16 +5703,17 @@ async fn s3_get(
         RequestKind::Read,
         object_max_processed_bytes(&state),
     );
-    if let Err(response) =
-        authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
+    let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
+        .await
     {
-        return response;
-    }
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
     if transformed_read && state.streaming_read_mode != StreamingReadMode::Transformed {
         return release_failure(
             state.control.as_ref(),
             &auth.context,
-            &authorization,
+            &grant,
             &key,
             s3_error::transformed_read_not_supported(&key),
         )
@@ -5780,7 +5725,7 @@ async fn s3_get(
             return release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &key,
                 backend_resolution_error_response(&key),
             )
@@ -5801,7 +5746,7 @@ async fn s3_get(
             return release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &key,
                 response,
             )
@@ -5823,7 +5768,7 @@ async fn s3_get(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     open_error_response(&key, error),
                 )
@@ -5863,8 +5808,7 @@ async fn s3_get(
             return metered_read_response(
                 state.control.clone(),
                 &auth,
-                operation,
-                &authorization,
+                &grant,
                 &key,
                 source_bytes.or(completed_source_bytes),
                 response,
@@ -5878,7 +5822,7 @@ async fn s3_get(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     transformed_read_error_response(&key, error),
                 )
@@ -5893,7 +5837,7 @@ async fn s3_get(
                     return release_failure(
                         state.control.as_ref(),
                         &auth.context,
-                        &authorization,
+                        &grant,
                         &key,
                         open_error_response(&key, error),
                     )
@@ -5907,7 +5851,7 @@ async fn s3_get(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     transformed_read_error_response(&key, error),
                 )
@@ -5928,7 +5872,7 @@ async fn s3_get(
             return release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &key,
                 response,
             )
@@ -5939,7 +5883,7 @@ async fn s3_get(
             return release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &key,
                 response,
             )
@@ -5963,8 +5907,7 @@ async fn s3_get(
         return metered_read_response(
             state.control.clone(),
             &auth,
-            operation,
-            &authorization,
+            &grant,
             &key,
             source_bytes.or(completed_source_bytes),
             response,
@@ -5979,7 +5922,7 @@ async fn s3_get(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     open_error_response(&key, error),
                 )
@@ -5991,7 +5934,7 @@ async fn s3_get(
         return release_failure(
             state.control.as_ref(),
             &auth.context,
-            &authorization,
+            &grant,
             &key,
             response,
         )
@@ -6002,8 +5945,7 @@ async fn s3_get(
         return metered_read_response(
             state.control.clone(),
             &auth,
-            operation,
-            &authorization,
+            &grant,
             &key,
             None,
             object.into_response(),
@@ -6018,7 +5960,7 @@ async fn s3_get(
     release_failure(
         state.control.as_ref(),
         &auth.context,
-        &authorization,
+        &grant,
         &key,
         s3_error::not_implemented(&key),
     )
@@ -6038,6 +5980,16 @@ mod tests {
     use http_body::{Frame, SizeHint};
 
     use super::*;
+
+    fn test_grant(authorization: &UsageAuthorization) -> AuthorizationGrant {
+        AuthorizationGrant::new(
+            authorization,
+            chrono::DateTime::parse_from_rfc3339("2026-08-31T12:34:56Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            7,
+        )
+    }
 
     #[test]
     fn avro_content_types_are_distinguished_from_text_formats() {
@@ -6073,9 +6025,9 @@ mod tests {
         async fn authorize(
             &self,
             _context: &AuthenticatedRequestContext,
-            _authorization: &UsageAuthorization,
-        ) -> Result<Option<crate::control::BlockReason>, AuthorizationError> {
-            Ok(None)
+            authorization: &UsageAuthorization,
+        ) -> Result<AuthorizationDecision, AuthorizationError> {
+            Ok(AuthorizationDecision::Granted(test_grant(authorization)))
         }
 
         async fn release(
@@ -6191,33 +6143,58 @@ mod tests {
     async fn persist_usage_evidence_writes_durable_journal_record() {
         let journal: Arc<dyn OperationJournal> =
             Arc::new(crate::transaction::InMemoryOperationJournal::new());
-        let event = UsageEvent::new(
+        let authorization = UsageAuthorization::new(
             Uuid::now_v7(),
             Uuid::now_v7(),
             "bucket",
-            RequestKind::Write,
             UsageRoute::PutObject,
+            RequestKind::Write,
             64,
-            32,
         );
-        insert_test_usage_intent(&journal, event.operation_id).await;
+        let pipeline_evidence = crate::control::PipelineEvidence {
+            revision: "revision-7".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            components: "component-a,component-b".to_string(),
+            fuel_consumed: 123,
+            duration_ms: 45,
+            spool_mode: "encrypted".to_string(),
+        };
+        let event = UsageEvent::from_grant(&test_grant(&authorization), 64, 32)
+            .with_pipeline_evidence(pipeline_evidence);
+        insert_test_usage_intent(&journal, event.operation_id()).await;
         persist_usage_evidence(Some(&journal), &event)
             .await
             .unwrap();
 
-        let evidence = journal.evidence(event.operation_id).await.unwrap();
+        let evidence = journal.evidence(event.operation_id()).await.unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].kind, "usage");
         assert_eq!(
             evidence[0].detail["receipt_id"].as_str().unwrap(),
-            event.id.to_string()
+            event.receipt_id().to_string()
         );
         assert_eq!(evidence[0].detail["source_bytes"].as_u64(), Some(64));
         assert_eq!(evidence[0].detail["output_bytes"].as_u64(), Some(32));
         assert_eq!(evidence[0].detail["processed_bytes"].as_u64(), Some(64));
+        assert_eq!(
+            evidence[0].detail["occurred_at"],
+            serde_json::json!(event.occurred_at())
+        );
+        assert_eq!(evidence[0].detail["rate_version"].as_i64(), Some(7));
         assert_eq!(evidence[0].detail["route"].as_str(), Some("PutObject"));
         assert_eq!(evidence[0].detail["kind"].as_str(), Some("write"));
         assert_eq!(evidence[0].detail["bucket"].as_str(), Some("bucket"));
+        assert_eq!(
+            evidence[0].detail["pipeline_evidence"],
+            serde_json::json!({
+                "revision": "revision-7",
+                "fingerprint": "fingerprint",
+                "components": "component-a,component-b",
+                "fuel_consumed": 123,
+                "duration_ms": 45,
+                "spool_mode": "encrypted",
+            })
+        );
     }
 
     #[tokio::test]
@@ -6225,16 +6202,16 @@ mod tests {
         let concrete = Arc::new(crate::transaction::InMemoryOperationJournal::new());
         concrete.fail_next_evidence_appends(1);
         let journal: Arc<dyn OperationJournal> = concrete;
-        let event = UsageEvent::new(
+        let authorization = UsageAuthorization::new(
             Uuid::now_v7(),
             Uuid::now_v7(),
             "bucket",
-            RequestKind::Write,
             UsageRoute::PutObject,
-            8,
+            RequestKind::Write,
             8,
         );
-        insert_test_usage_intent(&journal, event.operation_id).await;
+        let event = UsageEvent::from_grant(&test_grant(&authorization), 8, 8);
+        insert_test_usage_intent(&journal, event.operation_id()).await;
 
         assert!(
             persist_usage_evidence(Some(&journal), &event)
@@ -6243,7 +6220,7 @@ mod tests {
         );
         assert!(
             journal
-                .evidence(event.operation_id)
+                .evidence(event.operation_id())
                 .await
                 .unwrap()
                 .is_empty()
@@ -6265,22 +6242,22 @@ mod tests {
             1024,
         )
         .unwrap();
-        let event = UsageEvent::new(
+        let authorization = UsageAuthorization::new(
             Uuid::now_v7(),
             Uuid::now_v7(),
             "bucket",
-            RequestKind::Write,
             UsageRoute::PutObject,
-            8,
+            RequestKind::Write,
             8,
         );
+        let event = UsageEvent::from_grant(&test_grant(&authorization), 8, 8);
 
         persist_transaction_usage_evidence(Some(&journal), sink.durable_operation_id(), &event)
             .await
             .unwrap();
         assert!(
             journal
-                .evidence(event.operation_id)
+                .evidence(event.operation_id())
                 .await
                 .unwrap()
                 .is_empty()
@@ -6298,6 +6275,7 @@ mod tests {
             RequestKind::Write,
             128,
         );
+        let grant = test_grant(&authorization);
         let pipeline_evidence = crate::control::PipelineEvidence {
             revision: "revision-a".to_string(),
             fingerprint: "fingerprint-a".to_string(),
@@ -6317,7 +6295,7 @@ mod tests {
         insert_test_usage_intent(&journal, identity.operation_id).await;
         persist_usage_evidence(
             Some(&journal),
-            &multipart_completion_event(&authorization, &precommit_result, identity.receipt_id),
+            &multipart_completion_event(&grant, &precommit_result),
         )
         .await
         .unwrap();
@@ -6420,11 +6398,11 @@ mod tests {
         };
         let authorization =
             operation.authorization("bucket-a", UsageRoute::GetObject, RequestKind::Read, 1024);
+        let grant = test_grant(&authorization);
         let response = metered_read_response(
             control.clone(),
             &auth,
-            operation,
-            &authorization,
+            &grant,
             "key-a",
             None,
             axum::response::Response::new(Body::from("range")),
@@ -6435,15 +6413,7 @@ mod tests {
             *control.calls.lock().unwrap(),
             vec![UsageCall {
                 context: auth.context.clone(),
-                event: UsageEvent::new(
-                    operation.receipt_id,
-                    operation.operation_id,
-                    "bucket-a",
-                    RequestKind::Read,
-                    UsageRoute::GetObject,
-                    5,
-                    5,
-                ),
+                event: UsageEvent::from_grant(&grant, 5, 5),
             }]
         );
 
@@ -6474,11 +6444,11 @@ mod tests {
         };
         let authorization =
             operation.authorization("bucket-a", UsageRoute::GetObject, RequestKind::Read, 1024);
+        let grant = test_grant(&authorization);
         let response = metered_read_response(
             control,
             &auth,
-            operation,
-            &authorization,
+            &grant,
             "key-a",
             None,
             axum::response::Response::new(Body::from("range")),
@@ -6559,11 +6529,11 @@ mod tests {
         let operation = request_operation_identity();
         let authorization =
             operation.authorization("bucket", UsageRoute::PutObject, RequestKind::Write, 64);
+        let grant = test_grant(&authorization);
 
         let scope = direct_operation_scope(AuthorizedOperation {
             auth: &auth,
-            authorization: &authorization,
-            receipt_id: operation.receipt_id,
+            grant: &grant,
         });
 
         assert_eq!(scope.operation_id, authorization.operation_id());
@@ -6587,6 +6557,7 @@ mod tests {
             64,
         );
         insert_test_usage_intent(&journal, operation.operation_id).await;
+        let grant = test_grant(&authorization);
 
         let result = MultipartCompletionResult {
             etag: Some("\"etag\"".to_string()),
@@ -6601,7 +6572,7 @@ mod tests {
                 Some(&journal),
                 control.clone(),
                 &context,
-                multipart_completion_event(&authorization, &result, operation.receipt_id),
+                multipart_completion_event(&grant, &result),
                 "key-a",
             )
             .await
@@ -6612,9 +6583,9 @@ mod tests {
             let calls = control.calls.lock().unwrap();
             assert_eq!(calls.len(), 2);
             assert_eq!(calls[0], calls[1]);
-            assert_eq!(calls[0].event.operation_id, authorization.operation_id());
-            assert_eq!(calls[0].event.route, UsageRoute::CompleteMultipartUpload);
-            assert_eq!(calls[0].event.processed_bytes, 32);
+            assert_eq!(calls[0].event.operation_id(), authorization.operation_id());
+            assert_eq!(calls[0].event.route(), UsageRoute::CompleteMultipartUpload);
+            assert_eq!(calls[0].event.processed_bytes(), 32);
         }
         let evidence = journal.evidence(operation.operation_id).await.unwrap();
         assert_eq!(evidence.len(), 1);
@@ -6637,11 +6608,12 @@ mod tests {
         let operation = request_operation_identity();
         let authorization =
             operation.authorization("bucket", UsageRoute::PutObject, RequestKind::Write, 64);
+        let grant = test_grant(&authorization);
 
         let response = streaming_put_failure_response(
             &control,
             &context,
-            &authorization,
+            &grant,
             "key",
             StreamingPutError::PreserveReservation(Box::new(StreamingPutError::Transaction(
                 TransactionError::CompletionAmbiguous,
@@ -6667,11 +6639,12 @@ mod tests {
             RequestKind::Write,
             64,
         );
+        let grant = test_grant(&authorization);
 
         let response = multipart_completion_failure_response(
             &control,
             &context,
-            &authorization,
+            &grant,
             "key",
             MultipartCompletionError::PreserveReservation(Box::new(
                 MultipartCompletionError::Staging(StagingError::Fenced),
@@ -7082,11 +7055,12 @@ async fn s3_head(
     let operation = request_operation_identity();
     let authorization =
         operation.authorization(&bucket, UsageRoute::HeadObject, RequestKind::Read, 0);
-    if let Err(response) =
-        authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
+    let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
+        .await
     {
-        return response;
-    }
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
     if wants_transformed_read(&headers) {
         let response = s3_error::invalid_request(
             &key,
@@ -7095,7 +7069,7 @@ async fn s3_head(
         return release_failure(
             state.control.as_ref(),
             &auth.context,
-            &authorization,
+            &grant,
             &key,
             response,
         )
@@ -7108,7 +7082,7 @@ async fn s3_head(
             return release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &key,
                 backend_resolution_error_response(&key),
             )
@@ -7122,7 +7096,7 @@ async fn s3_head(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     response,
                 )
@@ -7132,7 +7106,7 @@ async fn s3_head(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::service_unavailable(
                         &key,
@@ -7145,7 +7119,7 @@ async fn s3_head(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::entity_too_large(&key),
                 )
@@ -7156,7 +7130,7 @@ async fn s3_head(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     response,
                 )
@@ -7166,8 +7140,7 @@ async fn s3_head(
                 state.control.clone(),
                 &auth.context,
                 OperationUsage {
-                    operation,
-                    authorization: &authorization,
+                    grant: &grant,
                     source_bytes: 0,
                     output_bytes: 0,
                 },
@@ -7183,7 +7156,7 @@ async fn s3_head(
             release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &key,
                 open_error_response(&key, error),
             )
@@ -7218,11 +7191,12 @@ async fn s3_delete(
         RequestKind::Write,
         0,
     );
-    if let Err(response) =
-        authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
+    let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
+        .await
     {
-        return response;
-    }
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
     info!("DELETE /{bucket}/{key} user={}", auth.user_id());
 
     if params.upload_id.is_some() {
@@ -7233,7 +7207,7 @@ async fn s3_delete(
                     return release_failure(
                         state.control.as_ref(),
                         &auth.context,
-                        &authorization,
+                        &grant,
                         &key,
                         backend_resolution_error_response(&key),
                     )
@@ -7244,7 +7218,7 @@ async fn s3_delete(
             return release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &key,
                 s3_error::multipart_not_supported(&key),
             )
@@ -7258,7 +7232,7 @@ async fn s3_delete(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::no_such_upload(&key),
                 )
@@ -7268,7 +7242,7 @@ async fn s3_delete(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::internal_error(&key, &error.to_string()),
                 )
@@ -7284,7 +7258,7 @@ async fn s3_delete(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     response,
                 )
@@ -7297,7 +7271,7 @@ async fn s3_delete(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::service_unavailable(&key, &error.to_string()),
                 )
@@ -7311,8 +7285,7 @@ async fn s3_delete(
                     state.control.clone(),
                     &auth.context,
                     OperationUsage {
-                        operation,
-                        authorization: &authorization,
+                        grant: &grant,
                         source_bytes: 0,
                         output_bytes: 0,
                     },
@@ -7328,7 +7301,7 @@ async fn s3_delete(
                 release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::no_such_upload(&key),
                 )
@@ -7339,8 +7312,7 @@ async fn s3_delete(
                     state.control.clone(),
                     &auth.context,
                     OperationUsage {
-                        operation,
-                        authorization: &authorization,
+                        grant: &grant,
                         source_bytes: 0,
                         output_bytes: 0,
                     },
@@ -7356,7 +7328,7 @@ async fn s3_delete(
                 release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::internal_error(&key, &error.to_string()),
                 )
@@ -7374,7 +7346,7 @@ async fn s3_delete(
             return release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &key,
                 backend_resolution_error_response(&key),
             )
@@ -7393,7 +7365,7 @@ async fn s3_delete(
                     return release_failure(
                         state.control.as_ref(),
                         &auth.context,
-                        &authorization,
+                        &grant,
                         &key,
                         open_error_response(&key, OpenObjectError::Rejected(error)),
                     )
@@ -7406,8 +7378,7 @@ async fn s3_delete(
                         state.control.clone(),
                         &auth.context,
                         OperationUsage {
-                            operation,
-                            authorization: &authorization,
+                            grant: &grant,
                             source_bytes: 0,
                             output_bytes: 0,
                         },
@@ -7446,8 +7417,7 @@ async fn s3_delete(
                     state.control.clone(),
                     &auth.context,
                     OperationUsage {
-                        operation,
-                        authorization: &authorization,
+                        grant: &grant,
                         source_bytes: 0,
                         output_bytes: 0,
                     },
@@ -7469,7 +7439,7 @@ async fn s3_delete(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::service_unavailable(
                         &key,
@@ -7496,8 +7466,7 @@ async fn s3_delete(
                 state.control.clone(),
                 &auth.context,
                 OperationUsage {
-                    operation,
-                    authorization: &authorization,
+                    grant: &grant,
                     source_bytes: 0,
                     output_bytes: 0,
                 },
@@ -7515,8 +7484,7 @@ async fn s3_delete(
                 state.control.clone(),
                 &auth.context,
                 OperationUsage {
-                    operation,
-                    authorization: &authorization,
+                    grant: &grant,
                     source_bytes: 0,
                     output_bytes: 0,
                 },
@@ -7647,11 +7615,13 @@ async fn s3_post(
             RequestKind::Write,
             object_max_processed_bytes(&state),
         );
-        if let Err(response) =
-            authorize_request(state.control.as_ref(), &auth.context, &authorization, &key).await
-        {
-            return response;
-        }
+        let grant =
+            match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
+                .await
+            {
+                Ok(grant) => grant,
+                Err(response) => return response,
+            };
         let lease = match staging
             .repository
             .acquire_completion(
@@ -7669,7 +7639,7 @@ async fn s3_post(
                     state.operation_journal.as_ref(),
                     state.control.clone(),
                     &auth.context,
-                    multipart_completion_event(&authorization, &result, operation.receipt_id),
+                    multipart_completion_event(&grant, &result),
                     &key,
                 )
                 .await
@@ -7697,7 +7667,7 @@ async fn s3_post(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     response,
                 )
@@ -7709,7 +7679,7 @@ async fn s3_post(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     response,
                 )
@@ -7719,7 +7689,7 @@ async fn s3_post(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::no_such_upload(&key),
                 )
@@ -7729,7 +7699,7 @@ async fn s3_post(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::internal_error(&key, &error.to_string()),
                 )
@@ -7739,7 +7709,7 @@ async fn s3_post(
         let recovered = match reconcile_existing_direct_completion(
             &state,
             &backend,
-            authorization.operation_id(),
+            grant.operation_id(),
             auth.workspace_id().as_str(),
             &bucket,
             &key,
@@ -7752,7 +7722,7 @@ async fn s3_post(
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
-                    &authorization,
+                    &grant,
                     &key,
                     s3_error::service_unavailable(
                         &key,
@@ -7802,8 +7772,7 @@ async fn s3_post(
                     &lease,
                     AuthorizedOperation {
                         auth: &auth,
-                        authorization: &authorization,
-                        receipt_id: operation.receipt_id,
+                        grant: &grant,
                     },
                     backend,
                 ),
@@ -7815,7 +7784,7 @@ async fn s3_post(
                     return multipart_completion_failure_response(
                         state.control.as_ref(),
                         &auth.context,
-                        &authorization,
+                        &grant,
                         &key,
                         error,
                     )
@@ -7834,7 +7803,7 @@ async fn s3_post(
             state.operation_journal.as_ref(),
             state.control.clone(),
             &auth.context,
-            multipart_completion_event(&authorization, &result, operation.receipt_id),
+            multipart_completion_event(&grant, &result),
             &key,
         )
         .await
@@ -8001,7 +7970,7 @@ async fn s3_list_objects(
     let operation = request_operation_identity();
     let authorization =
         operation.authorization(&bucket, UsageRoute::ListObjects, RequestKind::Read, 0);
-    if let Err(response) = authorize_request(
+    let grant = match authorize_request(
         state.control.as_ref(),
         &auth.context,
         &authorization,
@@ -8009,15 +7978,16 @@ async fn s3_list_objects(
     )
     .await
     {
-        return response;
-    }
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
         Ok(backend) => backend,
         Err(_) => {
             return release_failure(
                 state.control.as_ref(),
                 &auth.context,
-                &authorization,
+                &grant,
                 &bucket,
                 backend_resolution_error_response(&bucket),
             )
@@ -8050,7 +8020,7 @@ async fn s3_list_objects(
         return release_failure(
             state.control.as_ref(),
             &auth.context,
-            &authorization,
+            &grant,
             &bucket,
             response,
         )
@@ -8060,8 +8030,7 @@ async fn s3_list_objects(
         state.control.clone(),
         &auth.context,
         OperationUsage {
-            operation,
-            authorization: &authorization,
+            grant: &grant,
             source_bytes: 0,
             output_bytes: 0,
         },

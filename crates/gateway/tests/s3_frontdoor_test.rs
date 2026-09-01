@@ -13,8 +13,9 @@ use http_body::{Frame, SizeHint};
 use s4_gateway::Gateway;
 use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
 use s4_gateway::control::{
-    AuthenticatedRequestContext, AuthorizationError, ControlPlane, MeteringError, NoopControlPlane,
-    RequestKind, StreamingWriteMode, UsageAuthorization, UsageEvent, UsageRoute,
+    AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
+    BlockReason, ControlPlane, MeteringError, NoopControlPlane, RequestKind, StreamingWriteMode,
+    UsageAuthorization, UsageEvent, UsageRoute,
 };
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
 use s4_gateway::object::BodyLimits;
@@ -41,6 +42,17 @@ use tower::ServiceExt;
 
 const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/pub.pem");
 const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
+const TEST_RATE_VERSION: i32 = 7;
+
+fn test_occurred_at() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-08-31T12:34:56.123456Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+fn test_authorization_grant(authorization: &UsageAuthorization) -> AuthorizationGrant {
+    AuthorizationGrant::new(authorization, test_occurred_at(), TEST_RATE_VERSION)
+}
 
 struct PollTrackingBody {
     polls: Arc<AtomicUsize>,
@@ -82,9 +94,11 @@ impl ControlPlane for StreamingOffControl {
     async fn authorize(
         &self,
         _context: &AuthenticatedRequestContext,
-        _authorization: &UsageAuthorization,
-    ) -> Result<Option<s4_gateway::control::BlockReason>, AuthorizationError> {
-        Ok(None)
+        authorization: &UsageAuthorization,
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
+        Ok(AuthorizationDecision::Granted(test_authorization_grant(
+            authorization,
+        )))
     }
 
     async fn release(
@@ -123,6 +137,7 @@ struct RecordingMeteringControl {
     authorizations: Mutex<Vec<(AuthenticatedRequestContext, UsageAuthorization)>>,
     releases: Mutex<Vec<(AuthenticatedRequestContext, uuid::Uuid)>>,
     authorization_failure: Option<AuthorizationError>,
+    block_reason: Option<BlockReason>,
     failure: Option<MeteringError>,
 }
 
@@ -132,12 +147,20 @@ impl ControlPlane for RecordingMeteringControl {
         &self,
         context: &AuthenticatedRequestContext,
         authorization: &UsageAuthorization,
-    ) -> Result<Option<s4_gateway::control::BlockReason>, AuthorizationError> {
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
         self.authorizations
             .lock()
             .unwrap()
             .push((context.clone(), authorization.clone()));
-        self.authorization_failure.map_or(Ok(None), Err)
+        if let Some(error) = self.authorization_failure {
+            return Err(error);
+        }
+        if let Some(reason) = self.block_reason.clone() {
+            return Ok(AuthorizationDecision::Blocked(reason));
+        }
+        Ok(AuthorizationDecision::Granted(test_authorization_grant(
+            authorization,
+        )))
     }
 
     async fn release(
@@ -162,6 +185,41 @@ impl ControlPlane for RecordingMeteringControl {
             event: event.clone(),
         });
         self.failure.map_or(Ok(()), Err)
+    }
+}
+
+#[derive(Debug, Default)]
+struct StaleGrantControl {
+    previous: Mutex<Option<UsageAuthorization>>,
+}
+
+#[async_trait::async_trait]
+impl ControlPlane for StaleGrantControl {
+    async fn authorize(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        authorization: &UsageAuthorization,
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
+        let previous = self.previous.lock().unwrap().replace(authorization.clone());
+        Ok(AuthorizationDecision::Granted(test_authorization_grant(
+            previous.as_ref().unwrap_or(authorization),
+        )))
+    }
+
+    async fn release(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _operation_id: uuid::Uuid,
+    ) -> Result<(), AuthorizationError> {
+        Ok(())
+    }
+
+    async fn record(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _event: &UsageEvent,
+    ) -> Result<(), MeteringError> {
+        Ok(())
     }
 }
 
@@ -2114,18 +2172,20 @@ async fn launch_contract_billable_handlers_generate_distinct_server_usage_event_
     assert!(events.iter().all(|call| {
         call.context.user_id == "test-user"
             && call.context.workspace_id.as_str() == "test-user"
-            && call.event.bucket == "metered"
+            && call.event.bucket() == "metered"
+            && call.event.occurred_at() == test_occurred_at()
+            && call.event.rate_version() == TEST_RATE_VERSION
     }));
     assert_eq!(
         events
             .iter()
             .map(|call| {
                 (
-                    call.event.kind,
-                    call.event.route,
-                    call.event.source_bytes,
-                    call.event.output_bytes,
-                    call.event.processed_bytes,
+                    call.event.kind(),
+                    call.event.route(),
+                    call.event.source_bytes(),
+                    call.event.output_bytes(),
+                    call.event.processed_bytes(),
                 )
             })
             .collect::<Vec<_>>(),
@@ -2138,27 +2198,39 @@ async fn launch_contract_billable_handlers_generate_distinct_server_usage_event_
         ]
     );
     assert!(events.iter().all(|call| {
-        call.event.id.get_version_num() == 7
-            && call.event.operation_id != call.event.id
-            && call.event.operation_id.get_version_num() == 5
+        call.event.receipt_id().get_version_num() == 7
+            && call.event.operation_id() != call.event.receipt_id()
+            && call.event.operation_id().get_version_num() == 5
     }));
     assert_eq!(
         events
             .iter()
-            .map(|call| call.event.id)
+            .map(|call| call.event.receipt_id())
             .collect::<std::collections::HashSet<_>>()
             .len(),
         events.len()
     );
-    assert_ne!(events[2].event.id, events[3].event.id);
+    assert_ne!(events[2].event.receipt_id(), events[3].event.receipt_id());
+    let write_pipeline = events[0]
+        .event
+        .pipeline_evidence()
+        .expect("PUT records the resolved pipeline");
+    assert_eq!(write_pipeline.revision, "static");
+    assert!(!write_pipeline.fingerprint.is_empty());
+    assert!(
+        events[1..]
+            .iter()
+            .all(|call| call.event.pipeline_evidence().is_none())
+    );
     let authorizations = control.authorizations.lock().unwrap().clone();
     assert_eq!(authorizations.len(), events.len());
     for ((context, authorization), event) in authorizations.iter().zip(&events) {
         assert_eq!(context, &event.context);
-        assert_eq!(authorization.operation_id(), event.event.operation_id);
-        assert_eq!(authorization.bucket(), event.event.bucket);
-        assert_eq!(authorization.kind(), event.event.kind);
-        assert_eq!(authorization.route(), event.event.route);
+        assert_eq!(authorization.operation_id(), event.event.operation_id());
+        assert_eq!(authorization.receipt_id(), event.event.receipt_id());
+        assert_eq!(authorization.bucket(), event.event.bucket());
+        assert_eq!(authorization.kind(), event.event.kind());
+        assert_eq!(authorization.route(), event.event.route());
     }
     assert_eq!(
         authorizations
@@ -2291,6 +2363,93 @@ async fn launch_contract_authorization_unavailable_returns_service_unavailable_b
 }
 
 #[tokio::test]
+async fn launch_contract_blocked_authorization_does_not_poll_or_release() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let control = Arc::new(RecordingMeteringControl {
+        block_reason: Some(BlockReason::new("PaymentRequired", "out of credit")),
+        ..RecordingMeteringControl::default()
+    });
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .control = control.clone();
+    let app = build_router(state.clone());
+    let polls = Arc::new(AtomicUsize::new(0));
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/authorization/blocked.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not commit")),
+            }))
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>PaymentRequired</Code>"));
+    assert!(state.store.get("authorization", "blocked.txt").is_none());
+    assert_eq!(control.authorizations.lock().unwrap().len(), 1);
+    assert!(control.events.lock().unwrap().is_empty());
+    assert!(control.releases.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn launch_contract_mismatched_grant_fails_closed_without_polling_body() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let control = Arc::new(StaleGrantControl::default());
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .control = control;
+    let app = build_router(state.clone());
+    let headers = auth_headers(&access_key, &secret_key);
+
+    let seed = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri("/authorization/missing.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(seed).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/authorization/mismatched.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not commit")),
+            }))
+            .unwrap(),
+        &headers,
+    );
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>ServiceUnavailable</Code>"));
+    assert!(state.store.get("authorization", "mismatched.txt").is_none());
+}
+
+#[tokio::test]
 async fn launch_contract_successful_list_records_receipt_and_failed_list_is_not_billed() {
     let mut state = test_state().await;
     let (access_key, secret_key) = make_key(&state).await;
@@ -2324,14 +2483,16 @@ async fn launch_contract_successful_list_records_receipt_and_failed_list_is_not_
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].context.user_id, "test-user");
     assert_eq!(events[0].context.workspace_id.as_str(), "test-user");
-    assert_eq!(events[0].event.bucket, "listed");
-    assert_eq!(events[0].event.kind, RequestKind::Read);
-    assert_eq!(events[0].event.route, UsageRoute::ListObjects);
-    assert_eq!(events[0].event.source_bytes, 0);
-    assert_eq!(events[0].event.output_bytes, 0);
-    assert_eq!(events[0].event.processed_bytes, 0);
-    assert_eq!(events[0].event.id.get_version_num(), 7);
-    assert_eq!(events[0].event.operation_id.get_version_num(), 5);
+    assert_eq!(events[0].event.bucket(), "listed");
+    assert_eq!(events[0].event.kind(), RequestKind::Read);
+    assert_eq!(events[0].event.route(), UsageRoute::ListObjects);
+    assert_eq!(events[0].event.source_bytes(), 0);
+    assert_eq!(events[0].event.output_bytes(), 0);
+    assert_eq!(events[0].event.processed_bytes(), 0);
+    assert_eq!(events[0].event.receipt_id().get_version_num(), 7);
+    assert_eq!(events[0].event.operation_id().get_version_num(), 5);
+    assert_eq!(events[0].event.occurred_at(), test_occurred_at());
+    assert_eq!(events[0].event.rate_version(), TEST_RATE_VERSION);
 
     let response = app
         .oneshot(add_headers(
@@ -2467,9 +2628,9 @@ async fn launch_contract_list_metering_failure_replaces_success_with_service_una
     assert!(String::from_utf8_lossy(&body).contains("<Code>ServiceUnavailable</Code>"));
     let events = control.events.lock().unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event.route, UsageRoute::ListObjects);
-    assert_eq!(events[0].event.source_bytes, 0);
-    assert_eq!(events[0].event.output_bytes, 0);
+    assert_eq!(events[0].event.route(), UsageRoute::ListObjects);
+    assert_eq!(events[0].event.source_bytes(), 0);
+    assert_eq!(events[0].event.output_bytes(), 0);
     assert!(control.releases.lock().unwrap().is_empty());
 }
 
@@ -5384,10 +5545,10 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
             .iter()
             .map(|call| {
                 (
-                    call.event.kind,
-                    call.event.route,
-                    call.event.source_bytes,
-                    call.event.output_bytes,
+                    call.event.kind(),
+                    call.event.route(),
+                    call.event.source_bytes(),
+                    call.event.output_bytes(),
                 )
             })
             .collect::<Vec<_>>(),
@@ -5396,8 +5557,7 @@ async fn empty_prefix_safe_snapshot_streams_without_length_or_staging() {
     let events = control.events.lock().unwrap();
     let evidence = events[0]
         .event
-        .pipeline_evidence
-        .as_ref()
+        .pipeline_evidence()
         .expect("completed empty direct read must retain measured evidence");
     assert_eq!(evidence.revision, "static");
     assert_eq!(evidence.fuel_consumed, 0);

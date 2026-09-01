@@ -2,7 +2,7 @@
 
 # flake8: noqa
 """
-    S4 Gateway API
+    Maskura Gateway API
 
     Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline.
 

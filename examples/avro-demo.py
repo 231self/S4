@@ -3,19 +3,19 @@
 
 Start a local gateway with binary processing enabled and local auth:
 
-    AUTH_DISABLED=true S4_ENABLE_AVRO=true S4_TRANSFORMED_READ_SPOOL=encrypted \
+    AUTH_DISABLED=true MASKURA_ENABLE_AVRO=true MASKURA_TRANSFORMED_READ_SPOOL=encrypted \
         cargo run --bin s4-gateway
 
-The gateway prints ``S4_ACCESS_KEY`` / ``S4_SECRET_KEY`` at startup. Export them
+The gateway prints ``MASKURA_ACCESS_KEY`` / ``MASKURA_SECRET_KEY`` at startup. Export them
 and run this script:
 
-    export S4_ACCESS_KEY=... S4_SECRET_KEY=...
+    export MASKURA_ACCESS_KEY=... MASKURA_SECRET_KEY=...
     pip install requests fastavro
     python examples/avro-demo.py
 
 The script uploads a small Avro OCF with ``application/avro``, reads the stored
 object back (which is a normalized OCF), and reads it again through the typed
-processor with ``x-s4-encrypt-fields: email`` and no bound public key, which
+processor with ``x-maskura-encrypt-fields: email`` and no bound public key, which
 redacts the selected string field.
 """
 
@@ -25,9 +25,9 @@ import os
 import requests
 from fastavro import reader, writer
 
-GATEWAY = os.environ.get("S4_GATEWAY_URL", "http://127.0.0.1:8080")
-ACCESS = os.environ["S4_ACCESS_KEY"]
-SECRET = os.environ["S4_SECRET_KEY"]
+GATEWAY = os.environ.get("MASKURA_GATEWAY_URL", "http://127.0.0.1:8080")
+ACCESS = os.environ["MASKURA_ACCESS_KEY"]
+SECRET = os.environ["MASKURA_SECRET_KEY"]
 BUCKET = "avro-demo"
 KEY = "customers/day=2026-08-30/part-000.avro"
 
@@ -47,7 +47,7 @@ RECORDS = [
 
 
 def auth() -> dict:
-    return {"x-s4-access-key": ACCESS, "x-s4-secret-key": SECRET}
+    return {"x-maskura-access-key": ACCESS, "x-maskura-secret-key": SECRET}
 
 
 def encode_ocf(records: list) -> bytes:
@@ -80,8 +80,8 @@ def main() -> None:
         f"{GATEWAY}/{BUCKET}/{KEY}",
         headers={
             **auth(),
-            "x-s4-process": "read",
-            "x-s4-encrypt-fields": "email",
+            "x-maskura-process": "read",
+            "x-maskura-encrypt-fields": "email",
         },
         timeout=60,
     )

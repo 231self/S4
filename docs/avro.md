@@ -7,7 +7,7 @@ output schema before it emits the first object.
 ## Enablement
 
 Avro processing is off by default. Operators enable it with
-`S4_ENABLE_AVRO=true`. Disabled requests are rejected before the request body is
+`MASKURA_ENABLE_AVRO=true`. Disabled requests are rejected before the request body is
 polled. Raw GET, HEAD, and Range passthrough for stored Avro objects do not
 require the gate; only processing (PUT, processed GET, staged multipart
 completion) does.
@@ -22,13 +22,13 @@ The codec accepts:
   form `["null", T]`.
 - Logical `date`, `time-millis`, `time-micros`, `timestamp-millis`,
   `timestamp-micros`, `timestamp-nanos`, `uuid`, and `decimal` values.
-- Nested combinations of those types, subject to S4 Schema/Value IR limits.
+- Nested combinations of those types, subject to Maskura schema/value IR limits.
 
 It rejects recursive/named references, arbitrary unions, enums, and fixed
 values. Input OCF blocks may use `null`, `deflate`, `snappy`, or `zstandard`;
 generated output uses Zstandard with normalized metadata. Source input is capped
 before the Avro library reads it, and every emitted value is validated against
-the bounded S4 IR schema.
+the bounded Maskura IR schema.
 
 ## Processing model
 
@@ -44,7 +44,7 @@ bytes and cannot declare an output schema.
 
 ## Envelope encryption
 
-`x-s4-encrypt-fields` selects comma-separated string schema paths, for example
+`x-maskura-encrypt-fields` selects comma-separated string schema paths, for example
 `email` or `contacts[*].email`. With an authenticated public key, selected
 fields become `RSA-OAEP/AES-256-GCM` envelope records and the Avro schema is
 evolved before encoding. Without a public key, selected fields are redacted to
@@ -56,7 +56,7 @@ applies to single PUT and processed GET.
 
 Staged multipart completion concatenates the encrypted parts into one OCF source
 and runs it through the same processor rather than treating parts as independent
-streams. A processed read (`x-s4-process: read`) runs the source through the
+streams. A processed read (`x-maskura-process: read`) runs the source through the
 typed pump and stages the complete output in the existing encrypted read spool
 before disclosure. Processed read failures never disclose raw source bytes.
 
@@ -74,11 +74,11 @@ transform.
 
 ## Hive-compatible layouts
 
-S4 treats a Hive partition path as an ordinary object key. For example:
+Maskura treats a Hive partition path as an ordinary object key. For example:
 
 ```text
 warehouse/customers/day=2026-08-30/part-000.avro
 ```
 
-The Avro schema remains in the OCF header. S4 does not provide a Hive Metastore,
+The Avro schema remains in the OCF header. Maskura does not provide a Hive Metastore,
 table DDL, SQL query engine, or ORC support.

@@ -1,24 +1,26 @@
 [project]
-name = "s4_client"
+name = "maskura_client"
 version = "1.0.0"
-description = "S4 Gateway API"
+description = "Maskura Gateway API"
 authors = [
   {name = "OpenAPI Generator Community",email = "team@openapitools.org"},
 ]
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["OpenAPI", "OpenAPI-Generator", "S4 Gateway API"]
+keywords = ["OpenAPI", "OpenAPI-Generator", "Maskura Gateway API"]
 requires-python = ">=3.9"
 
 dependencies = [
   "urllib3 (>=2.1.0,<3.0.0)",
   "python-dateutil (>=2.8.2)",
   "pydantic (>=2)",
-  "typing-extensions (>=4.7.1)"
+  "typing-extensions (>=4.7.1)",
+  "requests (>=2.31)",
+  "cryptography (>=42)"
 ]
 
 [project.urls]
-Repository = "https://github.com/GIT_USER_ID/GIT_REPO_ID"
+Repository = "https://github.com/231self/S4"
 
 [tool.poetry]
 requires-poetry = ">=2.0"

@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let app = build_router(state);
 
-    info!("S4 gateway listening on {listen_addr} (OSS, no control plane)");
+    info!("Maskura Gateway listening on {listen_addr} (OSS, no control plane)");
     info!("Dashboard: http://localhost:8080");
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;

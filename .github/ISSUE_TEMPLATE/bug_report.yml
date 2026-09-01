@@ -1,7 +1,13 @@
 name: Bug report
-description: Report a problem with S4
+description: Report a problem with Maskura
 labels: [bug]
 body:
+  - type: markdown
+    attributes:
+      value: >-
+        Security vulnerability? Use [Maskura private vulnerability
+        reporting](https://github.com/231self/S4/security/advisories/new), not
+        this public form.
   - type: textarea
     id: what
     attributes:
@@ -15,8 +21,8 @@ body:
       label: Reproduction steps
       description: Commands, payloads, and configuration needed to reproduce.
       placeholder: |
-        s4ctl local init
-        s4ctl put ...
+        maskura local init
+        maskura put ...
     validations:
       required: true
   - type: input

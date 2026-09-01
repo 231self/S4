@@ -28,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== S4 E2E: MinIO read/write validation ==="
+echo "=== Maskura E2E: MinIO read/write validation ==="
 
 # 1. Start MinIO
 echo "--- Starting MinIO ---"
@@ -50,20 +50,21 @@ docker run "${MC_OPTS[@]}" mb local/s4-local --ignore-existing
 # 3. Build filters and binaries
 echo "--- Building filters and binaries ---"
 (cd "$ROOT" && bash scripts/build-filters.sh)
-(cd "$ROOT" && cargo build --locked -p s4-gateway -p s4ctl)
+(cd "$ROOT" && cargo build --locked -p s4-gateway --bin s4-gateway)
+(cd "$ROOT" && cargo build --locked -p s4ctl --bin maskura)
 
 # 4. Start the gateway against MinIO (auth disabled)
-echo "--- Starting S4 gateway on $GW_URL ---"
+echo "--- Starting Maskura Gateway on $GW_URL ---"
 S3_ENDPOINT=http://127.0.0.1:9000 \
 S3_ACCESS_KEY_ID=minioadmin \
 S3_SECRET_ACCESS_KEY=minioadmin \
 S3_REGION=us-east-1 \
 LISTEN_ADDR="127.0.0.1:$GW_PORT" \
-S4_KEYS_FILE="$KEYS_FILE" \
-S4_FILTER_COMPONENT="$ROOT/target/components/pii-default.component.wasm" \
-S4_STREAMING_WRITE_MODE=single \
-S4_STREAMING_READ_MODE=passthrough \
-S4_STREAMING_S3_PROVIDER=minio \
+MASKURA_FILTER_COMPONENT="$ROOT/target/components/pii-default.component.wasm" \
+MASKURA_STREAMING_WRITE_MODE=single \
+MASKURA_STREAMING_READ_MODE=passthrough \
+MASKURA_STREAMING_S3_PROVIDER=minio \
+MASKURA_KEYS_FILE="$KEYS_FILE" \
 AUTH_DISABLED=true \
 "$ROOT/target/debug/s4-gateway" > "$GW_LOG" 2>&1 &
 GW_PID=$!
@@ -83,8 +84,8 @@ curl -sf "$GW_URL/health" >/dev/null 2>&1 || {
 }
 
 # 5. Upload PII fixture through the gateway, read it back (verifies redaction)
-echo "--- Running s4ctl test upload through the gateway ---"
-S4_GATEWAY_URL="$GW_URL" "$ROOT/target/debug/s4ctl" test upload
+echo "--- Running maskura test upload through the gateway ---"
+MASKURA_GATEWAY_URL="$GW_URL" "$ROOT/target/debug/maskura" test upload
 
 # 6. Verify the stored object in MinIO is redacted
 echo "--- Verifying object in MinIO ---"

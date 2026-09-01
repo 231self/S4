@@ -1,4 +1,4 @@
-# s4_client.KeysApi
+# maskura_client.KeysApi
 
 All URIs are relative to *http://localhost*
 
@@ -18,24 +18,24 @@ Create a new API key
 
 
 ```python
-import s4_client
-from s4_client.models.api_key_response import ApiKeyResponse
-from s4_client.models.create_key_request import CreateKeyRequest
-from s4_client.rest import ApiException
+import maskura_client
+from maskura_client.models.api_key_response import ApiKeyResponse
+from maskura_client.models.create_key_request import CreateKeyRequest
+from maskura_client.rest import ApiException
 from pprint import pprint
 
 # Defining the host is optional and defaults to http://localhost
 # See configuration.py for a list of all supported configuration parameters.
-configuration = s4_client.Configuration(
+configuration = maskura_client.Configuration(
     host = "http://localhost"
 )
 
 
 # Enter a context with an instance of the API client
-with s4_client.ApiClient(configuration) as api_client:
+with maskura_client.ApiClient(configuration) as api_client:
     # Create an instance of the API class
-    api_instance = s4_client.KeysApi(api_client)
-    create_key_request = s4_client.CreateKeyRequest() # CreateKeyRequest | 
+    api_instance = maskura_client.KeysApi(api_client)
+    create_key_request = maskura_client.CreateKeyRequest() # CreateKeyRequest | 
 
     try:
         # Create a new API key
@@ -85,23 +85,23 @@ Revoke an API key
 
 
 ```python
-import s4_client
-from s4_client.models.delete_key_request import DeleteKeyRequest
-from s4_client.rest import ApiException
+import maskura_client
+from maskura_client.models.delete_key_request import DeleteKeyRequest
+from maskura_client.rest import ApiException
 from pprint import pprint
 
 # Defining the host is optional and defaults to http://localhost
 # See configuration.py for a list of all supported configuration parameters.
-configuration = s4_client.Configuration(
+configuration = maskura_client.Configuration(
     host = "http://localhost"
 )
 
 
 # Enter a context with an instance of the API client
-with s4_client.ApiClient(configuration) as api_client:
+with maskura_client.ApiClient(configuration) as api_client:
     # Create an instance of the API class
-    api_instance = s4_client.KeysApi(api_client)
-    delete_key_request = s4_client.DeleteKeyRequest() # DeleteKeyRequest | 
+    api_instance = maskura_client.KeysApi(api_client)
+    delete_key_request = maskura_client.DeleteKeyRequest() # DeleteKeyRequest | 
 
     try:
         # Revoke an API key
@@ -150,22 +150,22 @@ List API keys for the authenticated user
 
 
 ```python
-import s4_client
-from s4_client.models.list_key_response import ListKeyResponse
-from s4_client.rest import ApiException
+import maskura_client
+from maskura_client.models.list_key_response import ListKeyResponse
+from maskura_client.rest import ApiException
 from pprint import pprint
 
 # Defining the host is optional and defaults to http://localhost
 # See configuration.py for a list of all supported configuration parameters.
-configuration = s4_client.Configuration(
+configuration = maskura_client.Configuration(
     host = "http://localhost"
 )
 
 
 # Enter a context with an instance of the API client
-with s4_client.ApiClient(configuration) as api_client:
+with maskura_client.ApiClient(configuration) as api_client:
     # Create an instance of the API class
-    api_instance = s4_client.KeysApi(api_client)
+    api_instance = maskura_client.KeysApi(api_client)
 
     try:
         # List API keys for the authenticated user

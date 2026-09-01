@@ -16,7 +16,7 @@ Method | HTTP request | Description
 
 
 ```typescript
-import { createConfiguration, BackendApi } from 's4-client';
+import { createConfiguration, BackendApi } from '';
 
 const configuration = createConfiguration();
 const apiInstance = new BackendApi(configuration);
@@ -62,8 +62,8 @@ No authorization required
 
 
 ```typescript
-import { createConfiguration, BackendApi } from 's4-client';
-import type { BackendApiPutBackendRequest } from 's4-client';
+import { createConfiguration, BackendApi } from '';
+import type { BackendApiPutBackendRequest } from '';
 
 const configuration = createConfiguration();
 const apiInstance = new BackendApi(configuration);

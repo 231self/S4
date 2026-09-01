@@ -1,4 +1,4 @@
-# s4_client.BackendApi
+# maskura_client.BackendApi
 
 All URIs are relative to *http://localhost*
 
@@ -15,22 +15,22 @@ Method | HTTP request | Description
 
 
 ```python
-import s4_client
-from s4_client.models.backend_config_response import BackendConfigResponse
-from s4_client.rest import ApiException
+import maskura_client
+from maskura_client.models.backend_config_response import BackendConfigResponse
+from maskura_client.rest import ApiException
 from pprint import pprint
 
 # Defining the host is optional and defaults to http://localhost
 # See configuration.py for a list of all supported configuration parameters.
-configuration = s4_client.Configuration(
+configuration = maskura_client.Configuration(
     host = "http://localhost"
 )
 
 
 # Enter a context with an instance of the API client
-with s4_client.ApiClient(configuration) as api_client:
+with maskura_client.ApiClient(configuration) as api_client:
     # Create an instance of the API class
-    api_instance = s4_client.BackendApi(api_client)
+    api_instance = maskura_client.BackendApi(api_client)
 
     try:
         api_response = api_instance.get_backend()
@@ -75,24 +75,24 @@ No authorization required
 
 
 ```python
-import s4_client
-from s4_client.models.backend_config_request import BackendConfigRequest
-from s4_client.models.backend_config_response import BackendConfigResponse
-from s4_client.rest import ApiException
+import maskura_client
+from maskura_client.models.backend_config_request import BackendConfigRequest
+from maskura_client.models.backend_config_response import BackendConfigResponse
+from maskura_client.rest import ApiException
 from pprint import pprint
 
 # Defining the host is optional and defaults to http://localhost
 # See configuration.py for a list of all supported configuration parameters.
-configuration = s4_client.Configuration(
+configuration = maskura_client.Configuration(
     host = "http://localhost"
 )
 
 
 # Enter a context with an instance of the API client
-with s4_client.ApiClient(configuration) as api_client:
+with maskura_client.ApiClient(configuration) as api_client:
     # Create an instance of the API class
-    api_instance = s4_client.BackendApi(api_client)
-    backend_config_request = s4_client.BackendConfigRequest() # BackendConfigRequest | 
+    api_instance = maskura_client.BackendApi(api_client)
+    backend_config_request = maskura_client.BackendConfigRequest() # BackendConfigRequest | 
 
     try:
         api_response = api_instance.put_backend(backend_config_request)

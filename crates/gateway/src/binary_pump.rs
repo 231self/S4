@@ -55,7 +55,7 @@ impl BinaryTransform for IdentityBinaryTransform {
     }
 }
 
-/// Replaces explicitly selected string values with S4 envelope records.
+/// Replaces explicitly selected string values with Maskura envelope records.
 ///
 /// A missing public key deliberately redacts instead of producing a malformed
 /// envelope. No private key is accepted or retained by this transform.
@@ -80,7 +80,7 @@ impl EnvelopeBinaryTransform {
     }
 }
 
-/// Parses `x-s4-encrypt-fields`: comma-separated paths such as
+/// Parses `x-maskura-encrypt-fields` (or its legacy alias): comma-separated paths such as
 /// `email,contacts[*].email` or `$.email`.
 pub fn parse_envelope_targets(value: &str) -> Result<Vec<SchemaPath>, S4Error> {
     let mut paths = Vec::new();

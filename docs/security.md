@@ -1,10 +1,10 @@
-# S4 Security
+# Maskura security
 
-This document describes the security model of the S4 gateway as it exists in
+This document describes the security model of the Maskura Gateway as it exists in
 the current streaming architecture (Phases 0–12): who authenticates, how API
 keys are handled at rest and in use, how objects are transformed and staged,
 what the trust boundaries are, what a production deployment must configure, and
-what S4 explicitly does **not** guarantee. Anything not described here is not a
+what Maskura explicitly does **not** guarantee. Anything not described here is not a
 guarantee.
 
 For the vulnerability reporting process, see [SECURITY.md](../SECURITY.md).
@@ -15,10 +15,10 @@ For the vulnerability reporting process, see [SECURITY.md](../SECURITY.md).
 
 ```
                         ┌─────────────────────────────────────────────────────┐
-  Dashboard (browser)   │                 S4 gateway                          │
+  Dashboard (browser)   │              Maskura Gateway                       │
    Supabase Auth/JWT ───▶  /dashboard/*  (JWT-validated)                      │
                         │                                                     │
-  S4 SDK / CLI ─────────▶  S3 data plane  ── Wasm pipeline ──▶ storage        │
+  Maskura SDK / CLI ────▶  S3 data plane  ── Wasm pipeline ──▶ storage        │
   native S3 tools ──────▶  (SigV4 / API key)  (streaming, fail-closed)        │
                         │  (durable journal + staging for transactional paths)│
                         └─────────────────────────────────────────────────────┘
@@ -27,7 +27,7 @@ For the vulnerability reporting process, see [SECURITY.md](../SECURITY.md).
 
 Trust boundaries:
 
-1. **Identity** — the data plane is authenticated by S4 API keys. Requests are
+1. **Identity** — the data plane is authenticated by Maskura API keys. Requests are
    accepted only when the SigV4 signature or the SDK header secret verifies
    against a registered key; the dashboard is authenticated by Supabase Auth
    (JWT). `AUTH_DISABLED=true` bypasses auth and is a local-development-only
@@ -54,16 +54,22 @@ Trust boundaries:
 
 ### S3 data plane — API keys
 
-An S4 API key is a pair `s4_<32-hex>` (access key ID) + `s4s_<32-hex>`
+A Maskura API key is a pair `s4_<32-hex>` (access key ID) + `s4s_<32-hex>`
 (secret), revealed once at creation. Two authentication paths:
 
-1. **S4 SDK header path** — the client sends the plaintext secret in
-   `x-s4-access-key` / `x-s4-secret-key` headers or
+1. **Maskura SDK header path** — the client sends the plaintext secret in
+   `x-maskura-access-key` / `x-maskura-secret-key` headers or
    `Authorization: Bearer <access_key>:<secret>`. The gateway compares
    `sha256(secret)` against the stored `secret_hash`. Requires TLS.
 2. **Native S3 tools (SigV4)** — the client signs each request with AWS SigV4
-   using its S4 key. The gateway recomputes the signature and rejects requests
-   whose signature does not match the stored secret.
+   using its Maskura key. The gateway recomputes the signature and rejects requests
+whose signature does not match the stored secret.
+
+Legacy `x-s4-*` customer headers remain permanent aliases. When both canonical
+and legacy forms are present they must have byte-identical values; differing
+values fail closed before the request body is polled. Reserved metering,
+operation, and usage headers are rejected under both namespaces. Credential
+prefixes remain `s4_`, `s4s_`, and `s4m_` so existing credentials do not change.
 
 ### SigV4 verification
 
@@ -80,8 +86,9 @@ signature verification all complete before a request body is polled.
   requires signed `x-amz-date` and `x-amz-content-sha256`. In every SigV4 mode,
   every present `x-amz-*` header except `x-amz-user-agent` and
   `x-amz-checksum-mode`, plus each present request-semantic header
-  (`x-s4-storage-mode`, `x-s4-backend-url`, `x-s4-process`,
-  `x-s4-stable-fields`, `content-type`, `content-encoding`, and `content-md5`),
+  (`x-maskura-storage-mode`, `x-maskura-backend-url`, `x-maskura-process`,
+  `x-maskura-stable-fields`, `x-maskura-encrypt-fields`, `content-type`,
+  `content-encoding`, and `content-md5`, plus their exact legacy aliases),
   must appear in `SignedHeaders`, occur exactly once, contain valid UTF-8, and
   already equal AWS SigV4 TrimAll form: no leading or trailing SP/HTAB and every
   internal SP/HTAB run collapsed to one ASCII space. The gateway rejects rather
@@ -194,7 +201,7 @@ signatures — regenerate them if you need native S3 tools.
   by hash; guest state (linear memory, globals, resources) is strictly
   per-invocation and dropped when the object completes.
 - **Fuel and deadlines** — per-call and cumulative fuel budgets
-  (`S4_WASM_FUEL`), a per-call wall-clock deadline (epoch interruption, default
+  (`MASKURA_WASM_FUEL`), a per-call wall-clock deadline (epoch interruption, default
   30s) and an object deadline (default 5 minutes), plus cancellation tokens
   that interrupt active guest calls.
 - **Admission control** — streaming sessions run on a bounded worker pool with
@@ -216,7 +223,7 @@ signatures — regenerate them if you need native S3 tools.
 
 ## 5. Transformed reads — fail-closed disclosure rules
 
-Read-time processing (`x-s4-process: read`) runs the pipeline on the way out:
+Read-time processing (`x-maskura-process: read`) runs the pipeline on the way out:
 the object in storage is unchanged, and the caller receives only the
 transformed projection. This is the agent-safe-read path. The guarantees are
 deliberately strict:
@@ -237,11 +244,11 @@ deliberately strict:
   condition.
 - **Prefix-safe direct streaming only.** When *every* component in the
   pipeline snapshot is marked prefix-safe for read (operator-declared via
-  `S4_PREFIX_SAFE_COMPONENT_HASHES` at process start — imported components are
+  `MASKURA_PREFIX_SAFE_COMPONENT_HASHES` at process start — imported components are
   unsafe by default and the capability is immutable per component hash), the
   transformed output is streamed directly.
 - **Encrypted read spool otherwise.** Any snapshot containing an unsafe
-  component is rejected unless `S4_TRANSFORMED_READ_SPOOL=encrypted` is set.
+  component is rejected unless `MASKURA_TRANSFORMED_READ_SPOOL=encrypted` is set.
   The transformed output is then written to a disk spool in independently
   authenticated AES-256-GCM chunks under a key that lives **only in the request
   task** (a stale spool file is unreadable after a restart). The spool quota is
@@ -254,14 +261,14 @@ deliberately strict:
 - Transformed reads require stored, version-bound metadata and work with S3,
   managed storage, and in-memory backends (in local mode). Presigned backend
   URLs remain raw-only.
-- `S4_STREAMING_READ_MODE` gates the path: `off` (default) rejects transformed
+- `MASKURA_STREAMING_READ_MODE` gates the path: `off` (default) rejects transformed
   reads entirely; `passthrough` enables only raw streaming; `transformed`
   enables this path.
 
 ## 6. Storage backends
 
-- **Presigned URL proxy (`x-s4-backend-url`)** — the user generates a presigned
-  URL with their own cloud SDK; S4 filters and forwards. **No backend
+- **Presigned URL proxy (`x-maskura-backend-url`)** — the user generates a presigned
+  URL with their own cloud SDK; Maskura filters and forwards. **No backend
   credential is stored.** The gateway applies SSRF controls before any request
   is made (see §10).
 - **Per-workspace backend config** — `managed`, or `s3_compatible` with an
@@ -269,13 +276,13 @@ deliberately strict:
   unsupported and is rejected. Runtime S3-compatible endpoints are governed by
   `WorkspaceEndpointPolicy` (see §10), and dashboard reads return only a
   redacted configuration.
-- **Service storage** — S4-managed multi-cloud buckets (`S4_SERVICE_BUCKETS`),
+- **Service storage** — Maskura-managed multi-cloud buckets (`S4_SERVICE_BUCKETS`),
   tenant-namespaced by workspace and optionally backed by authoritative
   placement metadata (see §9).
-- **Resolution contract** — an explicit `x-s4-storage-mode: managed` request is
+- **Resolution contract** — an explicit `x-maskura-storage-mode: managed` request is
   resolved first, followed by a presigned URL, a per-workspace configuration,
   and configured service storage as the default. Only explicit single-tenant
-  mode (`AUTH_DISABLED=true` or `S4_SINGLE_TENANT=true`) may continue to the
+  mode (`AUTH_DISABLED=true` or `MASKURA_SINGLE_TENANT=true`) may continue to the
   global `S3_ENDPOINT` and then in-memory storage.
 - **Multi-tenant fail-closed boundary** — startup rejects `S3_ENDPOINT` and
   requires non-empty `S4_SERVICE_BUCKETS`. An unconfigured workspace therefore
@@ -288,14 +295,14 @@ durably and encrypted before any downstream processing (see §7).
 
 ## 7. Multipart staging — durable, encrypted, fenced
 
-`S4_MULTIPART_MODE=staged` (default `reject`) enables client multipart uploads
+`MASKURA_MULTIPART_MODE=staged` (default `reject`) enables client multipart uploads
 through a durable staging subsystem:
 
 - **Durable encrypted staging.** Each part is written to a local artifact file
   (`S4_MULTIPART_STAGING_DIR`) framed as `S4MP10` magic + JSON header
   (containing the wrapped DEK, tenant/upload/part identity, and a digest of the
   multipart snapshot) followed by AES-256-GCM chunks whose AAD binds the header
-  and chunk number. The artifact is then copied to a dedicated S4-controlled
+  and chunk number. The artifact is then copied to a dedicated Maskura-controlled
   object store (`S4_MULTIPART_STAGING_BUCKET`/`ENDPOINT`/credentials). The
   encryption key never exists in the gateway beyond the request lifetime, and
   the DEK is wrapped by the configured `KeyWrapping`.
@@ -328,7 +335,7 @@ through a durable staging subsystem:
 
 ## 8. Transactional writes — journal, atomic commit, reconciliation
 
-Streaming writes (`S4_STREAMING_WRITE_MODE=single` or `all`) run through a
+Streaming writes (`MASKURA_STREAMING_WRITE_MODE=single` or `all`) run through a
 durable transaction layer:
 
 - **Operation journal.** A Postgres-backed `OperationJournal`
@@ -436,9 +443,9 @@ Persisted S3-compatible workspace endpoints use a separate
 
 - The legacy 16 MiB whole-object buffering path was **removed** (Phase 12):
   there is no whole-object memory buffer on the data plane. The gateway runs
-  fixed-RSS streaming: source frames are bounded by `S4_SOURCE_MAX_FRAME_BYTES`
-  and decoded object bytes by `S4_MAX_OBJECT_BYTES`; per-record decoder limits
-  apply; and `S4_LEGACY_MAX_OBJECT_BYTES` is no longer load-bearing.
+  fixed-RSS streaming: source frames are bounded by `MASKURA_SOURCE_MAX_FRAME_BYTES`
+  and decoded object bytes by `MASKURA_MAX_OBJECT_BYTES`; per-record decoder limits
+  apply; and `MASKURA_LEGACY_MAX_OBJECT_BYTES` is no longer load-bearing.
 - `CompleteMultipartUpload` XML is capped at 1 MiB and parsed by a strict
   grammar parser (no general XML resolver): DTDs and entities are rejected
   before tokenization, parts must be sorted and unique, and part ETags/checksums
@@ -466,8 +473,17 @@ that do not embed the above.
 
 ## 14. Deployment responsibilities
 
-These are **operator responsibilities**; S4 will not and cannot enforce them
+These are **operator responsibilities**; Maskura will not and cannot enforce them
 from inside a container:
+
+Customer-configurable gateway settings use `MASKURA_*`. The corresponding
+shipped `S4_*` names are permanent aliases; startup resolves them without
+mutating the process environment and rejects differing dual values. Empty
+values are still values, so an empty canonical value conflicts with a non-empty
+legacy value. Internal/operator controls such as `S4_SECRET_KEK`,
+`S4_SERVICE_BUCKETS`, `S4_WORKSPACE_ENDPOINT_*`, `S4_PRESIGNED_HTTP_*`,
+`S4_SIGV4_*`, `S4_MANAGED_*`, and `S4_MULTIPART_STAGING_*` intentionally keep their existing
+names and are not exposed through customer aliases.
 
 - **TLS termination** — place the gateway behind a TLS-terminating proxy
   (platform load balancer, ingress, or reverse proxy). SigV4 is signed
@@ -485,7 +501,7 @@ from inside a container:
   writes require the durable operation journal; staged multipart requires
   Postgres plus the complete `S4_MULTIPART_STAGING_*` configuration; managed
   observe/enforce requires Postgres and transactional capabilities.
-- **Backend lifecycle permissions** — the backend credentials S4 uses for
+- **Backend lifecycle permissions** — the backend credentials Maskura uses for
   direct/managed streaming must be able to create, abort, and discover
   multipart uploads, complete uploads, and (for reconciliation) perform
   conditional reads/HEAD. The capability gate refuses streaming eligibility
@@ -493,15 +509,15 @@ from inside a container:
   cleanup SLA within five minutes.
 - **Feature-gate defaults** — all streaming features are **off/reject by
   default** and must be explicitly enabled:
-  `S4_STREAMING_READ_MODE=off`, `S4_STREAMING_WRITE_MODE=off`,
-  `S4_MULTIPART_MODE=reject`, `S4_MANAGED_STREAMING_MODE=off`. Enabling them
+  `MASKURA_STREAMING_READ_MODE=off`, `MASKURA_STREAMING_WRITE_MODE=off`,
+  `MASKURA_MULTIPART_MODE=reject`, `S4_MANAGED_STREAMING_MODE=off`. Enabling them
   without the corresponding durable dependencies causes startup to refuse
   configuration rather than silently degrade.
 - **Self-host hardening** — run the container as non-root; limit egress to the
-  configured backends, KMS/Vault, and Supabase; do not ship `S4_KEYS_FILE` or
+  configured backends, KMS/Vault, and Supabase; do not ship `MASKURA_KEYS_FILE` or
   `keys.json` in the image; do not set `AUTH_DISABLED` in production; put the
   spool and staging directories on private, capacity-reserved volumes sized
-  for `S4_SPOOL_MAX_OBJECT_BYTES`/`S4_SPOOL_QUOTA_BYTES` (including encrypted
+  for `MASKURA_SPOOL_MAX_OBJECT_BYTES`/`MASKURA_SPOOL_QUOTA_BYTES` (including encrypted
   framing overhead).
 - **Dependency/update policy** — track releases and apply security fixes
   promptly; run `just deny` (cargo-deny) and `just audit` (cargo-audit) in
@@ -510,18 +526,18 @@ from inside a container:
 
 ## 15. Non-guarantees — the data-plane vs. provider distinction
 
-S4 is a **data-plane processing gateway**, not a storage provider. S4 does not
+Maskura is a **data-plane processing gateway**, not a storage provider. Maskura does not
 secure the third-party storage it is pointed at:
 
-- S4 does not control bucket policies, server-side encryption, access logs,
+- Maskura does not control bucket policies, server-side encryption, access logs,
   retention, replication, or deletes on the destination. Configure those on
   the destination itself.
-- S4 forwards to the destination exactly the transformed representation and
+- Maskura forwards to the destination exactly the transformed representation and
   relies on the destination's credentials/permissions for access control.
   Misconfigured destination credentials, world-readable buckets, or missing
-  destination-side encryption are outside S4's control and are not S4
+  destination-side encryption are outside Maskura's control and are not Maskura
   vulnerabilities.
-- S4 does not secure the identity provider (Supabase) or the email/analytics
+- Maskura does not secure the identity provider (Supabase) or the email/analytics
   services used by the dashboard.
 - Client-side decryption keys (for per-field encryption) and stable-encrypt
-  keys are held by the client; S4 never holds them.
+  keys are held by the client; Maskura never holds them.

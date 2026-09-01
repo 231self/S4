@@ -22,10 +22,16 @@ use crate::integrity::{BodyVerifier, IntegrityError, StreamingSigning};
 const DEFAULT_REGION: &str = "us-east-1";
 const MAX_PRESIGN_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SEMANTIC_HEADERS: &[&str] = &[
+    "x-maskura-storage-mode",
+    "x-maskura-backend-url",
+    "x-maskura-process",
+    "x-maskura-stable-fields",
+    "x-maskura-encrypt-fields",
     "x-s4-storage-mode",
     "x-s4-backend-url",
     "x-s4-process",
     "x-s4-stable-fields",
+    "x-s4-encrypt-fields",
     "content-type",
     "content-encoding",
     "content-md5",
@@ -993,10 +999,16 @@ mod tests {
     #[test]
     fn requires_every_present_semantic_and_amz_header_to_be_signed() {
         let protected_headers = [
+            ("x-maskura-storage-mode", "managed"),
+            ("x-maskura-backend-url", "https://storage.example/object"),
+            ("x-maskura-process", "read"),
+            ("x-maskura-stable-fields", "email"),
+            ("x-maskura-encrypt-fields", "email"),
             ("x-s4-storage-mode", "managed"),
             ("x-s4-backend-url", "https://storage.example/object"),
             ("x-s4-process", "read"),
             ("x-s4-stable-fields", "email"),
+            ("x-s4-encrypt-fields", "email"),
             ("content-type", "text/plain"),
             ("content-encoding", "identity"),
             ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
@@ -1070,10 +1082,16 @@ mod tests {
     #[test]
     fn integrity_header_values_must_be_unique_utf8_and_trim_all_canonical() {
         let canonical_values = [
+            ("x-maskura-storage-mode", "managed"),
+            ("x-maskura-backend-url", "https://storage.example/object"),
+            ("x-maskura-process", "read"),
+            ("x-maskura-stable-fields", "email, account_id"),
+            ("x-maskura-encrypt-fields", "email"),
             ("x-s4-storage-mode", "managed"),
             ("x-s4-backend-url", "https://storage.example/object"),
             ("x-s4-process", "read"),
             ("x-s4-stable-fields", "email, account_id"),
+            ("x-s4-encrypt-fields", "email"),
             ("content-type", "text/plain; charset=utf-8"),
             ("content-encoding", "aws-chunked"),
             ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),

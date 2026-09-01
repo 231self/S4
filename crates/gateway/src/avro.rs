@@ -40,7 +40,7 @@ impl Default for AvroLimits {
 /// Decodes one OCF source and invokes `emit` once per logical record.
 ///
 /// The source reader is capped before the Avro library sees bytes; each emitted
-/// value is separately validated against the bounded S4 IR schema.
+/// value is separately validated against the bounded Maskura IR schema.
 pub fn decode_ocf<R, F>(source: R, limits: AvroLimits, mut emit: F) -> Result<SchemaIr, S4Error>
 where
     R: Read,

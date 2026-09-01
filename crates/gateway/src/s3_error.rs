@@ -110,7 +110,7 @@ pub fn multipart_not_supported(key: &str) -> axum::response::Response {
 pub fn not_implemented(key: &str) -> axum::response::Response {
     s3_error_xml(
         "NotImplemented",
-        "This operation is not supported by the S4 gateway.",
+        "This operation is not supported by the Maskura Gateway.",
         key,
         StatusCode::NOT_IMPLEMENTED,
     )
@@ -197,7 +197,7 @@ pub fn service_unavailable(key: &str, detail: &str) -> axum::response::Response 
 pub fn bucket_not_allowed(bucket: &str) -> axum::response::Response {
     s3_error_xml(
         "AccessDenied",
-        "Bucket creation and deletion are not allowed on the S4 gateway; use an existing bucket on a configured backend.",
+        "Bucket creation and deletion are not allowed on the Maskura Gateway; use an existing bucket on a configured backend.",
         bucket,
         StatusCode::FORBIDDEN,
     )

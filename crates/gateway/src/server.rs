@@ -26,6 +26,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
+use maskura_customer_config::{aliases as customer_env, resolve as resolve_customer_env};
 use md5::Md5;
 use rand::{RngCore, rngs::OsRng};
 use serde::de::DeserializeOwned;
@@ -46,6 +47,7 @@ use crate::control::{
     ControlPlane, MeteringError, RequestKind, StreamingWriteMode, UsageAuthorization, UsageEvent,
     UsageRoute,
 };
+use crate::customer_headers;
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::managed::{
@@ -232,9 +234,16 @@ fn client_metering_id_rejection(
     headers: &HeaderMap,
     key: &str,
 ) -> Option<axum::response::Response> {
-    if ["x-s4-metering-id", "x-s4-operation-id", "x-s4-usage-id"]
-        .into_iter()
-        .any(|name| headers.contains_key(name))
+    if [
+        "x-maskura-metering-id",
+        "x-maskura-operation-id",
+        "x-maskura-usage-id",
+        "x-s4-metering-id",
+        "x-s4-operation-id",
+        "x-s4-usage-id",
+    ]
+    .into_iter()
+    .any(|name| headers.contains_key(name))
     {
         return Some(s3_error::invalid_request(
             key,
@@ -609,11 +618,10 @@ pub struct StatePipelineTemplate {
 impl StatePipelineTemplate {
     #[doc(hidden)]
     pub fn from_env() -> anyhow::Result<Self> {
-        let source_body_limits = source_body_limits_from_env();
-        let explicit_component_path = component_path();
+        let source_body_limits = source_body_limits_from_env()?;
+        let explicit_component_path = component_path()?;
         let component_bytes = std::fs::read(&explicit_component_path)?;
-        let pipeline_fuel = std::env::var("S4_WASM_FUEL")
-            .ok()
+        let pipeline_fuel = resolve_customer_env(customer_env::WASM_FUEL)?
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(crate::plugin_registry::DEFAULT_PIPELINE_FUEL);
         let engine = Arc::new(s4_wasm_runtime::FilterEngine::with_fuel(
@@ -621,12 +629,12 @@ impl StatePipelineTemplate {
             pipeline_fuel,
         )?);
         let default_pipeline_limits = PipelineLimits::default();
-        let max_pipeline_output_bytes = std::env::var("S4_MAX_PIPELINE_OUTPUT_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default_pipeline_limits.max_output_bytes)
-            .min(default_pipeline_limits.max_output_bytes);
+        let max_pipeline_output_bytes =
+            resolve_customer_env(customer_env::MAX_PIPELINE_OUTPUT_BYTES)?
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default_pipeline_limits.max_output_bytes)
+                .min(default_pipeline_limits.max_output_bytes);
         let pipeline_limits = PipelineLimits {
             max_input_bytes: default_pipeline_limits
                 .max_input_bytes
@@ -640,7 +648,7 @@ impl StatePipelineTemplate {
             pipeline_limits,
             s4_wasm_runtime::ExecutorConfig::default(),
         )?;
-        let prefix_safe_hashes = prefix_safe_component_hashes();
+        let prefix_safe_hashes = prefix_safe_component_hashes()?;
 
         use sha2::Digest as _;
         let default_hash = hex::encode(sha2::Sha256::digest(&component_bytes));
@@ -652,7 +660,7 @@ impl StatePipelineTemplate {
             },
         )?;
 
-        if let Ok(plugin_dir) = std::env::var("S4_PLUGINS_DIR") {
+        if let Some(plugin_dir) = resolve_customer_env(customer_env::PLUGINS_DIR)? {
             let dir = std::path::Path::new(&plugin_dir);
             if dir.exists() {
                 plugins.load_from_dir_with_capabilities_excluding(
@@ -663,9 +671,10 @@ impl StatePipelineTemplate {
             }
         }
 
+        let stable_demo_component = bundled_stable_component()?;
         let demo = build_demo_pipeline_template(
             &component_bytes,
-            bundled_stable_component().as_deref(),
+            stable_demo_component.as_deref(),
             pipeline_fuel,
         )?;
         Ok(Self {
@@ -798,16 +807,18 @@ pub enum StreamingReadMode {
 }
 
 impl StreamingReadMode {
-    fn from_env() -> Self {
-        match std::env::var("S4_STREAMING_READ_MODE").as_deref() {
-            Ok("passthrough") => Self::Passthrough,
-            Ok("transformed") => Self::Transformed,
-            Ok("off") | Err(_) => Self::Off,
-            Ok(value) => {
-                warn!("invalid S4_STREAMING_READ_MODE={value:?}; using off");
-                Self::Off
-            }
-        }
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(
+            match resolve_customer_env(customer_env::STREAMING_READ_MODE)?.as_deref() {
+                Some("passthrough") => Self::Passthrough,
+                Some("transformed") => Self::Transformed,
+                Some("off") | None => Self::Off,
+                Some(value) => {
+                    warn!("invalid MASKURA_STREAMING_READ_MODE={value:?}; using off");
+                    Self::Off
+                }
+            },
+        )
     }
 
     fn streams_passthrough(self) -> bool {
@@ -815,52 +826,55 @@ impl StreamingReadMode {
     }
 }
 
-fn transformed_read_spool_enabled() -> bool {
-    std::env::var("S4_TRANSFORMED_READ_SPOOL")
-        .is_ok_and(|value| value.eq_ignore_ascii_case("encrypted"))
+fn transformed_read_spool_enabled() -> anyhow::Result<bool> {
+    Ok(resolve_customer_env(customer_env::TRANSFORMED_READ_SPOOL)?
+        .is_some_and(|value| value.eq_ignore_ascii_case("encrypted")))
 }
 
-fn binary_avro_enabled() -> bool {
-    std::env::var("S4_ENABLE_AVRO")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+fn binary_avro_enabled() -> anyhow::Result<bool> {
+    Ok(resolve_customer_env(customer_env::ENABLE_AVRO)?
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")))
 }
 
 /// Imported plugins are unsafe by default. Operators may opt known component
 /// digests into direct reads at process start; dashboard callers cannot raise
 /// this capability and a digest cannot be re-registered with different flags.
-fn prefix_safe_component_hashes() -> HashSet<String> {
-    std::env::var("S4_PREFIX_SAFE_COMPONENT_HASHES")
-        .ok()
-        .into_iter()
-        .flat_map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .filter_map(|hash| {
-            let valid = hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
-            if !valid {
-                warn!("ignoring invalid S4_PREFIX_SAFE_COMPONENT_HASHES entry");
-                None
-            } else {
-                Some(hash.to_ascii_lowercase())
-            }
-        })
-        .collect()
+fn prefix_safe_component_hashes() -> anyhow::Result<HashSet<String>> {
+    Ok(
+        resolve_customer_env(customer_env::PREFIX_SAFE_COMPONENT_HASHES)?
+            .into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|hash| {
+                let valid = hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+                if !valid {
+                    warn!("ignoring invalid MASKURA_PREFIX_SAFE_COMPONENT_HASHES entry");
+                    None
+                } else {
+                    Some(hash.to_ascii_lowercase())
+                }
+            })
+            .collect(),
+    )
 }
 
-fn streaming_write_mode() -> StreamingWriteMode {
-    match std::env::var("S4_STREAMING_WRITE_MODE").as_deref() {
-        Ok("single") => StreamingWriteMode::Single,
-        Ok("all") => StreamingWriteMode::All,
-        Ok("off") | Err(_) => StreamingWriteMode::Off,
-        Ok(value) => {
-            warn!("invalid S4_STREAMING_WRITE_MODE={value:?}; using off");
-            StreamingWriteMode::Off
-        }
-    }
+fn streaming_write_mode() -> anyhow::Result<StreamingWriteMode> {
+    Ok(
+        match resolve_customer_env(customer_env::STREAMING_WRITE_MODE)?.as_deref() {
+            Some("single") => StreamingWriteMode::Single,
+            Some("all") => StreamingWriteMode::All,
+            Some("off") | None => StreamingWriteMode::Off,
+            Some(value) => {
+                warn!("invalid MASKURA_STREAMING_WRITE_MODE={value:?}; using off");
+                StreamingWriteMode::Off
+            }
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -870,24 +884,28 @@ enum MultipartMode {
     Staged,
 }
 
-fn multipart_mode() -> MultipartMode {
-    match std::env::var("S4_MULTIPART_MODE").as_deref() {
-        Ok("staged") => MultipartMode::Staged,
-        Ok("reject") | Err(_) => MultipartMode::Reject,
-        Ok(value) => {
-            warn!("invalid S4_MULTIPART_MODE={value:?}; using reject");
-            MultipartMode::Reject
-        }
-    }
+fn multipart_mode() -> anyhow::Result<MultipartMode> {
+    Ok(
+        match resolve_customer_env(customer_env::MULTIPART_MODE)?.as_deref() {
+            Some("staged") => MultipartMode::Staged,
+            Some("reject") | None => MultipartMode::Reject,
+            Some(value) => {
+                warn!("invalid MASKURA_MULTIPART_MODE={value:?}; using reject");
+                MultipartMode::Reject
+            }
+        },
+    )
 }
 
-fn configured_s3_streaming_capabilities() -> Option<BackendCapabilities> {
-    let provider = std::env::var("S4_STREAMING_S3_PROVIDER").ok()?;
+fn configured_s3_streaming_capabilities() -> anyhow::Result<Option<BackendCapabilities>> {
+    let Some(provider) = resolve_customer_env(customer_env::STREAMING_S3_PROVIDER)? else {
+        return Ok(None);
+    };
     if !matches!(provider.as_str(), "aws" | "minio" | "r2" | "b2") {
-        warn!("unknown S4_STREAMING_S3_PROVIDER={provider:?}; direct streaming disabled");
-        return None;
+        warn!("unknown MASKURA_STREAMING_S3_PROVIDER={provider:?}; direct streaming disabled");
+        return Ok(None);
     }
-    Some(BackendCapabilities {
+    Ok(Some(BackendCapabilities {
         incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
         abort_incomplete_upload: true,
         cleanup_sla: Some(Duration::from_secs(5 * 60)),
@@ -898,7 +916,7 @@ fn configured_s3_streaming_capabilities() -> Option<BackendCapabilities> {
         list_operations: ListCapability::V1AndV2,
         multipart_responses: MultipartResponseCapability::Standard,
         completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
-    })
+    }))
 }
 
 fn configured_managed_streaming_capabilities() -> Option<BackendCapabilities> {
@@ -918,26 +936,26 @@ fn configured_managed_streaming_capabilities() -> Option<BackendCapabilities> {
     })
 }
 
-fn legacy_max_object_bytes() -> usize {
-    let configured = match std::env::var("S4_LEGACY_MAX_OBJECT_BYTES") {
-        Ok(raw) => match raw.parse::<usize>() {
+fn legacy_max_object_bytes() -> anyhow::Result<usize> {
+    let configured = match resolve_customer_env(customer_env::LEGACY_MAX_OBJECT_BYTES)? {
+        Some(raw) => match raw.parse::<usize>() {
             Ok(value) if value > 0 => value,
             _ => {
                 warn!(
-                    "invalid S4_LEGACY_MAX_OBJECT_BYTES={raw:?}; using {LEGACY_MAX_OBJECT_BYTES}"
+                    "invalid MASKURA_LEGACY_MAX_OBJECT_BYTES={raw:?}; using {LEGACY_MAX_OBJECT_BYTES}"
                 );
                 LEGACY_MAX_OBJECT_BYTES
             }
         },
-        Err(_) => LEGACY_MAX_OBJECT_BYTES,
+        None => LEGACY_MAX_OBJECT_BYTES,
     };
     let bounded = configured.min(LEGACY_MAX_OBJECT_BYTES);
     if bounded != configured {
         warn!(
-            "S4_LEGACY_MAX_OBJECT_BYTES={configured} exceeds the immutable 16 MiB limit; using {bounded}"
+            "MASKURA_LEGACY_MAX_OBJECT_BYTES={configured} exceeds the immutable 16 MiB limit; using {bounded}"
         );
     }
-    bounded
+    Ok(bounded)
 }
 
 /// Derive the deterministic-encryption key for an API key secret:
@@ -1062,7 +1080,7 @@ struct S3Query {
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "S4 Gateway API",
+        title = "Maskura Gateway API",
         version = "0.3.5",
         description = "Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline."
     ),
@@ -1771,6 +1789,7 @@ async fn authenticate_headers(
     keys: &Arc<dyn KeyRepository>,
     state: &AppState,
 ) -> Result<HeaderAuthentication, HeaderAuthError> {
+    customer_headers::validate_all(headers).map_err(|_| HeaderAuthError::Denied)?;
     if let Some(sigv4) = RequestAuthorization::parse(uri, headers).map_err(HeaderAuthError::from)? {
         // AUTH_DISABLED is an explicit local-only bypass retained for the
         // development S3 front door. Production always takes the strict
@@ -1880,8 +1899,10 @@ async fn authenticate_headers(
         }
         _ => {}
     };
-    // x-s4-mcp-token header: MCP bearer token.
-    if let Some(tok) = headers.get("x-s4-mcp-token").and_then(|v| v.to_str().ok()) {
+    // Canonical and legacy MCP headers resolve to one credential value.
+    if let Some(tok) = customer_headers::validated(headers, customer_headers::MCP_TOKEN)
+        .and_then(|v| v.to_str().ok())
+    {
         let user_id = if tok.starts_with("s4m_") {
             keys.resolve_mcp_token(tok)
                 .await
@@ -1903,12 +1924,10 @@ async fn authenticate_headers(
         }
         return Err(HeaderAuthError::Denied);
     }
-    let ak = headers
-        .get("x-s4-access-key")
+    let ak = customer_headers::validated(headers, customer_headers::ACCESS_KEY)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let sk = headers
-        .get("x-s4-secret-key")
+    let sk = customer_headers::validated(headers, customer_headers::SECRET_KEY)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let resolved = keys
@@ -2718,8 +2737,7 @@ fn s3_xml_ok(xml: String) -> axum::response::Response {
 }
 
 fn wants_transformed_read(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-s4-process")
+    customer_headers::validated(headers, customer_headers::PROCESS)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("read") || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -2883,7 +2901,7 @@ async fn begin_streaming_sink(
         ResolvedBackend::S3 { kind, client } => {
             let capabilities = state.s3_streaming_capabilities.ok_or_else(|| {
                 StreamingPutError::Unsupported(
-                    "direct S3 streaming needs S4_STREAMING_S3_PROVIDER".to_string(),
+                    "direct S3 streaming needs MASKURA_STREAMING_S3_PROVIDER".to_string(),
                 )
             })?;
             let journal = state.operation_journal.clone().ok_or_else(|| {
@@ -3076,7 +3094,7 @@ async fn streaming_single_put(
     if is_avro_content_type(headers) {
         if !state.binary_avro_enabled {
             return Err(StreamingPutError::Unsupported(
-                "Avro processing is disabled; set S4_ENABLE_AVRO=true".to_string(),
+                "Avro processing is disabled; set MASKURA_ENABLE_AVRO=true".to_string(),
             ));
         }
         return streaming_avro_single_put(
@@ -3105,8 +3123,7 @@ async fn streaming_single_put(
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
     let sink = Arc::clone(&sink_guard.sink);
-    let stable_fields = headers
-        .get("x-s4-stable-fields")
+    let stable_fields = customer_headers::validated(headers, customer_headers::STABLE_FIELDS)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
     let session = s4_wasm_runtime::Session {
@@ -3311,15 +3328,14 @@ fn avro_pump(
     >,
     s4_error::S4Error,
 > {
-    let targets = headers
-        .get("x-s4-encrypt-fields")
+    let targets = customer_headers::validated(headers, customer_headers::ENCRYPT_FIELDS)
         .map(|value| {
             value
                 .to_str()
                 .map_err(|_| {
                     s4_error::S4Error::new(
                         s4_error::codes::CONFIG_INVALID,
-                        "invalid x-s4-encrypt-fields",
+                        "invalid x-maskura-encrypt-fields",
                     )
                 })
                 .and_then(crate::binary_pump::parse_envelope_targets)
@@ -3959,7 +3975,7 @@ async fn complete_staged_multipart(
         if !state.binary_avro_enabled {
             return Err(MultipartCompletionError::Streaming(
                 StreamingPutError::Unsupported(
-                    "Avro processing is disabled; set S4_ENABLE_AVRO=true".to_string(),
+                    "Avro processing is disabled; set MASKURA_ENABLE_AVRO=true".to_string(),
                 ),
             ));
         }
@@ -5227,8 +5243,7 @@ fn transformed_session(
         config_json: None,
         public_key_pem: auth.public_key_pem.clone(),
         stable_key: auth.stable_key.clone(),
-        stable_fields: headers
-            .get("x-s4-stable-fields")
+        stable_fields: customer_headers::validated(headers, customer_headers::STABLE_FIELDS)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned),
     }
@@ -5296,7 +5311,7 @@ async fn avro_transformed_read_response(
             transformed_read_error_response(
                 key,
                 TransformedReadError::Capacity(
-                    "unsafe transformed reads require S4_TRANSFORMED_READ_SPOOL=encrypted"
+                    "unsafe transformed reads require MASKURA_TRANSFORMED_READ_SPOOL=encrypted"
                         .to_string(),
                 ),
             ),
@@ -5658,7 +5673,7 @@ async fn transformed_read_response(
             transformed_read_error_response(
                 key,
                 TransformedReadError::Capacity(
-                    "unsafe transformed reads require S4_TRANSFORMED_READ_SPOOL=encrypted"
+                    "unsafe transformed reads require MASKURA_TRANSFORMED_READ_SPOOL=encrypted"
                         .to_string(),
                 ),
             ),
@@ -5906,7 +5921,7 @@ async fn s3_get(
                 return transformed_read_error_response(
                     &key,
                     TransformedReadError::InvalidRequest(
-                        "Avro processing is disabled; set S4_ENABLE_AVRO=true".to_string(),
+                        "Avro processing is disabled; set MASKURA_ENABLE_AVRO=true".to_string(),
                     ),
                 );
             }
@@ -8564,7 +8579,8 @@ async fn root(
         .and_then(|v| v.to_str().ok())
         .map(|a| a.starts_with("AWS4-"))
         .unwrap_or(false)
-        || headers.contains_key("x-s4-access-key")
+        || headers.contains_key(customer_headers::ACCESS_KEY.canonical)
+        || headers.contains_key(customer_headers::ACCESS_KEY.legacy)
         || uri.query().is_some_and(|query| {
             query
                 .split('&')
@@ -8618,7 +8634,7 @@ async fn list_buckets(
     }
     names.sort();
     let mut xml = String::from(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>s4</ID><DisplayName>s4</DisplayName></Owner><Buckets>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>maskura</ID><DisplayName>Maskura</DisplayName></Owner><Buckets>"#,
     );
     for n in names {
         xml.push_str(&format!(
@@ -9062,14 +9078,24 @@ fn unique_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a st
         .transpose()
 }
 
+fn unique_customer_header(
+    headers: &HeaderMap,
+    alias: customer_headers::HeaderAlias,
+) -> Result<Option<&str>, StatusCode> {
+    customer_headers::aliased_unique(headers, alias)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?
+        .map(|value| value.to_str().map_err(|_| StatusCode::UNAUTHORIZED))
+        .transpose()
+}
+
 async fn authenticate_public_key_mutation(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<PublicKeyMutationActor, StatusCode> {
     let authorization = unique_header(headers, "authorization")?;
-    let access_key = unique_header(headers, "x-s4-access-key")?;
-    let secret_key = unique_header(headers, "x-s4-secret-key")?;
-    let mcp_token = unique_header(headers, "x-s4-mcp-token")?;
+    let access_key = unique_customer_header(headers, customer_headers::ACCESS_KEY)?;
+    let secret_key = unique_customer_header(headers, customer_headers::SECRET_KEY)?;
+    let mcp_token = unique_customer_header(headers, customer_headers::MCP_TOKEN)?;
     let api_headers_supplied = access_key.is_some() || secret_key.is_some();
     if (api_headers_supplied && authorization.is_some())
         || (mcp_token.is_some() && (api_headers_supplied || authorization.is_some()))
@@ -9178,11 +9204,16 @@ async fn create_plugin(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let name = headers
-        .get("x-s4-plugin-name")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("imported")
-        .to_string();
+    let name = match customer_headers::aliased(&headers, customer_headers::PLUGIN_NAME) {
+        Ok(Some(value)) => match value.to_str() {
+            Ok(value) => value.to_string(),
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid plugin name").into_response(),
+        },
+        Ok(None) => "imported".to_string(),
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "conflicting plugin name headers").into_response();
+        }
+    };
     match state.plugins.import(&name, &body) {
         Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
         Err(e) => (
@@ -9270,10 +9301,10 @@ async fn list_objects(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(objects)
 }
 
-fn component_path() -> PathBuf {
-    std::env::var("S4_FILTER_COMPONENT")
+fn component_path() -> anyhow::Result<PathBuf> {
+    Ok(resolve_customer_env(customer_env::FILTER_COMPONENT)?
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|| {
             let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             p.push("..");
             p.push("..");
@@ -9281,26 +9312,26 @@ fn component_path() -> PathBuf {
             p.push("components");
             p.push("pii-default.component.wasm");
             p
-        })
+        }))
 }
 
-fn bundled_stable_component() -> Option<Vec<u8>> {
-    let directory = match std::env::var("S4_PLUGINS_DIR") {
-        Ok(directory) => PathBuf::from(directory),
-        Err(_) => {
-            warn!("join demo disabled because S4_PLUGINS_DIR is not configured");
-            return None;
+fn bundled_stable_component() -> anyhow::Result<Option<Vec<u8>>> {
+    let directory = match resolve_customer_env(customer_env::PLUGINS_DIR)? {
+        Some(directory) => PathBuf::from(directory),
+        None => {
+            warn!("join demo disabled because MASKURA_PLUGINS_DIR is not configured");
+            return Ok(None);
         }
     };
     let path = directory.join("stable-encrypt.component.wasm");
     match std::fs::read(&path) {
-        Ok(component) => Some(component),
+        Ok(component) => Ok(Some(component)),
         Err(error) => {
             warn!(
                 "join demo disabled because {} is unavailable: {error}",
                 path.display()
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -9327,20 +9358,18 @@ fn validate_storage_boundary_startup(
     Ok(())
 }
 
-fn source_body_limits_from_env() -> BodyLimits {
-    BodyLimits {
-        max_frame_bytes: std::env::var("S4_SOURCE_MAX_FRAME_BYTES")
-            .ok()
+fn source_body_limits_from_env() -> anyhow::Result<BodyLimits> {
+    Ok(BodyLimits {
+        max_frame_bytes: resolve_customer_env(customer_env::SOURCE_MAX_FRAME_BYTES)?
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)
             .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES),
-        max_bytes: std::env::var("S4_MAX_OBJECT_BYTES")
-            .ok()
+        max_bytes: resolve_customer_env(customer_env::MAX_OBJECT_BYTES)?
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)
             .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
             .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
-    }
+    })
 }
 
 /// Build the engine state from environment variables, injecting the given
@@ -9367,10 +9396,14 @@ pub async fn build_state_with_pipeline_template(
     workspace_storage: Arc<dyn WorkspaceStorageRepository>,
     pipeline_template: &StatePipelineTemplate,
 ) -> anyhow::Result<Arc<AppState>> {
+    maskura_customer_config::validate(customer_env::GATEWAY_CUSTOMER_SETTINGS)?;
     let s3_endpoint = std::env::var("S3_ENDPOINT").ok();
     let auth_disabled = enabled_env_flag("AUTH_DISABLED");
-    let explicit_single_tenant =
-        explicit_single_tenant_mode(auth_disabled, enabled_env_flag("S4_SINGLE_TENANT"));
+    let explicit_single_tenant = explicit_single_tenant_mode(
+        auth_disabled,
+        resolve_customer_env(customer_env::SINGLE_TENANT)?
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+    );
     let service_backends = std::env::var("S4_SERVICE_BUCKETS")
         .ok()
         .map(|value| parse_service_backends(&value))
@@ -9385,7 +9418,7 @@ pub async fn build_state_with_pipeline_template(
     let workspace_endpoint_policy =
         WorkspaceEndpointPolicy::from_env(explicit_single_tenant).map_err(anyhow::Error::msg)?;
 
-    let source_body_limits = source_body_limits_from_env();
+    let source_body_limits = source_body_limits_from_env()?;
     let max_pipeline_output_bytes = pipeline_template.max_pipeline_output_bytes;
     let (gateway, plugins, demo_pipelines) = pipeline_template.instantiate()?;
 
@@ -9447,7 +9480,7 @@ pub async fn build_state_with_pipeline_template(
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(PLACEMENT_VERSION_V1);
-    let multipart_mode = multipart_mode();
+    let multipart_mode = multipart_mode()?;
     let multipart_tenant_quota_bytes = std::env::var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -9470,24 +9503,22 @@ pub async fn build_state_with_pipeline_template(
                 })
         })
         .transpose()?;
-    let streaming_write_mode = streaming_write_mode();
-    let s3_streaming_capabilities = configured_s3_streaming_capabilities();
+    let streaming_write_mode = streaming_write_mode()?;
+    let s3_streaming_capabilities = configured_s3_streaming_capabilities()?;
     let managed_streaming_capabilities = configured_managed_streaming_capabilities();
-    let spool_max_object_bytes = std::env::var("S4_SPOOL_MAX_OBJECT_BYTES")
-        .ok()
+    let spool_max_object_bytes = resolve_customer_env(customer_env::SPOOL_MAX_OBJECT_BYTES)?
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(source_body_limits.max_bytes)
         .min(source_body_limits.max_bytes);
-    let spool_quota_bytes = std::env::var("S4_SPOOL_QUOTA_BYTES")
-        .ok()
+    let spool_quota_bytes = resolve_customer_env(customer_env::SPOOL_QUOTA_BYTES)?
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value >= spool_max_object_bytes)
         .unwrap_or(spool_max_object_bytes.saturating_mul(2));
     let spool_config = CompatibilitySpoolConfig {
-        directory: std::env::var("S4_SPOOL_DIR")
+        directory: resolve_customer_env(customer_env::SPOOL_DIR)?
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("s4-spool")),
+            .unwrap_or_else(|| std::env::temp_dir().join("s4-spool")),
         max_object_bytes: spool_max_object_bytes,
         stale_after: Duration::from_secs(24 * 60 * 60),
     };
@@ -9497,18 +9528,18 @@ pub async fn build_state_with_pipeline_template(
     }
     schedule_spool_cleanup(spool_config.clone());
     let spool_quota = Arc::new(SpoolQuota::new(spool_quota_bytes));
-    let dev_memory_max_object_bytes = std::env::var("S4_DEV_MEMORY_MAX_OBJECT_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(LEGACY_MAX_OBJECT_BYTES)
-        .min(64 * 1024 * 1024);
+    let dev_memory_max_object_bytes =
+        resolve_customer_env(customer_env::DEV_MEMORY_MAX_OBJECT_BYTES)?
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(LEGACY_MAX_OBJECT_BYTES)
+            .min(64 * 1024 * 1024);
     let dev_memory_streaming_enabled = explicit_single_tenant
-        || std::env::var("S4_DEV_MEMORY_STREAMING")
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        || resolve_customer_env(customer_env::DEV_MEMORY_STREAMING)?
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
 
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
-    // a JSON file when S4_KEYS_FILE is set, a default JSON file in local
+    // a JSON file when MASKURA_KEYS_FILE (or its legacy alias) is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
     let mut operation_journal: Option<Arc<dyn OperationJournal>> = None;
     let mut postgres_pool = None;
@@ -9527,7 +9558,7 @@ pub async fn build_state_with_pipeline_template(
         )));
         postgres_pool = Some(pool.clone());
         Arc::new(PostgresKeyStore::with_cipher(pool, cipher.clone()))
-    } else if let Ok(keys_file) = std::env::var("S4_KEYS_FILE") {
+    } else if let Some(keys_file) = resolve_customer_env(customer_env::KEYS_FILE)? {
         info!("Key store: file ({keys_file})");
         Arc::new(FileKeyStore::with_cipher(
             PathBuf::from(keys_file),
@@ -9538,7 +9569,7 @@ pub async fn build_state_with_pipeline_template(
         info!("Key store: file ({}) (local mode)", path.display());
         Arc::new(FileKeyStore::with_cipher(path, cipher)?)
     } else {
-        info!("Key store: in-memory (set DATABASE_URL or S4_KEYS_FILE for persistence)");
+        info!("Key store: in-memory (set DATABASE_URL or MASKURA_KEYS_FILE for persistence)");
         Arc::new(KeyStore::with_cipher(cipher))
     };
     #[cfg(debug_assertions)]
@@ -9594,7 +9625,7 @@ pub async fn build_state_with_pipeline_template(
                 }
                 _ => {
                     warn!(
-                        "staged multipart requested without a complete S4-controlled staging backend; transformed multipart remains rejected"
+                        "staged multipart requested without a complete Maskura-controlled staging backend; transformed multipart remains rejected"
                     );
                     None
                 }
@@ -9673,13 +9704,13 @@ pub async fn build_state_with_pipeline_template(
             let (secret, created) = keys
                 .create_key("demo-user", "local-default", 0, None)
                 .await?;
-            println!("S4_ACCESS_KEY={}", created.key_id);
-            println!("S4_SECRET_KEY={secret}");
+            println!("MASKURA_ACCESS_KEY={}", created.key_id);
+            println!("MASKURA_SECRET_KEY={secret}");
         } else if let Some(k) = existing.into_iter().find(|k| k.label == "local-default")
             && let Some(secret) = keys.decrypt_secret(&k.key_id).await?
         {
-            println!("S4_ACCESS_KEY={}", k.key_id);
-            println!("S4_SECRET_KEY={secret}");
+            println!("MASKURA_ACCESS_KEY={}", k.key_id);
+            println!("MASKURA_SECRET_KEY={secret}");
         }
     }
 
@@ -9699,8 +9730,8 @@ pub async fn build_state_with_pipeline_template(
         explicit_single_tenant,
         workspace_endpoint_policy,
         control,
-        legacy_max_object_bytes: legacy_max_object_bytes(),
-        streaming_read_mode: StreamingReadMode::from_env(),
+        legacy_max_object_bytes: legacy_max_object_bytes()?,
+        streaming_read_mode: StreamingReadMode::from_env()?,
         streaming_write_mode,
         source_body_limits,
         max_pipeline_output_bytes,
@@ -9712,8 +9743,8 @@ pub async fn build_state_with_pipeline_template(
         managed_streaming_capabilities,
         spool_config,
         spool_quota,
-        transformed_read_spool_enabled: transformed_read_spool_enabled(),
-        binary_avro_enabled: binary_avro_enabled(),
+        transformed_read_spool_enabled: transformed_read_spool_enabled()?,
+        binary_avro_enabled: binary_avro_enabled()?,
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
         demo_pipelines,
@@ -9973,6 +10004,7 @@ mod demo_limiter_tests {
     #[test]
     fn stateless_demo_process_is_not_published_in_openapi() {
         let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(document["info"]["title"], "Maskura Gateway API");
         assert!(
             document["paths"]
                 .get("/dashboard/api/demo/process")
@@ -10031,7 +10063,7 @@ mod s3_provider_capability_tests {
     fn provider_selection_is_exact_and_fail_closed() {
         for provider in ["aws", "minio", "r2", "b2"] {
             unsafe { std::env::set_var("S4_STREAMING_S3_PROVIDER", provider) }
-            let capabilities = configured_s3_streaming_capabilities();
+            let capabilities = configured_s3_streaming_capabilities().unwrap();
             assert!(
                 capabilities.is_some(),
                 "provider {provider} must enable direct S3 streaming"
@@ -10041,8 +10073,8 @@ mod s3_provider_capability_tests {
             assert!(capabilities.supports_response_checksums());
         }
         unsafe { std::env::set_var("S4_STREAMING_S3_PROVIDER", "wasabi") }
-        assert!(configured_s3_streaming_capabilities().is_none());
+        assert!(configured_s3_streaming_capabilities().unwrap().is_none());
         unsafe { std::env::remove_var("S4_STREAMING_S3_PROVIDER") }
-        assert!(configured_s3_streaming_capabilities().is_none());
+        assert!(configured_s3_streaming_capabilities().unwrap().is_none());
     }
 }

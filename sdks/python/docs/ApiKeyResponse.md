@@ -15,7 +15,7 @@ Name | Type | Description | Notes
 ## Example
 
 ```python
-from s4_client.models.api_key_response import ApiKeyResponse
+from maskura_client.models.api_key_response import ApiKeyResponse
 
 # TODO update the JSON string below
 json = "{}"

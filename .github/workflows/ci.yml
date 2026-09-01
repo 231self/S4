@@ -4,6 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,6 +23,7 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -26,6 +35,7 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -34,10 +44,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -50,10 +61,11 @@ jobs:
       - name: Build Wasm filters
         run: bash scripts/build-filters.sh
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   sdk:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -67,10 +79,16 @@ jobs:
         if: ${{ !env.ACT }}
         run: |
           bash scripts/generate-sdks.sh
-          git diff --exit-code -- sdks/
+          changes="$(git status --porcelain --untracked-files=all -- sdks/)"
+          if [ -n "$changes" ]; then
+            git diff -- sdks/
+            git status --short --untracked-files=all -- sdks/
+            exit 1
+          fi
 
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -86,6 +104,7 @@ jobs:
 
   postgres:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-trixie@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
@@ -114,10 +133,11 @@ jobs:
       - name: Build Wasm filters
         run: bash scripts/build-filters.sh
       - name: Test Postgres migrations and secret envelopes
-        run: cargo test -p s4-gateway --test db_keys_test
+        run: cargo test --locked -p s4-gateway --test db_keys_test
 
   interop:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -134,7 +154,9 @@ jobs:
           python3 -m pip install --user awscli boto3
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Unmodified-client interop (AWS CLI + boto3)
-        run: cargo test -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
+        env:
+          S4_RUN_EXTERNAL_CLIENT_INTEROP: "1"
+        run: cargo test --locked -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
 
   # Aggregate status so branch protection's required `check` keeps working
   # and never ends up "skipped" when a constituent job fails.
@@ -142,10 +164,11 @@ jobs:
     needs: [fmt, lint, test, sdk, e2e, postgres, interop]
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Fail if any check failed
-        if: ${{ contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled') }}
+        if: ${{ contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled') || contains(join(needs.*.result, ','), 'skipped') }}
         run: exit 1
       - name: All checks passed
-        if: ${{ !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') }}
+        if: ${{ !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') && !contains(join(needs.*.result, ','), 'skipped') }}
         run: echo "all checks passed"

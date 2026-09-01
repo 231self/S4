@@ -1,12 +1,18 @@
 name: Weekly
 
-# Deep soak: repeated streaming round-trips, high-case property tests, and the
-# fixed-RSS memory bound. Runs less frequently than Nightly because the soak
-# path is intentionally long.
+# Deep soak and high-case property tests. Nightly already covers fixed-RSS and
+# MinIO E2E six minutes before this workflow starts each Monday.
 on:
   schedule:
     - cron: "23 3 * * 1"
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,6 +22,7 @@ env:
 jobs:
   soak:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -28,10 +35,11 @@ jobs:
       - name: Build Wasm filters
         run: bash scripts/build-filters.sh
       - name: Soak streaming round-trips (500 iterations)
-        run: S4_SOAK_ITERATIONS=500 cargo test -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored --nocapture
+        run: S4_SOAK_ITERATIONS=500 cargo test --locked -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored --nocapture
 
   property:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -44,28 +52,4 @@ jobs:
       - name: Build Wasm filters
         run: bash scripts/build-filters.sh
       - name: High-case property tests (50k cases)
-        run: PROPTEST_CASES=50000 cargo test -p s4-gateway --test property --test record_decoder
-
-  rss:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Fixed-RSS 1 GiB streaming
-        run: cargo test -p s4-gateway --test streaming_rss -- --nocapture
-
-  e2e:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
-        with:
-          targets: wasm32-wasip1,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-tools
-        run: cargo install --locked wasm-tools --version 1.255.0
-      - name: End-to-end (MinIO direct S3 streaming)
-        run: bash scripts/e2e-local.sh
+        run: PROPTEST_CASES=50000 cargo test --locked -p s4-gateway --test property --test record_decoder

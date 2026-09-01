@@ -62,8 +62,13 @@ impl Gateway {
     }
 
     pub fn with_registry(engine: FilterEngine, plugins: Arc<PluginRegistry>) -> Self {
+        Self::with_shared_registry(Arc::new(engine), plugins)
+    }
+
+    /// Build a gateway around an already compiled immutable engine.
+    pub fn with_shared_registry(engine: Arc<FilterEngine>, plugins: Arc<PluginRegistry>) -> Self {
         Self {
-            engine: Arc::new(engine),
+            engine,
             plugins: Some(plugins.clone()),
             resolver: Some(Arc::new(StaticPipelineResolver::new(plugins.clone()))),
             component_source: Some(plugins),

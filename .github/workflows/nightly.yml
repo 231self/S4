@@ -8,6 +8,13 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -16,6 +23,7 @@ env:
 jobs:
   property:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -28,20 +36,22 @@ jobs:
       - name: Build Wasm filters
         run: bash scripts/build-filters.sh
       - name: High-case property tests (10k cases)
-        run: PROPTEST_CASES=10000 cargo test -p s4-gateway --test property --test record_decoder
+        run: PROPTEST_CASES=10000 cargo test --locked -p s4-gateway --test property --test record_decoder
 
   rss:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Fixed-RSS 1 GiB streaming
-        run: cargo test -p s4-gateway --test streaming_rss -- --nocapture
+        run: cargo test --locked -p s4-gateway --test streaming_rss -- --nocapture
 
   interop:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -58,10 +68,13 @@ jobs:
           python3 -m pip install --user awscli boto3
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Unmodified-client interop (AWS CLI + boto3)
-        run: cargo test -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
+        env:
+          S4_RUN_EXTERNAL_CLIENT_INTEROP: "1"
+        run: cargo test --locked -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
 
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain

@@ -15,7 +15,7 @@ Method | HTTP request | Description
 
 
 ```typescript
-import { createConfiguration, ObjectsApi } from 's4-client';
+import { createConfiguration, ObjectsApi } from '';
 
 const configuration = createConfiguration();
 const apiInstance = new ObjectsApi(configuration);

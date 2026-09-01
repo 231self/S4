@@ -11,7 +11,7 @@ The local development environment simulates the Nitro Enclave topology using Doc
 
 The dev attestation provider uses a private CA, clearly marked root certificate, and `UNTRUSTED DEVELOPMENT ATTESTATION` labels in all tools and outputs. The production attestation chain (AWS Nitro root, KMS PCR conditions) is never present in dev images.
 
-The transport protocol, secret-provider trait, and attestation-provider trait are identical between dev and production, but their implementations are swapped. `s4ctl` and the dashboard prominently label dev attestations and refuse to treat dev PCRs as production-approved.
+The transport protocol, secret-provider trait, and attestation-provider trait are identical between dev and production, but their implementations are swapped. `maskura` and the dashboard prominently label dev attestations and refuse to treat dev PCRs as production-approved.
 
 ## Consequences
 

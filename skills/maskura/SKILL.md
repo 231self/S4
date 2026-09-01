@@ -1,12 +1,12 @@
 ---
-name: s4
-description: S4 — pluggable processing gateway for S3-compatible object storage. Use when working in the S4 codebase: building/testing, the Wasm plugin pipeline, the S3 data plane, envelope encryption, SDKs, or the CI/release pipeline.
+name: maskura
+description: Maskura is a pluggable processing gateway for S3-compatible object storage. Use when working in the Maskura codebase, including builds, tests, the Wasm plugin pipeline, the S3 data plane, envelope encryption, SDKs, or CI and release pipelines.
 ---
 
-# S4 — pluggable processing gateway for object storage
+# Maskura: pluggable processing gateway for object storage
 
-S4 is an S3-compatible gateway that runs WebAssembly plugins over every object in
-transit. Point any S3 SDK/tool at S4; each object passes through an ordered plugin
+Maskura is an S3-compatible gateway that runs WebAssembly plugins over every object in
+transit. Point any S3 SDK/tool at Maskura; each object passes through an ordered plugin
 pipeline (filter, redact, encrypt, convert, validate, route) and the result is
 forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
 
@@ -17,21 +17,21 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
   `begin(Context)`, `transform(Vec<u8>) -> Decision`, `finish()`.
   Decision variants: `Emit`, `Drop`, `Reject`.
 - **Sandbox** — wasmtime, 64 MiB memory, 10K table entries, 512 KiB stack, no host
-  imports. Fuel: `S4_WASM_FUEL` (default 1B; crypto filters need the pipeline
+  imports. Fuel: `MASKURA_WASM_FUEL` (default 1B; crypto filters need the pipeline
   budget, ~25M per RSA-OAEP wrap).
 - **Plugins are BYO** — write in any Wasm-capable language, `wasm-tools component
-  new`, then runtime import via `s4ctl plugin upload` (no gateway rebuild/restart).
-  `S4_PLUGINS_DIR` auto-loads a directory at startup. Default filter:
+  new`, then runtime import via `maskura plugin upload` (no gateway rebuild/restart).
+  `MASKURA_PLUGINS_DIR` auto-loads a directory at startup. Default filter:
   `filters/pii-default/` (redact emails / Luhn-valid cards / validated SSNs).
 - **Envelope encryption** — `filters/envelope-encrypt/` replaces each PII field
   with `{"alg":"RSA-OAEP/AES-256-GCM","iv","enc_dek","ct","tag"}` using the API
-  key's bound X.509 public key. S4 never holds the private key; clients decrypt
-  (`s4_client.decrypt_payload`). Falls back to redaction without a key.
+  key's bound X.509 public key. Maskura never holds the private key; clients decrypt
+  (`maskura_client.MaskuraClient.decrypt_payload`). Falls back to redaction without a key.
   `filters/stable-encrypt/` is AES-SIV deterministic encryption for JOIN keys
   (opt-in via stable-key/stable-fields context).
-- **Auth** — API keys (`x-s4-access-key`/`x-s4-secret-key` headers or
+- **Auth** — API keys (`x-maskura-access-key`/`x-maskura-secret-key` headers or
   `Authorization: Bearer <ak>:<sk>`). Key stores: in-memory `KeyStore`,
-  `FileKeyStore` (`S4_KEYS_FILE`, default in local mode), `PostgresKeyStore`
+  `FileKeyStore` (`MASKURA_KEYS_FILE`, default in local mode), `PostgresKeyStore`
   (`DATABASE_URL`). Secrets stored SHA-256-hashed. `AUTH_DISABLED=true` = demo
   bypass.
 - **Storage** — resolution is explicit managed override, presigned URL, repository-
@@ -51,26 +51,26 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
 
 ```bash
 just check            # fmt + clippy (-D warnings) + build filters + workspace tests
-just e2e              # MinIO data-plane e2e (Docker) — gateway server + s4ctl test upload
+just e2e              # MinIO data-plane e2e (Docker) + maskura test upload
 just build-sdks       # regenerate Python/TypeScript SDKs (docker openapi-generator)
 just ci-local         # run the real ci.yml locally via act (colima)
 just image-local      # dagger: build the deploy image (cargo-cached)
-just publish-local TAG=x  # dagger: push ghcr.io/231self/s4/s4:<tag>
-s4ctl local init      # run the published gateway image standalone (Docker, in-memory)
-s4ctl put/get         # S3 data plane through the pipeline
+just publish-local TAG=x  # dagger: push canonical + legacy image tags
+maskura local init    # run the published gateway image standalone (Docker, in-memory)
+maskura put/get       # S3 data plane through the pipeline
 bash examples/b2-encrypt-demo.sh   # B2 encryption round-trip (needs B2_* env vars)
 ```
 
 ## Layout
 
 - `crates/gateway/` — the server: S3 data plane + dashboard API (axum, utoipa).
-- `crates/s4ctl/` — the CLI.
+- `crates/s4ctl/` — shared `maskura` and legacy `s4ctl` CLI implementation.
 - `crates/wasm-runtime/` — wasmtime sandbox (`FilterEngine`).
 - `crates/policy/`, `crates/error/` — shared policy/error types.
 - `filters/*/` — 7 Wasm filter crates (wasm32, wit-bindgen).
 - `wit/s4-filter/world.wit` — the plugin interface.
 - `sdks/{python,typescript}/` — generated clients + `overlay/` hand-written
-  high-level client (`S4Client`).
+  high-level client (`MaskuraClient`, with `S4Client` compatibility export).
 - `migrations/` — sqlx migrations (run by the gateway at startup via `migrate!`).
 - `scripts/` — build-filters.sh, e2e-local.sh, generate-sdks.sh, check.sh.
 - `docs/plugins.md`, `docs/adr/` — plugin guide and architecture decisions.

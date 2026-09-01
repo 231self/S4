@@ -12,7 +12,7 @@ Name | Type | Description | Notes
 ## Example
 
 ```python
-from s4_client.models.create_key_request import CreateKeyRequest
+from maskura_client.models.create_key_request import CreateKeyRequest
 
 # TODO update the JSON string below
 json = "{}"

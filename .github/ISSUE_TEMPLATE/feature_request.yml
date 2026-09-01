@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest an enhancement for S4
+description: Suggest an enhancement for Maskura
 labels: [enhancement]
 body:
   - type: textarea
@@ -23,7 +23,7 @@ body:
         - Wasm filters / pipeline
         - Encryption
         - Storage backends
-        - CLI (s4ctl)
+        - CLI (maskura)
         - SDKs
         - Docs
         - Other

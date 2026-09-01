@@ -14,7 +14,7 @@ Name | Type | Description | Notes
 ## Example
 
 ```python
-from s4_client.models.list_key_response import ListKeyResponse
+from maskura_client.models.list_key_response import ListKeyResponse
 
 # TODO update the JSON string below
 json = "{}"

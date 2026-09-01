@@ -1,9 +1,9 @@
-"""Dagger pipeline for S4: build, test, publish.
+"""Dagger pipeline for Maskura: build, test, publish.
 
 Run locally (requires the Dagger CLI + engine):
     dagger call ci                      # fmt + clippy + filters + tests (cached)
     dagger call image                   # assemble the deploy image
-    dagger call publish --tag=v0.2.0    # build + push ghcr.io/231self/s4/s4:<tag>
+    dagger call publish --tag=v0.2.0    # push canonical + legacy image tags
 
 Sources are cloned in-engine via dag.git (no host filesystem dependency),
 and cargo registry + target dirs live on persistent cache volumes, so
@@ -13,13 +13,16 @@ repeated runs reuse compiled dependencies instead of recompiling.
 import dagger
 from dagger import dag, function, object_type
 
-REGISTRY = "ghcr.io/231self/s4/s4"
+REGISTRY = "ghcr.io/231self/maskura/maskura"
+LEGACY_REGISTRY = "ghcr.io/231self/s4/s4"
 REPO = "https://github.com/231self/S4.git"
 DEFAULT_REF = "main"
 
 
 @object_type
 class S4:
+    """Build, test, and publish Maskura."""
+
     @function
     async def builder(self, ref: str = DEFAULT_REF) -> dagger.Container:
         """Rust builder: workspace + wasm32 target + wasm-tools, cargo-cached."""
@@ -76,9 +79,9 @@ class S4:
                 builder.directory("/src/target/components"),
             )
             .with_env_variable(
-                "S4_FILTER_COMPONENT", "/app/components/pii-default.component.wasm"
+                "MASKURA_FILTER_COMPONENT", "/app/components/pii-default.component.wasm"
             )
-            .with_env_variable("S4_PLUGINS_DIR", "/app/components")
+            .with_env_variable("MASKURA_PLUGINS_DIR", "/app/components")
             .with_env_variable("LISTEN_ADDR", "0.0.0.0:8080")
             .with_exposed_port(8080)
             .with_entrypoint(["s4-gateway"])
@@ -86,6 +89,8 @@ class S4:
 
     @function
     async def publish(self, tag: str, ref: str = DEFAULT_REF) -> str:
-        """Build + publish the deploy image; returns the image reference."""
+        """Publish identical canonical and legacy deploy image tags."""
         img = await self.image(ref)
-        return await img.publish(f"{REGISTRY}:{tag}")
+        canonical = await img.publish(f"{REGISTRY}:{tag}")
+        await img.publish(f"{LEGACY_REGISTRY}:{tag}")
+        return canonical

@@ -1,10 +1,10 @@
 # Contributing
 
-Thanks for considering a contribution to S4.
+Thanks for considering a contribution to Maskura.
 
 ## Getting started
 
-1. Fork the repo and clone it.
+1. Fork [Maskura on GitHub](https://github.com/231self/S4/fork) and clone your fork.
 2. Install Rust 1.97.0 (see `rust-toolchain.toml`) with the `wasm32-wasip1` target:
    `rustup target add wasm32-wasip1`
 3. Install `wasm-tools` (`cargo install --locked wasm-tools --version 1.255.0`) and `just`.
@@ -14,7 +14,7 @@ Thanks for considering a contribution to S4.
 
 - Rust 2024 edition. No warnings allowed: production code builds with
   `RUSTFLAGS=-D warnings`.
-- Every functional change ships with tests. S4 favors unit tests in the crate plus
+- Every functional change ships with tests. Maskura favors unit tests in the crate plus
   end-to-end coverage (`just e2e`).
 - No raw SQL strings inline; use `sqlx` (runtime-checked queries) and migrations in
   `migrations/`. Never apply schema changes by hand.

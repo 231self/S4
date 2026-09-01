@@ -1,4 +1,4 @@
-# S4 Development Conventions
+# Maskura development conventions
 
 ## Version Control
 
@@ -67,7 +67,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - **Supabase Auth (GoTrue)** for user signup, login, magic-link emails, and session management.
 - Supabase JS client in the dashboard browser app; `jsonwebtoken` crate in the gateway validates JWTs.
 - API keys (S3 access key + secret) are separate from user sessions. Generated on key creation, hashed with SHA-256, stored in Postgres.
-- Gateway verifies API keys on S3 routes via `x-s4-access-key` / `x-s4-secret-key` headers or `Authorization: Bearer <access_key>:<secret>`.
+- Gateway verifies API keys on S3 routes via `x-maskura-access-key` / `x-maskura-secret-key` headers (with permanent `x-s4-*` aliases) or `Authorization: Bearer <access_key>:<secret>`.
 
 ### Database
 
@@ -79,12 +79,12 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### Storage (Object Data)
 
-- **Storage resolution order**: explicit `x-s4-storage-mode: managed`, per-object
-  presigned URL (`x-s4-backend-url`), per-workspace configuration, then configured
-  S4 service storage. Only explicit single-tenant mode may continue to global
+- **Storage resolution order**: explicit `x-maskura-storage-mode: managed`, per-object
+  presigned URL (`x-maskura-backend-url`), per-workspace configuration, then configured
+  Maskura service storage. Only explicit single-tenant mode may continue to global
   `S3_ENDPOINT` and then in-memory storage.
 
-- **Presigned URL proxy**: User generates a presigned PUT/GET URL for their bucket with their own SDK. Sends it as `x-s4-backend-url` header. S4 validates S4 API key, filters PII, HTTP-forwards to the presigned URL. No credentials stored in S4. Platform-agnostic (works with S3, R2, B2, MinIO).
+- **Presigned URL proxy**: User generates a presigned PUT/GET URL for their bucket with their own SDK. Sends it as `x-maskura-backend-url`. Maskura validates the API key, filters PII, and forwards to the presigned URL. No backend credentials are stored. Platform-agnostic (S3, R2, B2, MinIO).
 
 - **Per-workspace backend**: `WorkspaceStorageRepository` maps authenticated users
   to canonical, unchanged `WorkspaceId` values and returns either `managed` or
@@ -100,11 +100,11 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
   only for source `GET`; presigned `PUT`/`DELETE` stay HTTPS-only. AWS SDK clients
   make one attempt; transaction layers own their bounded retries.
 
-- **S4 Service Storage**: "Just works" mode. Users write PII-cleansed data without configuring any backend. S4 manages dedicated buckets across multiple cloud providers. Objects distributed via consistent hashing (150 virtual nodes per backend). Dual-write to primary + replica for cross-cloud resilience. Read falls back to replica on primary miss. Configured via `S4_SERVICE_BUCKETS` env var: `provider|endpoint|region|bucket|access_key|secret_key;...`. Implementation in `crates/gateway/src/service_storage.rs`.
+- **Maskura service storage**: "Just works" mode. Users write PII-cleansed data without configuring any backend. Maskura manages dedicated buckets across multiple cloud providers. Objects are distributed via consistent hashing (150 virtual nodes per backend), dual-written to primary + replica, and read from the replica on primary miss. The operator-only `S4_SERVICE_BUCKETS` setting remains unchanged. Implementation: `crates/gateway/src/service_storage.rs`.
 
 - **Multi-cloud write strategies — progress** (how concurrent multi-cloud writes work today, and the variants we track):
 
-  | Strategy | Status | Behavior in S4 today |
+  | Strategy | Status | Behavior in Maskura today |
   |----------|--------|----------------------|
   | Dispersed writes across providers | ✅ implemented | Consistent-hash ring (150 vnodes/backend) assigns each key a primary + one replica, so keys spread across all configured backends; a provider is just an S3-compatible endpoint label (`S4_SERVICE_BUCKETS`) |
   | Active-active writes | ✅ implemented | `put` dual-writes primary + replica concurrently (`tokio::join!`); a replica write failure is logged and does not fail the request |
@@ -119,13 +119,13 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 - Objects are NOT persisted in Postgres — only metadata (keys, usage receipts) goes there.
 
-### CLI (s4ctl)
+### CLI (`maskura`)
 
-- Binary crate at `crates/s4ctl/`. Full-featured CLI for S4 operations.
+- Binary crate at `crates/s4ctl/`. Full-featured CLI for Maskura operations; `s4ctl` remains an alias.
 - Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`. The legacy `set-aws` command submits unsupported `aws_role` configuration and is rejected by the gateway.
-- Auth from: `~/.config/s4/config.json` (login saved), `S4_ACCESS_KEY`/`S4_SECRET_KEY` env vars, or demo mode (empty keys fall through to gateway demo bypass).
+- Auth from the preserved `~/.config/s4/config.json`, `MASKURA_ACCESS_KEY`/`MASKURA_SECRET_KEY` (with permanent `S4_*` aliases), or demo mode.
 - Key expiry support: `--expiry never|30d|90d|1y` (or raw seconds).
-- Backend presign: generates presigned URLs via local AWS CLI for use with S4 proxy.
+- Backend presign: generates presigned URLs via local AWS CLI for use with the Maskura proxy.
 
 ### OpenAPI & SDK Generation
 
@@ -136,7 +136,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - `just build-sdks` extracts spec, runs `openapi-generator` (Docker) to produce Python and TypeScript SDKs in `sdks/python/` and `sdks/typescript/`.
 - Schema is the single source of truth — SDKs always in sync with server changes.
 - `scripts/generate-sdks.sh` re-applies the hand-written high-level client from `sdks/overlay/<lang>/` after each generation, so it survives regeneration:
-  - `s4_client/highlevel.py` / `highlevel.ts` — `S4Client` with `put_object`/`get_object` (S3 data plane, `x-s4-access-key`/`x-s4-secret-key` auth), `generate_keypair` (RSA-2048 SPKI), `attach_public_key`, and `decrypt_payload` (RSA-OAEP unwrap + AES-256-GCM) for client-side decryption of the stored envelopes. Python extras: `requests`, `cryptography`. TypeScript uses only Web Crypto + global fetch (Node ≥ 18 or browser).
+  - `s4_client/highlevel.py` / `highlevel.ts` — `MaskuraClient` with `S4Client` compatibility, `put_object`/`get_object` (S3 data plane, `x-maskura-*` auth), `generate_keypair` (RSA-2048 SPKI), `attach_public_key`, and `decrypt_payload` (RSA-OAEP unwrap + AES-256-GCM). Python extras: `requests`, `cryptography`. TypeScript uses Web Crypto + global fetch (Node 18+ or browser).
   - Client flow: `generate_keypair()` → `attach_public_key(public_pem)` once → `put_object(...)` (gateway encrypts PII server-side) → `get_object(...)` + `decrypt_payload(bytes, private_pem)`.
 
 ### Web Dashboard
@@ -147,7 +147,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### Deployment
 
-- Single Rust binary (`s4-gateway`). No separate frontend server in dev.
+- Single internal Rust binary (`s4-gateway`). No separate frontend server in dev.
 - **Local**: `restart-dev.sh` builds filters + gateway, kills stale port, nohup-launches.
 - **Cloud candidates**: any container platform (fly.io, render, run.dev). Domain: `s4.the-no-corp.com`.
 - **Emails**: loops.so for transactional (welcome, key created). Supabase Auth handles magic-link emails.
@@ -156,7 +156,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 ### Secrets & Config
 
 - All secrets via environment variables, never in source or committed config.
-- `S4_PORT`, `LISTEN_ADDR`, `S3_ENDPOINT`, `DATABASE_URL`, `SUPABASE_JWT_SECRET`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`.
+- `LISTEN_ADDR`, `S3_ENDPOINT`, `DATABASE_URL`, `SUPABASE_JWT_SECRET`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and the explicit customer/operator settings documented in `docs/security.md`.
 - Local dev uses Supabase CLI default credentials; cloud uses Supabase dashboard values.
 
 ### Key Formats
@@ -169,24 +169,24 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 - **Plugin pipeline**: Enabled plugins run in order. Output of plugin N becomes input of plugin N+1.
 - **Plugin registry** (`crates/gateway/src/plugin_registry.rs`): Stores metadata (id, name, version, enabled) and component bytes. Supports import, enable/disable, remove, reorder.
-- **Runtime import**: `POST /dashboard/api/plugins` with `.wasm` body + `x-s4-plugin-name` header.
+- **Runtime import**: `POST /dashboard/api/plugins` with `.wasm` body + `x-maskura-plugin-name` header.
 - **Runtime toggle**: `PUT /dashboard/api/plugins/{id}` with `{"enabled": true/false}`.
-- **Auto-load**: `S4_PLUGINS_DIR` env var loads all `.wasm` files from a directory at startup.
+- **Auto-load**: `MASKURA_PLUGINS_DIR` loads all `.wasm` files from a directory at startup.
 - **WIT interface** (`wit/s4-filter/world.wit`): `begin(Context)`, `transform(Vec<u8>) → Decision`, `finish()`. Context carries `format`, `content-type`, `policy-version`. Decision variants: `Emit`, `Drop`, `Reject`.
-- **Sandbox**: 64 MiB memory, 10K table entries, 512 KiB stack. No host imports — pure byte-in/byte-out. Fuel: `S4_WASM_FUEL` env var (default 1B) sets the per-session instruction budget. The baseline `FilterEngine::new` default is 10M (enough for redaction filters); crypto filters (RSA-OAEP is ~25M per wrap) require the pipeline budget, which defaults to 1B.
+- **Sandbox**: 64 MiB memory, 10K table entries, 512 KiB stack. No host imports; pure byte-in/byte-out. `MASKURA_WASM_FUEL` (default 1B) sets the per-session instruction budget. The baseline `FilterEngine::new` default is 10M; crypto filters require the larger pipeline budget.
 - **Default plugin**: `filters/pii-default/` — detects emails (via `@`), credit cards (Luhn check, 13-19 digits), SSNs (9 digits, SSA range validation). Redacts to `[REDACTED_EMAIL]`, `[REDACTED_CARD]`, `[REDACTED_SSN]`.
 
 ### Envelope Encryption per Field (design doc)
 
 **Goal**: Encrypt PII fields so they are recoverable by authorized clients, without
-storing plaintext or requiring S4 to hold decryption keys. Falls back to redaction
+storing plaintext or requiring Maskura to hold decryption keys. Falls back to redaction
 when no public key is configured.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      ENCRYPTION ARCHITECTURE                        │
 ├───────────────┬───────────────────────┬─────────────────────────────┤
-│  Client SDK   │     S4 Gateway        │       Storage               │
+│  Client SDK   │   Maskura Gateway     │       Storage               │
 ├───────────────┼───────────────────────┼─────────────────────────────┤
 │               │                       │                             │
 │ 1. Generate   │                       │                             │
@@ -255,7 +255,7 @@ record context {
 **Plugin composition (pipeline)**:
 
 ```
-PUT /bucket/data.jsonl + S4 API key (with X.509 cert)
+PUT /bucket/data.jsonl + Maskura API key (with X.509 cert)
   │
   ▼
 [noop]          ← pass-through, baseline benchmark
@@ -290,20 +290,20 @@ the API key configuration or request headers.
 **Client SDK flow**:
 
 ```bash
-# 1. Initialize — generates keypair, sends cert to S4
-s4ctl key create --label prod-encryption --generate-encryption-key
+# 1. Initialize: generate keypair and send the certificate to Maskura
+maskura key create --label prod-encryption --generate-encryption-key
 
-# 2. Upload — S4 encrypts PII fields with the cert
-s4ctl put ./data.jsonl ingest/data.jsonl --bucket my-ingest
+# 2. Upload: Maskura encrypts PII fields with the certificate
+maskura put ./data.jsonl ingest/data.jsonl --bucket my-ingest
 
 # 3. Download — client decrypts fields with private key
-s4ctl get ingest/data.jsonl --bucket my-ingest --decrypt
+maskura get ingest/data.jsonl --bucket my-ingest --decrypt
 ```
 
 **Security properties**:
 
-- S4 never has access to the client's private key
-- S4 never sees plaintext PII after encryption (only during the transform in the Wasm sandbox, which is ephemeral per-session)
+- Maskura never has access to the client's private key
+- Maskura never sees plaintext PII after encryption (only during the transform in the Wasm sandbox, which is ephemeral per-session)
 - Each field gets a unique DEK (even within the same record)
 - DEK is encrypted with RSA-OAEP (2048-bit minimum) — only the private key holder can recover it
 - AES-256-GCM provides authenticated encryption (confidentiality + integrity)

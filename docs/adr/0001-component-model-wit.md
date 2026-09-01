@@ -5,7 +5,7 @@ Status: Accepted
 
 ## Context
 
-S4 needs a contract between the gateway host and tenant-supplied filter plugins. The options considered:
+Maskura needs a contract between the gateway host and tenant-supplied filter plugins. The options considered:
 
 1. **Core Wasm C ABI** (pointer + length): Host and guest exchange raw linear memory pointers. Fragile, no type safety, manual memory management on the guest side.
 2. **WASI command model** (wasm32-wasip1): Treats each invocation as a separate process with stdin/stdout. Can't maintain state across records within a single object stream.

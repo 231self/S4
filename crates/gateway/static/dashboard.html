@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>S4 — pluggable processing gateway for object storage</title>
+<title>Maskura Gateway: pluggable processing for object storage</title>
 <!--SUPABASE-->
 <style>
 :root {
@@ -215,7 +215,7 @@ body {
 <body>
 
 <nav class="nav">
-  <div class="nav-brand">S4<span>&nbsp;gateway</span></div>
+  <div class="nav-brand">Maskura<span>&nbsp;Gateway</span></div>
   <div class="nav-right">
     <span id="user-display"></span>
     <button class="btn btn-outline" id="theme-btn" onclick="toggleTheme()" style="font-size:12px;padding:4px 12px">Dark</button>
@@ -226,7 +226,7 @@ body {
 <div class="container">
 <div class="hero">
   <h1>Run your plugins <mark>before</mark> data reaches storage</h1>
-  <p>Platform-agnostic processing gateway. Point any S3 client at S4 — filter, redact, encrypt, or convert every object with your Wasm plugins.</p>
+  <p>Platform-agnostic processing gateway. Point any S3 client at Maskura to filter, redact, encrypt, or convert every object with your Wasm plugins.</p>
 
   <canvas class="flow-canvas" id="flowCanvas" width="1200" height="320"></canvas>
 
@@ -238,14 +238,14 @@ body {
 
 # Upload — data runs through the plugin pipeline
 curl -X PUT http://localhost:9000/ingest/data.jsonl \
-  -H "x-s4-access-key: YOUR_KEY_ID" \
-  -H "x-s4-secret-key: YOUR_SECRET" \
+  -H "x-maskura-access-key: YOUR_KEY_ID" \
+  -H "x-maskura-secret-key: YOUR_SECRET" \
   --data-binary @data.jsonl
 
 # Read — filtered data comes back
 curl http://localhost:9000/ingest/data.jsonl \
-  -H "x-s4-access-key: YOUR_KEY_ID" \
-  -H "x-s4-secret-key: YOUR_SECRET"</div>
+  -H "x-maskura-access-key: YOUR_KEY_ID" \
+  -H "x-maskura-secret-key: YOUR_SECRET"</div>
     </div>
   </div>
 
@@ -262,7 +262,7 @@ curl http://localhost:9000/ingest/data.jsonl \
     <div class="feature-card">
       <div class="feature-icon">&#x2601;</div>
       <div class="feature-title">Multi-cloud storage</div>
-      <div class="feature-desc">S4 Service Storage distributes objects across AWS, R2, B2 using consistent hashing. Dual-write to primary + replica. Cross-cloud resilience by default.</div>
+      <div class="feature-desc">Maskura Service Storage distributes objects across AWS, R2, and B2 using consistent hashing. Dual-write to primary + replica. Cross-cloud resilience by default.</div>
     </div>
     <div class="feature-card">
       <div class="feature-icon">&#x1F4C1;</div>
@@ -272,12 +272,12 @@ curl http://localhost:9000/ingest/data.jsonl \
     <div class="feature-card">
       <div class="feature-icon">&#x1F511;</div>
       <div class="feature-title">Simple ACL</div>
-      <div class="feature-desc">S4 API keys (s4_xxx / s4s_xxx) authenticate S3 requests. Create, revoke, set expiry per key. No IAM policy complexity.</div>
+      <div class="feature-desc">Maskura API keys (s4_xxx / s4s_xxx) authenticate S3 requests. Create, revoke, set expiry per key. No IAM policy complexity.</div>
     </div>
     <div class="feature-card">
       <div class="feature-icon">&#x1F310;</div>
       <div class="feature-title">Cloud agnostic</div>
-      <div class="feature-desc">Presigned URL proxy works with S3, R2, B2, MinIO — any S3-compatible storage. BYO backend or use S4's managed buckets.</div>
+      <div class="feature-desc">Presigned URL proxy works with S3, R2, B2, MinIO, or any S3-compatible storage. Bring your own backend or use Maskura's managed buckets.</div>
     </div>
     <div class="feature-card">
       <div class="feature-icon">&#x1F9E9;</div>
@@ -345,8 +345,8 @@ curl http://localhost:9000/ingest/data.jsonl \
 
 <div class="section">
   <div class="section-label">Backend storage</div>
-  <div class="section-title">Where should S4 write filtered data?</div>
-  <div class="section-subtitle">S4 uses the Fivetran/Airbyte model: you create an IAM role (or API token) granting S4 access to your bucket. No long-lived credentials stored.</div>
+  <div class="section-title">Where should Maskura write filtered data?</div>
+  <div class="section-subtitle">Maskura uses the Fivetran/Airbyte model: you create an IAM role (or API token) granting Maskura access to your bucket. No long-lived credentials stored.</div>
 
   <div class="tab-bar" id="backend-tabs">
     <button class="tab-btn active" onclick="switchBackendTab('aws', this)">AWS S3</button>
@@ -357,8 +357,8 @@ curl http://localhost:9000/ingest/data.jsonl \
 
   <div class="tab-content active" id="backend-aws">
     <div class="card" style="margin-top:12px">
-      <div class="card-title">Step 1: Create an IAM Role for S4</div>
-      <div class="card-subtitle">Run this in your AWS account. S4 will assume this role to write filtered data to your bucket.</div>
+      <div class="card-title">Step 1: Create an IAM role for Maskura</div>
+      <div class="card-subtitle">Run this in your AWS account. Maskura will assume this role to write filtered data to your bucket.</div>
       <div class="code-wrapper">
         <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
         <div class="code-block" id="aws-iam-script">TRUST_POLICY=$(cat &lt;&lt;'EOF'
@@ -366,19 +366,19 @@ curl http://localhost:9000/ingest/data.jsonl \
   "Version": "2012-10-17",
   "Statement": [{
     "Effect": "Allow",
-    "Principal": {"AWS": "arn:aws:iam::S4_ACCOUNT_ID:role/s4-gateway"},
+    "Principal": {"AWS": "arn:aws:iam::MASKURA_ACCOUNT_ID:role/maskura-gateway"},
     "Action": "sts:AssumeRole",
-    "Condition": {"StringEquals": {"sts:ExternalId": "S4_EXTERNAL_ID"}}
+    "Condition": {"StringEquals": {"sts:ExternalId": "MASKURA_EXTERNAL_ID"}}
   }]
 }
 EOF
 )
 
-aws iam create-role --role-name s4-pii-filter \
+aws iam create-role --role-name maskura-pii-filter \
   --assume-role-policy-document "$TRUST_POLICY"
 
-aws iam put-role-policy --role-name s4-pii-filter \
-  --policy-name s4-bucket-access \
+aws iam put-role-policy --role-name maskura-pii-filter \
+  --policy-name maskura-bucket-access \
   --policy-document '{
   "Version": "2012-10-17",
   "Statement": [{
@@ -388,7 +388,7 @@ aws iam put-role-policy --role-name s4-pii-filter \
   }]
 }'
 
-echo "Role ARN: $(aws iam get-role --role-name s4-pii-filter --query 'Role.Arn' --output text)"</div>
+echo "Role ARN: $(aws iam get-role --role-name maskura-pii-filter --query 'Role.Arn' --output text)"</div>
       </div>
 
       <div class="card-title" style="margin-top:16px">Step 2: Paste your Role ARN</div>
@@ -396,7 +396,7 @@ echo "Role ARN: $(aws iam get-role --role-name s4-pii-filter --query 'Role.Arn' 
       <div class="form-row" style="margin-top:10px">
         <div style="flex:2">
           <div class="form-label">Role ARN</div>
-          <input class="form-input" id="backend-role-arn" placeholder="arn:aws:iam::123456789012:role/s4-pii-filter" />
+          <input class="form-input" id="backend-role-arn" placeholder="arn:aws:iam::123456789012:role/maskura-pii-filter" />
         </div>
         <div style="flex:1">
           <div class="form-label">External ID (copy this)</div>
@@ -467,7 +467,7 @@ echo "https://s3.us-west-004.backblazeb2.com"</div>
   <div class="tab-content" id="backend-minio">
     <div class="card" style="margin-top:12px">
       <div class="card-title">Connect to your MinIO instance</div>
-      <div class="card-subtitle">S4 connects directly to your MinIO server using access key + secret key.</div>
+      <div class="card-subtitle">Maskura connects directly to your MinIO server using access key + secret key.</div>
       <div class="form-row" style="margin-top:10px">
         <div style="flex:2">
           <div class="form-label">MinIO Endpoint</div>
@@ -492,7 +492,7 @@ echo "https://s3.us-west-004.backblazeb2.com"</div>
 <div class="section">
   <div class="section-label">Usage</div>
   <div class="section-title">Connect your tools</div>
-  <div class="section-subtitle">Generate a presigned URL for your bucket, then pipe it through S4 for plugin processing.</div>
+  <div class="section-subtitle">Generate a presigned URL for your bucket, then pipe it through Maskura for plugin processing.</div>
 
   <div class="tab-bar">
     <button class="tab-btn active" onclick="switchTab('bash', this)">Bash</button>
@@ -504,18 +504,18 @@ echo "https://s3.us-west-004.backblazeb2.com"</div>
   <div class="tab-content active" id="tab-bash">
     <div class="code-wrapper">
       <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
-      <div class="code-block">export S4_KEY=s4_YOUR_KEY_ID
-export S4_SECRET=s4s_YOUR_SECRET
-export S4=http://localhost:9000
+      <div class="code-block">export MASKURA_KEY=s4_YOUR_KEY_ID
+export MASKURA_SECRET=s4s_YOUR_SECRET
+export MASKURA=http://localhost:9000
 
 # Generate a presigned PUT URL using your AWS credentials
 PRESIGNED=$(aws s3 presign s3://my-bucket/uploads/data.jsonl --expires-in 604800)
 
-# Send through S4 — processed by the plugin pipeline before reaching your bucket
-curl -X PUT "$S4/my-bucket/uploads/data.jsonl" \
-  -H "x-s4-access-key: $S4_KEY" \
-  -H "x-s4-secret-key: $S4_SECRET" \
-  -H "x-s4-backend-url: $PRESIGNED" \
+# Send through Maskura; the plugin pipeline runs before the bucket write
+curl -X PUT "$MASKURA/my-bucket/uploads/data.jsonl" \
+  -H "x-maskura-access-key: $MASKURA_KEY" \
+  -H "x-maskura-secret-key: $MASKURA_SECRET" \
+  -H "x-maskura-backend-url: $PRESIGNED" \
   --data-binary @data.jsonl</div>
     </div>
   </div>
@@ -533,13 +533,13 @@ presigned = s3.generate_presigned_url(
     ExpiresIn=604800
 )
 
-# Send through S4
+# Send through Maskura
 r = requests.put(
     'http://localhost:9000/my-bucket/uploads/data.jsonl',
     headers={
-        'x-s4-access-key': 's4_YOUR_KEY_ID',
-        'x-s4-secret-key': 's4s_YOUR_SECRET',
-        'x-s4-backend-url': presigned
+        'x-maskura-access-key': 's4_YOUR_KEY_ID',
+        'x-maskura-secret-key': 's4s_YOUR_SECRET',
+        'x-maskura-backend-url': presigned
     },
     data=open('data.jsonl', 'rb')
 )</div>
@@ -561,12 +561,12 @@ let presigned = s3.put_object()
         std::time::Duration::from_secs(604800)
     )).await?;
 
-// Send through S4
+// Send through Maskura
 let client = reqwest::Client::new();
 let resp = client.put("http://localhost:9000/my-bucket/uploads/data.jsonl")
-    .header("x-s4-access-key", "s4_YOUR_KEY_ID")
-    .header("x-s4-secret-key", "s4s_YOUR_SECRET")
-    .header("x-s4-backend-url", presigned.uri())
+    .header("x-maskura-access-key", "s4_YOUR_KEY_ID")
+    .header("x-maskura-secret-key", "s4s_YOUR_SECRET")
+    .header("x-maskura-backend-url", presigned.uri())
     .body(std::fs::read("data.jsonl")?)
     .send().await?;</div>
     </div>
@@ -588,13 +588,13 @@ var presigned = presigner.presignPutObject(p -> p
     .signatureDuration(java.time.Duration.ofDays(7))
 );
 
-// Send through S4
+// Send through Maskura
 var client = HttpClient.newHttpClient();
 var httpReq = HttpRequest.newBuilder()
     .uri(URI.create("http://localhost:9000/my-bucket/uploads/data.jsonl"))
-    .header("x-s4-access-key", "s4_YOUR_KEY_ID")
-    .header("x-s4-secret-key", "s4s_YOUR_SECRET")
-    .header("x-s4-backend-url", presigned.url().toString())
+    .header("x-maskura-access-key", "s4_YOUR_KEY_ID")
+    .header("x-maskura-secret-key", "s4s_YOUR_SECRET")
+    .header("x-maskura-backend-url", presigned.url().toString())
     .PUT(HttpRequest.BodyPublishers.ofFile(Path.of("data.jsonl")))
     .build();
 client.send(httpReq, HttpResponse.BodyHandlers.ofString());</div>
@@ -605,7 +605,7 @@ client.send(httpReq, HttpResponse.BodyHandlers.ofString());</div>
 <div class="section">
   <div class="section-label">Client SDKs</div>
   <div class="section-title">Envelope encryption built in</div>
-  <div class="section-subtitle">Python and TypeScript SDKs ship a high-level client. Generate a keypair, hand S4 the public half once, and every PUT is envelope-encrypted server-side (RSA-OAEP + AES-256-GCM). Read back and decrypt with your private key — S4 never sees it.</div>
+  <div class="section-subtitle">Python and TypeScript SDKs ship a high-level client. Generate a keypair, hand Maskura the public half once, and every PUT is envelope-encrypted server-side (RSA-OAEP + AES-256-GCM). Read back and decrypt with your private key; Maskura never sees it.</div>
 
   <div class="tab-bar">
     <button class="tab-btn active" onclick="switchTab('sdk-python', this)">Python</button>
@@ -617,13 +617,13 @@ client.send(httpReq, HttpResponse.BodyHandlers.ofString());</div>
       <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
       <div class="code-block">pip install -e sdks/python requests cryptography
 
-from s4_client.highlevel import S4Client
+from maskura_client import MaskuraClient
 
-client = S4Client("http://localhost:9000", "s4_KEY_ID", "s4s_SECRET")
+client = MaskuraClient("http://localhost:9000", "s4_KEY_ID", "s4s_SECRET")
 
-# One-time: generate a keypair and hand S4 the public half.
+# One-time: generate a keypair and hand Maskura the public half.
 # The envelope-encrypt plugin encrypts on every PUT; only you can decrypt it.
-private_pem, public_pem = S4Client.generate_keypair()
+private_pem, public_pem = MaskuraClient.generate_keypair()
 client.attach_public_key(public_pem)
 
 # Write — PII envelope-encrypted server-side (RSA-OAEP + AES-256-GCM)
@@ -631,7 +631,7 @@ client.put_object("my-bucket", "ingest/data.jsonl", open("data.jsonl", "rb").rea
 
 # Read — decrypt the envelopes back to plaintext with your private key
 raw = client.get_object("my-bucket", "ingest/data.jsonl")
-plaintext = S4Client.decrypt_payload(raw, private_pem)</div>
+plaintext = MaskuraClient.decrypt_payload(raw, private_pem)</div>
     </div>
   </div>
 
@@ -640,16 +640,16 @@ plaintext = S4Client.decrypt_payload(raw, private_pem)</div>
       <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
       <div class="code-block">npm install sdks/typescript   # builds dist/ on install
 
-import { S4Client } from "s4-client/highlevel";
+import { MaskuraClient } from "maskura-client";
 
-const client = new S4Client({
+const client = new MaskuraClient({
   endpoint: "http://localhost:9000",
   accessKey: "s4_KEY_ID",
   secretKey: "s4s_SECRET",
 });
 
-// One-time: hand S4 the public half of a fresh keypair
-const { privateKeyPem, publicKeyPem } = await S4Client.generateKeypair();
+// One-time: hand Maskura the public half of a fresh keypair
+const { privateKeyPem, publicKeyPem } = await MaskuraClient.generateKeypair();
 await client.attachPublicKey(publicKeyPem);
 
 // Write — PII encrypted server-side (RSA-OAEP + AES-256-GCM)
@@ -659,7 +659,7 @@ await client.putObject("my-bucket", "ingest/data.jsonl",
 // Read — decrypt envelopes client-side
 const raw = await client.getObject("my-bucket", "ingest/data.jsonl");
 const plaintext = new TextDecoder().decode(
-  await S4Client.decryptPayload(raw, privateKeyPem));</div>
+  await MaskuraClient.decryptPayload(raw, privateKeyPem));</div>
     </div>
   </div>
 </div>
@@ -674,7 +674,7 @@ const plaintext = new TextDecoder().decode(
 </div>
 
 <footer class="footer container">
-  S4 Gateway &middot; pluggable processing &middot; <a href="https://github.com/231self/S4" style="color:var(--text-muted)">github.com/231self/S4</a>
+  Maskura Gateway &middot; pluggable processing &middot; <a href="https://github.com/231self/S4" style="color:var(--text-muted)">Maskura on GitHub</a>
 </footer>
 
 <script>
@@ -750,7 +750,7 @@ window.loadBackend = function() {
     document.getElementById('backend-minio-secret-key').value = cfg.secret_key || '';
     var script = document.getElementById('aws-iam-script');
     if (script && cfg.external_id) {
-      script.textContent = script.textContent.replace(/S4_EXTERNAL_ID/g, cfg.external_id);
+      script.textContent = script.textContent.replace(/MASKURA_EXTERNAL_ID/g, cfg.external_id);
     }
   }).catch(function(){});
 };
@@ -1041,7 +1041,7 @@ window.drawFlow = function() {
     ctx.textAlign = 'center';
     ctx.fillStyle = textColor;
     ctx.fillText('Your SDK', filterX / 2, labelY);
-    ctx.fillText('S4', cx, labelY);
+    ctx.fillText('Maskura', cx, labelY);
     ctx.font = '10px -apple-system,BlinkMacSystemFont,sans-serif';
     ctx.fillText('Plugin Pipeline', cx, labelY + 14);
     ctx.font = 'bold 12px -apple-system,BlinkMacSystemFont,sans-serif';
@@ -1175,7 +1175,7 @@ window.drawFlow = function() {
       var beforeFilter = rd.x > filterX + filterW + 8;
 
       if (passedFilterR) {
-        // After S4: show original (decrypted)
+        // After Maskura: show original (decrypted)
         ctx.fillStyle = successRgb;
         ctx.globalAlpha = 0.7;
         ctx.fillText(rd.original, rd.x + 4, rd.y + rd.h / 2 + 3);
@@ -1189,7 +1189,7 @@ window.drawFlow = function() {
         ctx.globalAlpha = 0.55;
         ctx.fillText(rd.masked, rd.x + 4, rd.y + rd.h / 2 + 3);
       } else {
-        // In S4 filter: transition — show masked fading, green particles
+        // In Maskura filter: transition — show masked fading, green particles
         ctx.fillStyle = accent;
         ctx.globalAlpha = 0.5;
         ctx.fillText(rd.masked, rd.x + 4, rd.y + rd.h / 2 + 3);

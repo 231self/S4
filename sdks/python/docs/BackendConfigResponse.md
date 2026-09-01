@@ -17,7 +17,7 @@ Name | Type | Description | Notes
 ## Example
 
 ```python
-from s4_client.models.backend_config_response import BackendConfigResponse
+from maskura_client.models.backend_config_response import BackendConfigResponse
 
 # TODO update the JSON string below
 json = "{}"

@@ -20,9 +20,19 @@ kill_port() {
   fi
 }
 
-GATEWAY_PORT="${S4_PORT:-9000}"
+if [ "${MASKURA_PORT+x}" = x ] && [ "${S4_PORT+x}" = x ] && [ "$MASKURA_PORT" != "$S4_PORT" ]; then
+  echo "ERROR: conflicting environment aliases: MASKURA_PORT and S4_PORT" >&2
+  exit 1
+fi
+if [ "${MASKURA_PORT+x}" = x ]; then
+  GATEWAY_PORT="$MASKURA_PORT"
+elif [ "${S4_PORT+x}" = x ]; then
+  GATEWAY_PORT="$S4_PORT"
+else
+  GATEWAY_PORT=9000
+fi
 
-echo "=== S4 Dev Harness ==="
+echo "=== Maskura dev harness ==="
 echo "Port: $GATEWAY_PORT"
 
 echo ""

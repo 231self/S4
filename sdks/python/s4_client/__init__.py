@@ -3,7 +3,7 @@
 # flake8: noqa
 
 """
-    S4 Gateway API
+    Maskura Gateway API
 
     Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline.
 
@@ -65,3 +65,8 @@ from s4_client.models.create_key_request import CreateKeyRequest as CreateKeyReq
 from s4_client.models.delete_key_request import DeleteKeyRequest as DeleteKeyRequest
 from s4_client.models.list_key_response import ListKeyResponse as ListKeyResponse
 from s4_client.models.object_response import ObjectResponse as ObjectResponse
+
+# High-level canonical and compatibility exports maintained by the Maskura overlay.
+from s4_client.highlevel import MaskuraClient as MaskuraClient
+from s4_client.highlevel import S4Client as S4Client
+__all__.extend(["MaskuraClient", "S4Client"])

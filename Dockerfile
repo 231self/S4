@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Optimized deploy image for S4 gateway.
+# Optimized deploy image for the maskura gateway.
 # Pre-built Wasm components committed to components/; single arch (amd64).
 
 FROM rust:1.97.0-trixie@sha256:b92b8c8574f8f3b207fcb0912fb3e2de4041580b5934d90312d53938c9a038a9 AS build
@@ -7,6 +7,7 @@ WORKDIR /src
 
 # Dependencies first — this layer caches across source changes.
 COPY Cargo.toml Cargo.lock ./
+COPY crates/customer-config/Cargo.toml crates/customer-config/
 COPY crates/error/Cargo.toml crates/error/
 COPY crates/wasm-runtime/Cargo.toml crates/wasm-runtime/
 COPY crates/gateway/Cargo.toml crates/gateway/
@@ -36,8 +37,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/gateway-bin /usr/local/bin/s4-gateway
 COPY components /app/components
-ENV S4_FILTER_COMPONENT=/app/components/pii-default.component.wasm
-ENV S4_PLUGINS_DIR=/app/components
+ENV MASKURA_FILTER_COMPONENT=/app/components/pii-default.component.wasm
+ENV MASKURA_PLUGINS_DIR=/app/components
 ENV LISTEN_ADDR=0.0.0.0:8080
 EXPOSE 8080
 ENTRYPOINT ["s4-gateway"]

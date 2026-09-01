@@ -752,6 +752,13 @@ fn auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
+fn canonical_auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("x-maskura-access-key", ak.to_string()),
+        ("x-maskura-secret-key", sk.to_string()),
+    ]
+}
+
 fn add_headers(req: Request<Body>, hdrs: &[(&'static str, String)]) -> Request<Body> {
     let (mut parts, body) = req.into_parts();
     for (k, v) in hdrs {
@@ -817,6 +824,60 @@ async fn public_key_mutation_rejects_unauthenticated_requests_in_production_and_
                 .public_key_pem
                 .is_none(),
             "rejected request must not mutate the key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auth_header_aliases_accept_old_new_and_equal_dual_but_reject_conflicts() {
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let cases = [
+        (
+            "legacy",
+            auth_headers(&access_key, &secret_key),
+            StatusCode::OK,
+        ),
+        (
+            "canonical",
+            canonical_auth_headers(&access_key, &secret_key),
+            StatusCode::OK,
+        ),
+        (
+            "equal-dual",
+            vec![
+                ("x-maskura-access-key", access_key.clone()),
+                ("x-s4-access-key", access_key.clone()),
+                ("x-maskura-secret-key", secret_key.clone()),
+                ("x-s4-secret-key", secret_key.clone()),
+            ],
+            StatusCode::OK,
+        ),
+        (
+            "conflicting-dual",
+            vec![
+                ("x-maskura-access-key", access_key.clone()),
+                ("x-s4-access-key", "s4_conflict".to_string()),
+                ("x-maskura-secret-key", secret_key.clone()),
+                ("x-s4-secret-key", secret_key.clone()),
+            ],
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+
+    for (name, headers, expected) in cases {
+        let request = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/aliases/{name}.txt"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(name))
+                .unwrap(),
+            &headers,
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            expected
         );
     }
 }
@@ -1007,7 +1068,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
 
     let header_request = add_headers(
         public_key_request(&header_key, TEST_PUBLIC_KEY_PEM),
-        &auth_headers(&header_key, &header_secret),
+        &canonical_auth_headers(&header_key, &header_secret),
     );
     assert_eq!(
         app.clone().oneshot(header_request).await.unwrap().status(),
@@ -2304,31 +2365,44 @@ async fn metering_unavailable_after_put_returns_service_unavailable_without_roll
 async fn launch_contract_supplied_metering_id_is_rejected_generically_before_mutation() {
     let (app, state) = router().await;
     let (access_key, secret_key) = make_key(&state).await;
-    let polls = Arc::new(AtomicUsize::new(0));
-    let request = add_headers(
-        Request::builder()
-            .method("PUT")
-            .uri("/metered/rejected.txt")
-            .header(header::CONTENT_TYPE, "text/plain")
-            .header("x-s4-metering-id", "018f0f6e-7b31-7c1d-8f2f-84f808b9c175")
-            .body(Body::new(PollTrackingBody {
-                polls: polls.clone(),
-                data: Some(Bytes::from_static(b"must not commit")),
-            }))
-            .unwrap(),
-        &auth_headers(&access_key, &secret_key),
-    );
+    for (index, reserved_header) in [
+        "x-maskura-metering-id",
+        "x-maskura-operation-id",
+        "x-maskura-usage-id",
+        "x-s4-metering-id",
+        "x-s4-operation-id",
+        "x-s4-usage-id",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let key = format!("rejected-{index}.txt");
+        let request = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/metered/{key}"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header(reserved_header, "018f0f6e-7b31-7c1d-8f2f-84f808b9c175")
+                .body(Body::new(PollTrackingBody {
+                    polls: polls.clone(),
+                    data: Some(Bytes::from_static(b"must not commit")),
+                }))
+                .unwrap(),
+            &auth_headers(&access_key, &secret_key),
+        );
 
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(polls.load(Ordering::SeqCst), 0);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("<Code>InvalidRequest</Code>"));
-    assert!(!body.contains("metering"));
-    assert!(state.store.get("metered", "rejected.txt").is_none());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("<Code>InvalidRequest</Code>"));
+        assert!(!body.contains("metering"));
+        assert!(state.store.get("metered", &key).is_none());
+    }
 }
 
 #[tokio::test]
@@ -3776,7 +3850,7 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             StatusCode::FORBIDDEN,
         ),
         (
-            "removed S4 semantic header",
+            "removed legacy semantic header",
             HeaderChange::Remove("x-s4-process"),
             StatusCode::FORBIDDEN,
         ),
@@ -3824,6 +3898,70 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn sigv4_signs_the_exact_old_or_new_semantic_header_names() {
+    let (app, state) = router().await;
+    let (access_key, secret_key) = make_key(&state).await;
+
+    for (index, (name, value)) in [
+        ("x-s4-process", "write"),
+        ("x-maskura-process", "write"),
+        ("x-s4-encrypt-fields", "email"),
+        ("x-maskura-encrypt-fields", "email"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = signed_request(
+            &access_key,
+            &secret_key,
+            "PUT",
+            &format!("http://s4.local/sigv4-aliases/{index}.txt"),
+            b"signed alias",
+            &[("content-type", "text/plain"), (name, value)],
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK,
+            "signed {name}"
+        );
+    }
+
+    let equal_dual = signed_request(
+        &access_key,
+        &secret_key,
+        "PUT",
+        "http://s4.local/sigv4-aliases/equal.txt",
+        b"equal aliases",
+        &[
+            ("content-type", "text/plain"),
+            ("x-maskura-process", "write"),
+            ("x-s4-process", "write"),
+        ],
+    );
+    assert_eq!(
+        app.clone().oneshot(equal_dual).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let conflicting = signed_request(
+        &access_key,
+        &secret_key,
+        "PUT",
+        "http://s4.local/sigv4-aliases/conflict.txt",
+        b"conflicting aliases",
+        &[
+            ("content-type", "text/plain"),
+            ("x-maskura-process", "write"),
+            ("x-s4-process", "read"),
+        ],
+    );
+    assert_eq!(
+        app.oneshot(conflicting).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
 }
 
 #[tokio::test]
@@ -4083,7 +4221,7 @@ async fn presigned_host_only_get_accepts_but_appended_protected_headers_are_reje
 }
 
 #[tokio::test]
-async fn non_sigv4_api_key_auth_keeps_raw_semantic_header_behavior() {
+async fn non_sigv4_api_key_auth_rejects_duplicate_semantic_headers() {
     let (app, state) = router().await;
     let (access_key, secret_key) = make_key(&state).await;
     let request = append_headers(
@@ -4103,8 +4241,11 @@ async fn non_sigv4_api_key_auth_keeps_raw_semantic_header_behavior() {
         ],
     );
 
-    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
-    assert!(state.store.get("semantic", "api-key.txt").is_some());
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(state.store.get("semantic", "api-key.txt").is_none());
 }
 
 #[tokio::test]
@@ -4244,7 +4385,7 @@ async fn tsv_roundtrip_filters_and_preserves() {
 #[tokio::test]
 async fn managed_storage_isolates_users() {
     // The per-user namespace ({uid}/{bucket}/{key}) is the isolation guarantee
-    // for S4-managed storage. It is enforced by the key prefix the gateway
+    // for Maskura-managed storage. It is enforced by the key prefix the gateway
     // builds in s3_put/s3_get when service storage is configured, and by
     // per-key authentication. This test asserts the authentication half:
     // user1's credentials authenticate as user1, user2's as user2, and neither

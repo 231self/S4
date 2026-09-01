@@ -13,6 +13,7 @@ use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use axum::http::HeaderMap;
 use reqwest::Url;
 
+use crate::customer_headers;
 use crate::s3_safety::{s3_retry_config, s3_timeout_config};
 use crate::service_storage::ServiceStorage;
 use crate::store::MemoryStore;
@@ -129,8 +130,8 @@ impl BackendResolver {
         headers: &HeaderMap,
         _operation: StorageOperation,
     ) -> Result<ResolvedBackendSelection, String> {
-        let managed_requested = headers
-            .get("x-s4-storage-mode")
+        let managed_requested = customer_headers::aliased(headers, customer_headers::STORAGE_MODE)
+            .map_err(|_| "conflicting storage mode headers".to_string())?
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("managed"));
 
@@ -147,8 +148,8 @@ impl BackendResolver {
             });
         }
 
-        if let Some(raw_url) = headers
-            .get("x-s4-backend-url")
+        if let Some(raw_url) = customer_headers::aliased(headers, customer_headers::BACKEND_URL)
+            .map_err(|_| "conflicting backend URL headers".to_string())?
             .and_then(|value| value.to_str().ok())
         {
             let url =

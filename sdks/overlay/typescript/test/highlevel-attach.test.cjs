@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { S4Client } = require("../dist/highlevel.js");
+const { MaskuraClient, S4Client } = require("../dist/highlevel.js");
 
 test("attachPublicKey sends target API key credentials", async () => {
   const originalFetch = global.fetch;
@@ -12,7 +12,7 @@ test("attachPublicKey sends target API key credentials", async () => {
   };
 
   try {
-    const client = new S4Client({
+    const client = new MaskuraClient({
       endpoint: "https://gateway.example/",
       accessKey: "test-access",
       secretKey: "test-secret",
@@ -26,10 +26,12 @@ test("attachPublicKey sends target API key credentials", async () => {
   assert.equal(request.url, "https://gateway.example/dashboard/api/keys/public-key");
   assert.equal(request.options.method, "PUT");
   assert.deepEqual(request.options.headers, {
-    "x-s4-access-key": "test-access",
-    "x-s4-secret-key": "test-secret",
+    "x-maskura-access-key": "test-access",
+    "x-maskura-secret-key": "test-secret",
     "Content-Type": "application/json",
   });
+
+  assert.ok(new S4Client({ endpoint: "https://gateway.example", accessKey: "a", secretKey: "s" }) instanceof MaskuraClient);
   assert.deepEqual(JSON.parse(request.options.body), {
     key_id: "test-access",
     public_key_pem: "test-public-key",

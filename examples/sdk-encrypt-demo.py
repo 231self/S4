@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""S4 Python SDK round-trip demo.
+"""Maskura Python SDK round-trip demo.
 
 1. Generate an RSA-2048 keypair
 2. Bind the public key to an API key (gateway stores it)
@@ -7,8 +7,8 @@
 4. get_object()  -> the stored bytes come back unchanged (envelopes)
 5. decrypt_payload() -> recover the plaintext with the private key
 
-Requires a running S4 gateway with the envelope-encrypt pipeline enabled.
-This script starts one itself (docker image pinned to the s4ctl version) and
+Requires a running Maskura Gateway with the envelope-encrypt pipeline enabled.
+This script starts one itself (Docker image pinned to the `maskura` version) and
 switches the pipeline via the dashboard API, so it is self-contained.
 
 Run:
@@ -27,9 +27,9 @@ import requests
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "sdks", "python"))
 
-from s4_client import S4Client  # noqa: E402
+from maskura_client import MaskuraClient  # noqa: E402
 
-GATEWAY = os.environ.get("S4_GATEWAY_URL", "http://127.0.0.1:8080")
+GATEWAY = os.environ.get("MASKURA_GATEWAY_URL", "http://127.0.0.1:8080")
 CONTAINER = "s4-local-gateway"
 BUCKET = "sdk-demo"
 KEY = "records.txt"
@@ -52,13 +52,13 @@ def wait_health(url: str, tries: int = 30) -> None:
 
 
 def main() -> None:
-    version = os.environ.get("S4CTL_VERSION")
+    version = os.environ.get("MASKURA_VERSION")
     if version:
-        tag = f"ghcr.io/231self/s4/s4:v{version}"
+        tag = f"ghcr.io/231self/maskura/maskura:v{version}"
     else:
-        tag = f"ghcr.io/231self/s4/s4:v0.3.3"
+        tag = f"ghcr.io/231self/maskura/maskura:v0.3.3"
 
-    print("=== S4 Python SDK round-trip demo ===")
+    print("=== Maskura Python SDK round-trip demo ===")
     sh("docker", "rm", "-f", CONTAINER)
     sh(
         "docker", "run", "-d", "--name", CONTAINER, "-p", "127.0.0.1:8080:8080",
@@ -73,13 +73,17 @@ def main() -> None:
     component = os.path.join(REPO, "target", "components", "envelope-encrypt.component.wasm")
     requests.post(
         f"{GATEWAY}/dashboard/api/plugins",
-        headers={"x-s4-plugin-name": "envelope-encrypt"},
+        headers={"x-maskura-plugin-name": "envelope-encrypt"},
         data=open(component, "rb").read(),
     )
 
     print("--- SDK flow ---")
-    client = S4Client(gateway=GATEWAY)
-    pub, priv = client.generate_keypair()
+    credential = requests.post(
+        f"{GATEWAY}/dashboard/api/keys",
+        json={"label": "sdk-demo", "expires_in": 3600},
+    ).json()
+    client = MaskuraClient(GATEWAY, credential["key_id"], credential["secret"])
+    priv, pub = client.generate_keypair()
     client.attach_public_key(pub)
     client.put_object(BUCKET, KEY, PAYLOAD)
     blob = client.get_object(BUCKET, KEY)

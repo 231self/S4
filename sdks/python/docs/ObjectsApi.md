@@ -1,4 +1,4 @@
-# s4_client.ObjectsApi
+# maskura_client.ObjectsApi
 
 All URIs are relative to *http://localhost*
 
@@ -16,22 +16,22 @@ List all objects in the store
 
 
 ```python
-import s4_client
-from s4_client.models.object_response import ObjectResponse
-from s4_client.rest import ApiException
+import maskura_client
+from maskura_client.models.object_response import ObjectResponse
+from maskura_client.rest import ApiException
 from pprint import pprint
 
 # Defining the host is optional and defaults to http://localhost
 # See configuration.py for a list of all supported configuration parameters.
-configuration = s4_client.Configuration(
+configuration = maskura_client.Configuration(
     host = "http://localhost"
 )
 
 
 # Enter a context with an instance of the API client
-with s4_client.ApiClient(configuration) as api_client:
+with maskura_client.ApiClient(configuration) as api_client:
     # Create an instance of the API class
-    api_instance = s4_client.ObjectsApi(api_client)
+    api_instance = maskura_client.ObjectsApi(api_client)
 
     try:
         # List all objects in the store

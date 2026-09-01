@@ -1,4 +1,4 @@
-# Fly.io app config: S4 gateway, scale-to-zero.
+# Fly.io app config: Maskura Gateway, scale-to-zero.
 #
 #   fly launch --no-deploy
 #   fly secrets set SUPABASE_URL=... SUPABASE_ANON_KEY=... SUPABASE_JWT_SECRET=... \
@@ -8,7 +8,7 @@
 app = "s4"
 
 [build]
-  image = "ghcr.io/231self/s4:latest"
+  image = "ghcr.io/231self/maskura/maskura:latest"
 
 [http_service]
   internal_port = 8080
@@ -24,5 +24,5 @@ app = "s4"
 # All configuration is runtime env/secrets, never baked into the image.
 [env]
   AUTH_DISABLED = "false"
-  S4_MAX_OBJECT_BYTES = "67108864"
-  S4_MAX_PIPELINE_OUTPUT_BYTES = "67108864"
+  MASKURA_MAX_OBJECT_BYTES = "67108864"
+  MASKURA_MAX_PIPELINE_OUTPUT_BYTES = "67108864"

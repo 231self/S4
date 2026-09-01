@@ -4,6 +4,7 @@ pub mod binary_ir;
 pub mod binary_pump;
 pub mod binary_reductor;
 pub mod control;
+pub mod customer_headers;
 pub mod entity;
 pub mod format;
 pub mod integrity;

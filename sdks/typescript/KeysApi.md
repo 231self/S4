@@ -17,8 +17,8 @@ Method | HTTP request | Description
 
 
 ```typescript
-import { createConfiguration, KeysApi } from 's4-client';
-import type { KeysApiCreateKeyRequest } from 's4-client';
+import { createConfiguration, KeysApi } from '';
+import type { KeysApiCreateKeyRequest } from '';
 
 const configuration = createConfiguration();
 const apiInstance = new KeysApi(configuration);
@@ -73,8 +73,8 @@ No authorization required
 
 
 ```typescript
-import { createConfiguration, KeysApi } from 's4-client';
-import type { KeysApiDeleteKeyRequest } from 's4-client';
+import { createConfiguration, KeysApi } from '';
+import type { KeysApiDeleteKeyRequest } from '';
 
 const configuration = createConfiguration();
 const apiInstance = new KeysApi(configuration);
@@ -128,7 +128,7 @@ No authorization required
 
 
 ```typescript
-import { createConfiguration, KeysApi } from 's4-client';
+import { createConfiguration, KeysApi } from '';
 
 const configuration = createConfiguration();
 const apiInstance = new KeysApi(configuration);

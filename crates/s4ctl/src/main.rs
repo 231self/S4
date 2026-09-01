@@ -1,34 +1,78 @@
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use maskura_customer_config::{EnvAlias, aliases as customer_env, resolve as resolve_customer_env};
 use reqwest::Url;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const DEFAULT_GATEWAY: &str = "http://localhost:9000";
+const HOSTED_WORKSPACE_ID_ENV: EnvAlias = EnvAlias::new("MASKURA_WORKSPACE_ID", "S4_WORKSPACE_ID");
+const HOSTED_ACCESS_TOKEN_ENV: EnvAlias = EnvAlias::new("MASKURA_ACCESS_TOKEN", "S4_ACCESS_TOKEN");
 
 #[derive(Parser)]
 #[command(
-    name = "s4ctl",
-    about = "CLI for S4 — pluggable processing gateway for S3-compatible storage",
+    name = "maskura",
+    about = "CLI for Maskura, a pluggable processing gateway for S3-compatible storage",
     version
 )]
 struct Cli {
-    #[arg(short = 'e', long, env = "S4_GATEWAY_URL", default_value = DEFAULT_GATEWAY)]
-    gateway: String,
+    #[arg(short = 'e', long)]
+    gateway: Option<String>,
 
     #[command(subcommand)]
     command: Command,
+
+    #[arg(skip)]
+    customer_env: CustomerEnv,
+
+    #[arg(skip)]
+    program: Program,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Program {
+    #[default]
+    Maskura,
+    S4ctl,
+}
+
+impl Program {
+    fn from_executable(executable: &std::ffi::OsStr) -> Self {
+        let stem = std::path::Path::new(executable)
+            .file_stem()
+            .and_then(|value| value.to_str());
+        if stem == Some("s4ctl") {
+            Self::S4ctl
+        } else {
+            Self::Maskura
+        }
+    }
+
+    fn current() -> Self {
+        std::env::args_os()
+            .next()
+            .as_deref()
+            .map(Self::from_executable)
+            .unwrap_or_default()
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Maskura => "maskura",
+            Self::S4ctl => "s4ctl",
+        }
+    }
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Log in with an S4 API key (saves to ~/.s4/config.json)
+    /// Log in with a Maskura API key (uses the existing shared config path)
     Login {
-        #[arg(short, long, env = "S4_ACCESS_KEY")]
-        access_key: String,
-        #[arg(short = 's', long, env = "S4_SECRET_KEY")]
-        secret_key: String,
+        #[arg(short, long)]
+        access_key: Option<String>,
+        #[arg(short = 's', long)]
+        secret_key: Option<String>,
         /// Bucket name for subsequent commands
         #[arg(short, long)]
         bucket: Option<String>,
@@ -58,21 +102,21 @@ enum Command {
         cmd: PluginCmd,
     },
 
-    /// Manage hosted filter pipelines as a workspace owner. Authenticates with
-    /// a Supabase access token (`S4_ACCESS_TOKEN` / `--token`) — never an S4
-    /// data-plane API key.
+    /// Manage hosted filter pipelines as a workspace owner. Authenticates with a
+    /// Supabase access token (`MASKURA_ACCESS_TOKEN` / `--token`) - never a
+    /// Maskura data-plane API key.
     Hosted {
         /// Workspace ID (UUID)
-        #[arg(long, env = "S4_WORKSPACE_ID")]
-        workspace: String,
+        #[arg(long)]
+        workspace: Option<String>,
         /// Supabase access token (JWT)
-        #[arg(long, env = "S4_ACCESS_TOKEN")]
+        #[arg(long)]
         token: Option<String>,
         #[command(subcommand)]
         cmd: HostedCmd,
     },
 
-    /// Upload a file through S4 (runs it through the plugin pipeline)
+    /// Upload a file through Maskura (runs it through the plugin pipeline)
     Put {
         /// Source file to upload
         file: PathBuf,
@@ -83,7 +127,7 @@ enum Command {
         bucket: Option<String>,
     },
 
-    /// Download an object through S4
+    /// Download an object through Maskura
     Get {
         /// Object key to retrieve
         key: String,
@@ -387,6 +431,44 @@ struct Config {
     bucket: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct CustomerEnv {
+    gateway: Option<String>,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    workspace_id: Option<String>,
+    access_token: Option<String>,
+}
+
+impl CustomerEnv {
+    fn from_process() -> anyhow::Result<Self> {
+        Ok(Self {
+            gateway: resolve_customer_env(customer_env::GATEWAY_URL)?,
+            access_key: resolve_customer_env(customer_env::ACCESS_KEY)?,
+            secret_key: resolve_customer_env(customer_env::SECRET_KEY)?,
+            workspace_id: resolve_customer_env(HOSTED_WORKSPACE_ID_ENV)?,
+            access_token: resolve_customer_env(HOSTED_ACCESS_TOKEN_ENV)?,
+        })
+    }
+}
+
+impl Cli {
+    fn parse_for_program() -> Self {
+        let program = Program::current();
+        let matches = Self::command().name(program.name()).get_matches();
+        let mut cli = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        cli.program = program;
+        cli
+    }
+
+    fn requested_gateway(&self) -> &str {
+        self.gateway
+            .as_deref()
+            .or(self.customer_env.gateway.as_deref())
+            .unwrap_or(DEFAULT_GATEWAY)
+    }
+}
+
 impl Config {
     fn path() -> PathBuf {
         config_dir().join("config.json")
@@ -427,15 +509,15 @@ impl Client {
         let access_key = config
             .access_key
             .clone()
-            .or_else(|| std::env::var("S4_ACCESS_KEY").ok());
+            .or_else(|| cli.customer_env.access_key.clone());
         let secret_key = config
             .secret_key
             .clone()
-            .or_else(|| std::env::var("S4_SECRET_KEY").ok());
+            .or_else(|| cli.customer_env.secret_key.clone());
         let gateway = config
             .gateway
             .as_deref()
-            .unwrap_or(&cli.gateway)
+            .unwrap_or_else(|| cli.requested_gateway())
             .trim_end_matches('/')
             .to_string();
         let bucket = config.bucket.clone();
@@ -444,7 +526,13 @@ impl Client {
             access_key: access_key.unwrap_or_default(),
             secret_key: secret_key.unwrap_or_default(),
             bucket,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .user_agent(format!(
+                    "{}/{}",
+                    cli.program.name(),
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .build()?,
         })
     }
 
@@ -457,8 +545,14 @@ impl Client {
 
     fn auth_headers(&self) -> anyhow::Result<HeaderMap> {
         let mut h = HeaderMap::new();
-        h.insert("x-s4-access-key", HeaderValue::from_str(&self.access_key)?);
-        h.insert("x-s4-secret-key", HeaderValue::from_str(&self.secret_key)?);
+        h.insert(
+            "x-maskura-access-key",
+            HeaderValue::from_str(&self.access_key)?,
+        );
+        h.insert(
+            "x-maskura-secret-key",
+            HeaderValue::from_str(&self.secret_key)?,
+        );
         Ok(h)
     }
 
@@ -536,7 +630,7 @@ impl Client {
     }
 
     /// POST a raw byte body (used for Wasm plugin uploads); `name` is sent
-    /// as the `x-s4-plugin-name` header.
+    /// as the `x-maskura-plugin-name` header.
     async fn api_post_raw<R: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
@@ -545,7 +639,7 @@ impl Client {
     ) -> anyhow::Result<R> {
         let mut headers = self.auth_headers()?;
         headers.insert(
-            "x-s4-plugin-name",
+            "x-maskura-plugin-name",
             HeaderValue::from_str(name).context("invalid plugin name")?,
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/wasm"));
@@ -827,7 +921,8 @@ fn parse_draft_step(raw: &str) -> anyhow::Result<serde_json::Value> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse_for_program();
+    cli.customer_env = CustomerEnv::from_process()?;
     let config = Config::load();
 
     match &cli.command {
@@ -836,10 +931,18 @@ async fn main() -> anyhow::Result<()> {
             secret_key,
             bucket,
         } => {
+            let access_key = access_key
+                .as_ref()
+                .or(cli.customer_env.access_key.as_ref())
+                .context("missing access key: use --access-key or MASKURA_ACCESS_KEY")?;
+            let secret_key = secret_key
+                .as_ref()
+                .or(cli.customer_env.secret_key.as_ref())
+                .context("missing secret key: use --secret-key or MASKURA_SECRET_KEY")?;
             let mut cfg = config;
             cfg.access_key = Some(access_key.clone());
             cfg.secret_key = Some(secret_key.clone());
-            cfg.gateway = Some(cli.gateway.clone());
+            cfg.gateway = Some(cli.requested_gateway().to_string());
             if let Some(b) = bucket {
                 cfg.bucket = Some(b.clone());
             }
@@ -858,7 +961,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Whoami => {
             let client = Client::new(&cli, &config)?;
             let keys: Vec<serde_json::Value> = client.api_get("/dashboard/api/keys").await?;
-            println!("S4 Gateway: {}", client.gateway);
+            println!("Maskura Gateway: {}", client.gateway);
             println!(
                 "Access Key: {}...",
                 &client.access_key[..16.min(client.access_key.len())]
@@ -888,7 +991,10 @@ async fn main() -> anyhow::Result<()> {
                     let keys: Vec<serde_json::Value> =
                         client.api_get("/dashboard/api/keys").await?;
                     if keys.is_empty() {
-                        println!("No keys. Create one with: s4ctl key create --label my-key");
+                        println!(
+                            "No keys. Create one with: {} key create --label my-key",
+                            cli.program.name()
+                        );
                     } else {
                         for k in &keys {
                             let exp = k["expires_at"]
@@ -928,7 +1034,8 @@ async fn main() -> anyhow::Result<()> {
                     client.api_put("/dashboard/api/backend", &body).await?;
                     println!("Backend set to AWS IAM Role: {}", role_arn);
                     println!(
-                        "Run 's4ctl backend get' to see your External ID for the trust policy."
+                        "Run '{} backend get' to see your External ID for the trust policy.",
+                        cli.program.name()
                     );
                 }
                 BackendCmd::SetR2 { endpoint, token } => {
@@ -992,12 +1099,17 @@ async fn main() -> anyhow::Result<()> {
                         let url = String::from_utf8_lossy(&status.stdout).trim().to_string();
                         println!("Presigned PUT URL ({}s TTL):", expires);
                         println!("{}", url);
-                        println!("\n# Use with s4ctl:");
-                        println!("s4ctl put ./file --key {} --bucket {}", key, bucket);
+                        println!("\n# Use with {}:", cli.program.name());
+                        println!(
+                            "{} put ./file --key {} --bucket {}",
+                            cli.program.name(),
+                            key,
+                            bucket
+                        );
                         println!("# Or with curl:");
                         println!("curl -X PUT \"{}\" \\", url);
-                        println!("  -H \"x-s4-access-key: {}\" \\", client.access_key);
-                        println!("  -H \"x-s4-secret-key: {}\"", client.secret_key);
+                        println!("  -H \"x-maskura-access-key: {}\" \\", client.access_key);
+                        println!("  -H \"x-maskura-secret-key: {}\"", client.secret_key);
                         println!("  --data-binary @file");
                     } else {
                         let err = String::from_utf8_lossy(&status.stderr);
@@ -1088,18 +1200,22 @@ async fn main() -> anyhow::Result<()> {
             token,
             cmd,
         } => {
+            let workspace = workspace
+                .as_deref()
+                .or(cli.customer_env.workspace_id.as_deref())
+                .context(
+                    "hosted commands require a workspace via --workspace or MASKURA_WORKSPACE_ID",
+                )?;
             let token = token
-                .clone()
-                .or_else(|| std::env::var("S4_ACCESS_TOKEN").ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "hosted commands require a Supabase access token via --token or S4_ACCESS_TOKEN"
-                    )
-                })?;
+                .as_deref()
+                .or(cli.customer_env.access_token.as_deref())
+                .context(
+                    "hosted commands require a Supabase access token via --token or MASKURA_ACCESS_TOKEN",
+                )?;
             if token.is_empty() {
-                bail!("S4_ACCESS_TOKEN must not be empty");
+                bail!("MASKURA_ACCESS_TOKEN must not be empty");
             }
-            let api = HostedApi::new(&cli.gateway, workspace, &token)?;
+            let api = HostedApi::new(cli.requested_gateway(), workspace, token)?;
             match cmd {
                 HostedCmd::Catalog => {
                     let value: serde_json::Value = api.get(&["filter-catalog"]).await?;
@@ -1205,7 +1321,8 @@ async fn main() -> anyhow::Result<()> {
                         created["validation_run_id"].as_str().unwrap_or("?")
                     );
                     println!(
-                        "Poll with: s4ctl hosted --workspace {} validation {}",
+                        "Poll with: {} hosted --workspace {} validation {}",
+                        cli.program.name(),
                         api.workspace,
                         created["version_id"].as_str().unwrap_or("?")
                     );
@@ -1502,9 +1619,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Health => {
-            let resp = reqwest::get(format!("{}/health", cli.gateway)).await?;
+            let gateway = cli.requested_gateway();
+            let resp = reqwest::get(format!("{gateway}/health")).await?;
             if resp.status().is_success() {
-                println!("S4 gateway is healthy at {}", cli.gateway);
+                println!("Maskura Gateway is healthy at {gateway}");
             } else {
                 bail!(
                     "Gateway unhealthy: {} {}",
@@ -1517,9 +1635,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Local { cmd } => {
             const LOCAL_GATEWAY_NAME: &str = "s4-local-gateway";
             // Pin the gateway image to the CLI version (v0.3.3 image for
-            // s4ctl 0.3.3) so CLI and gateway always match — never :latest.
-            let local_gateway_image =
-                format!("ghcr.io/231self/s4/s4:v{}", env!("CARGO_PKG_VERSION"));
+            // maskura 0.3.3) so CLI and gateway always match; never :latest.
+            let local_gateway_image = format!(
+                "ghcr.io/231self/maskura/maskura:v{}",
+                env!("CARGO_PKG_VERSION")
+            );
 
             match cmd {
                 LocalCmd::Init => {
@@ -1560,14 +1680,15 @@ async fn main() -> anyhow::Result<()> {
                             "-e",
                             "AUTH_DISABLED=true",
                             "-e",
-                            "S4_KEYS_FILE=/app/data/keys.json",
+                            "MASKURA_KEYS_FILE=/app/data/keys.json",
                             &local_gateway_image,
                         ])
                         .status()?;
                     if !run_status.success() {
                         bail!(
                             "failed to start gateway container — is {local_gateway_image} pullable? \
-                             (the image tag must match the s4ctl version; has v{} been released?)",
+                             (the image tag must match the {} version; has v{} been released?)",
+                            cli.program.name(),
                             env!("CARGO_PKG_VERSION")
                         );
                     }
@@ -1607,25 +1728,31 @@ async fn main() -> anyhow::Result<()> {
                     cfg.bucket = None;
                     cfg.save()?;
 
-                    println!("S4 local gateway is running (published image).");
+                    println!("Maskura Gateway is running locally (published image).");
                     println!("  Gateway: {url}");
                     println!("  Storage: in-memory (durable MinIO via `just dev-up` in the repo)");
                     println!("  Keys:    persisted in the s4-local-keys volume");
                     println!();
                     println!("Quickstart:");
-                    println!("  s4ctl put ./data.csv ingest/data.csv --bucket s4-local");
-                    println!("  s4ctl get ingest/data.csv --bucket s4-local");
+                    println!(
+                        "  {} put ./data.csv ingest/data.csv --bucket s4-local",
+                        cli.program.name()
+                    );
+                    println!(
+                        "  {} get ingest/data.csv --bucket s4-local",
+                        cli.program.name()
+                    );
                     println!();
-                    println!("Stop with: s4ctl local down");
+                    println!("Stop with: {} local down", cli.program.name());
                 }
                 LocalCmd::Down => {
                     let status = std::process::Command::new("docker")
                         .args(["rm", "-f", LOCAL_GATEWAY_NAME])
                         .status()?;
                     if status.success() {
-                        println!("S4 local gateway stopped.");
+                        println!("Maskura Gateway stopped locally.");
                     } else {
-                        println!("S4 local gateway is not running.");
+                        println!("Maskura Gateway is not running locally.");
                     }
                 }
             }
@@ -1646,7 +1773,7 @@ async fn main() -> anyhow::Result<()> {
                     .read_to_end(&mut data)?;
 
                 let client = Client::new(&cli, &config).unwrap_or_else(|_| Client {
-                    gateway: cli.gateway.clone(),
+                    gateway: cli.requested_gateway().to_string(),
                     access_key: String::new(),
                     secret_key: String::new(),
                     bucket: None,
@@ -1737,7 +1864,6 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1824,6 +1950,7 @@ mod tests {
             headers.get("Authorization").unwrap().to_str().unwrap(),
             "Bearer secret-token"
         );
+        assert!(headers.get("x-maskura-access-key").is_none());
         assert!(headers.get("x-s4-access-key").is_none());
     }
 
@@ -1856,5 +1983,27 @@ mod tests {
         .unwrap();
         let request = delete_request.await.unwrap();
         assert!(request.starts_with("DELETE /dashboard/api/workspaces/ws-abc/"));
+    }
+
+    #[test]
+    fn executable_names_select_canonical_and_legacy_program_labels() {
+        assert_eq!(
+            Program::from_executable(std::ffi::OsStr::new("/tmp/maskura")),
+            Program::Maskura
+        );
+        assert_eq!(
+            Program::from_executable(std::ffi::OsStr::new("/tmp/s4ctl")),
+            Program::S4ctl
+        );
+        assert_eq!(Program::Maskura.name(), "maskura");
+        assert_eq!(Program::S4ctl.name(), "s4ctl");
+    }
+
+    #[test]
+    fn hosted_env_names_are_canonical_with_permanent_legacy_aliases() {
+        assert_eq!(HOSTED_WORKSPACE_ID_ENV.canonical, "MASKURA_WORKSPACE_ID");
+        assert_eq!(HOSTED_WORKSPACE_ID_ENV.legacy, "S4_WORKSPACE_ID");
+        assert_eq!(HOSTED_ACCESS_TOKEN_ENV.canonical, "MASKURA_ACCESS_TOKEN");
+        assert_eq!(HOSTED_ACCESS_TOKEN_ENV.legacy, "S4_ACCESS_TOKEN");
     }
 }

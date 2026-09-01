@@ -12,7 +12,8 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   CARGO_BUILD_JOBS: 2
-  IMAGE: ghcr.io/${{ github.repository_owner }}/s4/s4
+  IMAGE: ghcr.io/${{ github.repository_owner }}/maskura/maskura
+  LEGACY_IMAGE: ghcr.io/${{ github.repository_owner }}/s4/s4
 
 jobs:
   # Native per-arch builds: amd64 on the x64 runner, arm64 on the native
@@ -48,19 +49,26 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
-      - name: Build gateway and MCP releases (${{ matrix.suffix }})
+      - name: Build gateway, CLI, and MCP releases (${{ matrix.suffix }})
         run: |
           mkdir -p dist/components
-          cargo build --release -p s4-gateway -p s4-mcp
+          cargo build --release -p s4-gateway -p s4-mcp -p s4ctl
           cp target/release/s4-gateway dist/s4-gateway
+          cp target/release/maskura-mcp dist/maskura-mcp-linux-${{ matrix.suffix }}
           cp target/release/s4-mcp dist/s4-mcp-linux-${{ matrix.suffix }}
+          cp target/release/maskura dist/maskura-linux-${{ matrix.suffix }}
+          cp target/release/s4ctl dist/s4ctl-linux-${{ matrix.suffix }}
           cp -r target/components/. dist/components/
 
-      - name: Upload MCP binary (${{ matrix.suffix }})
+      - name: Upload CLI and MCP binaries (${{ matrix.suffix }})
         uses: actions/upload-artifact@v4
         with:
-          name: s4-mcp-${{ matrix.suffix }}
-          path: dist/s4-mcp-linux-${{ matrix.suffix }}
+          name: maskura-binaries-${{ matrix.suffix }}
+          path: |
+            dist/maskura-mcp-linux-${{ matrix.suffix }}
+            dist/s4-mcp-linux-${{ matrix.suffix }}
+            dist/maskura-linux-${{ matrix.suffix }}
+            dist/s4ctl-linux-${{ matrix.suffix }}
           if-no-files-found: error
 
       - name: Set up Docker Buildx
@@ -76,7 +84,9 @@ jobs:
           file: Dockerfile.release
           platforms: ${{ matrix.platform }}
           load: true
-          tags: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
+            ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
 
       - name: Boot-smoke image (${{ matrix.suffix }})
         env:
@@ -93,7 +103,10 @@ jobs:
       - name: Push image (${{ matrix.suffix }})
         env:
           IMAGE_REF: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
-        run: docker push "$IMAGE_REF"
+          LEGACY_IMAGE_REF: ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
+        run: |
+          docker push "$IMAGE_REF"
+          docker push "$LEGACY_IMAGE_REF"
 
   release:
     needs: build
@@ -101,10 +114,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download MCP binaries
+      - name: Download CLI and MCP binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: s4-mcp-*
+          pattern: maskura-binaries-*
           path: dist
           merge-multiple: true
 
@@ -120,63 +133,64 @@ jobs:
         with:
           driver: docker-container
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Merge multi-arch manifest
         run: |
           docker buildx imagetools create \
             -t ${{ env.IMAGE }}:${{ github.ref_name }} \
             -t ${{ env.IMAGE }}:latest \
+            -t ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }} \
+            -t ${{ env.LEGACY_IMAGE }}:latest \
             ${{ env.IMAGE }}:${{ github.ref_name }}-amd64 \
             ${{ env.IMAGE }}:${{ github.ref_name }}-arm64
 
       - name: Extract release artifacts from image
         run: |
           mkdir -p dist/filters
-          docker create --name s4-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ github.ref_name }}-amd64"
-          docker cp s4-extract:/usr/local/bin/s4-gateway dist/s4-gateway-linux-x86_64
-          docker cp s4-extract:/app/components/. dist/filters/
-          docker rm s4-extract
+          docker create --name maskura-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ github.ref_name }}-amd64"
+          docker cp maskura-extract:/usr/local/bin/s4-gateway dist/maskura-gateway-linux-x86_64
+          cp dist/maskura-gateway-linux-x86_64 dist/s4-gateway-linux-x86_64
+          docker cp maskura-extract:/app/components/. dist/filters/
+          docker rm maskura-extract
+          tar -czf dist/maskura-filters.tar.gz -C dist filters
           tar -czf dist/s4-filters.tar.gz -C dist filters
-          tar -czf dist/s4-python-sdk.tar.gz -C sdks python
-          tar -czf dist/s4-typescript-sdk.tar.gz -C sdks typescript
+          npm install --prefix sdks/typescript --no-package-lock
+          npm run --prefix sdks/typescript build
+          python3 sdks/package-release.py --output-dir dist
 
-      - name: Make image public
+      - name: Make canonical and legacy images public
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api -X PATCH "/repos/${{ github.repository }}/packages/container/s4" \
-            -f visibility=public \
-            || echo "warning: could not set image visibility to public"
-
-      - name: Prune old image versions (keep latest + last 3 tags)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          keep=3
-          gh api --paginate "/repos/${{ github.repository }}/packages/container/s4/versions?per_page=100" \
-            --jq '[.[] | select((.metadata.container.tags | length) > 0)
-                   | {id, created: .created_at, tag: .metadata.container.tags[0]}]
-                  | sort_by(.created) | reverse' \
-            | jq -c '.[]' \
-            | tail -n +$((keep + 2)) \
-            | while read -r v; do
-                id=$(echo "$v" | jq -r .id)
-                tag=$(echo "$v" | jq -r .tag)
-                echo "pruning image version $tag ($id)"
-                gh api -X DELETE "/repos/${{ github.repository }}/packages/container/s4/versions/$id" \
-                  || echo "warning: could not delete $tag"
-              done
-          echo "prune done (kept latest + $keep tags)"
+          gh api -X PATCH "/orgs/${{ github.repository_owner }}/packages/container/maskura%2Fmaskura" \
+            -f visibility=public
+          gh api -X PATCH "/orgs/${{ github.repository_owner }}/packages/container/s4%2Fs4" \
+            -f visibility=public
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
+             dist/maskura-gateway-linux-x86_64 \
              dist/s4-gateway-linux-x86_64 \
+             dist/maskura-mcp-linux-amd64 \
+             dist/maskura-mcp-linux-arm64 \
              dist/s4-mcp-linux-amd64 \
              dist/s4-mcp-linux-arm64 \
+             dist/maskura-linux-amd64 \
+             dist/maskura-linux-arm64 \
+             dist/s4ctl-linux-amd64 \
+             dist/s4ctl-linux-arm64 \
+             dist/maskura-filters.tar.gz \
              dist/s4-filters.tar.gz \
-            dist/s4-python-sdk.tar.gz \
-            dist/s4-typescript-sdk.tar.gz \
-            --repo "${{ github.repository }}" \
+             dist/maskura-python-sdk.tar.gz \
+             dist/s4-python-sdk.tar.gz \
+             dist/maskura-typescript-sdk.tar.gz \
+             dist/s4-typescript-sdk.tar.gz \
+             --repo "${{ github.repository }}" \
             --generate-notes

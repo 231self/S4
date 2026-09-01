@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/customer-config",
   "crates/error",
   "crates/policy",
   "crates/wasm-runtime",
@@ -24,9 +25,10 @@ members = [
 version = "0.3.5"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/231self/s4"
+repository = "https://github.com/231self/S4"
 
 [workspace.dependencies]
+maskura-customer-config = { path = "crates/customer-config" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 hex = "0.4"

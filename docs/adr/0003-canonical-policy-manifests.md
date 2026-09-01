@@ -5,7 +5,7 @@ Status: Accepted
 
 ## Context
 
-Tenant-defined pipeline configuration (destinations, routes, filters, limits) must be verifiably authentic. S4 operators must not silently change policy. The signed manifest is the customer's attestable statement of intent.
+Tenant-defined pipeline configuration (destinations, routes, filters, limits) must be verifiably authentic. Maskura operators must not silently change policy. The signed manifest is the customer's attestable statement of intent.
 
 Options considered:
 - **JSON with detached signature**: Non-deterministic whitespace and key ordering make verification fragile.
@@ -19,6 +19,6 @@ Use canonical CBOR encoding with lexicographically sorted map keys and Ed25519 s
 ## Consequences
 
 - Trust roots are tenant-managed Ed25519 public keys provisioned during onboarding.
-- Policy updates require a new signature; the dashboard can draft but `s4ctl` signs and activates.
+- Policy updates require a new signature; the dashboard can draft but `maskura` signs and activates.
 - Manifests have short expiry; monotonic version warnings on stale manifests discourage rollback.
 - Implementation uses `ciborium` crate with BTreeMap-based canonical serialization.

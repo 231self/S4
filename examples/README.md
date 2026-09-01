@@ -6,20 +6,21 @@ never committed.
 ## Local quickstart (`local-quickstart.sh`)
 
 The getting-started flow as a testable script: start the gateway from the
-published image (pinned to the s4ctl version), push a sample through the
+published image (pinned to the `maskura` executable version), push a sample through the
 pipeline, assert redaction, stop.
 
 ```bash
 bash examples/local-quickstart.sh
 ```
 
-Requires `s4ctl` (`cargo install s4ctl --git https://github.com/231self/S4`)
+Requires `maskura`
+(`cargo install --git https://github.com/231self/S4 --bin maskura s4ctl`)
 and Docker.
 
 ## B2 demos (`b2-encrypt-demo.sh`, `b2-redact-demo.sh`)
 
 Round-trips against a real Backblaze B2 bucket, fetching the stored object
-**directly from B2** (bypassing S4) so you can see exactly what leaves your
+**directly from B2** (bypassing Maskura) so you can see exactly what leaves your
 writer:
 
 - **`b2-encrypt-demo.sh`** — envelope-encryption: pre-encrypt fixture →

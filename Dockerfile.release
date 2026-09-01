@@ -9,8 +9,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY dist/s4-gateway /usr/local/bin/s4-gateway
 COPY dist/components /app/components
-ENV S4_FILTER_COMPONENT=/app/components/pii-default.component.wasm
-ENV S4_PLUGINS_DIR=/app/components
+ENV MASKURA_FILTER_COMPONENT=/app/components/pii-default.component.wasm
+ENV MASKURA_PLUGINS_DIR=/app/components
 ENV LISTEN_ADDR=0.0.0.0:8080
 EXPOSE 8080
 ENTRYPOINT ["s4-gateway"]

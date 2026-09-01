@@ -55,8 +55,12 @@ fn security_doc_has_reporting_section() {
 fn security_doc_offers_private_reporting_channels() {
     let content = lower(&security_doc());
     assert!(
-        content.contains("github private vulnerability reporting"),
+        content.contains("private vulnerability reporting"),
         "SECURITY.md must reference GitHub private vulnerability reporting"
+    );
+    assert!(
+        content.contains("https://github.com/231self/s4/security/advisories/new"),
+        "SECURITY.md must link to this repository's private reporting form"
     );
     assert!(
         content.contains("security@231self.com"),

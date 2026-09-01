@@ -2,8 +2,8 @@
 # B2 envelope-encryption demo:
 #   1. PRE-ENCRYPT  — the PII fixture as you have it
 #   2. ENCRYPTED AT REST — the bytes stored in B2, fetched DIRECTLY from the
-#      bucket (bypassing S4) so you can see what leaves your writer
-#   3. DECRYPTED — GET through S4 + client-side decryption with the private key
+#      bucket (bypassing Maskura) so you can see what leaves your writer
+#   3. DECRYPTED — GET through Maskura + client-side decryption with the private key
 #
 # Credentials come from the environment (never committed):
 #   B2_S3_ENDPOINT=https://s3.us-east-005.backblazeb2.com
@@ -71,7 +71,7 @@ echo "--- Pipeline: pii-default OFF, envelope-encrypt ON ---"
 PII_ID="$(curl -fsS "$GATEWAY_URL/dashboard/api/plugins" | python3 -c \
   "import json,sys; print([p['id'] for p in json.load(sys.stdin) if p['name']=='pii-default'][0])")"
 curl -fsS -X PUT "$GATEWAY_URL/dashboard/api/plugins/$PII_ID" -H "Content-Type: application/json" -d '{"enabled":false}' -o /dev/null
-curl -fsS -X POST "$GATEWAY_URL/dashboard/api/plugins" -H "x-s4-plugin-name: envelope-encrypt" \
+curl -fsS -X POST "$GATEWAY_URL/dashboard/api/plugins" -H "x-maskura-plugin-name: envelope-encrypt" \
   --data-binary "@$ROOT/target/components/envelope-encrypt.component.wasm" -o /dev/null
 
 CERT_JSON="$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$(cat "$CERT")")"
@@ -84,21 +84,21 @@ echo "===== STAGE 1: PRE-ENCRYPT — the fixture as you have it ====="
 cat "$INPUT"
 
 echo
-echo "===== PUT through S4 (envelope-encrypt) -> B2 ====="
+echo "===== PUT through Maskura (envelope-encrypt) -> B2 ====="
 curl -fsS -X PUT "$GATEWAY_URL/$OBJ_KEY" \
-  -H "x-s4-access-key: $AK" -H "x-s4-secret-key: $SK" \
+  -H "x-maskura-access-key: $AK" -H "x-maskura-secret-key: $SK" \
   -H "Content-Type: text/plain" --data-binary "@$INPUT" \
   -o /dev/null -w "PUT status: %{http_code}\n"
 
 echo
-echo "===== STAGE 2: ENCRYPTED AT REST — fetched DIRECTLY from B2 (bypassing S4) ====="
+echo "===== STAGE 2: ENCRYPTED AT REST — fetched directly from B2 (bypassing Maskura) ====="
 docker run --rm -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color alias set b2 "$B2_S3_ENDPOINT" "$B2_ACCESS_KEY_ID" "$B2_SECRET_ACCESS_KEY" >/dev/null
 docker run --rm -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color cat "b2/$B2_BUCKET/$OBJ_KEY" | tee "$RAW"
 echo "(raw object: $(wc -c < "$RAW") bytes in bucket '$B2_BUCKET', key '$OBJ_KEY')"
 
 echo
-echo "===== STAGE 3: GET through S4 ====="
-curl -fsS "$GATEWAY_URL/$OBJ_KEY" -H "x-s4-access-key: $AK" -H "x-s4-secret-key: $SK" -o "$THROUGH"
+echo "===== STAGE 3: GET through Maskura ====="
+curl -fsS "$GATEWAY_URL/$OBJ_KEY" -H "x-maskura-access-key: $AK" -H "x-maskura-secret-key: $SK" -o "$THROUGH"
 echo "returned $(wc -c < "$THROUGH") bytes (envelopes pass through unchanged)"
 
 echo
@@ -152,5 +152,5 @@ if missing:
 print(f"PASS: all {len(want)} PII values recovered by decryption")
 EOF
 
-curl -fsS -X DELETE "$GATEWAY_URL/$OBJ_KEY" -H "x-s4-access-key: $AK" -H "x-s4-secret-key: $SK" -o /dev/null 2>/dev/null || true
+curl -fsS -X DELETE "$GATEWAY_URL/$OBJ_KEY" -H "x-maskura-access-key: $AK" -H "x-maskura-secret-key: $SK" -o /dev/null 2>/dev/null || true
 echo "Demo complete."

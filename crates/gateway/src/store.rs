@@ -1541,11 +1541,13 @@ fn chrono_now() -> String {
 mod tests {
     use super::*;
     use crate::key_cipher::{KeyWrapping, LocalKeyWrapping};
-    use rand::rngs::OsRng;
-    use rsa::pkcs8::{EncodePublicKey, LineEnding};
 
     const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/pub.pem");
     const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
+    const TEST_RSA_1024_PUBLIC_KEY_PEM: &str =
+        include_str!("../../../tests/fixtures/pii/crypto/rsa-1024-public.pem");
+    const TEST_RSA_4096_PUBLIC_KEY_PEM: &str =
+        include_str!("../../../tests/fixtures/pii/crypto/rsa-4096-public.pem");
 
     #[derive(Debug)]
     struct FailingKeyWrapping;
@@ -1596,14 +1598,6 @@ mod tests {
         Arc::new(SecretCipher::new(Arc::new(FailingKeyWrapping)))
     }
 
-    fn generated_public_key_pem(bits: usize) -> String {
-        rsa::RsaPrivateKey::new(&mut OsRng, bits)
-            .unwrap()
-            .to_public_key()
-            .to_public_key_pem(LineEnding::LF)
-            .unwrap()
-    }
-
     #[test]
     fn credential_labels_and_ttls_are_canonical_and_bounded() {
         assert_eq!(
@@ -1638,8 +1632,8 @@ mod tests {
             TEST_CERTIFICATE_PEM.trim()
         );
         assert!(canonicalize_public_key_pem("not a PEM").is_err());
-        assert!(canonicalize_public_key_pem(&generated_public_key_pem(1024)).is_err());
-        assert!(canonicalize_public_key_pem(&generated_public_key_pem(4096)).is_ok());
+        assert!(canonicalize_public_key_pem(TEST_RSA_1024_PUBLIC_KEY_PEM).is_err());
+        assert!(canonicalize_public_key_pem(TEST_RSA_4096_PUBLIC_KEY_PEM).is_ok());
         assert!(canonicalize_public_key_pem(&"x".repeat(MAX_PUBLIC_KEY_PEM_BYTES + 1)).is_err());
     }
 

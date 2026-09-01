@@ -16,7 +16,9 @@ use reqwest::Url;
 use crate::s3_safety::{s3_retry_config, s3_timeout_config};
 use crate::service_storage::ServiceStorage;
 use crate::store::MemoryStore;
-use crate::workspace_storage::{RuntimeBackendConfig, WorkspaceId, WorkspaceStorageRepository};
+use crate::workspace_storage::{
+    RuntimeBackendConfig, WorkspaceId, WorkspaceStorageRepository, WorkspaceStorageRouting,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StorageOperation {
@@ -54,6 +56,17 @@ impl ResolvedBackend {
             Self::Memory(_) => BackendKind::Memory,
         }
     }
+}
+
+/// Backend selection plus the workspace routing fence captured with it.
+///
+/// Presigned and explicit single-tenant overrides have no workspace routing
+/// fence. Hosted managed commit paths must use this selection and require a
+/// stable persisted fence before publishing authority.
+#[derive(Clone)]
+pub struct ResolvedBackendSelection {
+    pub backend: ResolvedBackend,
+    pub workspace_routing: Option<WorkspaceStorageRouting>,
 }
 
 fn workspace_s3_http_client() -> SharedHttpClient {
@@ -102,21 +115,36 @@ impl BackendResolver {
         &self,
         workspace_id: &WorkspaceId,
         headers: &HeaderMap,
-        _operation: StorageOperation,
+        operation: StorageOperation,
     ) -> Result<ResolvedBackend, String> {
-        // S7a managed-storage override ("I don't care where"): a request with
-        // `x-s4-storage-mode: managed` always uses S4-managed storage, even when
-        // the workspace has a BYO backend configured. Any other value (or no
-        // header) keeps the normal priority below.
-        if headers
+        Ok(self
+            .resolve_with_routing(workspace_id, headers, operation)
+            .await?
+            .backend)
+    }
+
+    pub async fn resolve_with_routing(
+        &self,
+        workspace_id: &WorkspaceId,
+        headers: &HeaderMap,
+        _operation: StorageOperation,
+    ) -> Result<ResolvedBackendSelection, String> {
+        let managed_requested = headers
             .get("x-s4-storage-mode")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("managed"))
-        {
+            .is_some_and(|value| value.eq_ignore_ascii_case("managed"));
+
+        // The request-level shortcut is a single-tenant development feature.
+        // Hosted routing must consult persisted workspace state first so a BYO
+        // workspace cannot be redirected into S4-managed storage by a header.
+        if self.explicit_single_tenant && managed_requested {
             if self.managed.is_empty() {
                 return Err("managed storage is not configured (no S4_SERVICE_BUCKETS)".to_string());
             }
-            return Ok(ResolvedBackend::Managed(self.managed.clone()));
+            return Ok(ResolvedBackendSelection {
+                backend: ResolvedBackend::Managed(self.managed.clone()),
+                workspace_routing: None,
+            });
         }
 
         if let Some(raw_url) = headers
@@ -125,15 +153,23 @@ impl BackendResolver {
         {
             let url =
                 Url::parse(raw_url).map_err(|_| "invalid presigned backend URL".to_string())?;
-            return Ok(ResolvedBackend::PresignedHttp(url));
+            return Ok(ResolvedBackendSelection {
+                backend: ResolvedBackend::PresignedHttp(url),
+                workspace_routing: None,
+            });
         }
 
-        match self
+        let resolution = self
             .workspace_storage
-            .get_runtime_config(workspace_id)
+            .get_runtime_resolution(workspace_id)
             .await
-            .map_err(|_| "workspace storage is unavailable".to_string())?
-        {
+            .map_err(|_| "workspace storage is unavailable".to_string())?;
+        if resolution.routing.is_transitioning() {
+            return Err("workspace storage is transitioning".to_string());
+        }
+        let workspace_routing = Some(resolution.routing);
+
+        match resolution.config {
             Some(RuntimeBackendConfig::Managed) => {
                 if self.managed.is_empty() {
                     return Err(
@@ -141,7 +177,10 @@ impl BackendResolver {
                             .to_string(),
                     );
                 }
-                return Ok(ResolvedBackend::Managed(self.managed.clone()));
+                return Ok(ResolvedBackendSelection {
+                    backend: ResolvedBackend::Managed(self.managed.clone()),
+                    workspace_routing,
+                });
             }
             Some(RuntimeBackendConfig::S3Compatible {
                 endpoint,
@@ -172,27 +211,39 @@ impl BackendResolver {
                 let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
                     .force_path_style(true)
                     .build();
-                return Ok(ResolvedBackend::S3 {
-                    kind: BackendKind::PerUserS3,
-                    client: Client::from_conf(s3_config),
+                return Ok(ResolvedBackendSelection {
+                    backend: ResolvedBackend::S3 {
+                        kind: BackendKind::PerUserS3,
+                        client: Client::from_conf(s3_config),
+                    },
+                    workspace_routing,
                 });
             }
             None => {}
         }
 
         if !self.managed.is_empty() {
-            return Ok(ResolvedBackend::Managed(self.managed.clone()));
+            return Ok(ResolvedBackendSelection {
+                backend: ResolvedBackend::Managed(self.managed.clone()),
+                workspace_routing,
+            });
         }
         if !self.explicit_single_tenant {
             return Err("workspace storage is unavailable".to_string());
         }
         if let Some(client) = &self.global_s3 {
-            return Ok(ResolvedBackend::S3 {
-                kind: BackendKind::GlobalS3,
-                client: client.clone(),
+            return Ok(ResolvedBackendSelection {
+                backend: ResolvedBackend::S3 {
+                    kind: BackendKind::GlobalS3,
+                    client: client.clone(),
+                },
+                workspace_routing,
             });
         }
-        Ok(ResolvedBackend::Memory(self.memory.clone()))
+        Ok(ResolvedBackendSelection {
+            backend: ResolvedBackend::Memory(self.memory.clone()),
+            workspace_routing,
+        })
     }
 }
 
@@ -831,6 +882,10 @@ mod tests {
 
     struct FailingWorkspaceStorageRepository;
 
+    struct PersistedWorkspaceStorageRepository {
+        resolution: crate::workspace_storage::WorkspaceStorageResolution,
+    }
+
     #[async_trait]
     impl WorkspaceStorageRepository for FailingWorkspaceStorageRepository {
         async fn resolve_workspace(
@@ -875,6 +930,55 @@ mod tests {
             Err(crate::workspace_storage::WorkspaceStorageError::Repository(
                 "database details must not escape".to_string(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceStorageRepository for PersistedWorkspaceStorageRepository {
+        async fn resolve_workspace(
+            &self,
+            user_id: &str,
+        ) -> Result<WorkspaceId, crate::workspace_storage::WorkspaceStorageError> {
+            WorkspaceId::new(user_id)
+        }
+
+        async fn get_runtime_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<Option<RuntimeBackendConfig>, crate::workspace_storage::WorkspaceStorageError>
+        {
+            panic!("backend routing must use the atomic runtime resolution")
+        }
+
+        async fn get_runtime_resolution(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<
+            crate::workspace_storage::WorkspaceStorageResolution,
+            crate::workspace_storage::WorkspaceStorageError,
+        > {
+            Ok(self.resolution.clone())
+        }
+
+        async fn get_public_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> Result<
+            crate::workspace_storage::BackendConfigResponse,
+            crate::workspace_storage::WorkspaceStorageError,
+        > {
+            Ok(crate::workspace_storage::BackendConfigResponse::unconfigured())
+        }
+
+        async fn put_config(
+            &self,
+            _workspace_id: &WorkspaceId,
+            _request: crate::workspace_storage::BackendConfigRequest,
+        ) -> Result<
+            crate::workspace_storage::BackendConfigResponse,
+            crate::workspace_storage::WorkspaceStorageError,
+        > {
+            Ok(crate::workspace_storage::BackendConfigResponse::unconfigured())
         }
     }
 
@@ -999,6 +1103,9 @@ mod tests {
 
         let managed = Arc::new(ServiceStorage::new(vec![ServiceBackend {
             provider: "test".to_string(),
+            provider_instance_id: None,
+            provider_account_id: None,
+            credential_epoch: None,
             endpoint: "https://managed.example".to_string(),
             region: "us-east-1".to_string(),
             bucket: "managed".to_string(),
@@ -1031,6 +1138,28 @@ mod tests {
             .await
             .unwrap();
         let resolver = BackendResolver::new(
+            repository.clone(),
+            managed.clone(),
+            Some(global.clone()),
+            memory.clone(),
+            false,
+            workspace_policy_with(false, &["user.example"], &[], &["93.184.216.34:443"]),
+        );
+        assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::PerUserS3).await;
+
+        // Hosted persisted BYO state is authoritative. A request header cannot
+        // redirect the workspace into managed storage; unknown values are also
+        // ignored.
+        let mut managed_override = HeaderMap::new();
+        managed_override.insert("x-s4-storage-mode", "managed".parse().unwrap());
+        assert_operations_resolve_to(&resolver, &managed_override, BackendKind::PerUserS3).await;
+        let mut unknown_mode = HeaderMap::new();
+        unknown_mode.insert("x-s4-storage-mode", "archive".parse().unwrap());
+        assert_operations_resolve_to(&resolver, &unknown_mode, BackendKind::PerUserS3).await;
+
+        // Preserve the request-level shortcut only in explicit single-tenant
+        // development mode.
+        let development = BackendResolver::new(
             repository,
             managed,
             Some(global),
@@ -1038,16 +1167,7 @@ mod tests {
             true,
             workspace_policy(true),
         );
-        assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::PerUserS3).await;
-
-        // S7a: x-s4-storage-mode: managed forces managed storage even for a
-        // workspace with a BYO backend configured; unknown values are ignored.
-        let mut managed_override = HeaderMap::new();
-        managed_override.insert("x-s4-storage-mode", "managed".parse().unwrap());
-        assert_operations_resolve_to(&resolver, &managed_override, BackendKind::Managed).await;
-        let mut unknown_mode = HeaderMap::new();
-        unknown_mode.insert("x-s4-storage-mode", "archive".parse().unwrap());
-        assert_operations_resolve_to(&resolver, &unknown_mode, BackendKind::PerUserS3).await;
+        assert_operations_resolve_to(&development, &managed_override, BackendKind::Managed).await;
 
         // x-s4-storage-mode: managed errors when no managed backend is configured.
         let no_managed = BackendResolver::new(
@@ -1127,6 +1247,9 @@ mod tests {
 
         let managed = Arc::new(ServiceStorage::new(vec![ServiceBackend {
             provider: "test".to_string(),
+            provider_instance_id: None,
+            provider_account_id: None,
+            credential_epoch: None,
             endpoint: "https://managed.example".to_string(),
             region: "us-east-1".to_string(),
             bucket: "managed".to_string(),
@@ -1200,6 +1323,9 @@ mod tests {
 
         let managed = Arc::new(ServiceStorage::new(vec![ServiceBackend {
             provider: "test".to_string(),
+            provider_instance_id: None,
+            provider_account_id: None,
+            credential_epoch: None,
             endpoint: "https://managed.example".to_string(),
             region: "us-east-1".to_string(),
             bucket: "managed".to_string(),
@@ -1247,22 +1373,146 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_repository_failure_is_bounded_and_fail_closed() {
+        use crate::service_storage::ServiceBackend;
+
         let resolver = BackendResolver::new(
             Arc::new(FailingWorkspaceStorageRepository),
-            Arc::new(ServiceStorage::new(Vec::new())),
+            Arc::new(ServiceStorage::new(vec![ServiceBackend {
+                provider: "test".to_string(),
+                provider_instance_id: None,
+                provider_account_id: None,
+                credential_epoch: None,
+                endpoint: "https://managed.example".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "managed".to_string(),
+                access_key: "key".to_string(),
+                secret_key: "secret".to_string(),
+            }])),
             Some(test_s3_client().await),
             Arc::new(MemoryStore::new()),
             false,
             workspace_policy(false),
         );
         let workspace = WorkspaceId::new("workspace").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-s4-storage-mode", "managed".parse().unwrap());
         let Err(error) = resolver
-            .resolve(&workspace, &HeaderMap::new(), StorageOperation::Get)
+            .resolve(&workspace, &headers, StorageOperation::Get)
             .await
         else {
-            panic!("repository failure must not use a fallback backend");
+            panic!("hosted managed header must not bypass a repository failure");
         };
         assert_eq!(error, "workspace storage is unavailable");
+    }
+
+    #[tokio::test]
+    async fn hosted_selection_captures_one_atomic_config_and_epoch_snapshot() {
+        use crate::service_storage::ServiceBackend;
+        use crate::workspace_storage::{
+            WorkspaceStorageResolution, WorkspaceStorageTransitionState,
+        };
+
+        let repository = Arc::new(PersistedWorkspaceStorageRepository {
+            resolution: WorkspaceStorageResolution::persisted(
+                Some(RuntimeBackendConfig::S3Compatible {
+                    endpoint: "https://tenant.storage.example".to_string(),
+                    access_key: "key".to_string(),
+                    secret_key: "secret".to_string(),
+                    region: "us-east-1".to_string(),
+                }),
+                17,
+                WorkspaceStorageTransitionState::Stable,
+            ),
+        });
+        let resolver = BackendResolver::new(
+            repository,
+            Arc::new(ServiceStorage::new(vec![ServiceBackend {
+                provider: "test".to_string(),
+                provider_instance_id: None,
+                provider_account_id: None,
+                credential_epoch: None,
+                endpoint: "https://managed.example".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "managed".to_string(),
+                access_key: "key".to_string(),
+                secret_key: "secret".to_string(),
+            }])),
+            None,
+            Arc::new(MemoryStore::new()),
+            false,
+            workspace_policy_with(false, &["*.storage.example"], &[], &["93.184.216.34:443"]),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-s4-storage-mode", "managed".parse().unwrap());
+
+        let selection = resolver
+            .resolve_with_routing(
+                &WorkspaceId::new("workspace").unwrap(),
+                &headers,
+                StorageOperation::Put,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selection.backend.kind(), BackendKind::PerUserS3);
+        assert_eq!(
+            selection.workspace_routing,
+            Some(WorkspaceStorageRouting::Persisted {
+                routing_epoch: 17,
+                transition_state: WorkspaceStorageTransitionState::Stable,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_mode_transition_fences_new_routing() {
+        use crate::service_storage::ServiceBackend;
+        use crate::workspace_storage::{
+            WorkspaceStorageResolution, WorkspaceStorageTransitionState,
+        };
+
+        for transition_state in [
+            WorkspaceStorageTransitionState::TransitioningToManaged,
+            WorkspaceStorageTransitionState::TransitioningToS3Compatible,
+        ] {
+            let resolver = BackendResolver::new(
+                Arc::new(PersistedWorkspaceStorageRepository {
+                    resolution: WorkspaceStorageResolution::persisted(
+                        Some(RuntimeBackendConfig::Managed),
+                        18,
+                        transition_state,
+                    ),
+                }),
+                Arc::new(ServiceStorage::new(vec![ServiceBackend {
+                    provider: "test".to_string(),
+                    provider_instance_id: None,
+                    provider_account_id: None,
+                    credential_epoch: None,
+                    endpoint: "https://managed.example".to_string(),
+                    region: "us-east-1".to_string(),
+                    bucket: "managed".to_string(),
+                    access_key: "key".to_string(),
+                    secret_key: "secret".to_string(),
+                }])),
+                None,
+                Arc::new(MemoryStore::new()),
+                false,
+                workspace_policy(false),
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("x-s4-storage-mode", "managed".parse().unwrap());
+
+            let Err(error) = resolver
+                .resolve(
+                    &WorkspaceId::new("workspace").unwrap(),
+                    &headers,
+                    StorageOperation::Put,
+                )
+                .await
+            else {
+                panic!("mode transition must fence new requests");
+            };
+            assert_eq!(error, "workspace storage is transitioning");
+        }
     }
 
     #[test]

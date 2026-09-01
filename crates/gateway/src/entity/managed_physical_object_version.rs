@@ -7,7 +7,12 @@ pub struct Model {
     pub tenant_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub backend_id: String,
-    pub backend_fingerprint: String,
+    pub provider_kind: String,
+    pub provider_instance_id: String,
+    pub provider_account_id: String,
+    pub canonical_endpoint: String,
+    pub provider_region: String,
+    pub credential_epoch: i64,
     #[sea_orm(primary_key, auto_increment = false)]
     pub provider_bucket: String,
     #[sea_orm(primary_key, auto_increment = false)]

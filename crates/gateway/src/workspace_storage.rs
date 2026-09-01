@@ -128,6 +128,80 @@ impl RuntimeBackendConfig {
     }
 }
 
+/// Persisted state of a workspace storage-mode transition.
+///
+/// Managed mutations may only commit against a `Stable` routing epoch. The
+/// directional states let an adapter fence new work while it reconciles work
+/// captured under the previous epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceStorageTransitionState {
+    Stable,
+    TransitioningToManaged,
+    TransitioningToS3Compatible,
+}
+
+/// Routing fence returned atomically with the runtime backend configuration.
+///
+/// `Unfenced` is the compatibility default for repositories that have not yet
+/// persisted routing epochs. It is intentionally explicit so managed commit
+/// code cannot mistake a synthetic epoch for a durable fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceStorageRouting {
+    Unfenced,
+    Persisted {
+        routing_epoch: u64,
+        transition_state: WorkspaceStorageTransitionState,
+    },
+}
+
+impl WorkspaceStorageRouting {
+    /// Epoch that a managed mutation may capture for a fenced commit.
+    pub fn stable_epoch(self) -> Option<u64> {
+        match self {
+            Self::Persisted {
+                routing_epoch,
+                transition_state: WorkspaceStorageTransitionState::Stable,
+            } => Some(routing_epoch),
+            Self::Unfenced | Self::Persisted { .. } => None,
+        }
+    }
+
+    pub fn is_transitioning(self) -> bool {
+        matches!(self, Self::Persisted { .. }) && self.stable_epoch().is_none()
+    }
+}
+
+/// Atomic runtime snapshot used to select a backend and capture its routing
+/// fence. Credential-bearing configuration remains non-serializable.
+#[derive(Clone)]
+pub struct WorkspaceStorageResolution {
+    pub config: Option<RuntimeBackendConfig>,
+    pub routing: WorkspaceStorageRouting,
+}
+
+impl WorkspaceStorageResolution {
+    pub fn unfenced(config: Option<RuntimeBackendConfig>) -> Self {
+        Self {
+            config,
+            routing: WorkspaceStorageRouting::Unfenced,
+        }
+    }
+
+    pub fn persisted(
+        config: Option<RuntimeBackendConfig>,
+        routing_epoch: u64,
+        transition_state: WorkspaceStorageTransitionState,
+    ) -> Self {
+        Self {
+            config,
+            routing: WorkspaceStorageRouting::Persisted {
+                routing_epoch,
+                transition_state,
+            },
+        }
+    }
+}
+
 impl TryFrom<BackendConfigRequest> for RuntimeBackendConfig {
     type Error = WorkspaceStorageError;
 
@@ -215,6 +289,19 @@ pub trait WorkspaceStorageRepository: Send + Sync + 'static {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<RuntimeBackendConfig>, WorkspaceStorageError>;
+
+    /// Returns configuration and its routing fence from one repository
+    /// snapshot. Persisted adapters should override this when they add routing
+    /// epochs; the default preserves existing adapters while marking them as
+    /// explicitly unfenced.
+    async fn get_runtime_resolution(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceStorageResolution, WorkspaceStorageError> {
+        Ok(WorkspaceStorageResolution::unfenced(
+            self.get_runtime_config(workspace_id).await?,
+        ))
+    }
 
     async fn get_public_config(
         &self,
@@ -374,6 +461,37 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let resolution = repository.get_runtime_resolution(&workspace).await.unwrap();
+        assert_eq!(resolution.routing, WorkspaceStorageRouting::Unfenced);
+        assert!(resolution.config.is_some());
+    }
+
+    #[test]
+    fn persisted_runtime_resolution_carries_epoch_and_transition_state() {
+        let resolution = WorkspaceStorageResolution::persisted(
+            Some(RuntimeBackendConfig::Managed),
+            42,
+            WorkspaceStorageTransitionState::Stable,
+        );
+        assert_eq!(
+            resolution.routing,
+            WorkspaceStorageRouting::Persisted {
+                routing_epoch: 42,
+                transition_state: WorkspaceStorageTransitionState::Stable,
+            }
+        );
+        assert!(!resolution.routing.is_transitioning());
+        assert_eq!(resolution.routing.stable_epoch(), Some(42));
+        assert_eq!(WorkspaceStorageRouting::Unfenced.stable_epoch(), None);
+
+        for transition_state in [
+            WorkspaceStorageTransitionState::TransitioningToManaged,
+            WorkspaceStorageTransitionState::TransitioningToS3Compatible,
+        ] {
+            let routing = WorkspaceStorageResolution::persisted(None, 43, transition_state).routing;
+            assert!(routing.is_transitioning());
+            assert_eq!(routing.stable_epoch(), None);
+        }
     }
 
     #[tokio::test]

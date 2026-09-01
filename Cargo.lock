@@ -4543,6 +4543,7 @@ dependencies = [
  "quick-xml",
  "reqwest",
  "rmcp",
+ "s4-gateway",
  "schemars",
  "serde",
  "serde_json",
@@ -4550,6 +4551,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

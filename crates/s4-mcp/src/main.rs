@@ -14,7 +14,7 @@ use rmcp::schemars::JsonSchema;
 use rmcp::tool;
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServiceExt, tool_router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
@@ -187,6 +187,14 @@ struct ListObjectsParams {
     bucket: String,
     #[serde(default)]
     prefix: String,
+    /// Opaque token returned by the previous truncated page.
+    continuation_token: Option<String>,
+    /// Maximum number of keys and common prefixes to return (S3 caps this at 1000).
+    max_keys: Option<u32>,
+    /// Group keys that share the substring between the prefix and this delimiter.
+    delimiter: Option<String>,
+    /// On the first page, begin listing lexicographically after this key.
+    start_after: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -256,9 +264,24 @@ impl S4Server {
             Ok(url) => url,
             Err(error) => return Ok(tool_error(error.to_string())),
         };
-        url.query_pairs_mut()
-            .append_pair("list-type", "2")
-            .append_pair("prefix", &params.prefix);
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("list-type", "2")
+                .append_pair("prefix", &params.prefix);
+            if let Some(token) = params.continuation_token.as_deref() {
+                query.append_pair("continuation-token", token);
+            }
+            if let Some(max_keys) = params.max_keys {
+                query.append_pair("max-keys", &max_keys.to_string());
+            }
+            if let Some(delimiter) = params.delimiter.as_deref() {
+                query.append_pair("delimiter", delimiter);
+            }
+            if let Some(start_after) = params.start_after.as_deref() {
+                query.append_pair("start-after", start_after);
+            }
+        }
         let response = match self
             .client
             .get(url)
@@ -276,20 +299,15 @@ impl S4Server {
             Ok(body) => body,
             Err(error) => return Ok(tool_error(error)),
         };
-        let keys = match parse_s3_list_keys(&body) {
-            Ok(keys) => keys,
+        let page = match parse_s3_list_page(&body) {
+            Ok(page) => page,
             Err(error) => {
                 return Ok(tool_error(format!(
                     "invalid ListObjectsV2 response: {error}"
                 )));
             }
         };
-        let message = if keys.is_empty() {
-            format!("no objects matching prefix '{}'", params.prefix)
-        } else {
-            keys.join("\n")
-        };
-        Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
+        Ok(list_page_result(page, &params.prefix))
     }
 
     #[tool(description = "Delete an object through the S4 gateway")]
@@ -379,6 +397,14 @@ fn tool_error(message: impl Into<String>) -> CallToolResult {
 struct ListBucketResult {
     #[serde(rename = "Contents", default)]
     contents: Vec<ListObject>,
+    #[serde(rename = "CommonPrefixes", default)]
+    common_prefixes: Vec<CommonPrefix>,
+    #[serde(rename = "IsTruncated", default)]
+    is_truncated: bool,
+    #[serde(rename = "NextContinuationToken")]
+    next_continuation_token: Option<String>,
+    #[serde(rename = "KeyCount")]
+    key_count: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,13 +413,65 @@ struct ListObject {
     key: String,
 }
 
-fn parse_s3_list_keys(xml: &str) -> Result<Vec<String>, quick_xml::DeError> {
+#[derive(Debug, Deserialize)]
+struct CommonPrefix {
+    #[serde(rename = "Prefix")]
+    prefix: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct ListObjectsPage {
+    keys: Vec<String>,
+    common_prefixes: Vec<String>,
+    is_truncated: bool,
+    next_continuation_token: Option<String>,
+    key_count: usize,
+}
+
+fn parse_s3_list_page(xml: &str) -> anyhow::Result<ListObjectsPage> {
     let result: ListBucketResult = quick_xml::de::from_str(xml)?;
-    Ok(result
+    if result.is_truncated
+        && result
+            .next_continuation_token
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        anyhow::bail!("truncated response has no next continuation token");
+    }
+    let keys = result
         .contents
         .into_iter()
         .map(|object| object.key)
-        .collect())
+        .collect::<Vec<_>>();
+    let common_prefixes = result
+        .common_prefixes
+        .into_iter()
+        .map(|prefix| prefix.prefix)
+        .collect::<Vec<_>>();
+    let key_count = result
+        .key_count
+        .unwrap_or(keys.len() + common_prefixes.len());
+    Ok(ListObjectsPage {
+        keys,
+        common_prefixes,
+        is_truncated: result.is_truncated,
+        next_continuation_token: result.next_continuation_token,
+        key_count,
+    })
+}
+
+fn list_page_result(page: ListObjectsPage, prefix: &str) -> CallToolResult {
+    let message = if page.is_truncated || !page.common_prefixes.is_empty() {
+        serde_json::to_string(&page).expect("list page is serializable")
+    } else if page.keys.is_empty() {
+        format!("no objects matching prefix '{prefix}'")
+    } else {
+        page.keys.join("\n")
+    };
+    let structured_content = serde_json::to_value(&page).expect("list page is serializable");
+    let mut result = CallToolResult::success(vec![ContentBlock::text(message)]);
+    result.structured_content = Some(structured_content);
+    result
 }
 
 #[tokio::main]
@@ -417,10 +495,15 @@ mod tests {
         Router,
         body::Body,
         extract::{Request, State},
-        http::{HeaderMap as AxumHeaderMap, Method, Response},
+        http::{HeaderMap as AxumHeaderMap, Method, Response, StatusCode},
         routing::any,
     };
     use http_body_util::BodyExt;
+    use s4_gateway::managed::{
+        AuthorityListPage, AuthorityListQuery, CopyStatus, InMemoryManagedRepository,
+        LogicalObjectKey, ManagedListCursorBinding, ManagedListCursorPosition,
+        ManagedListCursorRequest, ManagedListVersion, ManagedRepository, ObjectAuthority,
+    };
 
     use super::*;
 
@@ -436,6 +519,114 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockState {
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    }
+
+    #[derive(Clone)]
+    struct ManagedAuthorityState {
+        repository: Arc<InMemoryManagedRepository>,
+    }
+
+    fn authority_list_xml(page: &AuthorityListPage, continuation: Option<&str>) -> String {
+        let contents = page
+            .objects
+            .iter()
+            .map(|authority| format!("<Contents><Key>{}</Key></Contents>", authority.logical.key))
+            .collect::<String>();
+        let truncated = continuation.is_some();
+        let continuation_xml = continuation
+            .map(|token| format!("<NextContinuationToken>{token}</NextContinuationToken>"))
+            .unwrap_or_default();
+        format!(
+            "<ListBucketResult><KeyCount>{}</KeyCount><IsTruncated>{truncated}</IsTruncated>{continuation_xml}{contents}</ListBucketResult>",
+            page.objects.len(),
+        )
+    }
+
+    async fn managed_authority_gateway(
+        State(state): State<ManagedAuthorityState>,
+        request: Request,
+    ) -> Response<Body> {
+        let query =
+            url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+                .into_owned()
+                .collect::<std::collections::HashMap<_, _>>();
+        let binding = ManagedListCursorBinding {
+            tenant_id: "mcp-managed-tenant".to_string(),
+            bucket: request.uri().path().trim_start_matches('/').to_string(),
+            prefix: query.get("prefix").cloned().unwrap_or_default(),
+            delimiter: query.get("delimiter").cloned(),
+            version: ManagedListVersion::V2,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        if let Some(token) = query.get("continuation-token") {
+            let cursor = state
+                .repository
+                .use_list_cursor(token.parse().unwrap(), &binding, now)
+                .await
+                .unwrap();
+            return Response::new(Body::from(
+                cursor.response_state["xml"].as_str().unwrap().to_string(),
+            ));
+        }
+
+        let max_keys = query
+            .get("max-keys")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1000);
+        let first = state
+            .repository
+            .list_authority(AuthorityListQuery {
+                tenant_id: binding.tenant_id.clone(),
+                bucket: binding.bucket.clone(),
+                prefix: binding.prefix.clone(),
+                after: query.get("start-after").cloned(),
+                max_keys,
+            })
+            .await
+            .unwrap();
+        let continuation = if let Some(after) = first.next_after.clone() {
+            let second = state
+                .repository
+                .list_authority(AuthorityListQuery {
+                    tenant_id: binding.tenant_id.clone(),
+                    bucket: binding.bucket.clone(),
+                    prefix: binding.prefix.clone(),
+                    after: Some(after.clone()),
+                    max_keys,
+                })
+                .await
+                .unwrap();
+            let second_xml = authority_list_xml(&second, None);
+            Some(
+                state
+                    .repository
+                    .create_list_cursor(
+                        ManagedListCursorRequest {
+                            binding,
+                            position: ManagedListCursorPosition {
+                                last_key: Some(after),
+                                last_common_prefix: None,
+                            },
+                            response_state: serde_json::json!({"xml": second_xml}),
+                            final_page: second.next_after.is_none(),
+                        },
+                        now,
+                    )
+                    .await
+                    .unwrap()
+                    .id
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        Response::new(Body::from(authority_list_xml(
+            &first,
+            continuation.as_deref(),
+        )))
     }
 
     fn test_server() -> S4Server {
@@ -491,25 +682,36 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_decodes_s3_list_keys() {
+    fn parses_s3_list_page_metadata_and_decodes_values() {
         let xml = r#"<?xml version="1.0"?>
 <ListBucketResult>
+  <KeyCount>3</KeyCount>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>next&amp;page</NextContinuationToken>
   <Contents><Key>a.txt</Key></Contents>
   <Contents><Key>dir/a&amp;b.txt</Key></Contents>
+  <CommonPrefixes><Prefix>dir/nested&amp;/</Prefix></CommonPrefixes>
 </ListBucketResult>"#;
         assert_eq!(
-            parse_s3_list_keys(xml).unwrap(),
-            vec!["a.txt", "dir/a&b.txt"]
+            parse_s3_list_page(xml).unwrap(),
+            ListObjectsPage {
+                keys: vec!["a.txt".to_string(), "dir/a&b.txt".to_string()],
+                common_prefixes: vec!["dir/nested&/".to_string()],
+                is_truncated: true,
+                next_continuation_token: Some("next&page".to_string()),
+                key_count: 3,
+            }
         );
     }
 
     #[test]
     fn empty_s3_list_has_no_keys() {
-        assert!(
-            parse_s3_list_keys("<ListBucketResult/>")
-                .unwrap()
-                .is_empty()
-        );
+        let page = parse_s3_list_page("<ListBucketResult/>").unwrap();
+        assert!(page.keys.is_empty());
+        assert!(page.common_prefixes.is_empty());
+        assert!(!page.is_truncated);
+        assert_eq!(page.next_continuation_token, None);
+        assert_eq!(page.key_count, 0);
     }
 
     async fn mock_gateway(State(state): State<MockState>, request: Request) -> Response<Body> {
@@ -540,6 +742,52 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("list-type=2"))
         {
+            if path == "/malformed" {
+                return Response::new(Body::from(
+                    "<ListBucketResult><Contents><Key>broken</Contents></ListBucketResult>",
+                ));
+            }
+            if path == "/truncated-no-token" {
+                return Response::new(Body::from(
+                    "<ListBucketResult><KeyCount>1</KeyCount><IsTruncated>true</IsTruncated><Contents><Key>orphaned-page</Key></Contents></ListBucketResult>",
+                ));
+            }
+            if path == "/gateway-failure" {
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::from("<Error><Code>SlowDown</Code></Error>"))
+                    .unwrap();
+            }
+            if path == "/managed" {
+                let query_params =
+                    url::form_urlencoded::parse(query.as_deref().unwrap_or_default().as_bytes())
+                        .into_owned()
+                        .collect::<std::collections::HashMap<_, _>>();
+                if query_params
+                    .get("delimiter")
+                    .is_some_and(|value| value == "/")
+                {
+                    return Response::new(Body::from(
+                        "<ListBucketResult><KeyCount>3</KeyCount><IsTruncated>false</IsTruncated><Contents><Key>tenant/root.txt</Key></Contents><CommonPrefixes><Prefix>tenant/logs/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>tenant/reports/</Prefix></CommonPrefixes></ListBucketResult>",
+                    ));
+                }
+                if query_params
+                    .get("continuation-token")
+                    .is_some_and(|token| token == "managed/page+2==")
+                {
+                    return Response::new(Body::from(
+                        "<ListBucketResult><KeyCount>2</KeyCount><IsTruncated>false</IsTruncated><Contents><Key>managed/object-1000</Key></Contents><Contents><Key>managed/object-1001</Key></Contents></ListBucketResult>",
+                    ));
+                }
+                let contents = (0..1000)
+                    .map(|index| {
+                        format!("<Contents><Key>managed/object-{index:04}</Key></Contents>")
+                    })
+                    .collect::<String>();
+                return Response::new(Body::from(format!(
+                    "<ListBucketResult><KeyCount>1000</KeyCount><IsTruncated>true</IsTruncated><NextContinuationToken>managed/page+2==</NextContinuationToken>{contents}</ListBucketResult>"
+                )));
+            }
             return Response::new(Body::from(
                 "<ListBucketResult><Contents><Key>logs/a&amp;b.txt</Key></Contents></ListBucketResult>",
             ));
@@ -561,6 +809,18 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}"), state)
+    }
+
+    async fn managed_authority_server(repository: Arc<InMemoryManagedRepository>) -> String {
+        let app = Router::new()
+            .route("/{*path}", any(managed_authority_gateway))
+            .with_state(ManagedAuthorityState { repository });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
     }
 
     fn result_text(result: &CallToolResult) -> String {
@@ -606,6 +866,10 @@ mod tests {
             .s4_list_objects(Parameters(ListObjectsParams {
                 bucket: "records".to_string(),
                 prefix: "logs/".to_string(),
+                continuation_token: None,
+                max_keys: None,
+                delimiter: None,
+                start_after: None,
             }))
             .await
             .unwrap();
@@ -681,5 +945,219 @@ mod tests {
             .unwrap();
         assert_eq!(result.is_error, Some(true));
         assert!(result_text(&result).contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn list_pages_through_managed_namespace_over_1000_objects() {
+        let (gateway_url, state) = mock_server().await;
+        let server = S4Server::new(
+            Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
+        )
+        .unwrap();
+
+        let first = server
+            .s4_list_objects(Parameters(ListObjectsParams {
+                bucket: "managed".to_string(),
+                prefix: "managed/".to_string(),
+                continuation_token: None,
+                max_keys: None,
+                delimiter: None,
+                start_after: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(first.is_error, Some(false));
+        let first_page = first.structured_content.as_ref().unwrap();
+        assert_eq!(first_page["keys"].as_array().unwrap().len(), 1000);
+        assert_eq!(first_page["key_count"], 1000);
+        assert_eq!(first_page["is_truncated"], true);
+        assert_eq!(first_page["next_continuation_token"], "managed/page+2==");
+        assert!(result_text(&first).contains("managed/page+2=="));
+
+        let token = first_page["next_continuation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second = server
+            .s4_list_objects(Parameters(ListObjectsParams {
+                bucket: "managed".to_string(),
+                prefix: "managed/".to_string(),
+                continuation_token: Some(token),
+                max_keys: Some(1000),
+                delimiter: None,
+                start_after: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(second.is_error, Some(false));
+        let second_page = second.structured_content.as_ref().unwrap();
+        assert_eq!(second_page["keys"].as_array().unwrap().len(), 2);
+        assert_eq!(second_page["key_count"], 2);
+        assert_eq!(second_page["is_truncated"], false);
+        assert!(second_page["next_continuation_token"].is_null());
+        assert_eq!(
+            result_text(&second),
+            "managed/object-1000\nmanaged/object-1001"
+        );
+
+        let total = first_page["keys"].as_array().unwrap().len()
+            + second_page["keys"].as_array().unwrap().len();
+        assert_eq!(total, 1002);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].query.as_deref(),
+            Some(
+                "list-type=2&prefix=managed%2F&continuation-token=managed%2Fpage%2B2%3D%3D&max-keys=1000"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_through_real_managed_authority_and_cursor_repository() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        for index in 0..1002 {
+            repository
+                .publish(
+                    ObjectAuthority {
+                        logical: LogicalObjectKey::new(
+                            "mcp-managed-tenant",
+                            "managed-live",
+                            &format!("managed/object-{index:04}"),
+                        ),
+                        generation: uuid::Uuid::now_v7(),
+                        digest: format!("digest-{index}"),
+                        size: index,
+                        metadata: std::collections::BTreeMap::new(),
+                        placement_version: 1,
+                        primary_backend_id: "primary".to_string(),
+                        primary_version_id: None,
+                        replica_backend_id: None,
+                        primary_status: CopyStatus::Ready,
+                        replica_status: CopyStatus::Absent,
+                        tombstone: false,
+                        cas_version: 0,
+                        created_at_ms: 0,
+                        updated_at_ms: 0,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let gateway_url = managed_authority_server(repository).await;
+        let server = S4Server::new(
+            Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
+        )
+        .unwrap();
+
+        let first = server
+            .s4_list_objects(Parameters(ListObjectsParams {
+                bucket: "managed-live".to_string(),
+                prefix: "managed/".to_string(),
+                continuation_token: None,
+                max_keys: Some(1000),
+                delimiter: None,
+                start_after: None,
+            }))
+            .await
+            .unwrap();
+        let first_page = first.structured_content.as_ref().unwrap();
+        assert_eq!(first_page["keys"].as_array().unwrap().len(), 1000);
+        assert_eq!(first_page["is_truncated"], true);
+        let token = first_page["next_continuation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let second = server
+            .s4_list_objects(Parameters(ListObjectsParams {
+                bucket: "managed-live".to_string(),
+                prefix: "managed/".to_string(),
+                continuation_token: Some(token),
+                max_keys: Some(1000),
+                delimiter: None,
+                start_after: None,
+            }))
+            .await
+            .unwrap();
+        let second_page = second.structured_content.as_ref().unwrap();
+        assert_eq!(
+            second_page["keys"],
+            serde_json::json!(["managed/object-1000", "managed/object-1001"])
+        );
+        assert_eq!(second_page["is_truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn list_forwards_delimiter_and_start_after_and_returns_common_prefixes() {
+        let (gateway_url, state) = mock_server().await;
+        let server = S4Server::new(
+            Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
+        )
+        .unwrap();
+        let result = server
+            .s4_list_objects(Parameters(ListObjectsParams {
+                bucket: "managed".to_string(),
+                prefix: "tenant/".to_string(),
+                continuation_token: None,
+                max_keys: Some(3),
+                delimiter: Some("/".to_string()),
+                start_after: Some("tenant/a b".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        let page = result.structured_content.as_ref().unwrap();
+        assert_eq!(page["keys"], serde_json::json!(["tenant/root.txt"]));
+        assert_eq!(
+            page["common_prefixes"],
+            serde_json::json!(["tenant/logs/", "tenant/reports/"])
+        );
+        assert_eq!(page["key_count"], 3);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result_text(&result)).unwrap(),
+            *page
+        );
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].query.as_deref(),
+            Some("list-type=2&prefix=tenant%2F&max-keys=3&delimiter=%2F&start-after=tenant%2Fa+b")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_reports_malformed_truncated_and_gateway_failures() {
+        let (gateway_url, _) = mock_server().await;
+        let server = S4Server::new(
+            Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
+        )
+        .unwrap();
+
+        for (bucket, expected) in [
+            ("malformed", "invalid ListObjectsV2 response"),
+            ("truncated-no-token", "no next continuation token"),
+            ("gateway-failure", "gateway returned 503"),
+        ] {
+            let result = server
+                .s4_list_objects(Parameters(ListObjectsParams {
+                    bucket: bucket.to_string(),
+                    prefix: String::new(),
+                    continuation_token: None,
+                    max_keys: None,
+                    delimiter: None,
+                    start_after: None,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "bucket {bucket}");
+            assert!(
+                result_text(&result).contains(expected),
+                "unexpected error for {bucket}: {}",
+                result_text(&result)
+            );
+        }
     }
 }

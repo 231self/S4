@@ -1,4 +1,6 @@
 pub mod api_key;
+pub mod managed_list_cursor;
+pub mod managed_logical_operation;
 pub mod managed_multipart_activity;
 pub mod managed_namespace;
 pub mod managed_namespace_purge;
@@ -6,6 +8,7 @@ pub mod managed_object_authority;
 pub mod managed_object_repair;
 pub mod managed_physical_object_version;
 pub mod managed_physical_write_intent;
+pub mod managed_workspace_usage;
 pub mod mcp_token;
 pub mod multipart_cleanup_audit;
 pub mod multipart_part_attempt;

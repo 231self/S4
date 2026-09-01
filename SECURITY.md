@@ -1,6 +1,6 @@
 # Security Policy
 
-S4 is a processing gateway for object storage: it exists so that sensitive data
+Maskura is a processing gateway for object storage: it exists so that sensitive data
 (PII, credentials, regulated fields) is transformed before it reaches a storage
 backend. We take security reports seriously and publish this policy so
 reporters know exactly what is supported, how to report privately, and what we
@@ -8,7 +8,7 @@ commit to in return.
 
 ## Supported versions
 
-We support the **latest stable minor release** of S4. Security fixes are
+We support the **latest stable minor release** of Maskura. Security fixes are
 backported to that release line and shipped as a new patch release.
 
 - Current stable line: **0.3.x** (this repository is at 0.3.5).
@@ -27,8 +27,8 @@ pull request, or discussion.
 
 Two equivalent private channels:
 
-1. **GitHub private vulnerability reporting** — Security → Report a
-   vulnerability on this repository.
+1. **[Maskura private vulnerability reporting](https://github.com/231self/S4/security/advisories/new)**
+   — Security → Report a vulnerability on this repository.
 2. **security@231self.com** — for reports that cannot go through GitHub, or
    for incidents already in progress.
 
@@ -87,14 +87,14 @@ In scope:
 
 Out of scope:
 
-- The security posture of the third-party storage backends S4 is pointed at
-  (S3, R2, B2, MinIO, and similar). S4 transforms and forwards; it does not
+- The security posture of the third-party storage backends Maskura is pointed at
+  (S3, R2, B2, MinIO, and similar). Maskura transforms and forwards; it does not
   secure the destination.
 - Supabase or other identity providers used for dashboard sessions.
-- Vulnerabilities in upstream dependencies that have no S4-specific impact.
+- Vulnerabilities in upstream dependencies that have no Maskura-specific impact.
 
 ## Key handling note
 
-S4 stores only envelopes and hashes of API key secrets, never plaintext. If you
-suspect a key compromise, revoke the key immediately (`s4ctl key revoke`) and
+Maskura stores only envelopes and hashes of API key secrets, never plaintext. If you
+suspect a key compromise, revoke the key immediately (`maskura key revoke`) and
 rotate any backend credentials it could reach before reporting.

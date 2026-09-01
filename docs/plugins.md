@@ -1,6 +1,6 @@
-# S4 Plugins — create and consume your own
+# Maskura plugins: create and consume your own
 
-Plugins are how S4 transforms text data. A plugin is a WebAssembly component that receives
+Plugins are how Maskura transforms text data. A plugin is a WebAssembly component that receives
 each object's payload, optionally transforms it, and returns a decision. Plugins run in
 a pipeline — the output of one is the input of the next — so you compose transforms:
 filter, then encrypt, then convert.
@@ -17,7 +17,7 @@ Plugins implement one world, `s4:filter`
 | `finish()` | once at the end | Flush buffered output; return trailing bytes |
 
 Sandbox limits: wasmtime, 64 MiB memory, 10K table entries, 512 KiB stack, no host
-imports, and a fuel budget (`S4_WASM_FUEL`, default 1B — enough for crypto filters).
+imports, and a fuel budget (`MASKURA_WASM_FUEL`, default 1B; enough for crypto filters).
 
 ## Write one (Rust)
 
@@ -79,20 +79,20 @@ with `addr-spec` / `card-validate` style libraries and a pure-Wasm crypto fallba
 At runtime — no gateway rebuild, no restart:
 
 ```bash
-s4ctl plugin upload my-filter.component.wasm     # prints the plugin id
-s4ctl plugin list                                # shows pipeline order
-s4ctl plugin reorder my-filter pii-default       # output of one feeds the next
-s4ctl plugin disable <id>                        # remove from the pipeline
-s4ctl plugin delete <id>                         # drop the plugin
+maskura plugin upload my-filter.component.wasm     # prints the plugin id
+maskura plugin list                                # shows pipeline order
+maskura plugin reorder my-filter pii-default       # output of one feeds the next
+maskura plugin disable <id>                        # remove from the pipeline
+maskura plugin delete <id>                         # drop the plugin
 ```
 
 Or auto-load a directory of plugins at gateway startup:
 
 ```bash
-S4_PLUGINS_DIR=./components ./target/debug/s4-gateway
+MASKURA_PLUGINS_DIR=./components ./target/debug/s4-gateway
 ```
 
-The default local setup preloads `pii-default` via `S4_FILTER_COMPONENT`.
+The default local setup preloads `pii-default` via `MASKURA_FILTER_COMPONENT`.
 
 ## Decision semantics
 

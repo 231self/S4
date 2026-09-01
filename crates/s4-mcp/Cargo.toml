@@ -4,14 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Local stdio MCP server for the S4 object-processing gateway"
+description = "Local stdio MCP server for the Maskura object-processing gateway"
 publish = false
 
 [[bin]]
 name = "s4-mcp"
 path = "src/main.rs"
 
+[[bin]]
+name = "maskura-mcp"
+path = "src/maskura_mcp.rs"
+
 [dependencies]
+maskura-customer-config.workspace = true
 anyhow = "1"
 futures-util = "0.3"
 quick-xml = { version = "0.38", features = ["serialize"] }

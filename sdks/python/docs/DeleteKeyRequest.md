@@ -10,7 +10,7 @@ Name | Type | Description | Notes
 ## Example
 
 ```python
-from s4_client.models.delete_key_request import DeleteKeyRequest
+from maskura_client.models.delete_key_request import DeleteKeyRequest
 
 # TODO update the JSON string below
 json = "{}"

@@ -5,7 +5,7 @@ Status: Accepted
 
 ## Context
 
-S4 needs a control-plane data store for users, workspaces, destinations, policies, API keys, usage records, and audit events. Options:
+Maskura needs a control-plane data store for users, workspaces, destinations, policies, API keys, usage records, and audit events. Options:
 
 - **Cloudflare D1**: Global SQLite but limited relational constraints and per-request latency variance.
 - **Durable Objects**: Good for stateful coordination but not a relational store.

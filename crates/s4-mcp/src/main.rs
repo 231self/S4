@@ -1,12 +1,11 @@
-//! Local stdio MCP server for S4.
-//!
-//! Each tool call uses the gateway's S3-compatible HTTP surface, preserving the
-//! same authentication, processing, storage, and metering path as native S3
-//! traffic.
+// Local stdio MCP server for Maskura. Each tool call uses the gateway's
+// S3-compatible HTTP surface, preserving the same authentication, processing,
+// storage, and metering path as native S3 traffic.
 
-use std::{env, fmt};
+use std::fmt;
 
 use futures_util::StreamExt;
+use maskura_customer_config::{aliases as customer_env, resolve as resolve_customer_env};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -18,10 +17,6 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
-const ENV_GATEWAY_URL: &str = "S4_GATEWAY_URL";
-const ENV_MCP_TOKEN: &str = "S4_MCP_TOKEN";
-const ENV_ACCESS_KEY: &str = "S4_ACCESS_KEY";
-const ENV_SECRET_KEY: &str = "S4_SECRET_KEY";
 const MAX_TEXT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -51,17 +46,14 @@ struct Config {
 
 impl Config {
     fn from_env() -> anyhow::Result<Self> {
-        let gateway_url =
-            env::var(ENV_GATEWAY_URL).unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_string());
-        let mcp_token = env::var(ENV_MCP_TOKEN)
-            .ok()
-            .filter(|value| !value.is_empty());
-        let access_key = env::var(ENV_ACCESS_KEY)
-            .ok()
-            .filter(|value| !value.is_empty());
-        let secret_key = env::var(ENV_SECRET_KEY)
-            .ok()
-            .filter(|value| !value.is_empty());
+        let gateway_url = resolve_customer_env(customer_env::GATEWAY_URL)?
+            .unwrap_or_else(|| DEFAULT_GATEWAY_URL.to_string());
+        let mcp_token =
+            resolve_customer_env(customer_env::MCP_TOKEN)?.filter(|value| !value.is_empty());
+        let access_key =
+            resolve_customer_env(customer_env::ACCESS_KEY)?.filter(|value| !value.is_empty());
+        let secret_key =
+            resolve_customer_env(customer_env::SECRET_KEY)?.filter(|value| !value.is_empty());
         Self::new(&gateway_url, mcp_token, access_key, secret_key)
     }
 
@@ -72,27 +64,27 @@ impl Config {
         secret_key: Option<String>,
     ) -> anyhow::Result<Self> {
         let gateway_url = Url::parse(gateway_url)
-            .map_err(|error| anyhow::anyhow!("invalid {ENV_GATEWAY_URL}: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("invalid MASKURA_GATEWAY_URL: {error}"))?;
         if !matches!(gateway_url.scheme(), "http" | "https") || gateway_url.host().is_none() {
-            anyhow::bail!("{ENV_GATEWAY_URL} must be an absolute HTTP(S) URL");
+            anyhow::bail!("MASKURA_GATEWAY_URL must be an absolute HTTP(S) URL");
         }
 
         let auth = if let Some(token) = mcp_token {
-            GatewayAuth::McpToken(parse_secret_header(ENV_MCP_TOKEN, &token)?)
+            GatewayAuth::McpToken(parse_secret_header("MASKURA_MCP_TOKEN", &token)?)
         } else {
             let access_key = access_key.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "missing credentials: set {ENV_MCP_TOKEN}, or both {ENV_ACCESS_KEY} and {ENV_SECRET_KEY}"
+                    "missing credentials: set MASKURA_MCP_TOKEN, or both MASKURA_ACCESS_KEY and MASKURA_SECRET_KEY"
                 )
             })?;
             let secret_key = secret_key.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "missing credentials: set {ENV_MCP_TOKEN}, or both {ENV_ACCESS_KEY} and {ENV_SECRET_KEY}"
+                    "missing credentials: set MASKURA_MCP_TOKEN, or both MASKURA_ACCESS_KEY and MASKURA_SECRET_KEY"
                 )
             })?;
             GatewayAuth::ApiKey {
-                access_key: parse_secret_header(ENV_ACCESS_KEY, &access_key)?,
-                secret_key: parse_secret_header(ENV_SECRET_KEY, &secret_key)?,
+                access_key: parse_secret_header("MASKURA_ACCESS_KEY", &access_key)?,
+                secret_key: parse_secret_header("MASKURA_SECRET_KEY", &secret_key)?,
             }
         };
 
@@ -103,14 +95,14 @@ impl Config {
         let mut headers = HeaderMap::new();
         match &self.auth {
             GatewayAuth::McpToken(token) => {
-                headers.insert("x-s4-mcp-token", token.clone());
+                headers.insert("x-maskura-mcp-token", token.clone());
             }
             GatewayAuth::ApiKey {
                 access_key,
                 secret_key,
             } => {
-                headers.insert("x-s4-access-key", access_key.clone());
-                headers.insert("x-s4-secret-key", secret_key.clone());
+                headers.insert("x-maskura-access-key", access_key.clone());
+                headers.insert("x-maskura-secret-key", secret_key.clone());
             }
         }
         headers
@@ -123,15 +115,15 @@ fn parse_secret_header(name: &str, value: &str) -> anyhow::Result<HeaderValue> {
 }
 
 #[derive(Clone)]
-struct S4Server {
+struct MaskuraServer {
     config: Config,
     client: reqwest::Client,
 }
 
-impl S4Server {
+impl MaskuraServer {
     fn new(config: Config) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .user_agent(concat!("s4-mcp/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("maskura-mcp/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self { config, client })
     }
@@ -164,7 +156,7 @@ struct PutObjectParams {
     key: String,
     /// UTF-8 object body.
     body: String,
-    /// Content-Type used by S4 to select the processing format.
+    /// Content-Type used by Maskura to select the processing format.
     #[serde(default = "default_content_type")]
     content_type: String,
 }
@@ -204,9 +196,9 @@ struct DeleteObjectParams {
 }
 
 #[tool_router(server_handler)]
-impl S4Server {
-    #[tool(description = "Store a UTF-8 object through the configured S4 pipeline")]
-    async fn s4_put_object(
+impl MaskuraServer {
+    #[tool(description = "Store a UTF-8 object through the configured Maskura pipeline")]
+    async fn maskura_put_object(
         &self,
         Parameters(params): Parameters<PutObjectParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -229,8 +221,8 @@ impl S4Server {
         Ok(status_only_result(response, "stored", &params.bucket, &params.key).await)
     }
 
-    #[tool(description = "Read an object through the S4 gateway")]
-    async fn s4_get_object(
+    #[tool(description = "Read an object through the Maskura Gateway")]
+    async fn maskura_get_object(
         &self,
         Parameters(params): Parameters<GetObjectParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -240,7 +232,7 @@ impl S4Server {
         };
         let mut request = self.client.get(url).headers(self.config.auth_headers());
         if params.process {
-            request = request.header("x-s4-process", "read");
+            request = request.header("x-maskura-process", "read");
         }
         let response = match request.send().await {
             Ok(response) => response,
@@ -256,7 +248,7 @@ impl S4Server {
     }
 
     #[tool(description = "List object keys in a bucket using ListObjectsV2")]
-    async fn s4_list_objects(
+    async fn maskura_list_objects(
         &self,
         Parameters(params): Parameters<ListObjectsParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -310,8 +302,8 @@ impl S4Server {
         Ok(list_page_result(page, &params.prefix))
     }
 
-    #[tool(description = "Delete an object through the S4 gateway")]
-    async fn s4_delete_object(
+    #[tool(description = "Delete an object through the Maskura Gateway")]
+    async fn maskura_delete_object(
         &self,
         Parameters(params): Parameters<DeleteObjectParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -327,10 +319,42 @@ impl S4Server {
             .await;
         Ok(status_only_result(response, "deleted", &params.bucket, &params.key).await)
     }
+
+    #[tool(description = "Legacy alias for maskura_put_object")]
+    async fn s4_put_object(
+        &self,
+        params: Parameters<PutObjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.maskura_put_object(params).await
+    }
+
+    #[tool(description = "Legacy alias for maskura_get_object")]
+    async fn s4_get_object(
+        &self,
+        params: Parameters<GetObjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.maskura_get_object(params).await
+    }
+
+    #[tool(description = "Legacy alias for maskura_list_objects")]
+    async fn s4_list_objects(
+        &self,
+        params: Parameters<ListObjectsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.maskura_list_objects(params).await
+    }
+
+    #[tool(description = "Legacy alias for maskura_delete_object")]
+    async fn s4_delete_object(
+        &self,
+        params: Parameters<DeleteObjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.maskura_delete_object(params).await
+    }
 }
 
 fn object_url_for_tool(
-    server: &S4Server,
+    server: &MaskuraServer,
     bucket: &str,
     key: &str,
     require_key: bool,
@@ -480,8 +504,8 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .with_writer(std::io::stderr)
         .init();
-    let server = S4Server::new(Config::from_env()?)?;
-    tracing::info!("s4-mcp stdio server ready");
+    let server = MaskuraServer::new(Config::from_env()?)?;
+    tracing::info!("maskura-mcp stdio server ready");
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -629,8 +653,8 @@ mod tests {
         )))
     }
 
-    fn test_server() -> S4Server {
-        S4Server::new(
+    fn test_server() -> MaskuraServer {
+        MaskuraServer::new(
             Config::new(
                 "http://localhost:8080",
                 Some("s4m_test".to_string()),
@@ -663,7 +687,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains(ENV_MCP_TOKEN));
+        assert!(error.contains("MASKURA_MCP_TOKEN"));
         assert!(!error.contains("secret"));
     }
 
@@ -712,6 +736,29 @@ mod tests {
         assert!(!page.is_truncated);
         assert_eq!(page.next_continuation_token, None);
         assert_eq!(page.key_count, 0);
+    }
+
+    #[test]
+    fn publishes_canonical_and_legacy_tool_names() {
+        let mut names: Vec<_> = MaskuraServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "maskura_delete_object",
+                "maskura_get_object",
+                "maskura_list_objects",
+                "maskura_put_object",
+                "s4_delete_object",
+                "s4_get_object",
+                "s4_list_objects",
+                "s4_put_object",
+            ]
+        );
     }
 
     async fn mock_gateway(State(state): State<MockState>, request: Request) -> Response<Body> {
@@ -835,13 +882,13 @@ mod tests {
     #[tokio::test]
     async fn tools_preserve_mcp_auth_and_processing_semantics() {
         let (gateway_url, state) = mock_server().await;
-        let server = S4Server::new(
+        let server = MaskuraServer::new(
             Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
         )
         .unwrap();
 
         let put = server
-            .s4_put_object(Parameters(PutObjectParams {
+            .maskura_put_object(Parameters(PutObjectParams {
                 bucket: "records".to_string(),
                 key: "daily report.json".to_string(),
                 body: r#"{"email":"alice@example.com"}"#.to_string(),
@@ -852,7 +899,7 @@ mod tests {
         assert_eq!(put.is_error, Some(false));
 
         let get = server
-            .s4_get_object(Parameters(GetObjectParams {
+            .maskura_get_object(Parameters(GetObjectParams {
                 bucket: "records".to_string(),
                 key: "daily report.json".to_string(),
                 process: true,
@@ -863,7 +910,7 @@ mod tests {
         assert_eq!(result_text(&get), "processed object");
 
         let list = server
-            .s4_list_objects(Parameters(ListObjectsParams {
+            .maskura_list_objects(Parameters(ListObjectsParams {
                 bucket: "records".to_string(),
                 prefix: "logs/".to_string(),
                 continuation_token: None,
@@ -877,7 +924,7 @@ mod tests {
         assert_eq!(result_text(&list), "logs/a&b.txt");
 
         let delete = server
-            .s4_delete_object(Parameters(DeleteObjectParams {
+            .maskura_delete_object(Parameters(DeleteObjectParams {
                 bucket: "records".to_string(),
                 key: "daily report.json".to_string(),
             }))
@@ -889,10 +936,10 @@ mod tests {
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].method, Method::PUT);
         assert_eq!(requests[0].path, "/records/daily%20report.json");
-        assert_eq!(requests[0].headers["x-s4-mcp-token"], "s4m_test-token");
+        assert_eq!(requests[0].headers["x-maskura-mcp-token"], "s4m_test-token");
         assert_eq!(requests[0].headers[CONTENT_TYPE], "application/json");
         assert_eq!(requests[0].body, br#"{"email":"alice@example.com"}"#);
-        assert_eq!(requests[1].headers["x-s4-process"], "read");
+        assert_eq!(requests[1].headers["x-maskura-process"], "read");
         assert_eq!(requests[2].method, Method::GET);
         assert_eq!(
             requests[2].query.as_deref(),
@@ -904,7 +951,7 @@ mod tests {
     #[tokio::test]
     async fn api_key_auth_uses_both_gateway_headers() {
         let (gateway_url, state) = mock_server().await;
-        let server = S4Server::new(
+        let server = MaskuraServer::new(
             Config::new(
                 &gateway_url,
                 None,
@@ -923,20 +970,20 @@ mod tests {
             .unwrap();
 
         let requests = state.requests.lock().unwrap();
-        assert_eq!(requests[0].headers["x-s4-access-key"], "s4_access");
-        assert_eq!(requests[0].headers["x-s4-secret-key"], "s4s_secret");
-        assert!(!requests[0].headers.contains_key("x-s4-mcp-token"));
+        assert_eq!(requests[0].headers["x-maskura-access-key"], "s4_access");
+        assert_eq!(requests[0].headers["x-maskura-secret-key"], "s4s_secret");
+        assert!(!requests[0].headers.contains_key("x-maskura-mcp-token"));
     }
 
     #[tokio::test]
     async fn get_rejects_responses_above_the_text_limit() {
         let (gateway_url, _) = mock_server().await;
-        let server = S4Server::new(
+        let server = MaskuraServer::new(
             Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
         )
         .unwrap();
         let result = server
-            .s4_get_object(Parameters(GetObjectParams {
+            .maskura_get_object(Parameters(GetObjectParams {
                 bucket: "records".to_string(),
                 key: "too-large".to_string(),
                 process: false,
@@ -950,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn list_pages_through_managed_namespace_over_1000_objects() {
         let (gateway_url, state) = mock_server().await;
-        let server = S4Server::new(
+        let server = MaskuraServer::new(
             Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
         )
         .unwrap();
@@ -1046,7 +1093,7 @@ mod tests {
                 .unwrap();
         }
         let gateway_url = managed_authority_server(repository).await;
-        let server = S4Server::new(
+        let server = MaskuraServer::new(
             Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
         )
         .unwrap();
@@ -1092,7 +1139,7 @@ mod tests {
     #[tokio::test]
     async fn list_forwards_delimiter_and_start_after_and_returns_common_prefixes() {
         let (gateway_url, state) = mock_server().await;
-        let server = S4Server::new(
+        let server = MaskuraServer::new(
             Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
         )
         .unwrap();
@@ -1131,7 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn list_reports_malformed_truncated_and_gateway_failures() {
         let (gateway_url, _) = mock_server().await;
-        let server = S4Server::new(
+        let server = MaskuraServer::new(
             Config::new(&gateway_url, Some("s4m_test-token".to_string()), None, None).unwrap(),
         )
         .unwrap();

@@ -3,7 +3,7 @@
 Typed binary formats such as Avro and Parquet do not pass through the
 byte-oriented `s4:filter` plugin pipeline. A binary encoder needs its complete
 output schema before it writes the first record. Use a binary reductor when a
-format-specific logical type must be converted to an S4-supported type before a
+format-specific logical type must be converted to a Maskura-supported type before a
 typed transform, then reconstructed for output.
 
 The contract is `s4:binary-reductor@0.1.0` in
@@ -28,7 +28,7 @@ do not reuse plans across component versions.
 
 ## Canonical IR
 
-Schema and value inputs are canonical JSON representations of the bounded S4
+Schema and value inputs are canonical JSON representations of the bounded Maskura
 IR. The definitive Rust types and validators are in
 [`crates/gateway/src/binary_ir.rs`](../crates/gateway/src/binary_ir.rs).
 
@@ -62,7 +62,7 @@ Generate bindings and implement the exported `Guest` trait:
 ```rust
 wit_bindgen::generate!({
     world: "binary-reductor",
-    path: "path/to/S4/wit/s4-binary-reductor/world.wit",
+    path: "path/to/maskura/wit/s4-binary-reductor/world.wit",
 });
 
 struct MyReductor;
@@ -98,7 +98,7 @@ wasm-tools component new target/wasm32-unknown-unknown/release/my_reductor.wasm 
 
 ## Test locally
 
-From an S4 checkout:
+From a Maskura checkout:
 
 ```bash
 bash scripts/build-filters.sh

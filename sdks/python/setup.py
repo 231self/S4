@@ -1,7 +1,7 @@
 # coding: utf-8
 
 """
-    S4 Gateway API
+    Maskura Gateway API
 
     Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline.
 
@@ -20,7 +20,7 @@ from setuptools import setup, find_packages  # noqa: H301
 #
 # prerequisite: setuptools
 # http://pypi.python.org/pypi/setuptools
-NAME = "s4-client"
+NAME = "maskura_client"
 VERSION = "1.0.0"
 PYTHON_REQUIRES = ">= 3.9"
 REQUIRES = [
@@ -28,16 +28,18 @@ REQUIRES = [
     "python-dateutil >= 2.8.2",
     "pydantic >= 2",
     "typing-extensions >= 4.7.1",
+    "requests >= 2.31",
+    "cryptography >= 42",
 ]
 
 setup(
     name=NAME,
     version=VERSION,
-    description="S4 Gateway API",
+    description="Maskura Gateway API",
     author="OpenAPI Generator community",
     author_email="team@openapitools.org",
-    url="",
-    keywords=["OpenAPI", "OpenAPI-Generator", "S4 Gateway API"],
+    url="https://github.com/231self/S4",
+    keywords=["OpenAPI", "OpenAPI-Generator", "Maskura Gateway API"],
     install_requires=REQUIRES,
     packages=find_packages(exclude=["test", "tests"]),
     include_package_data=True,
@@ -46,5 +48,5 @@ setup(
     long_description="""\
     Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline.
     """,  # noqa: E501
-    package_data={"s4_client": ["py.typed"]},
+    package_data={"s4_client": ["py.typed"], "maskura_client": ["py.typed"]},
 )

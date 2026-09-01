@@ -11,3 +11,5 @@ export type { PromiseMiddleware as Middleware, Middleware as ObservableMiddlewar
 export { Observable } from './rxjsStub';
 export { PromiseBackendApi as BackendApi,  PromiseKeysApi as KeysApi,  PromiseObjectsApi as ObjectsApi } from './types/PromiseAPI';
 
+
+export * from "./highlevel";

@@ -28,9 +28,9 @@ services:
       S3_SECRET_ACCESS_KEY: minioadmin
       S3_REGION: us-east-1
       LISTEN_ADDR: 0.0.0.0:8080
-      S4_FILTER_COMPONENT: /app/pii-default.component.wasm
+      MASKURA_FILTER_COMPONENT: /app/pii-default.component.wasm
       AUTH_DISABLED: "true"
-      S4_KEYS_FILE: /app/data/keys.json
+      MASKURA_KEYS_FILE: /app/data/keys.json
     volumes:
       - s4-keys:/app/data
     depends_on:

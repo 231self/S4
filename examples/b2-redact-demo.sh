@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # B2 redaction demo: PUT a PII fixture through the pii-default pipeline into a
-# real B2 bucket, then fetch the object DIRECTLY from B2 (bypassing S4) and
+# real B2 bucket, then fetch the object directly from B2 (bypassing Maskura) and
 # confirm the stored bytes contain no plaintext PII.
 #
 # Credentials come from the environment (never committed):
@@ -61,7 +61,7 @@ curl -fsS -X PUT "$GATEWAY_URL/$OBJ_KEY" \
   -H "Content-Type: text/plain" --data-binary "@$INPUT" \
   -o /dev/null -w "PUT status: %{http_code}\n"
 
-echo "--- stored in B2 (fetched DIRECTLY, bypassing S4) ---"
+echo "--- stored in B2 (fetched directly, bypassing Maskura) ---"
 docker run --rm -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color alias set b2 "$B2_S3_ENDPOINT" "$B2_ACCESS_KEY_ID" "$B2_SECRET_ACCESS_KEY" >/dev/null
 docker run --rm -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color cat "b2/$B2_BUCKET/$OBJ_KEY" | tee "$RAW"
 

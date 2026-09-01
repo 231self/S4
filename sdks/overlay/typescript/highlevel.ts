@@ -1,14 +1,14 @@
 /**
- * High-level S4 client: object write/read + envelope encrypt/decrypt.
+ * High-level Maskura client: object write/read + envelope encrypt/decrypt.
  *
  * The generated low-level client covers the dashboard API (keys, plugins,
  * backends). This module adds the S3 data-plane operations the gateway
  * exposes plus the client side of the envelope-encryption scheme:
  *
  * - `putObject` / `getObject` — raw byte objects through the gateway,
- *   authenticated with the S4 API key headers.
+ *   authenticated with the Maskura API key headers.
  * - `generateKeypair` — an RSA-2048 keypair (SPKI public key). Give the
- *   public half to S4 and keep the private half locally; S4 never sees it.
+ *   public half to Maskura and keep the private half locally; Maskura never sees it.
  * - `attachPublicKey` — bind the public key to this API key. After this,
  *   the gateway's `envelope-encrypt` plugin encrypts every detected PII
  *   field server-side on PUT.
@@ -17,34 +17,34 @@
  *   private key, and AES-256-GCM-decrypts the field back to plaintext.
  *
  * Write path (server-side encryption):
- *   const client = new S4Client({ endpoint, accessKey, secretKey });
- *   const { privateKeyPem, publicKeyPem } = await S4Client.generateKeypair();
+ *   const client = new MaskuraClient({ endpoint, accessKey, secretKey });
+ *   const { privateKeyPem, publicKeyPem } = await MaskuraClient.generateKeypair();
  *   await client.attachPublicKey(publicKeyPem);            // once per key
  *   await client.putObject("my-bucket", "ingest/data.jsonl", payload);
  *
  * Read path (client-side decryption):
  *   const raw = await client.getObject("my-bucket", "ingest/data.jsonl");
- *   const plaintext = await S4Client.decryptPayload(raw, privateKeyPem);
+ *   const plaintext = await MaskuraClient.decryptPayload(raw, privateKeyPem);
  *
  * Uses only the Web Crypto API and global fetch (browser or Node >= 18).
  */
 
 declare const globalThis: any;
 
-export interface S4ClientOptions {
+export interface MaskuraClientOptions {
   endpoint: string;
   accessKey: string;
   secretKey: string;
   timeoutMs?: number;
 }
 
-export class S4Client {
+export class MaskuraClient {
   private readonly endpoint: string;
   private readonly accessKey: string;
   private readonly secretKey: string;
   private readonly timeoutMs: number;
 
-  constructor(opts: S4ClientOptions) {
+  constructor(opts: MaskuraClientOptions) {
     this.endpoint = opts.endpoint.replace(/\/$/, "");
     this.accessKey = opts.accessKey;
     this.secretKey = opts.secretKey;
@@ -52,7 +52,7 @@ export class S4Client {
   }
 
   private authHeaders(): Record<string, string> {
-    return { "x-s4-access-key": this.accessKey, "x-s4-secret-key": this.secretKey };
+    return { "x-maskura-access-key": this.accessKey, "x-maskura-secret-key": this.secretKey };
   }
 
   // -- keys ---------------------------------------------------------
@@ -73,8 +73,8 @@ export class S4Client {
     const spki = await subtle.exportKey("spki", kp.publicKey);
     const pkcs8 = await subtle.exportKey("pkcs8", kp.privateKey);
     return {
-      publicKeyPem: S4Client.toPem(spki, "PUBLIC KEY"),
-      privateKeyPem: S4Client.toPem(pkcs8, "PRIVATE KEY"),
+      publicKeyPem: MaskuraClient.toPem(spki, "PUBLIC KEY"),
+      privateKeyPem: MaskuraClient.toPem(pkcs8, "PRIVATE KEY"),
     };
   }
 
@@ -91,7 +91,7 @@ export class S4Client {
 
   // -- object data plane -------------------------------------------
 
-  /** Upload `data` to `bucket/key` through the S4 filter pipeline. */
+  /** Upload `data` to `bucket/key` through the Maskura filter pipeline. */
   async putObject(
     bucket: string,
     key: string,
@@ -125,7 +125,7 @@ export class S4Client {
     const subtle = globalThis.crypto.subtle;
     const privKey = await subtle.importKey(
       "pkcs8",
-      S4Client.pemToDer(privateKeyPem),
+      MaskuraClient.pemToDer(privateKeyPem),
       { name: "RSA-OAEP", hash: "SHA-256" },
       false,
       ["decrypt"],
@@ -135,7 +135,7 @@ export class S4Client {
     const out: number[] = [];
     let pos = 0;
     while (true) {
-      const idx = S4Client.indexOf(bytes, marker, pos);
+      const idx = MaskuraClient.indexOf(bytes, marker, pos);
       if (idx < 0) {
         for (let i = pos; i < bytes.length; i++) out.push(bytes[i]!);
         break;
@@ -163,7 +163,7 @@ export class S4Client {
         break;
       }
       const env = JSON.parse(new TextDecoder().decode(new Uint8Array(bytes.slice(start, end))));
-      const plain = await S4Client.decryptEnvelope(env, privKey);
+      const plain = await MaskuraClient.decryptEnvelope(env, privKey);
       for (let i = pos; i < start; i++) out.push(bytes[i]!);
       for (let i = 0; i < plain.length; i++) out.push(plain[i]!);
       pos = end;
@@ -177,11 +177,11 @@ export class S4Client {
     const dek = await subtle.decrypt(
       { name: "RSA-OAEP" },
       privKey,
-      S4Client.b64ToBuf(env.enc_dek),
+      MaskuraClient.b64ToBuf(env.enc_dek),
     );
-    const iv = S4Client.b64ToBuf(env.iv);
-    const ct = new Uint8Array(S4Client.b64ToBuf(env.ct));
-    const tag = new Uint8Array(S4Client.b64ToBuf(env.tag));
+    const iv = MaskuraClient.b64ToBuf(env.iv);
+    const ct = new Uint8Array(MaskuraClient.b64ToBuf(env.ct));
+    const tag = new Uint8Array(MaskuraClient.b64ToBuf(env.tag));
     const aead = await subtle.importKey("raw", dek, "AES-GCM", false, ["decrypt"]);
     const combined = new Uint8Array(ct.length + tag.length);
     combined.set(ct, 0);
@@ -200,7 +200,7 @@ export class S4Client {
 
   private static pemToDer(pem: string): ArrayBuffer {
     const b64 = pem.replace(/-----BEGIN [^-]+-----/g, "").replace(/-----END [^-]+-----/g, "").replace(/\s+/g, "");
-    return S4Client.b64ToBuf(b64);
+    return MaskuraClient.b64ToBuf(b64);
   }
 
   private static b64ToBuf(b64: string): ArrayBuffer {
@@ -220,3 +220,8 @@ export class S4Client {
     return -1;
   }
 }
+
+export type S4ClientOptions = MaskuraClientOptions;
+
+/** Permanent compatibility export for existing integrations. */
+export class S4Client extends MaskuraClient {}

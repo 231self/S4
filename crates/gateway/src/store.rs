@@ -755,7 +755,7 @@ impl KeyRepository for KeyStore {
 /// Loads the file once at construction and rewrites it atomically (0600 on
 /// unix) after every mutation, so API keys survive gateway restarts without
 /// Postgres. This is the default in local mode (`AUTH_DISABLED=true` without
-/// `DATABASE_URL`), or opt in explicitly with `S4_KEYS_FILE`.
+/// `DATABASE_URL`), or opt in explicitly with `MASKURA_KEYS_FILE`.
 #[derive(Debug)]
 pub struct FileKeyStore {
     keys: RwLock<HashMap<String, ApiKey>>,

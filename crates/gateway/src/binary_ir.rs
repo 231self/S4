@@ -4,7 +4,7 @@
 //! owned, so recursive schemas cannot be represented, and validation additionally
 //! bounds structural nesting.
 //!
-//! S4 Canonical JSON v1 is UTF-8 without a BOM, contains no insignificant
+//! Maskura Canonical JSON v1 is UTF-8 without a BOM, contains no insignificant
 //! whitespace, and sorts every JSON object key lexicographically. Arrays retain
 //! their declared order, including schema and value record fields. Encoding goes
 //! through [`serde_json::Value`], whose object map is sorted when serde_json's

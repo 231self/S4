@@ -8,7 +8,12 @@ license.workspace = true
 name = "s4ctl"
 path = "src/main.rs"
 
+[[bin]]
+name = "maskura"
+path = "src/maskura.rs"
+
 [dependencies]
+maskura-customer-config.workspace = true
 anyhow = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -70,7 +70,7 @@ for entry in "${FILTERS[@]}"; do
   # Rust crate names use underscores; package names use dashes.
   lib_name="${crate//-/_}"
   echo "=== Building ${crate} (WASI) ==="
-  cargo build --release -p "${crate}" --target "${TARGET}"
+  cargo build --locked --release -p "${crate}" --target "${TARGET}"
   wasm-tools component new \
     "${BIN_DIR}/${lib_name}.wasm" \
     --adapt "wasi_snapshot_preview1=${ADAPTER}" \
@@ -82,14 +82,14 @@ done
 # auto-load directory.
 TEST_OUT_DIR="$ROOT/target/test-components"
 mkdir -p "$TEST_OUT_DIR"
-cargo build --release -p test-filter --target "$TARGET"
+cargo build --locked --release -p test-filter --target "$TARGET"
 wasm-tools component new \
   "${BIN_DIR}/test_filter.wasm" \
   --adapt "wasi_snapshot_preview1=${ADAPTER}" \
   -o "${TEST_OUT_DIR}/test-filter.component.wasm"
 
 # v0.2 world fixture: exercises `operation` and `config-json` context delivery.
-cargo build --release -p test-filter-v02 --target "$TARGET"
+cargo build --locked --release -p test-filter-v02 --target "$TARGET"
 wasm-tools component new \
   "${BIN_DIR}/test_filter_v02.wasm" \
   --adapt "wasi_snapshot_preview1=${ADAPTER}" \
@@ -97,7 +97,7 @@ wasm-tools component new \
 
 # Binary reductors receive no host imports. Build this fixture for the bare Wasm
 # target and componentize it without a WASI adapter.
-cargo build --release -p test-binary-reductor --target "$NO_WASI_TARGET"
+cargo build --locked --release -p test-binary-reductor --target "$NO_WASI_TARGET"
 wasm-tools component new \
   "${NO_WASI_BIN_DIR}/test_binary_reductor.wasm" \
   -o "${TEST_OUT_DIR}/test-binary-reductor.component.wasm"

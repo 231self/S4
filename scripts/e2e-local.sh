@@ -50,7 +50,7 @@ docker run "${MC_OPTS[@]}" mb local/s4-local --ignore-existing
 # 3. Build filters and binaries
 echo "--- Building filters and binaries ---"
 (cd "$ROOT" && bash scripts/build-filters.sh)
-(cd "$ROOT" && cargo build -p s4-gateway -p s4ctl)
+(cd "$ROOT" && cargo build --locked -p s4-gateway -p s4ctl)
 
 # 4. Start the gateway against MinIO (auth disabled)
 echo "--- Starting S4 gateway on $GW_URL ---"

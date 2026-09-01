@@ -29,10 +29,10 @@ if [ ! -f "$PROJECT_DIR/target/components/pii-default.component.wasm" ]; then
 fi
 
 echo "→ Building gateway..."
-(cd "$PROJECT_DIR" && cargo build -p s4-gateway)
+(cd "$PROJECT_DIR" && cargo build --locked -p s4-gateway)
 
 echo "→ Starting gateway on port $GATEWAY_PORT..."
-(cd "$PROJECT_DIR" && AUTH_DISABLED=true S4_KEYS_FILE="$KEYS_FILE" LISTEN_ADDR="127.0.0.1:$GATEWAY_PORT" cargo run -p s4-gateway) &
+(cd "$PROJECT_DIR" && AUTH_DISABLED=true S4_KEYS_FILE="$KEYS_FILE" LISTEN_ADDR="127.0.0.1:$GATEWAY_PORT" cargo run --locked -p s4-gateway) &
 GATEWAY_PID=$!
 
 # Wait for gateway to be ready

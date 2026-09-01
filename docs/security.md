@@ -246,7 +246,13 @@ deliberately strict:
   pipeline snapshot is marked prefix-safe for read (operator-declared via
   `MASKURA_PREFIX_SAFE_COMPONENT_HASHES` at process start — imported components are
   unsafe by default and the capability is immutable per component hash), the
-  transformed output is streamed directly.
+  transformed output is streamed directly with bounded backpressure and no
+  disk spool. Actual source/output bytes, fuel, duration, and component evidence
+  are settled only after successful pipeline completion. EOF is withheld during
+  bounded exact settlement retries. Cancellation before disclosure releases the
+  reservation; cancellation, pipeline failure, or exhausted settlement after
+  disclosure leaves the reservation for bounded control-plane recovery and
+  never records successful customer usage.
 - **Encrypted read spool otherwise.** Any snapshot containing an unsafe
   component is rejected unless `MASKURA_TRANSFORMED_READ_SPOOL=encrypted` is set.
   The transformed output is then written to a disk spool in independently

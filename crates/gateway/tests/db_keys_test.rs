@@ -305,7 +305,7 @@ fn managed_store_migration_fails_closed_with_existing_authority_rows() {
     with_pool(|pool| async move {
         let schema = format!("managed_upgrade_{}", uuid::Uuid::new_v4().simple());
         let migration =
-            include_str!("../../../migrations/20260831000001_managed_store_operations.sql");
+            include_str!("../../../migrations/20260901000003_managed_store_operations.sql");
         let upgrade = format!(
             "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\"; \
              CREATE TABLE managed_object_authorities (\

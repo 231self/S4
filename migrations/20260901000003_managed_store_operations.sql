@@ -1,3 +1,5 @@
+-- Version 20260901000003 is globally unique across the shared public/private
+-- `_sqlx_migrations` table.
 -- Customer-level managed mutations, capacity accounting, and opaque list
 -- cursors. Physical provider journals remain independent child operations.
 -- The pre-operation schema did not persist enough information to reconstruct

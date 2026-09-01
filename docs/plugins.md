@@ -112,31 +112,34 @@ The default local setup preloads `pii-default` via `MASKURA_FILTER_COMPONENT`.
   `email-detect`, `ssn-detect`, `card-detect`, `envelope-encrypt`, `stable-encrypt`.
 - The original WIT design is recorded in `docs/adr/0001-component-model-wit.md`.
 
-## Hosted workspaces (`s4ctl hosted`)
+## Hosted workspaces (`maskura hosted`)
 
-Self-hosted/local gateways load plugins with the `s4ctl plugin` commands above and a
-directory (`S4_PLUGINS_DIR`) at startup. Hosted S4 workspaces instead manage plugins as
-first-class relational configuration owned by the workspace owner — the `s4ctl plugin`
-commands and directory auto-enable **do not** apply there and are not available on hosted
-S4. Hosted management authenticates with a **Supabase access token**
-(`S4_ACCESS_TOKEN` or `--token`) and a workspace ID (`S4_WORKSPACE_ID` or
-`--workspace`); an S4 data-plane API key is never accepted for hosted mutations.
+Self-hosted/local gateways load plugins with the `maskura plugin` commands above and a
+directory (`MASKURA_PLUGINS_DIR`) at startup. Hosted Maskura workspaces instead manage
+plugins as first-class relational configuration owned by the workspace owner. The
+`maskura plugin` commands and directory auto-enable **do not** apply there and are not
+available on hosted Maskura. Hosted management is available only when the hosted deployment
+enables filter pipelines (and separately enables custom uploads). It authenticates with a
+**Supabase access token** (`MASKURA_ACCESS_TOKEN` or `--token`) and a workspace ID
+(`MASKURA_WORKSPACE_ID` or `--workspace`); a Maskura data-plane API key is never accepted
+for hosted mutations. The legacy `s4ctl` binary and `S4_ACCESS_TOKEN` /
+`S4_WORKSPACE_ID` environment names remain permanent aliases.
 
 ```bash
-export S4_ACCESS_TOKEN=<supabase-jwt>
-export S4_WORKSPACE_ID=<workspace-uuid>
-s4ctl hosted catalog                  # catalog + versions + capability grants
-s4ctl hosted upload ./my-filter.component.wasm \
+export MASKURA_ACCESS_TOKEN=<supabase-jwt>
+export MASKURA_WORKSPACE_ID=<workspace-uuid>
+maskura hosted catalog                  # catalog + versions + capability grants
+maskura hosted upload ./my-filter.component.wasm \
   --slug my-filter --display-name "My Filter" --version 1.0.0 \
   --world s4-filter@0.2.0 --wit-version 0.2.0 --capability stable_fields
-s4ctl hosted validation <version-id>  # poll the secret-free validation run
-s4ctl hosted grant --installation-id <id> --capability stable_fields --version-id <version-id>
-s4ctl hosted pipelines create --direction write --name "redact"
-s4ctl hosted pipelines draft --pipeline-id <id> --step <install-id>:<version-id>:config.json
-s4ctl hosted pipelines publish --pipeline-id <id>
-s4ctl hosted assign-default write --pipeline-id <id>
-s4ctl hosted assign-bucket write ingest --pipeline-id <id>
-s4ctl hosted audit
+maskura hosted validation <version-id>  # poll the secret-free validation run
+maskura hosted grant --installation-id <id> --capability stable_fields --version-id <version-id>
+maskura hosted pipelines create write "redact"
+maskura hosted pipelines draft <pipeline-id> --step <install-id>:<version-id>:config.json
+maskura hosted pipelines publish <pipeline-id>
+maskura hosted assign-default write --pipeline-id <id>
+maskura hosted assign-bucket write ingest --pipeline-id <id>
+maskura hosted audit
 ```
 
 - **Worlds.** Components implement `s4-filter@0.1.0` (no config) or `s4-filter@0.2.0`

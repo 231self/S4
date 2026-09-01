@@ -4,6 +4,8 @@ use maskura_customer_config::{EnvAlias, aliases as customer_env, resolve as reso
 use reqwest::Url;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 const DEFAULT_GATEWAY: &str = "http://localhost:9000";
@@ -699,18 +701,191 @@ struct HostedApi {
     http: reqwest::Client,
 }
 
+#[derive(Debug)]
+struct HostedHttpError {
+    method: &'static str,
+    url: Url,
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl fmt::Display for HostedHttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.status == reqwest::StatusCode::CONFLICT {
+            write!(
+                formatter,
+                "stale hosted state: {} {} returned {}: {}",
+                self.method, self.url, self.status, self.body
+            )
+        } else {
+            write!(
+                formatter,
+                "{} {} returned {}: {}",
+                self.method, self.url, self.status, self.body
+            )
+        }
+    }
+}
+
+impl std::error::Error for HostedHttpError {}
+
+#[derive(Deserialize)]
+struct HostedCatalog {
+    plugins: Vec<HostedCatalogEntry>,
+}
+
+#[derive(Deserialize)]
+struct HostedCatalogEntry {
+    plugin: HostedCatalogPlugin,
+    installation: HostedInstallation,
+    versions: Vec<HostedCatalogVersion>,
+}
+
+#[derive(Deserialize)]
+struct HostedCatalogPlugin {
+    id: String,
+    display_name: String,
+    lifecycle_state: String,
+}
+
+#[derive(Deserialize)]
+struct HostedInstallation {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct HostedCatalogVersion {
+    version_label: String,
+    artifact_digest: String,
+    lifecycle_state: String,
+    wit_world: String,
+}
+
+#[derive(Deserialize)]
+struct HostedValidationStatus {
+    version: HostedValidationVersion,
+    runs: Vec<HostedValidationRun>,
+}
+
+#[derive(Deserialize)]
+struct HostedValidationVersion {
+    version_label: String,
+    wit_world: String,
+}
+
+#[derive(Deserialize)]
+struct HostedValidationRun {
+    id: String,
+    state: String,
+    diagnostic_code: Option<String>,
+    diagnostic_message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HostedPipelines {
+    pipelines: Vec<HostedPipeline>,
+}
+
+#[derive(Deserialize)]
+struct HostedPipeline {
+    id: String,
+    direction: String,
+    name: String,
+    active_revision_id: Option<String>,
+    draft_revision: Option<HostedDraftRevision>,
+    published_revisions: Vec<HostedPublishedRevision>,
+}
+
+#[derive(Deserialize)]
+struct HostedDraftRevision {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct HostedPublishedRevision {
+    revision_no: u64,
+    published_at: Option<String>,
+    explicit_passthrough: bool,
+}
+
+#[derive(Deserialize)]
+struct HostedAssignments {
+    assignments: Vec<HostedAssignment>,
+    bucket_scopes: Vec<HostedBucketScope>,
+}
+
+#[derive(Deserialize)]
+struct HostedAssignment {
+    direction: String,
+    pipeline_id: String,
+    bucket_scope_id: Option<String>,
+    lock_version: i64,
+}
+
+#[derive(Deserialize)]
+struct HostedBucketScope {
+    id: String,
+    bucket_name: String,
+}
+
+#[derive(Serialize)]
+struct SetAssignmentBody<'a> {
+    pipeline_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock_version: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct HostedAudit {
+    events: Vec<HostedAuditEvent>,
+}
+
+#[derive(Deserialize)]
+struct HostedAuditEvent {
+    created_at: String,
+    event_type: String,
+    actor_user_id: String,
+}
+
 impl HostedApi {
     fn new(gateway: &str, workspace: &str, token: &str) -> anyhow::Result<Self> {
         let gateway = Url::parse(gateway).context("invalid hosted gateway URL")?;
         if gateway.cannot_be_a_base() {
             bail!("hosted gateway URL cannot be used as a base URL");
         }
+        let loopback_http = gateway.scheme() == "http"
+            && gateway.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+        if gateway.scheme() != "https" && !loopback_http {
+            bail!("refusing to send a hosted bearer token to non-HTTPS, non-loopback gateway");
+        }
         Ok(Self {
             gateway,
             workspace: workspace.to_string(),
             token: token.to_string(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
         })
+    }
+
+    fn request_error(
+        method: &'static str,
+        url: Url,
+        status: reqwest::StatusCode,
+        body: String,
+    ) -> anyhow::Error {
+        HostedHttpError {
+            method,
+            url,
+            status,
+            body,
+        }
+        .into()
     }
 
     fn path(&self, segments: &[&str]) -> anyhow::Result<Url> {
@@ -730,8 +905,10 @@ impl HostedApi {
 
     fn path_with_query(&self, segments: &[&str], query: &[(&str, String)]) -> anyhow::Result<Url> {
         let mut url = self.path(segments)?;
-        url.query_pairs_mut()
-            .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
+        if !query.is_empty() {
+            url.query_pairs_mut()
+                .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
+        }
         Ok(url)
     }
 
@@ -769,7 +946,7 @@ impl HostedApi {
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            bail!("GET {}: {} — {}", url, status, body);
+            return Err(Self::request_error("GET", url, status, body));
         }
         serde_json::from_str(&body).with_context(|| format!("parse GET {}: {}", url, body))
     }
@@ -790,7 +967,7 @@ impl HostedApi {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("POST {}: {} — {}", url, status, text);
+            return Err(Self::request_error("POST", url, status, text));
         }
         serde_json::from_str(&text).with_context(|| format!("parse POST {}: {}", url, text))
     }
@@ -811,7 +988,7 @@ impl HostedApi {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("PUT {}: {} — {}", url, status, text);
+            return Err(Self::request_error("PUT", url, status, text));
         }
         serde_json::from_str(&text).with_context(|| format!("parse PUT {}: {}", url, text))
     }
@@ -828,7 +1005,7 @@ impl HostedApi {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("PUT {}: {} — {}", url, status, text);
+            return Err(Self::request_error("PUT", url, status, text));
         }
         Ok(())
     }
@@ -845,7 +1022,7 @@ impl HostedApi {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("DELETE {}: {} — {}", url, status, text);
+            return Err(Self::request_error("DELETE", url, status, text));
         }
         Ok(())
     }
@@ -854,6 +1031,7 @@ impl HostedApi {
     async fn stage_artifact(&self, bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
         let mut headers = self.auth_headers()?;
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/wasm"));
+        let url = self.path(&["filter-artifacts"])?;
         let resp = self
             .http
             .post(self.path(&["filter-artifacts"])?)
@@ -864,10 +1042,55 @@ impl HostedApi {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("POST filter-artifacts: {} — {}", status, text);
+            return Err(Self::request_error("POST", url, status, text));
         }
         serde_json::from_str(&text)
             .with_context(|| format!("parse POST filter-artifacts: {}", text))
+    }
+
+    async fn current_draft_revision_id(&self, pipeline_id: &str) -> anyhow::Result<String> {
+        let value: HostedPipelines = self.get(&["filter-pipelines"]).await?;
+        let pipeline = value
+            .pipelines
+            .into_iter()
+            .find(|pipeline| pipeline.id == pipeline_id)
+            .with_context(|| format!("pipeline {pipeline_id} was not found"))?;
+        pipeline
+            .draft_revision
+            .map(|revision| revision.id)
+            .with_context(|| {
+                format!("pipeline {pipeline_id} has no current draft; hosted state may be stale")
+            })
+    }
+
+    async fn current_assignment_lock_version(
+        &self,
+        direction: &str,
+        bucket: Option<&str>,
+    ) -> anyhow::Result<Option<i64>> {
+        let value: HostedAssignments = self.get(&["filter-assignments"]).await?;
+        let bucket_scope_id = match bucket {
+            Some(bucket) => match value
+                .bucket_scopes
+                .iter()
+                .find(|scope| scope.bucket_name == bucket)
+            {
+                Some(scope) => Some(scope.id.as_str()),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        Ok(value
+            .assignments
+            .iter()
+            .find(|assignment| {
+                assignment.direction == direction
+                    && match bucket {
+                        Some(_) => assignment.bucket_scope_id.as_deref() == bucket_scope_id,
+                        None => assignment.bucket_scope_id.is_none(),
+                    }
+            })
+            .map(|assignment| assignment.lock_version))
     }
 }
 
@@ -915,6 +1138,7 @@ fn parse_draft_step(raw: &str) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::json!({
         "installation_id": parts[0],
         "plugin_version_id": parts[1],
+        "enabled": true,
         "config_json": config_json,
     }))
 }
@@ -1218,35 +1442,25 @@ async fn main() -> anyhow::Result<()> {
             let api = HostedApi::new(cli.requested_gateway(), workspace, token)?;
             match cmd {
                 HostedCmd::Catalog => {
-                    let value: serde_json::Value = api.get(&["filter-catalog"]).await?;
-                    let plugins = value["plugins"].as_array().cloned().unwrap_or_default();
-                    if plugins.is_empty() {
+                    let catalog: HostedCatalog = api.get(&["filter-catalog"]).await?;
+                    if catalog.plugins.is_empty() {
                         println!("No plugins in the workspace catalog.");
                     } else {
-                        for entry in &plugins {
-                            let installation = &entry["installation"];
-                            let plugin = &entry["plugin"];
+                        for entry in &catalog.plugins {
                             println!(
-                                "{}  {}  install={}  world={}",
-                                plugin["id"].as_str().unwrap_or("?"),
-                                plugin["display_name"].as_str().unwrap_or("?"),
-                                installation["id"].as_str().unwrap_or("?"),
-                                installation["world"]
-                                    .as_str()
-                                    .or_else(|| plugin["world"].as_str())
-                                    .unwrap_or("?")
+                                "{}  {}  install={}  state={}",
+                                entry.plugin.id,
+                                entry.plugin.display_name,
+                                entry.installation.id,
+                                entry.plugin.lifecycle_state,
                             );
-                            for version in entry["versions"].as_array().unwrap_or(&vec![]) {
+                            for version in &entry.versions {
                                 println!(
-                                    "    version {}  digest={}  state={}",
-                                    version["version"].as_str().unwrap_or("?"),
-                                    version["digest"]
-                                        .as_str()
-                                        .unwrap_or("?")
-                                        .chars()
-                                        .take(12)
-                                        .collect::<String>(),
-                                    version["state"].as_str().unwrap_or("?")
+                                    "    version {}  world={}  digest={}  state={}",
+                                    version.version_label,
+                                    version.wit_world,
+                                    version.artifact_digest.chars().take(12).collect::<String>(),
+                                    version.lifecycle_state,
                                 );
                             }
                         }
@@ -1328,34 +1542,28 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 HostedCmd::Validation { version_id } => {
-                    let value: serde_json::Value = api
+                    let value: HostedValidationStatus = api
                         .get(&["filter-plugin-versions", version_id, "validation"])
                         .await?;
-                    let version = &value["version"];
                     println!(
                         "Version {} (world {})",
-                        version["version"].as_str().unwrap_or("?"),
-                        version["wit_world"].as_str().unwrap_or("?")
+                        value.version.version_label, value.version.wit_world
                     );
-                    let runs = value["runs"].as_array().cloned().unwrap_or_default();
-                    if runs.is_empty() {
+                    if value.runs.is_empty() {
                         println!("No validation runs yet.");
                     } else {
-                        for run in &runs {
-                            let state = run["state"].as_str().unwrap_or("?");
-                            let diagnostic = run["diagnostic_code"]
-                                .as_str()
-                                .and_then(|code| {
-                                    run["diagnostic_message"]
-                                        .as_str()
-                                        .map(|msg| format!("{code}: {msg}"))
-                                })
+                        for run in &value.runs {
+                            let diagnostic = run
+                                .diagnostic_code
+                                .as_deref()
+                                .zip(run.diagnostic_message.as_deref())
+                                .map(|(code, message)| format!("{code}: {message}"))
                                 .unwrap_or_else(|| "ok".to_string());
                             println!(
                                 "run {}  state={}  {}",
-                                run["id"].as_str().unwrap_or("?"),
-                                state,
-                                if state == "succeeded" {
+                                run.id,
+                                run.state,
+                                if run.state == "succeeded" {
                                     "succeeded"
                                 } else {
                                     &diagnostic
@@ -1402,31 +1610,24 @@ async fn main() -> anyhow::Result<()> {
                 }
                 HostedCmd::Pipelines { cmd } => match cmd {
                     HostedPipelineCmd::List => {
-                        let value: serde_json::Value = api.get(&["filter-pipelines"]).await?;
-                        let pipelines = value["pipelines"].as_array().cloned().unwrap_or_default();
-                        if pipelines.is_empty() {
+                        let value: HostedPipelines = api.get(&["filter-pipelines"]).await?;
+                        if value.pipelines.is_empty() {
                             println!("No pipelines.");
                         } else {
-                            for pipeline in &pipelines {
-                                let active = pipeline["active_revision_id"].as_str().unwrap_or("-");
+                            for pipeline in &value.pipelines {
                                 println!(
                                     "{}  {}  {}  active_revision={}",
-                                    pipeline["id"].as_str().unwrap_or("?"),
-                                    pipeline["direction"].as_str().unwrap_or("?"),
-                                    pipeline["name"].as_str().unwrap_or("?"),
-                                    active
+                                    pipeline.id,
+                                    pipeline.direction,
+                                    pipeline.name,
+                                    pipeline.active_revision_id.as_deref().unwrap_or("-")
                                 );
-                                for revision in pipeline["published_revisions"]
-                                    .as_array()
-                                    .unwrap_or(&vec![])
-                                {
-                                    let passthrough =
-                                        revision["explicit_passthrough"].as_bool().unwrap_or(false);
+                                for revision in &pipeline.published_revisions {
                                     println!(
                                         "    rev {}  published_at={}  passthrough={}",
-                                        revision["revision_no"].as_u64().unwrap_or(0),
-                                        revision["published_at"].as_str().unwrap_or("?"),
-                                        passthrough
+                                        revision.revision_no,
+                                        revision.published_at.as_deref().unwrap_or("?"),
+                                        revision.explicit_passthrough
                                     );
                                 }
                             }
@@ -1451,7 +1652,9 @@ async fn main() -> anyhow::Result<()> {
                             .iter()
                             .map(|raw| parse_draft_step(raw))
                             .collect::<anyhow::Result<Vec<_>>>()?;
+                        let draft_revision_id = api.current_draft_revision_id(pipeline_id).await?;
                         let body = serde_json::json!({
+                            "draft_revision_id": draft_revision_id,
                             "explicit_passthrough": passthrough,
                             "steps": parsed,
                         });
@@ -1466,7 +1669,10 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     HostedPipelineCmd::Publish { pipeline_id } => {
-                        let body = serde_json::json!({});
+                        let draft_revision_id = api.current_draft_revision_id(pipeline_id).await?;
+                        let body = serde_json::json!({
+                            "draft_revision_id": draft_revision_id,
+                        });
                         let published: serde_json::Value = api
                             .post(&["filter-pipelines", pipeline_id, "publish"], &body)
                             .await?;
@@ -1497,38 +1703,33 @@ async fn main() -> anyhow::Result<()> {
                     }
                 },
                 HostedCmd::Assignments => {
-                    let value: serde_json::Value = api.get(&["filter-assignments"]).await?;
-                    let assignments = value["assignments"].as_array().cloned().unwrap_or_default();
-                    let scopes = value["bucket_scopes"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default();
-                    if assignments.is_empty() {
+                    let value: HostedAssignments = api.get(&["filter-assignments"]).await?;
+                    if value.assignments.is_empty() {
                         println!("No assignments (workspace defaults inherit).");
                     } else {
-                        for assignment in &assignments {
-                            let scope_id = assignment["bucket_scope_id"].as_str().unwrap_or("-");
+                        for assignment in &value.assignments {
                             println!(
-                                "{}  pipeline={}  scope={}",
-                                assignment["direction"].as_str().unwrap_or("?"),
-                                assignment["pipeline_id"].as_str().unwrap_or("?"),
-                                scope_id
+                                "{}  pipeline={}  scope={}  lock_version={}",
+                                assignment.direction,
+                                assignment.pipeline_id,
+                                assignment.bucket_scope_id.as_deref().unwrap_or("-"),
+                                assignment.lock_version,
                             );
                         }
                     }
-                    for scope in &scopes {
-                        println!(
-                            "bucket scope {} = {}",
-                            scope["id"].as_str().unwrap_or("?"),
-                            scope["bucket_name"].as_str().unwrap_or("?")
-                        );
+                    for scope in &value.bucket_scopes {
+                        println!("bucket scope {} = {}", scope.id, scope.bucket_name);
                     }
                 }
                 HostedCmd::AssignDefault {
                     direction,
                     pipeline_id,
                 } => {
-                    let body = serde_json::json!({ "pipeline_id": pipeline_id });
+                    let lock_version = api.current_assignment_lock_version(direction, None).await?;
+                    let body = SetAssignmentBody {
+                        pipeline_id,
+                        lock_version,
+                    };
                     let _: serde_json::Value = api
                         .put(&["filter-assignments", direction, "default"], &body)
                         .await?;
@@ -1539,14 +1740,28 @@ async fn main() -> anyhow::Result<()> {
                     bucket,
                     pipeline_id,
                 } => {
-                    let body = serde_json::json!({ "pipeline_id": pipeline_id });
+                    let lock_version = api
+                        .current_assignment_lock_version(direction, Some(bucket))
+                        .await?;
+                    let body = SetAssignmentBody {
+                        pipeline_id,
+                        lock_version,
+                    };
                     let _: serde_json::Value = api
                         .put(&["filter-assignments", direction, "buckets", bucket], &body)
                         .await?;
                     println!("{direction} pipeline {pipeline_id} assigned to bucket {bucket}.");
                 }
                 HostedCmd::UnassignBucket { direction, bucket } => {
-                    let body = serde_json::json!({});
+                    let lock_version = api
+                        .current_assignment_lock_version(direction, Some(bucket))
+                        .await?
+                        .with_context(|| {
+                            format!(
+                                "no {direction} assignment exists for bucket {bucket}; hosted state may already have changed"
+                            )
+                        })?;
+                    let body = serde_json::json!({ "lock_version": lock_version });
                     api.delete_unit(&["filter-assignments", direction, "buckets", bucket], &body)
                         .await?;
                     println!("Removed {direction} assignment for bucket {bucket}.");
@@ -1555,18 +1770,14 @@ async fn main() -> anyhow::Result<()> {
                     let query = limit
                         .map(|limit| vec![("limit", limit.to_string())])
                         .unwrap_or_default();
-                    let value: serde_json::Value =
-                        api.get_with_query(&["filter-audit"], &query).await?;
-                    let events = value["events"].as_array().cloned().unwrap_or_default();
-                    if events.is_empty() {
+                    let value: HostedAudit = api.get_with_query(&["filter-audit"], &query).await?;
+                    if value.events.is_empty() {
                         println!("No audit events.");
                     } else {
-                        for event in &events {
+                        for event in &value.events {
                             println!(
                                 "{}  {}  {}",
-                                event["created_at"].as_str().unwrap_or("?"),
-                                event["action"].as_str().unwrap_or("?"),
-                                event["actor_user_id"].as_str().unwrap_or("?")
+                                event.created_at, event.event_type, event.actor_user_id
                             );
                         }
                     }
@@ -1870,6 +2081,14 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn success_server(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        response_server("200 OK", &[], body).await
+    }
+
+    async fn response_server(
+        status: &'static str,
+        headers: &'static [(&'static str, &'static str)],
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -1877,8 +2096,12 @@ mod tests {
             let mut request = vec![0; 16 * 1024];
             let read = socket.read(&mut request).await.unwrap();
             request.truncate(read);
+            let extra_headers = headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect::<String>();
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -1893,6 +2116,7 @@ mod tests {
         let step = parse_draft_step("install-1:version-2").unwrap();
         assert_eq!(step["installation_id"], "install-1");
         assert_eq!(step["plugin_version_id"], "version-2");
+        assert_eq!(step["enabled"], true);
         assert!(step["config_json"].is_null());
     }
 
@@ -1952,6 +2176,57 @@ mod tests {
         );
         assert!(headers.get("x-maskura-access-key").is_none());
         assert!(headers.get("x-s4-access-key").is_none());
+    }
+
+    #[test]
+    fn hosted_token_rejects_unapproved_non_loopback_http_destinations() {
+        let error = HostedApi::new("http://api.example", "ws-abc", "secret-token")
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("non-HTTPS, non-loopback"));
+        assert!(!error.to_string().contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn hosted_client_does_not_follow_bearer_redirects() {
+        let (gateway, request) = response_server(
+            "302 Found",
+            &[("Location", "http://api.example/collect")],
+            "redirect",
+        )
+        .await;
+        let api = HostedApi::new(&gateway, "ws-abc", "secret-token").unwrap();
+        let error = api
+            .get::<serde_json::Value>(&["filter-catalog"])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<HostedHttpError>().unwrap().status,
+            reqwest::StatusCode::FOUND
+        );
+        assert!(
+            request
+                .await
+                .unwrap()
+                .contains("authorization: Bearer secret-token\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_conflicts_are_typed_as_stale_state() {
+        let (gateway, request) = response_server("409 Conflict", &[], "assignment changed").await;
+        let api = HostedApi::new(&gateway, "ws-abc", "secret-token").unwrap();
+        let error = api
+            .put_unit(
+                &["filter-assignments", "write", "default"],
+                &serde_json::json!({"pipeline_id": "pipeline-1", "lock_version": 1}),
+            )
+            .await
+            .unwrap_err();
+        let typed = error.downcast_ref::<HostedHttpError>().unwrap();
+        assert_eq!(typed.status, reqwest::StatusCode::CONFLICT);
+        assert!(error.to_string().contains("stale hosted state"));
+        request.await.unwrap();
     }
 
     #[tokio::test]

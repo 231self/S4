@@ -46,6 +46,7 @@ pub struct PluginCapabilities {
     pub prefix_safe_for_read: bool,
 }
 
+#[derive(Clone)]
 struct Plugin {
     info: PluginInfo,
     component_hash: String,
@@ -55,6 +56,7 @@ struct Plugin {
 
 /// One entry in the bounded digest-keyed compile cache. Weight is the guest
 /// memory reservation of the compiled engine; eviction is weighted LRU.
+#[derive(Clone)]
 struct CacheEntry {
     engine: Arc<FilterEngine>,
     capabilities: PluginCapabilities,
@@ -62,7 +64,7 @@ struct CacheEntry {
     weight: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RegistryState {
     plugins: HashMap<String, Plugin>,
     order: Vec<String>,
@@ -113,6 +115,7 @@ pub struct PluginRegistry {
     fuel: u64,
     pipeline_limits: PipelineLimits,
     executor: Arc<WasmExecutor>,
+    executor_config: ExecutorConfig,
 }
 
 #[derive(Clone)]
@@ -331,6 +334,20 @@ impl PluginRegistry {
             fuel,
             pipeline_limits: pipeline_limits.validate()?,
             executor: Arc::new(WasmExecutor::new(executor_config)?),
+            executor_config,
+        })
+    }
+
+    /// Create an isolated registry that reuses only immutable compiled Wasm
+    /// engines and component bytes. Catalog mutations and executor admission
+    /// state remain local to the returned registry.
+    pub fn isolated_clone(&self) -> Result<Self, S4Error> {
+        Ok(Self {
+            state: RwLock::new(self.state.read().unwrap().clone()),
+            fuel: self.fuel,
+            pipeline_limits: self.pipeline_limits,
+            executor: Arc::new(WasmExecutor::new(self.executor_config)?),
+            executor_config: self.executor_config,
         })
     }
 
@@ -1588,6 +1605,40 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(registry.list().len(), 2);
         assert_eq!(registry.state.read().unwrap().engines.len(), 1);
+    }
+
+    #[test]
+    fn isolated_clone_shares_compiled_engines_but_not_mutable_state() {
+        let registry = PluginRegistry::new();
+        let bytes = component();
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let plugin = registry.import("shared", &bytes).unwrap();
+        let isolated = registry.isolated_clone().unwrap();
+
+        let original_engine = registry
+            .state
+            .read()
+            .unwrap()
+            .engines
+            .get(&digest)
+            .unwrap()
+            .engine
+            .clone();
+        let isolated_engine = isolated
+            .state
+            .read()
+            .unwrap()
+            .engines
+            .get(&digest)
+            .unwrap()
+            .engine
+            .clone();
+        assert!(Arc::ptr_eq(&original_engine, &isolated_engine));
+        assert!(!Arc::ptr_eq(&registry.executor, &isolated.executor));
+
+        isolated.set_enabled(&plugin.id, false).unwrap();
+        assert!(registry.get_info(&plugin.id).unwrap().enabled);
+        assert!(!isolated.get_info(&plugin.id).unwrap().enabled);
     }
 
     #[test]

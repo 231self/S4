@@ -572,6 +572,117 @@ struct DemoPipelines {
     join: Option<PipelineSnapshot>,
 }
 
+struct DemoPipelineTemplate {
+    registry: PluginRegistry,
+    pii_id: String,
+    stable_id: Option<String>,
+}
+
+impl DemoPipelineTemplate {
+    fn instantiate(&self) -> anyhow::Result<DemoPipelines> {
+        let registry = self.registry.isolated_clone()?;
+        if let Some(stable_id) = &self.stable_id {
+            registry.set_enabled(stable_id, false);
+        }
+        let safe = registry.snapshot().constrained(demo_pipeline_limits())?;
+        let join = if let Some(stable_id) = &self.stable_id {
+            registry.set_enabled(stable_id, true);
+            registry.reorder(vec![stable_id.clone(), self.pii_id.clone()]);
+            Some(registry.snapshot().constrained(demo_pipeline_limits())?)
+        } else {
+            None
+        };
+        Ok(DemoPipelines { safe, join })
+    }
+}
+
+/// Immutable startup pipeline artifacts that can produce isolated gateway
+/// state without recompiling the same Wasm components.
+#[doc(hidden)]
+pub struct StatePipelineTemplate {
+    engine: Arc<s4_wasm_runtime::FilterEngine>,
+    plugins: PluginRegistry,
+    demo: DemoPipelineTemplate,
+    max_pipeline_output_bytes: u64,
+}
+
+impl StatePipelineTemplate {
+    #[doc(hidden)]
+    pub fn from_env() -> anyhow::Result<Self> {
+        let source_body_limits = source_body_limits_from_env();
+        let explicit_component_path = component_path();
+        let component_bytes = std::fs::read(&explicit_component_path)?;
+        let pipeline_fuel = std::env::var("S4_WASM_FUEL")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(crate::plugin_registry::DEFAULT_PIPELINE_FUEL);
+        let engine = Arc::new(s4_wasm_runtime::FilterEngine::with_fuel(
+            &component_bytes,
+            pipeline_fuel,
+        )?);
+        let default_pipeline_limits = PipelineLimits::default();
+        let max_pipeline_output_bytes = std::env::var("S4_MAX_PIPELINE_OUTPUT_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default_pipeline_limits.max_output_bytes)
+            .min(default_pipeline_limits.max_output_bytes);
+        let pipeline_limits = PipelineLimits {
+            max_input_bytes: default_pipeline_limits
+                .max_input_bytes
+                .min(source_body_limits.max_bytes),
+            max_output_bytes: max_pipeline_output_bytes,
+            max_cumulative_fuel: pipeline_fuel,
+            ..default_pipeline_limits
+        };
+        let plugins = PluginRegistry::with_options(
+            pipeline_fuel,
+            pipeline_limits,
+            s4_wasm_runtime::ExecutorConfig::default(),
+        )?;
+        let prefix_safe_hashes = prefix_safe_component_hashes();
+
+        use sha2::Digest as _;
+        let default_hash = hex::encode(sha2::Sha256::digest(&component_bytes));
+        plugins.import_with_capabilities(
+            "pii-default",
+            &component_bytes,
+            PluginCapabilities {
+                prefix_safe_for_read: prefix_safe_hashes.contains(&default_hash),
+            },
+        )?;
+
+        if let Ok(plugin_dir) = std::env::var("S4_PLUGINS_DIR") {
+            let dir = std::path::Path::new(&plugin_dir);
+            if dir.exists() {
+                plugins.load_from_dir_with_capabilities_excluding(
+                    dir,
+                    &prefix_safe_hashes,
+                    Some(&explicit_component_path),
+                )?;
+            }
+        }
+
+        let demo = build_demo_pipeline_template(
+            &component_bytes,
+            bundled_stable_component().as_deref(),
+            pipeline_fuel,
+        )?;
+        Ok(Self {
+            engine,
+            plugins,
+            demo,
+            max_pipeline_output_bytes,
+        })
+    }
+
+    fn instantiate(&self) -> anyhow::Result<(Gateway, Arc<PluginRegistry>, DemoPipelines)> {
+        let plugins = Arc::new(self.plugins.isolated_clone()?);
+        let gateway = Gateway::with_shared_registry(Arc::clone(&self.engine), plugins.clone());
+        Ok((gateway, plugins, self.demo.instantiate()?))
+    }
+}
+
 /// The process's single `AppState` shares this anonymous admission policy across
 /// all router clones and both processing routes. A noisy anonymous client can
 /// exhaust the shared allowance; edge or identity-aware limiting is the
@@ -638,32 +749,44 @@ fn demo_pipeline_limits() -> PipelineLimits {
     }
 }
 
+fn build_demo_pipeline_template(
+    pii_component: &[u8],
+    stable_component: Option<&[u8]>,
+    engine_fuel: u64,
+) -> anyhow::Result<DemoPipelineTemplate> {
+    let registry = PluginRegistry::with_fuel(engine_fuel);
+    let pii = registry.import("pii-default", pii_component)?;
+    let stable_id = if let Some(component) = stable_component {
+        let stable = match registry.import("stable-encrypt", component) {
+            Ok(stable) => stable,
+            Err(error) => {
+                warn!("stable-encrypt unavailable for the stateless demo: {error}");
+                return Ok(DemoPipelineTemplate {
+                    registry,
+                    pii_id: pii.id,
+                    stable_id: None,
+                });
+            }
+        };
+        registry.reorder(vec![stable.id.clone(), pii.id.clone()]);
+        Some(stable.id)
+    } else {
+        None
+    };
+    Ok(DemoPipelineTemplate {
+        registry,
+        pii_id: pii.id,
+        stable_id,
+    })
+}
+
+#[cfg(test)]
 fn build_demo_pipelines(
     pii_component: &[u8],
     stable_component: Option<&[u8]>,
     engine_fuel: u64,
 ) -> anyhow::Result<DemoPipelines> {
-    let registry = PluginRegistry::with_fuel(engine_fuel);
-    let pii = registry.import("pii-default", pii_component)?;
-    let safe = registry.snapshot().constrained(demo_pipeline_limits())?;
-    let join = stable_component.and_then(|component| {
-        let stable = match registry.import("stable-encrypt", component) {
-            Ok(stable) => stable,
-            Err(error) => {
-                warn!("stable-encrypt unavailable for the stateless demo: {error}");
-                return None;
-            }
-        };
-        registry.reorder(vec![stable.id, pii.id.clone()]);
-        match registry.snapshot().constrained(demo_pipeline_limits()) {
-            Ok(snapshot) => Some(snapshot),
-            Err(error) => {
-                warn!("join demo pipeline constraints are invalid: {error}");
-                None
-            }
-        }
-    });
-    Ok(DemoPipelines { safe, join })
+    build_demo_pipeline_template(pii_component, stable_component, engine_fuel)?.instantiate()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9204,6 +9327,22 @@ fn validate_storage_boundary_startup(
     Ok(())
 }
 
+fn source_body_limits_from_env() -> BodyLimits {
+    BodyLimits {
+        max_frame_bytes: std::env::var("S4_SOURCE_MAX_FRAME_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES),
+        max_bytes: std::env::var("S4_MAX_OBJECT_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
+            .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
+    }
+}
+
 /// Build the engine state from environment variables, injecting the given
 /// control plane and key-wrapping backend. This is the shared construction
 /// path for both the OSS self-host binary (`NoopControlPlane` +
@@ -9213,6 +9352,20 @@ pub async fn build_state(
     control: Arc<dyn ControlPlane>,
     wrapping: Arc<dyn KeyWrapping>,
     workspace_storage: Arc<dyn WorkspaceStorageRepository>,
+) -> anyhow::Result<Arc<AppState>> {
+    let pipeline_template = StatePipelineTemplate::from_env()?;
+    build_state_with_pipeline_template(control, wrapping, workspace_storage, &pipeline_template)
+        .await
+}
+
+/// Build isolated state from startup artifacts that have already compiled the
+/// configured Wasm components.
+#[doc(hidden)]
+pub async fn build_state_with_pipeline_template(
+    control: Arc<dyn ControlPlane>,
+    wrapping: Arc<dyn KeyWrapping>,
+    workspace_storage: Arc<dyn WorkspaceStorageRepository>,
+    pipeline_template: &StatePipelineTemplate,
 ) -> anyhow::Result<Arc<AppState>> {
     let s3_endpoint = std::env::var("S3_ENDPOINT").ok();
     let auth_disabled = enabled_env_flag("AUTH_DISABLED");
@@ -9232,81 +9385,9 @@ pub async fn build_state(
     let workspace_endpoint_policy =
         WorkspaceEndpointPolicy::from_env(explicit_single_tenant).map_err(anyhow::Error::msg)?;
 
-    let source_body_limits = BodyLimits {
-        max_frame_bytes: std::env::var("S4_SOURCE_MAX_FRAME_BYTES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES),
-        max_bytes: std::env::var("S4_MAX_OBJECT_BYTES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
-            .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
-    };
-
-    let explicit_component_path = component_path();
-    let component_bytes = std::fs::read(&explicit_component_path)?;
-    let pipeline_fuel = std::env::var("S4_WASM_FUEL")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(crate::plugin_registry::DEFAULT_PIPELINE_FUEL);
-    use sha2::Digest as _;
-
-    let engine = s4_wasm_runtime::FilterEngine::with_fuel(&component_bytes, pipeline_fuel)?;
-    let default_pipeline_limits = PipelineLimits::default();
-    let max_pipeline_output_bytes = std::env::var("S4_MAX_PIPELINE_OUTPUT_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default_pipeline_limits.max_output_bytes)
-        .min(default_pipeline_limits.max_output_bytes);
-    let pipeline_limits = PipelineLimits {
-        max_input_bytes: default_pipeline_limits
-            .max_input_bytes
-            .min(source_body_limits.max_bytes),
-        max_output_bytes: max_pipeline_output_bytes,
-        max_cumulative_fuel: pipeline_fuel,
-        ..default_pipeline_limits
-    };
-    let plugins = Arc::new(PluginRegistry::with_options(
-        pipeline_fuel,
-        pipeline_limits,
-        s4_wasm_runtime::ExecutorConfig::default(),
-    )?);
-    let prefix_safe_hashes = prefix_safe_component_hashes();
-
-    // Only a startup-controlled component digest can grant direct-read safety.
-    let default_hash = hex::encode(sha2::Sha256::digest(&component_bytes));
-    plugins.import_with_capabilities(
-        "pii-default",
-        &component_bytes,
-        PluginCapabilities {
-            prefix_safe_for_read: prefix_safe_hashes.contains(&default_hash),
-        },
-    )?;
-
-    // Auto-load plugins from S4_PLUGINS_DIR if set
-    if let Ok(plugin_dir) = std::env::var("S4_PLUGINS_DIR") {
-        let dir = std::path::Path::new(&plugin_dir);
-        if dir.exists() {
-            plugins.load_from_dir_with_capabilities_excluding(
-                dir,
-                &prefix_safe_hashes,
-                Some(&explicit_component_path),
-            )?;
-        }
-    }
-
-    let stable_demo_component = bundled_stable_component();
-    let demo_pipelines = build_demo_pipelines(
-        &component_bytes,
-        stable_demo_component.as_deref(),
-        pipeline_fuel,
-    )?;
-
-    let gateway = Gateway::with_registry(engine, plugins.clone());
+    let source_body_limits = source_body_limits_from_env();
+    let max_pipeline_output_bytes = pipeline_template.max_pipeline_output_bytes;
+    let (gateway, plugins, demo_pipelines) = pipeline_template.instantiate()?;
 
     // Envelope encryption for API key secrets (needed to verify SigV4).
     // The wrapping backend is injected by the caller so the engine stays

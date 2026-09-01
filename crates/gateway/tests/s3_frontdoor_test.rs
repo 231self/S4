@@ -20,7 +20,10 @@ use s4_gateway::control::{
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
 use s4_gateway::object::BodyLimits;
 use s4_gateway::plugin_registry::{PipelineLimits, PluginRegistry};
-use s4_gateway::server::{AppState, StreamingReadMode, build_router, build_state};
+use s4_gateway::server::{
+    AppState, StatePipelineTemplate, StreamingReadMode, build_router,
+    build_state_with_pipeline_template,
+};
 use s4_gateway::sigv4::SigV4Policy;
 use s4_gateway::store::{
     FileKeyStore, KeyRepository, KeyStore, MAX_CREDENTIAL_LABEL_BYTES, MAX_CREDENTIAL_TTL_SECONDS,
@@ -33,7 +36,7 @@ use std::convert::Infallible;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
@@ -240,50 +243,58 @@ impl http_body::Body for PollTrackingBody {
     }
 }
 
+fn test_pipeline_template() -> &'static StatePipelineTemplate {
+    static PIPELINES: OnceLock<StatePipelineTemplate> = OnceLock::new();
+    PIPELINES.get_or_init(|| {
+        // SAFETY: the process-wide fixture initializes the environment once,
+        // before any test state reads it.
+        unsafe {
+            std::env::set_var("AUTH_DISABLED", "0");
+            std::env::set_var("S4_SINGLE_TENANT", "1");
+            std::env::set_var("S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST", "127.0.0.1");
+            std::env::remove_var("S4_WORKSPACE_ENDPOINT_ALLOWLIST");
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("S4_KEYS_FILE");
+            std::env::remove_var("S3_ENDPOINT");
+            std::env::remove_var("S4_SECRET_KEK");
+            std::env::remove_var("S4_SERVICE_BUCKETS");
+            std::env::remove_var("S4_LEGACY_MAX_OBJECT_BYTES");
+            std::env::remove_var("S4_MAX_OBJECT_BYTES");
+            std::env::remove_var("S4_MAX_PIPELINE_OUTPUT_BYTES");
+            std::env::remove_var("S4_STREAMING_READ_MODE");
+            std::env::remove_var("S4_STREAMING_WRITE_MODE");
+            std::env::remove_var("S4_TRANSFORMED_READ_SPOOL");
+            std::env::remove_var("S4_PREFIX_SAFE_COMPONENT_HASHES");
+            std::env::remove_var("S4_SPOOL_DIR");
+            std::env::remove_var("S4_SPOOL_MAX_OBJECT_BYTES");
+            std::env::remove_var("S4_SPOOL_QUOTA_BYTES");
+            std::env::remove_var("S4_STREAMING_S3_PROVIDER");
+            std::env::remove_var("S4_MANAGED_STREAMING_MODE");
+            std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
+            std::env::remove_var("S4_MANAGED_PLACEMENT_VERSION");
+            std::env::remove_var("S4_DEV_MEMORY_STREAMING");
+            std::env::remove_var("S4_MULTIPART_MODE");
+            // Phase 12 removed the legacy buffered PUT/GET path entirely; the
+            // streaming in-memory dev backend is the only write/read path left.
+            std::env::set_var("S4_STREAMING_WRITE_MODE", "single");
+            std::env::set_var("S4_STREAMING_READ_MODE", "passthrough");
+            std::env::set_var("S4_DEV_MEMORY_STREAMING", "1");
+            // Load the built filter components so the full pipeline (including
+            // stable-encrypt) is available for joinable-read tests.
+            let components =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
+            std::env::set_var("S4_PLUGINS_DIR", components);
+        }
+        StatePipelineTemplate::from_env().expect("compile test pipeline components")
+    })
+}
+
 async fn test_state() -> Arc<AppState> {
-    // SAFETY: test-only env mutation; every test in this file sets the same
-    // values so concurrent runs stay deterministic.
-    unsafe {
-        std::env::set_var("AUTH_DISABLED", "0");
-        std::env::set_var("S4_SINGLE_TENANT", "1");
-        std::env::set_var("S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST", "127.0.0.1");
-        std::env::remove_var("S4_WORKSPACE_ENDPOINT_ALLOWLIST");
-        std::env::remove_var("DATABASE_URL");
-        std::env::remove_var("S4_KEYS_FILE");
-        std::env::remove_var("S3_ENDPOINT");
-        std::env::remove_var("S4_SECRET_KEK");
-        std::env::remove_var("S4_SERVICE_BUCKETS");
-        std::env::remove_var("S4_LEGACY_MAX_OBJECT_BYTES");
-        std::env::remove_var("S4_MAX_OBJECT_BYTES");
-        std::env::remove_var("S4_MAX_PIPELINE_OUTPUT_BYTES");
-        std::env::remove_var("S4_STREAMING_READ_MODE");
-        std::env::remove_var("S4_STREAMING_WRITE_MODE");
-        std::env::remove_var("S4_TRANSFORMED_READ_SPOOL");
-        std::env::remove_var("S4_PREFIX_SAFE_COMPONENT_HASHES");
-        std::env::remove_var("S4_SPOOL_DIR");
-        std::env::remove_var("S4_SPOOL_MAX_OBJECT_BYTES");
-        std::env::remove_var("S4_SPOOL_QUOTA_BYTES");
-        std::env::remove_var("S4_STREAMING_S3_PROVIDER");
-        std::env::remove_var("S4_MANAGED_STREAMING_MODE");
-        std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
-        std::env::remove_var("S4_MANAGED_PLACEMENT_VERSION");
-        std::env::remove_var("S4_DEV_MEMORY_STREAMING");
-        std::env::remove_var("S4_MULTIPART_MODE");
-        // Phase 12 removed the legacy buffered PUT/GET path entirely; the
-        // streaming in-memory dev backend is the only write/read path left.
-        std::env::set_var("S4_STREAMING_WRITE_MODE", "single");
-        std::env::set_var("S4_STREAMING_READ_MODE", "passthrough");
-        std::env::set_var("S4_DEV_MEMORY_STREAMING", "1");
-        // Load the built filter components so the full pipeline (including
-        // stable-encrypt) is available for joinable-read tests.
-        let components =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
-        std::env::set_var("S4_PLUGINS_DIR", components);
-    }
-    build_state(
+    build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
         default_wrapping().expect("wrapping"),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
+        test_pipeline_template(),
     )
     .await
     .expect("build_state")
@@ -4454,6 +4465,9 @@ async fn unmodified_rust_sdk_default_put_is_accepted() {
 
 #[tokio::test]
 async fn available_aws_cli_and_boto3_interoperate() {
+    if std::env::var("S4_RUN_EXTERNAL_CLIENT_INTEROP").as_deref() != Ok("1") {
+        return;
+    }
     let aws_available = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new("aws")
@@ -4472,9 +4486,14 @@ async fn available_aws_cli_and_boto3_interoperate() {
     )
     .await
     .is_ok_and(|result| result.is_ok_and(|output| output.status.success()));
-    if !aws_available && !boto3_available {
-        return;
-    }
+    assert!(
+        aws_available,
+        "S4_RUN_EXTERNAL_CLIENT_INTEROP requires AWS CLI"
+    );
+    assert!(
+        boto3_available,
+        "S4_RUN_EXTERNAL_CLIENT_INTEROP requires boto3"
+    );
 
     let mut state = test_state().await;
     Arc::get_mut(&mut state)

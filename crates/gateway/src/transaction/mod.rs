@@ -33,6 +33,8 @@ use uuid::Uuid;
 
 pub const DIRECT_PART_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RECONCILIATION_SLA: Duration = Duration::from_secs(5 * 60);
+pub const PROVIDER_MUTATION_AMBIGUITY_WINDOW: Duration = Duration::from_secs(75);
+pub const EXACT_ABSENCE_CONFIRMATION_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -81,7 +83,10 @@ impl OperationState {
             (self, next),
             (Self::Intent, Self::Open | Self::Aborting)
                 | (Self::Open, Self::Completing | Self::Aborting)
-                | (Self::Completing, Self::Committed | Self::CommitUnknown)
+                | (
+                    Self::Completing,
+                    Self::Committed | Self::CommitUnknown | Self::ProvenAborted
+                )
                 | (Self::CommitUnknown, Self::Committed | Self::ProvenAborted)
                 | (Self::Aborting, Self::ProvenAborted)
         )
@@ -99,11 +104,21 @@ impl fmt::Display for OperationState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceDestinationBinding {
+    pub backend_config_version: String,
+    pub capability_attestation_id: String,
+    pub routing_epoch: u64,
+    pub routing_lease_id: Uuid,
+    pub routing_fencing_token: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectDestination {
     pub backend_id: String,
     pub bucket: String,
     pub logical_key: String,
     pub physical_key: String,
+    pub workspace_binding: Option<WorkspaceDestinationBinding>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,6 +140,8 @@ pub struct OperationRecord {
     pub committed: Option<StoredObjectMeta>,
     pub lease_owner: Option<String>,
     pub lease_expires_at_ms: Option<i64>,
+    pub mutation_not_before_ms: Option<i64>,
+    pub exact_absence_observed_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -207,6 +224,8 @@ impl OperationRecord {
             committed: None,
             lease_owner: None,
             lease_expires_at_ms: None,
+            mutation_not_before_ms: None,
+            exact_absence_observed_at_ms: None,
             created_at_ms: now,
             updated_at_ms: now,
         }
@@ -315,6 +334,22 @@ pub trait OperationJournal: Send + Sync {
     async fn parts(&self, operation_id: Uuid) -> Result<Vec<PartRecord>, JournalError>;
     async fn append_evidence(&self, evidence: EvidenceRecord) -> Result<(), JournalError>;
     async fn evidence(&self, operation_id: Uuid) -> Result<Vec<EvidenceRecord>, JournalError>;
+    /// Extends the durable period during which an accepted remote mutation may
+    /// still commit, and invalidates any earlier absence observation.
+    async fn record_mutation_launch(
+        &self,
+        operation_id: Uuid,
+        not_before_ms: i64,
+    ) -> Result<(), JournalError>;
+    /// Records an exact absence observation once the mutation ambiguity window
+    /// has elapsed. Returns true only for a later observation separated by at
+    /// least `minimum_separation_ms`.
+    async fn confirm_exact_absence(
+        &self,
+        operation_id: Uuid,
+        observed_at_ms: i64,
+        minimum_separation_ms: i64,
+    ) -> Result<bool, JournalError>;
     async fn claim_reconcilable(
         &self,
         owner: &str,
@@ -505,6 +540,19 @@ pub enum CompletionProbe {
     Inconclusive,
 }
 
+/// Fence invoked immediately before and throughout each provider call.
+///
+/// Implementations renew the durable routing lease. Returning an error causes
+/// the in-flight provider future to be dropped and prevents any later probe,
+/// abort, or mutation from the stale worker.
+#[async_trait]
+pub trait ProviderMutationFence: Send + Sync {
+    fn heartbeat_interval(&self) -> Duration;
+    async fn assert_current(&self) -> Result<(), BackendError>;
+    async fn heartbeat(&self) -> Result<(), BackendError>;
+    async fn cancelled(&self);
+}
+
 #[async_trait]
 pub trait TransactionBackend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities;
@@ -646,6 +694,7 @@ pub struct OperationReconciler {
     backend: Arc<dyn TransactionBackend>,
     owner: String,
     lease: Duration,
+    exact_absence_confirmation_delay: Duration,
 }
 
 impl OperationReconciler {
@@ -660,6 +709,7 @@ impl OperationReconciler {
             backend,
             owner: owner.into(),
             lease: Duration::from_secs(30),
+            exact_absence_confirmation_delay: EXACT_ABSENCE_CONFIRMATION_DELAY,
         })
     }
 
@@ -684,6 +734,21 @@ impl OperationReconciler {
         } else {
             Ok(false)
         }
+    }
+
+    /// Reconciles a row already claimed by this reconciler's owner.
+    /// Workspace recovery uses this after journal claim and route-lease CAS so
+    /// no provider call can precede either durable ownership check.
+    pub async fn reconcile_claimed(
+        &self,
+        operation: OperationRecord,
+    ) -> Result<(), TransactionError> {
+        if operation.lease_owner.as_deref() != Some(self.owner.as_str()) {
+            return Err(TransactionError::Journal(JournalError::Conflict(
+                "reconciler does not own the claimed operation".to_string(),
+            )));
+        }
+        self.reconcile(operation).await
     }
 
     async fn reconcile(&self, operation: OperationRecord) -> Result<(), TransactionError> {
@@ -764,6 +829,16 @@ impl OperationReconciler {
                 if !self.backend.has_exact_version_recovery() {
                     meta.version_history_complete = false;
                 }
+                for version_id in &meta.superseded_version_ids {
+                    if meta.version_id.as_deref() == Some(version_id) {
+                        return Err(TransactionError::Journal(JournalError::Corrupt(
+                            "authoritative provider version was listed as redundant".to_string(),
+                        )));
+                    }
+                    self.backend
+                        .delete_object_version(operation, version_id)
+                        .await?;
+                }
                 let evidence_kind = if meta.version_history_complete {
                     "provider_version_history_complete"
                 } else {
@@ -802,6 +877,25 @@ impl OperationReconciler {
                     .await?;
             }
             CompletionProbe::ProvenAbsentExact => {
+                let observed_at_ms = unix_time_ms();
+                if !self
+                    .journal
+                    .confirm_exact_absence(
+                        operation.id,
+                        observed_at_ms,
+                        duration_ms(self.exact_absence_confirmation_delay),
+                    )
+                    .await?
+                {
+                    self.journal
+                        .append_evidence(EvidenceRecord::new(
+                            operation.id,
+                            "completion_exact_absence_pending",
+                            serde_json::json!({"observed_at_ms": observed_at_ms}),
+                        ))
+                        .await?;
+                    return Ok(());
+                }
                 self.abort_discovered(operation).await?;
                 self.journal
                     .append_evidence(EvidenceRecord::new(
@@ -876,6 +970,7 @@ mod tests {
             (OperationState::Open, OperationState::Aborting),
             (OperationState::Completing, OperationState::Committed),
             (OperationState::Completing, OperationState::CommitUnknown),
+            (OperationState::Completing, OperationState::ProvenAborted),
             (OperationState::CommitUnknown, OperationState::Committed),
             (OperationState::CommitUnknown, OperationState::ProvenAborted),
             (OperationState::Aborting, OperationState::ProvenAborted),
@@ -967,6 +1062,7 @@ mod tests {
             bucket: "provider-bucket".to_string(),
             logical_key: "logical/key".to_string(),
             physical_key: "managed/generation/key".to_string(),
+            workspace_binding: None,
         };
         let first = ManagedOperationScope::deterministic_child(
             parent,

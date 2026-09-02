@@ -1314,6 +1314,7 @@ impl ServiceStorage {
             bucket: self.backends[index].bucket.clone(),
             logical_key: logical.object_key(),
             physical_key: physical_key.to_string(),
+            workspace_binding: None,
         };
         let (operation_id, expected_namespace_epoch) = match child_identity {
             ManagedChildIdentity::Supplied(scope) => {
@@ -2670,6 +2671,7 @@ mod tests {
                 bucket: "bucket".to_string(),
                 logical_key: "bucket/key".to_string(),
                 physical_key: "managed/physical".to_string(),
+                workspace_binding: None,
             },
             ExpectedObject::default(),
             "tenant".to_string(),
@@ -2770,6 +2772,7 @@ mod tests {
                     bucket: provider.bucket.clone(),
                     logical_key: "bucket/key".to_string(),
                     physical_key: "managed/physical".to_string(),
+                    workspace_binding: None,
                 },
                 ExpectedObject::default(),
                 "tenant".to_string(),

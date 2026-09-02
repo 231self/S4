@@ -17,9 +17,14 @@ use crate::customer_headers;
 use crate::s3_safety::{s3_retry_config, s3_timeout_config};
 use crate::service_storage::ServiceStorage;
 use crate::store::MemoryStore;
+use crate::transaction::WorkspaceDestinationBinding;
 use crate::workspace_storage::{
-    RuntimeBackendConfig, WorkspaceId, WorkspaceStorageRepository, WorkspaceStorageRouting,
+    BackendConfigVersionId, CapabilityAttestationId, RuntimeBackendConfig, WorkspaceId,
+    WorkspaceOperationLease, WorkspaceStorageRepository, WorkspaceStorageRouting,
+    WorkspaceStreamingBackendIdentity,
 };
+
+pub use crate::workspace_storage::S3ProviderFamily as WorkspaceS3Provider;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StorageOperation {
@@ -40,10 +45,124 @@ pub enum BackendKind {
     Memory,
 }
 
+impl WorkspaceS3Provider {
+    fn classify(host: &str) -> Option<Self> {
+        let labels = host.split('.').collect::<Vec<_>>();
+        let aws_standard = matches!(labels.as_slice(), ["s3", "amazonaws", "com"])
+            || matches!(labels.as_slice(), ["s3-external-1", "amazonaws", "com"])
+            || matches!(labels.as_slice(), ["s3", region, "amazonaws", "com"] if aws_s3_region(region, false))
+            || matches!(labels.as_slice(), ["s3", "dualstack", region, "amazonaws", "com"] if aws_s3_region(region, false))
+            || matches!(labels.as_slice(), ["s3-fips", region, "amazonaws", "com"] if aws_s3_region(region, false))
+            || matches!(labels.as_slice(), ["s3-fips", "dualstack", region, "amazonaws", "com"] if aws_s3_region(region, false))
+            || matches!(labels.as_slice(), [legacy, "amazonaws", "com"] if legacy
+                .strip_prefix("s3-")
+                .is_some_and(|region| aws_s3_region(region, false)));
+        let aws_china = matches!(labels.as_slice(), ["s3", region, "amazonaws", "com", "cn"] if aws_s3_region(region, true))
+            || matches!(labels.as_slice(), ["s3", "dualstack", region, "amazonaws", "com", "cn"] if aws_s3_region(region, true))
+            || matches!(labels.as_slice(), ["s3-fips", region, "amazonaws", "com", "cn"] if aws_s3_region(region, true))
+            || matches!(labels.as_slice(), ["s3-fips", "dualstack", region, "amazonaws", "com", "cn"] if aws_s3_region(region, true));
+        if aws_standard || aws_china {
+            return Some(Self::Aws);
+        }
+        if host == "storage.googleapis.com" {
+            return Some(Self::Gcs);
+        }
+        if matches!(labels.as_slice(), ["s3", region, "backblazeb2", "com"] if valid_b2_region(region))
+        {
+            return Some(Self::B2);
+        }
+        if host.ends_with(".r2.cloudflarestorage.com") && labels.len() == 4 {
+            return Some(Self::R2);
+        }
+        if host.ends_with(".digitaloceanspaces.com") && labels.len() == 3 {
+            return Some(Self::DigitalOcean);
+        }
+        if (host == "s3.wasabisys.com" || (host.ends_with(".wasabisys.com") && labels.len() == 4))
+            && labels.first().is_some_and(|label| *label == "s3")
+        {
+            return Some(Self::Wasabi);
+        }
+        None
+    }
+}
+
+fn valid_b2_region(region: &str) -> bool {
+    let mut labels = region.split('-');
+    let (Some(country), Some(area), Some(cluster), None) =
+        (labels.next(), labels.next(), labels.next(), labels.next())
+    else {
+        return false;
+    };
+    country.len() == 2
+        && country.bytes().all(|byte| byte.is_ascii_lowercase())
+        && !area.is_empty()
+        && area.bytes().all(|byte| byte.is_ascii_lowercase())
+        && cluster.len() == 3
+        && cluster.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn aws_s3_region(region: &str, china_partition: bool) -> bool {
+    const STANDARD: &[&str] = &[
+        "af-south-1",
+        "ap-east-1",
+        "ap-east-2",
+        "ap-northeast-1",
+        "ap-northeast-2",
+        "ap-northeast-3",
+        "ap-south-1",
+        "ap-south-2",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-southeast-3",
+        "ap-southeast-4",
+        "ap-southeast-5",
+        "ap-southeast-6",
+        "ap-southeast-7",
+        "ca-central-1",
+        "ca-west-1",
+        "eu-central-1",
+        "eu-central-2",
+        "eu-north-1",
+        "eu-south-1",
+        "eu-south-2",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-west-3",
+        "il-central-1",
+        "me-central-1",
+        "me-south-1",
+        "mx-central-1",
+        "sa-east-1",
+        "us-east-1",
+        "us-east-2",
+        "us-gov-east-1",
+        "us-gov-west-1",
+        "us-west-1",
+        "us-west-2",
+    ];
+    const CHINA: &[&str] = &["cn-north-1", "cn-northwest-1"];
+    if china_partition {
+        CHINA.contains(&region)
+    } else {
+        STANDARD.contains(&region)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceS3Streaming {
+    pub provider: WorkspaceS3Provider,
+    pub identity: WorkspaceStreamingBackendIdentity,
+    pub routing_epoch: u64,
+}
+
 #[derive(Clone)]
 pub enum ResolvedBackend {
     PresignedHttp(Url),
-    S3 { kind: BackendKind, client: Client },
+    S3 {
+        kind: BackendKind,
+        client: Client,
+        workspace_streaming: Option<WorkspaceS3Streaming>,
+    },
     Managed(Arc<ServiceStorage>),
     Memory(Arc<MemoryStore>),
 }
@@ -194,6 +313,11 @@ impl BackendResolver {
                     .validate(&endpoint)
                     .await
                     .map_err(|_| "workspace storage is unavailable".to_string())?;
+                let workspace_streaming = workspace_streaming_binding(
+                    &endpoint,
+                    resolution.streaming.as_ref(),
+                    resolution.routing,
+                );
                 let credentials =
                     Credentials::new(access_key, secret_key, None, None, "s4-backend");
                 // Tenant-selected destinations must never inherit process proxy
@@ -216,6 +340,7 @@ impl BackendResolver {
                     backend: ResolvedBackend::S3 {
                         kind: BackendKind::PerUserS3,
                         client: Client::from_conf(s3_config),
+                        workspace_streaming,
                     },
                     workspace_routing,
                 });
@@ -237,6 +362,7 @@ impl BackendResolver {
                 backend: ResolvedBackend::S3 {
                     kind: BackendKind::GlobalS3,
                     client: client.clone(),
+                    workspace_streaming: None,
                 },
                 workspace_routing,
             });
@@ -246,6 +372,144 @@ impl BackendResolver {
             workspace_routing,
         })
     }
+
+    /// Reconstructs the exact historical BYO client referenced by a durable
+    /// operation. Current workspace config is deliberately not consulted.
+    pub async fn resolve_historical_workspace_s3(
+        &self,
+        workspace_id: &WorkspaceId,
+        binding: &WorkspaceDestinationBinding,
+    ) -> Result<ResolvedBackend, String> {
+        let config_version = BackendConfigVersionId::new(binding.backend_config_version.clone())
+            .map_err(|_| "workspace storage recovery identity is invalid".to_string())?;
+        let attestation_id =
+            CapabilityAttestationId::new(binding.capability_attestation_id.clone())
+                .map_err(|_| "workspace storage recovery identity is invalid".to_string())?;
+        let resolution = self
+            .workspace_storage
+            .get_runtime_resolution_by_version(workspace_id, &config_version)
+            .await
+            .map_err(|_| "historical workspace storage is unavailable".to_string())?;
+        let identity = resolution
+            .streaming
+            .as_ref()
+            .ok_or_else(|| "historical workspace storage is unattested".to_string())?;
+        if identity.config_version != config_version
+            || identity.attestation.id != attestation_id
+            || resolution.routing.stable_epoch() != Some(binding.routing_epoch)
+        {
+            return Err("historical workspace storage identity changed".to_string());
+        }
+        let RuntimeBackendConfig::S3Compatible {
+            endpoint,
+            access_key,
+            secret_key,
+            region,
+        } = resolution
+            .config
+            .ok_or_else(|| "historical workspace storage config is missing".to_string())?
+        else {
+            return Err("historical workspace storage kind changed".to_string());
+        };
+        let endpoint = self
+            .workspace_endpoint_policy
+            .validate(&endpoint)
+            .await
+            .map_err(|_| "historical workspace storage endpoint is unavailable".to_string())?;
+        let workspace_streaming =
+            workspace_streaming_binding(&endpoint, Some(identity), resolution.routing)
+                .ok_or_else(|| "historical workspace storage attestation is invalid".to_string())?;
+        let credentials = Credentials::new(access_key, secret_key, None, None, "s4-recovery");
+        let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new(region))
+            .endpoint_url(endpoint.as_str())
+            .credentials_provider(credentials)
+            .retry_config(s3_retry_config())
+            .timeout_config(s3_timeout_config())
+            .http_client(workspace_s3_http_client())
+            .load()
+            .await;
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(true)
+            .build();
+        Ok(ResolvedBackend::S3 {
+            kind: BackendKind::PerUserS3,
+            client: Client::from_conf(s3_config),
+            workspace_streaming: Some(workspace_streaming),
+        })
+    }
+
+    /// Startup/periodic reconciliation hook for a nonterminal journal row.
+    /// Private adapters call this before handing the exact backend to an
+    /// `OperationReconciler`.
+    pub async fn recover_workspace_operation(
+        &self,
+        workspace_id: &WorkspaceId,
+        operation_id: uuid::Uuid,
+        binding: &WorkspaceDestinationBinding,
+        journal_claim_owner: &str,
+        ttl: Duration,
+    ) -> Result<(ResolvedBackend, WorkspaceOperationLease), String> {
+        let config_version = BackendConfigVersionId::new(binding.backend_config_version.clone())
+            .map_err(|_| "workspace storage recovery identity is invalid".to_string())?;
+        let attestation_id =
+            CapabilityAttestationId::new(binding.capability_attestation_id.clone())
+                .map_err(|_| "workspace storage recovery identity is invalid".to_string())?;
+        let expected = WorkspaceOperationLease {
+            operation_id,
+            lease_id: binding.routing_lease_id,
+            config_version,
+            attestation_id,
+            routing_epoch: binding.routing_epoch,
+            fencing_token: binding.routing_fencing_token,
+            // Expiry is deliberately not journaled. The repository compares
+            // its durable expiry while CASing the persisted identity above.
+            expires_at_ms: 0,
+        };
+        let lease = self
+            .workspace_storage
+            .recover_streaming_operation_lease(workspace_id, &expected, journal_claim_owner, ttl)
+            .await
+            .map_err(|_| "workspace storage recovery lease is unavailable".to_string())?;
+        if lease.operation_id != operation_id
+            || lease.lease_id != binding.routing_lease_id
+            || lease.config_version.as_str() != binding.backend_config_version
+            || lease.attestation_id.as_str() != binding.capability_attestation_id
+            || lease.routing_epoch != binding.routing_epoch
+            || lease.fencing_token <= binding.routing_fencing_token
+        {
+            return Err("workspace storage recovery fence changed".to_string());
+        }
+        let backend = self
+            .resolve_historical_workspace_s3(workspace_id, binding)
+            .await?;
+        Ok((backend, lease))
+    }
+}
+
+fn workspace_streaming_binding(
+    endpoint: &Url,
+    identity: Option<&WorkspaceStreamingBackendIdentity>,
+    routing: WorkspaceStorageRouting,
+) -> Option<WorkspaceS3Streaming> {
+    if endpoint.scheme() != "https" || endpoint.port().is_some() || endpoint.path() != "/" {
+        return None;
+    }
+    let provider = WorkspaceS3Provider::classify(endpoint.host_str()?)?;
+    let identity = identity?.clone();
+    identity.attestation.validate().ok()?;
+    if identity.attestation.provider != provider {
+        return None;
+    }
+    let routing_epoch = routing.stable_epoch()?;
+    if routing_epoch == 0 {
+        return None;
+    }
+    Some(WorkspaceS3Streaming {
+        provider,
+        identity,
+        routing_epoch,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,6 +603,16 @@ impl WorkspaceEndpointPolicy {
     pub async fn validate(&self, endpoint: &str) -> Result<Url, String> {
         if !endpoint.is_ascii() {
             return Err("workspace endpoint must use an ASCII hostname".to_string());
+        }
+        let authority = endpoint
+            .split_once("://")
+            .map(|(_, remainder)| remainder)
+            .unwrap_or_default()
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        if authority.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err("workspace endpoint host must be lowercase".to_string());
         }
         let url = Url::parse(endpoint)
             .map_err(|_| "workspace endpoint must be an absolute HTTP(S) URL".to_string())?;
@@ -1465,6 +1739,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_provider_families_receive_fenced_immutable_streaming_profiles() {
+        use crate::transaction::{
+            BackendCapabilities, CompletionReconciliation, ConditionalReadCapability,
+            IncompleteUploadDiscovery, ListCapability, MultipartResponseCapability,
+            ResponseChecksumCapability, VersioningCapability,
+        };
+        use crate::workspace_storage::{
+            BackendConfigVersionId, CapabilityAttestationId, S3CapabilityAttestation,
+            S3StreamingPermissions, WorkspaceStorageTransitionState,
+            WorkspaceStreamingBackendIdentity,
+        };
+
+        fn identity(
+            provider: WorkspaceS3Provider,
+            version: &str,
+        ) -> WorkspaceStreamingBackendIdentity {
+            WorkspaceStreamingBackendIdentity {
+                config_version: BackendConfigVersionId::new(version).unwrap(),
+                attestation: S3CapabilityAttestation {
+                    id: CapabilityAttestationId::new(format!("attestation-{version}")).unwrap(),
+                    provider,
+                    capabilities: BackendCapabilities {
+                        incomplete_upload_discovery:
+                            IncompleteUploadDiscovery::ExactKeyAndStartTime,
+                        abort_incomplete_upload: true,
+                        cleanup_sla: Some(Duration::from_secs(60)),
+                        lifecycle_rule: false,
+                        versioning: VersioningCapability::Optional,
+                        conditional_reads: ConditionalReadCapability::Etag,
+                        response_checksums: ResponseChecksumCapability::Unsupported,
+                        list_operations: ListCapability::V1AndV2,
+                        multipart_responses: MultipartResponseCapability::Standard,
+                        completion_reconciliation:
+                            CompletionReconciliation::HeadWithOperationIdentity,
+                    },
+                    permissions: S3StreamingPermissions {
+                        put_object: true,
+                        create_multipart_upload: true,
+                        upload_part: true,
+                        complete_multipart_upload: true,
+                        abort_multipart_upload: true,
+                        list_multipart_uploads: true,
+                        list_parts: true,
+                        head_object: true,
+                        read_operation_metadata: true,
+                        list_object_versions: true,
+                        delete_object_version: true,
+                    },
+                    exact_version_recovery: provider == WorkspaceS3Provider::B2,
+                },
+            }
+        }
+
+        for (endpoint, expected_provider) in [
+            ("https://s3.amazonaws.com", WorkspaceS3Provider::Aws),
+            ("https://storage.googleapis.com", WorkspaceS3Provider::Gcs),
+            (
+                "https://s3.us-east-005.backblazeb2.com",
+                WorkspaceS3Provider::B2,
+            ),
+            (
+                "https://account.r2.cloudflarestorage.com",
+                WorkspaceS3Provider::R2,
+            ),
+            (
+                "https://nyc3.digitaloceanspaces.com",
+                WorkspaceS3Provider::DigitalOcean,
+            ),
+            (
+                "https://s3.us-east-1.wasabisys.com",
+                WorkspaceS3Provider::Wasabi,
+            ),
+        ] {
+            let url = Url::parse(endpoint).unwrap();
+            let config_identity = identity(expected_provider, "config-v1");
+            let first = workspace_streaming_binding(
+                &url,
+                Some(&config_identity),
+                WorkspaceStorageRouting::Persisted {
+                    routing_epoch: 17,
+                    transition_state: WorkspaceStorageTransitionState::Stable,
+                },
+            )
+            .unwrap();
+            let retry = workspace_streaming_binding(
+                &url,
+                Some(&config_identity),
+                WorkspaceStorageRouting::Persisted {
+                    routing_epoch: 17,
+                    transition_state: WorkspaceStorageTransitionState::Stable,
+                },
+            )
+            .unwrap();
+            assert_eq!(first, retry, "{endpoint}");
+            assert_eq!(first.provider, expected_provider, "{endpoint}");
+            first
+                .identity
+                .attestation
+                .capabilities
+                .streaming_eligibility()
+                .unwrap();
+
+            let next_identity = identity(expected_provider, "config-v2");
+            let changed_version = workspace_streaming_binding(
+                &url,
+                Some(&next_identity),
+                WorkspaceStorageRouting::Persisted {
+                    routing_epoch: 17,
+                    transition_state: WorkspaceStorageTransitionState::Stable,
+                },
+            )
+            .unwrap();
+            let changed_routing = workspace_streaming_binding(
+                &url,
+                Some(&config_identity),
+                WorkspaceStorageRouting::Persisted {
+                    routing_epoch: 18,
+                    transition_state: WorkspaceStorageTransitionState::Stable,
+                },
+            )
+            .unwrap();
+            assert_ne!(first.identity, changed_version.identity);
+            assert_ne!(first.routing_epoch, changed_routing.routing_epoch);
+        }
+    }
+
+    #[test]
+    fn workspace_streaming_profiles_refuse_unknown_or_unfenced_endpoints() {
+        use crate::workspace_storage::WorkspaceStorageTransitionState;
+
+        for endpoint in [
+            "https://objects.example",
+            "https://ec2.us-east-1.amazonaws.com",
+            "https://bucket.s3.us-east-1.amazonaws.com",
+            "https://evilbackblazeb2.com",
+            "https://account.r2.cloudflarestorage.com/prefix",
+            "https://s3.us-east-1.wasabisys.com:8443",
+        ] {
+            assert!(
+                workspace_streaming_binding(
+                    &Url::parse(endpoint).unwrap(),
+                    None,
+                    WorkspaceStorageRouting::Persisted {
+                        routing_epoch: 1,
+                        transition_state: WorkspaceStorageTransitionState::Stable,
+                    },
+                )
+                .is_none(),
+                "{endpoint}",
+            );
+        }
+        assert!(
+            workspace_streaming_binding(
+                &Url::parse("https://s3.amazonaws.com").unwrap(),
+                None,
+                WorkspaceStorageRouting::Unfenced,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn hosted_endpoint_grammar_accepts_only_data_plane_origins() {
+        for (host, provider) in [
+            ("s3.amazonaws.com", WorkspaceS3Provider::Aws),
+            ("s3.us-east-1.amazonaws.com", WorkspaceS3Provider::Aws),
+            ("s3-us-west-2.amazonaws.com", WorkspaceS3Provider::Aws),
+            ("s3-external-1.amazonaws.com", WorkspaceS3Provider::Aws),
+            (
+                "s3.dualstack.eu-west-1.amazonaws.com",
+                WorkspaceS3Provider::Aws,
+            ),
+            (
+                "s3-fips.us-gov-west-1.amazonaws.com",
+                WorkspaceS3Provider::Aws,
+            ),
+            (
+                "s3-fips.dualstack.us-gov-west-1.amazonaws.com",
+                WorkspaceS3Provider::Aws,
+            ),
+            ("s3.cn-north-1.amazonaws.com.cn", WorkspaceS3Provider::Aws),
+            ("storage.googleapis.com", WorkspaceS3Provider::Gcs),
+            ("s3.us-east-005.backblazeb2.com", WorkspaceS3Provider::B2),
+            ("account.r2.cloudflarestorage.com", WorkspaceS3Provider::R2),
+            (
+                "nyc3.digitaloceanspaces.com",
+                WorkspaceS3Provider::DigitalOcean,
+            ),
+            ("s3.us-east-1.wasabisys.com", WorkspaceS3Provider::Wasabi),
+        ] {
+            assert_eq!(
+                WorkspaceS3Provider::classify(host),
+                Some(provider),
+                "{host}"
+            );
+        }
+
+        for host in [
+            "bucket.s3.us-east-1.amazonaws.com",
+            "bucket.s3-accesspoint.us-east-1.amazonaws.com",
+            "name-123.s3-accesspoint.us-east-1.amazonaws.com",
+            "name-123.s3-object-lambda.us-east-1.amazonaws.com",
+            "name-123.s3-outposts.us-east-1.amazonaws.com",
+            "s3-control.us-east-1.amazonaws.com",
+            "bucket.s3-accelerate.amazonaws.com",
+            "bucket.s3-accelerate.dualstack.amazonaws.com",
+            "s3-accelerate.amazonaws.com",
+            "s3-website-us-east-1.amazonaws.com",
+            "s3-website.us-east-1.amazonaws.com",
+            "s3-evil.amazonaws.com",
+            "s3-mars-1.amazonaws.com",
+            "s3.evil.amazonaws.com",
+            "s3.dualstack.evil.amazonaws.com",
+            "s3-fips.evil.amazonaws.com",
+            "s3-external-2.amazonaws.com",
+            "ec2.us-east-1.amazonaws.com",
+            "r2.cloudflarestorage.com",
+            "bucket.account.r2.cloudflarestorage.com",
+            "bucket.nyc3.digitaloceanspaces.com",
+            "s3.foo.us-east-005.backblazeb2.com",
+            "s3.evil.backblazeb2.com",
+            "s3.us-east-5.backblazeb2.com",
+            "s3.us-east-0005.backblazeb2.com",
+            "s3.u-east-005.backblazeb2.com",
+            "s3.us-ea5t-005.backblazeb2.com",
+        ] {
+            assert_eq!(WorkspaceS3Provider::classify(host), None, "{host}");
+        }
+    }
+
+    #[tokio::test]
     async fn persisted_mode_transition_fences_new_routing() {
         use crate::service_storage::ServiceBackend;
         use crate::workspace_storage::{
@@ -1681,6 +2186,9 @@ mod tests {
             "https://user@objects.example",
             "https://objects.example?token=secret",
             "https://objects.example#fragment",
+            "https://Objects.example",
+            "https://s3.US-east-005.backblazeb2.com",
+            "https://s3.us-\u{00e9}ast-005.backblazeb2.com",
         ] {
             assert!(policy.validate(endpoint).await.is_err(), "{endpoint}");
         }

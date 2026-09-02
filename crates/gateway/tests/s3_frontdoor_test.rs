@@ -11,7 +11,9 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use s4_gateway::Gateway;
-use s4_gateway::backend::{PresignedHttpPolicy, TokioAddressResolver};
+use s4_gateway::backend::{
+    AddressResolver, PresignedHttpPolicy, TokioAddressResolver, WorkspaceEndpointPolicy,
+};
 use s4_gateway::control::{
     AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
     BlockReason, ControlPlane, MeteringError, NoopControlPlane, RequestKind, StreamingWriteMode,
@@ -33,10 +35,21 @@ use s4_gateway::store::{
     FileKeyStore, KeyRepository, KeyStore, MAX_CREDENTIAL_LABEL_BYTES, MAX_CREDENTIAL_TTL_SECONDS,
     MAX_PUBLIC_KEY_PEM_BYTES, PostgresKeyStore,
 };
-use s4_gateway::transaction::SpoolQuota;
-use s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
+use s4_gateway::transaction::{
+    BackendCapabilities, CompletionReconciliation, ConditionalReadCapability,
+    InMemoryOperationJournal, IncompleteUploadDiscovery, ListCapability,
+    MultipartResponseCapability, OperationJournal, ResponseChecksumCapability, SpoolQuota,
+    VersioningCapability,
+};
+use s4_gateway::workspace_storage::{
+    BackendConfigRequest, BackendConfigResponse, BackendConfigVersionId, CapabilityAttestationId,
+    InMemoryWorkspaceStorageRepository, RuntimeBackendConfig, S3CapabilityAttestation,
+    S3ProviderFamily, S3StreamingPermissions, WorkspaceId, WorkspaceStorageError,
+    WorkspaceStorageRepository, WorkspaceStorageResolution, WorkspaceStreamingBackendIdentity,
+};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -72,6 +85,101 @@ struct FrameSequenceBody {
 
 struct ChannelBody {
     receiver: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
+struct FixedPublicResolver;
+
+#[async_trait::async_trait]
+impl AddressResolver for FixedPublicResolver {
+    async fn resolve(&self, _host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )])
+    }
+}
+
+struct RejectingAttestedRepository;
+
+#[async_trait::async_trait]
+impl WorkspaceStorageRepository for RejectingAttestedRepository {
+    async fn resolve_workspace(&self, user_id: &str) -> Result<WorkspaceId, WorkspaceStorageError> {
+        WorkspaceId::new(user_id)
+    }
+
+    async fn get_runtime_config(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<RuntimeBackendConfig>, WorkspaceStorageError> {
+        Ok(self.get_runtime_resolution(workspace_id).await?.config)
+    }
+
+    async fn get_runtime_resolution(
+        &self,
+        _workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceStorageResolution, WorkspaceStorageError> {
+        Ok(WorkspaceStorageResolution::persisted_attested(
+            RuntimeBackendConfig::S3Compatible {
+                endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                region: "us-east-1".to_string(),
+            },
+            7,
+            WorkspaceStreamingBackendIdentity {
+                config_version: BackendConfigVersionId::new("config-v1").unwrap(),
+                attestation: S3CapabilityAttestation {
+                    id: CapabilityAttestationId::new("attestation-v1").unwrap(),
+                    provider: S3ProviderFamily::Aws,
+                    capabilities: BackendCapabilities {
+                        incomplete_upload_discovery:
+                            IncompleteUploadDiscovery::ExactKeyAndStartTime,
+                        abort_incomplete_upload: true,
+                        cleanup_sla: Some(Duration::from_secs(60)),
+                        lifecycle_rule: false,
+                        versioning: VersioningCapability::Optional,
+                        conditional_reads: ConditionalReadCapability::Etag,
+                        response_checksums: ResponseChecksumCapability::Unsupported,
+                        list_operations: ListCapability::V1AndV2,
+                        multipart_responses: MultipartResponseCapability::Standard,
+                        completion_reconciliation:
+                            CompletionReconciliation::HeadWithOperationIdentity,
+                    },
+                    permissions: S3StreamingPermissions {
+                        put_object: true,
+                        create_multipart_upload: true,
+                        upload_part: true,
+                        complete_multipart_upload: true,
+                        abort_multipart_upload: true,
+                        list_multipart_uploads: true,
+                        list_parts: true,
+                        head_object: true,
+                        read_operation_metadata: true,
+                        list_object_versions: false,
+                        delete_object_version: false,
+                    },
+                    exact_version_recovery: false,
+                },
+            },
+        ))
+    }
+
+    async fn get_public_config(
+        &self,
+        _workspace_id: &WorkspaceId,
+    ) -> Result<BackendConfigResponse, WorkspaceStorageError> {
+        Ok(BackendConfigResponse::unconfigured())
+    }
+
+    async fn put_config(
+        &self,
+        _workspace_id: &WorkspaceId,
+        _request: BackendConfigRequest,
+    ) -> Result<BackendConfigResponse, WorkspaceStorageError> {
+        Err(WorkspaceStorageError::UnsupportedConfig(
+            "test repository is immutable".to_string(),
+        ))
+    }
 }
 
 impl FrameSequenceBody {
@@ -1974,6 +2082,77 @@ async fn unsupported_streaming_backend_is_rejected_without_polling_body() {
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     assert_eq!(polls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn avro_acquires_workspace_lease_before_first_body_poll() {
+    let mut state = build_state_with_pipeline_template(
+        Arc::new(NoopControlPlane),
+        default_wrapping().expect("wrapping"),
+        Arc::new(RejectingAttestedRepository),
+        test_pipeline_template(),
+    )
+    .await
+    .expect("build attested test state");
+    let (access_key, secret_key) = make_key(&state).await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_write_mode = StreamingWriteMode::Single;
+    state_mut.binary_avro_enabled = true;
+    state_mut.dev_memory_streaming_enabled = false;
+    let journal: Arc<dyn OperationJournal> = Arc::new(InMemoryOperationJournal::durable_for_test());
+    state_mut.operation_journal = Some(journal);
+    state_mut.workspace_endpoint_policy = WorkspaceEndpointPolicy::new(
+        true,
+        Vec::<String>::new(),
+        Vec::<String>::new(),
+        Arc::new(FixedPublicResolver),
+    )
+    .unwrap();
+    let app = build_router(state);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/stream/rejected.avro")
+            .header(header::CONTENT_TYPE, "application/avro")
+            .body(Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::from_static(b"must not be read")),
+            }))
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "default-rejecting lease repository must fail before Avro body polling"
+    );
+}
+
+#[tokio::test]
+async fn avro_decoder_failure_aborts_admitted_sink_without_visibility() {
+    let mut state = test_state().await;
+    let (access_key, secret_key) = make_key(&state).await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.binary_avro_enabled = true;
+    state_mut.dev_memory_streaming_enabled = true;
+    let app = build_router(state.clone());
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/stream/invalid.avro")
+            .header(header::CONTENT_TYPE, "application/avro")
+            .body(Body::from("not an Avro object container"))
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
+
+    let response = app.oneshot(request).await.unwrap();
+    assert!(!response.status().is_success());
+    assert!(state.store.get("stream", "invalid.avro").is_none());
 }
 
 #[tokio::test]

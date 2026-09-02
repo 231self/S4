@@ -1,10 +1,12 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, ServerSideEncryption};
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::{Buf, Bytes, BytesMut};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -13,10 +15,11 @@ use crate::s3_safety::record_s3_failure;
 
 use super::{
     AbortSignal, BackendCapabilities, BackendError, CompletionProbe, DIRECT_PART_BYTES,
-    DiscoveredMultipartPart, DiscoveredObjectVersion, DiscoveredUpload, EvidenceRecord,
-    MultipartUploadInspection, ObjectDestination, ObjectSinkTransaction, OperationJournal,
-    OperationRecord, OperationState, PartRecord, SinkCommitState, StoredObjectMeta,
-    TransactionBackend, TransactionError, UploadedPart, sha256_hex, unix_time_ms,
+    DiscoveredMultipartPart, DiscoveredObjectVersion, DiscoveredUpload,
+    EXACT_ABSENCE_CONFIRMATION_DELAY, EvidenceRecord, MultipartUploadInspection, ObjectDestination,
+    ObjectSinkTransaction, OperationJournal, OperationRecord, OperationState,
+    PROVIDER_MUTATION_AMBIGUITY_WINDOW, PartRecord, ProviderMutationFence, SinkCommitState,
+    StoredObjectMeta, TransactionBackend, TransactionError, UploadedPart, sha256_hex, unix_time_ms,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +41,7 @@ pub struct AwsS3TransactionBackend {
     capabilities: BackendCapabilities,
     server_side_encryption: Option<S3ServerSideEncryption>,
     exact_version_recovery: bool,
+    mutation_fence: Option<Arc<dyn ProviderMutationFence>>,
 }
 
 impl AwsS3TransactionBackend {
@@ -49,6 +53,7 @@ impl AwsS3TransactionBackend {
             capabilities,
             server_side_encryption: None,
             exact_version_recovery: false,
+            mutation_fence: None,
         }
     }
 
@@ -65,9 +70,43 @@ impl AwsS3TransactionBackend {
             .with_exact_version_recovery()
     }
 
+    /// BYO B2 uses exact version recovery but must not inherit managed-storage
+    /// SSE requirements; customer buckets may not grant that capability.
+    pub fn new_b2(client: Client, capabilities: BackendCapabilities) -> Self {
+        Self::new(client, capabilities).with_exact_version_recovery()
+    }
+
     fn with_exact_version_recovery(mut self) -> Self {
         self.exact_version_recovery = true;
         self
+    }
+
+    pub fn with_mutation_fence(mut self, fence: Arc<dyn ProviderMutationFence>) -> Self {
+        self.mutation_fence = Some(fence);
+        self
+    }
+
+    async fn fenced<F, T>(&self, future: F) -> Result<T, BackendError>
+    where
+        F: Future<Output = T>,
+    {
+        let Some(fence) = &self.mutation_fence else {
+            return Ok(future.await);
+        };
+        fence.assert_current().await?;
+        let interval = fence
+            .heartbeat_interval()
+            .max(std::time::Duration::from_millis(1));
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                result = &mut future => return Ok(result),
+                () = tokio::time::sleep(interval) => fence.heartbeat().await?,
+                () = fence.cancelled() => return Err(BackendError::ambiguous(
+                    "provider call cancelled after routing fence loss",
+                )),
+            }
+        }
     }
 
     fn encryption_matches(&self, actual: Option<&ServerSideEncryption>) -> bool {
@@ -92,13 +131,19 @@ impl AwsS3TransactionBackend {
                     && version.encryption_matches
                     && !version.delete_marker
             }),
-            None => versions.iter().find(|version| {
-                version.is_latest
-                    && version.operation_matches
-                    && version.expected_metadata_matches
-                    && version.encryption_matches
-                    && !version.delete_marker
-            }),
+            None => versions
+                .iter()
+                .filter(|version| {
+                    version.operation_matches
+                        && version.expected_metadata_matches
+                        && version.encryption_matches
+                        && !version.delete_marker
+                })
+                .max_by(|left, right| {
+                    left.last_modified_ms
+                        .cmp(&right.last_modified_ms)
+                        .then_with(|| left.version_id.cmp(&right.version_id))
+                }),
         };
         let Some(candidate) = candidate else {
             return Ok(None);
@@ -135,16 +180,26 @@ impl AwsS3TransactionBackend {
         }
 
         let upload = self
-            .client
-            .create_multipart_upload()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .set_content_type(operation.expected.metadata.get("content-type").cloned())
-            .set_metadata(Some(object_metadata(operation)))
-            .set_server_side_encryption(self.server_side_encryption.map(|value| value.sdk_value()))
-            .send()
-            .await
-            .map_err(|error| ambiguous("rewrite_create_multipart", &error))?;
+            .fenced(
+                self.client
+                    .create_multipart_upload()
+                    .bucket(&operation.destination.bucket)
+                    .key(&operation.destination.physical_key)
+                    .set_content_type(operation.expected.metadata.get("content-type").cloned())
+                    .set_metadata(Some(object_metadata(operation)))
+                    .set_server_side_encryption(
+                        self.server_side_encryption.map(|value| value.sdk_value()),
+                    )
+                    .send(),
+            )
+            .await?
+            .map_err(|error| {
+                provider_error(
+                    "rewrite_create_multipart",
+                    ProviderErrorPhase::AfterPossibleMutation,
+                    &error,
+                )
+            })?;
         let upload_id = upload.upload_id().ok_or_else(|| {
             BackendError::ambiguous("metadata rewrite create-multipart response omitted upload ID")
         })?;
@@ -172,17 +227,25 @@ impl AwsS3TransactionBackend {
                 let part_number = i32::try_from(part_number)
                     .map_err(|_| BackendError::definitive("multipart object has too many parts"))?;
                 let output = self
-                    .client
-                    .upload_part_copy()
-                    .bucket(&operation.destination.bucket)
-                    .key(&operation.destination.physical_key)
-                    .upload_id(upload_id)
-                    .part_number(part_number)
-                    .copy_source(&source)
-                    .copy_source_range(format!("bytes={start}-{end}"))
-                    .send()
-                    .await
-                    .map_err(|error| ambiguous("rewrite_upload_part_copy", &error))?;
+                    .fenced(
+                        self.client
+                            .upload_part_copy()
+                            .bucket(&operation.destination.bucket)
+                            .key(&operation.destination.physical_key)
+                            .upload_id(upload_id)
+                            .part_number(part_number)
+                            .copy_source(&source)
+                            .copy_source_range(format!("bytes={start}-{end}"))
+                            .send(),
+                    )
+                    .await?
+                    .map_err(|error| {
+                        provider_error(
+                            "rewrite_upload_part_copy",
+                            ProviderErrorPhase::AfterPossibleMutation,
+                            &error,
+                        )
+                    })?;
                 let etag = output
                     .copy_part_result()
                     .and_then(|result| result.e_tag())
@@ -199,19 +262,27 @@ impl AwsS3TransactionBackend {
                 );
             }
             let output = self
-                .client
-                .complete_multipart_upload()
-                .bucket(&operation.destination.bucket)
-                .key(&operation.destination.physical_key)
-                .upload_id(upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(parts))
-                        .build(),
+                .fenced(
+                    self.client
+                        .complete_multipart_upload()
+                        .bucket(&operation.destination.bucket)
+                        .key(&operation.destination.physical_key)
+                        .upload_id(upload_id)
+                        .multipart_upload(
+                            CompletedMultipartUpload::builder()
+                                .set_parts(Some(parts))
+                                .build(),
+                        )
+                        .send(),
                 )
-                .send()
-                .await
-                .map_err(|error| ambiguous("rewrite_complete_multipart", &error))?;
+                .await?
+                .map_err(|error| {
+                    provider_error(
+                        "rewrite_complete_multipart",
+                        ProviderErrorPhase::AfterPossibleMutation,
+                        &error,
+                    )
+                })?;
             let stored = StoredObjectMeta {
                 etag: output.e_tag().map(ToOwned::to_owned),
                 version_id: output.version_id().map(ToOwned::to_owned),
@@ -237,13 +308,15 @@ impl AwsS3TransactionBackend {
         }
         .await;
         if result.is_err()
-            && let Err(error) = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&operation.destination.bucket)
-                .key(&operation.destination.physical_key)
-                .upload_id(upload_id)
-                .send()
+            && let Ok(Err(error)) = self
+                .fenced(
+                    self.client
+                        .abort_multipart_upload()
+                        .bucket(&operation.destination.bucket)
+                        .key(&operation.destination.physical_key)
+                        .upload_id(upload_id)
+                        .send(),
+                )
                 .await
         {
             record_s3_failure("rewrite_abort_multipart", &error);
@@ -261,12 +334,14 @@ impl AwsS3TransactionBackend {
             return Ok(CompletionProbe::Committed(stored));
         }
         match self
-            .client
-            .head_object()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .send()
-            .await
+            .fenced(
+                self.client
+                    .head_object()
+                    .bucket(&operation.destination.bucket)
+                    .key(&operation.destination.physical_key)
+                    .send(),
+            )
+            .await?
         {
             Ok(output) => {
                 let matches_operation = output
@@ -328,7 +403,11 @@ impl AwsS3TransactionBackend {
                     Ok(CompletionProbe::ProvenAbsent)
                 }
             }
-            Err(error) => Err(ambiguous("probe_head_object", &error)),
+            Err(error) => Err(provider_error(
+                "probe_head_object",
+                ProviderErrorPhase::Observation,
+                &error,
+            )),
         }
     }
 }
@@ -395,11 +474,67 @@ fn copy_source(operation: &OperationRecord, version_id: Option<&str>) -> String 
     source
 }
 
-fn ambiguous<E, R>(
+#[derive(Clone, Copy)]
+enum ProviderErrorPhase {
+    Mutation,
+    CompleteMultipart,
+    AfterPossibleMutation,
+    Observation,
+}
+
+fn provider_error<E>(
     operation: &'static str,
-    error: &aws_smithy_runtime_api::client::result::SdkError<E, R>,
-) -> BackendError {
-    BackendError::ambiguous(record_s3_failure(operation, error).to_string())
+    phase: ProviderErrorPhase,
+    error: &aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> BackendError
+where
+    E: ProvideErrorMetadata,
+{
+    let failure = record_s3_failure(operation, error);
+    let definitive = match error {
+        aws_smithy_runtime_api::client::result::SdkError::ConstructionFailure(_) => {
+            matches!(
+                phase,
+                ProviderErrorPhase::Mutation | ProviderErrorPhase::CompleteMultipart
+            )
+        }
+        aws_smithy_runtime_api::client::result::SdkError::ServiceError(context) => {
+            let status = context.raw().status().as_u16();
+            let ambiguous_code = context.err().code().is_some_and(|code| {
+                code.to_ascii_lowercase().contains("timeout")
+                    || matches!(
+                        code,
+                        "SlowDown"
+                            | "Throttling"
+                            | "ThrottlingException"
+                            | "TooManyRequests"
+                            | "TooManyRequestsException"
+                    )
+            });
+            match (status, ambiguous_code) {
+                (_, true) | (408 | 429 | 500..=599, _) => false,
+                (400..=499, false) => match phase {
+                    ProviderErrorPhase::Mutation => true,
+                    ProviderErrorPhase::CompleteMultipart => {
+                        context.err().code() != Some("NoSuchUpload")
+                    }
+                    ProviderErrorPhase::AfterPossibleMutation | ProviderErrorPhase::Observation => {
+                        false
+                    }
+                },
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if definitive {
+        BackendError::definitive(failure.to_string())
+    } else {
+        BackendError::ambiguous(failure.to_string())
+    }
 }
 
 #[async_trait]
@@ -418,17 +553,21 @@ impl TransactionBackend for AwsS3TransactionBackend {
         body: Bytes,
     ) -> Result<StoredObjectMeta, BackendError> {
         let output = self
-            .client
-            .put_object()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .set_content_type(operation.expected.metadata.get("content-type").cloned())
-            .set_metadata(Some(object_metadata(operation)))
-            .set_server_side_encryption(self.server_side_encryption.map(|value| value.sdk_value()))
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .map_err(|error| ambiguous("put_object", &error))?;
+            .fenced(
+                self.client
+                    .put_object()
+                    .bucket(&operation.destination.bucket)
+                    .key(&operation.destination.physical_key)
+                    .set_content_type(operation.expected.metadata.get("content-type").cloned())
+                    .set_metadata(Some(object_metadata(operation)))
+                    .set_server_side_encryption(
+                        self.server_side_encryption.map(|value| value.sdk_value()),
+                    )
+                    .body(ByteStream::from(body))
+                    .send(),
+            )
+            .await?
+            .map_err(|error| provider_error("put_object", ProviderErrorPhase::Mutation, &error))?;
         let stored = StoredObjectMeta {
             etag: output.e_tag().map(ToOwned::to_owned),
             version_id: output.version_id().map(ToOwned::to_owned),
@@ -453,16 +592,22 @@ impl TransactionBackend for AwsS3TransactionBackend {
 
     async fn create_multipart(&self, operation: &OperationRecord) -> Result<String, BackendError> {
         let output = self
-            .client
-            .create_multipart_upload()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .set_content_type(operation.expected.metadata.get("content-type").cloned())
-            .set_metadata(Some(object_metadata(operation)))
-            .set_server_side_encryption(self.server_side_encryption.map(|value| value.sdk_value()))
-            .send()
-            .await
-            .map_err(|error| ambiguous("create_multipart", &error))?;
+            .fenced(
+                self.client
+                    .create_multipart_upload()
+                    .bucket(&operation.destination.bucket)
+                    .key(&operation.destination.physical_key)
+                    .set_content_type(operation.expected.metadata.get("content-type").cloned())
+                    .set_metadata(Some(object_metadata(operation)))
+                    .set_server_side_encryption(
+                        self.server_side_encryption.map(|value| value.sdk_value()),
+                    )
+                    .send(),
+            )
+            .await?
+            .map_err(|error| {
+                provider_error("create_multipart", ProviderErrorPhase::Mutation, &error)
+            })?;
         output
             .upload_id()
             .map(ToOwned::to_owned)
@@ -477,16 +622,18 @@ impl TransactionBackend for AwsS3TransactionBackend {
         body: Bytes,
     ) -> Result<String, BackendError> {
         let output = self
-            .client
-            .upload_part()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .map_err(|error| ambiguous("upload_part", &error))?;
+            .fenced(
+                self.client
+                    .upload_part()
+                    .bucket(&operation.destination.bucket)
+                    .key(&operation.destination.physical_key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(body))
+                    .send(),
+            )
+            .await?
+            .map_err(|error| provider_error("upload_part", ProviderErrorPhase::Mutation, &error))?;
         output
             .e_tag()
             .map(ToOwned::to_owned)
@@ -516,15 +663,23 @@ impl TransactionBackend for AwsS3TransactionBackend {
             ))
             .build();
         let first = self
-            .client
-            .complete_multipart_upload()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .upload_id(upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-            .map_err(|error| ambiguous("complete_multipart", &error))?;
+            .fenced(
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&operation.destination.bucket)
+                    .key(&operation.destination.physical_key)
+                    .upload_id(upload_id)
+                    .multipart_upload(completed)
+                    .send(),
+            )
+            .await?
+            .map_err(|error| {
+                provider_error(
+                    "complete_multipart",
+                    ProviderErrorPhase::CompleteMultipart,
+                    &error,
+                )
+            })?;
         let mut rewritten = self
             .rewrite_completed_multipart_metadata(operation, first.version_id())
             .await?;
@@ -547,14 +702,22 @@ impl TransactionBackend for AwsS3TransactionBackend {
         operation: &OperationRecord,
         upload_id: &str,
     ) -> Result<(), BackendError> {
-        self.client
-            .abort_multipart_upload()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .upload_id(upload_id)
-            .send()
-            .await
-            .map_err(|error| ambiguous("abort_multipart", &error))?;
+        self.fenced(
+            self.client
+                .abort_multipart_upload()
+                .bucket(&operation.destination.bucket)
+                .key(&operation.destination.physical_key)
+                .upload_id(upload_id)
+                .send(),
+        )
+        .await?
+        .map_err(|error| {
+            provider_error(
+                "abort_multipart",
+                ProviderErrorPhase::AfterPossibleMutation,
+                &error,
+            )
+        })?;
         Ok(())
     }
 
@@ -567,15 +730,23 @@ impl TransactionBackend for AwsS3TransactionBackend {
         let mut discovered = Vec::new();
         loop {
             let output = self
-                .client
-                .list_multipart_uploads()
-                .bucket(&operation.destination.bucket)
-                .prefix(&operation.destination.physical_key)
-                .set_key_marker(key_marker.clone())
-                .set_upload_id_marker(upload_id_marker.clone())
-                .send()
-                .await
-                .map_err(|error| ambiguous("list_multipart_uploads", &error))?;
+                .fenced(
+                    self.client
+                        .list_multipart_uploads()
+                        .bucket(&operation.destination.bucket)
+                        .prefix(&operation.destination.physical_key)
+                        .set_key_marker(key_marker.clone())
+                        .set_upload_id_marker(upload_id_marker.clone())
+                        .send(),
+                )
+                .await?
+                .map_err(|error| {
+                    provider_error(
+                        "list_multipart_uploads",
+                        ProviderErrorPhase::Observation,
+                        &error,
+                    )
+                })?;
             for upload in output.uploads() {
                 let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
                     continue;
@@ -623,15 +794,23 @@ impl TransactionBackend for AwsS3TransactionBackend {
         let mut seen_version_ids = HashSet::new();
         loop {
             let output = self
-                .client
-                .list_object_versions()
-                .bucket(&operation.destination.bucket)
-                .prefix(&operation.destination.physical_key)
-                .set_key_marker(key_marker.clone())
-                .set_version_id_marker(version_id_marker.clone())
-                .send()
-                .await
-                .map_err(|error| ambiguous("list_object_versions", &error))?;
+                .fenced(
+                    self.client
+                        .list_object_versions()
+                        .bucket(&operation.destination.bucket)
+                        .prefix(&operation.destination.physical_key)
+                        .set_key_marker(key_marker.clone())
+                        .set_version_id_marker(version_id_marker.clone())
+                        .send(),
+                )
+                .await?
+                .map_err(|error| {
+                    provider_error(
+                        "list_object_versions",
+                        ProviderErrorPhase::Observation,
+                        &error,
+                    )
+                })?;
             for version in output.versions() {
                 let (Some(key), Some(version_id)) = (version.key(), version.version_id()) else {
                     continue;
@@ -643,14 +822,22 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     continue;
                 }
                 let head = self
-                    .client
-                    .head_object()
-                    .bucket(&operation.destination.bucket)
-                    .key(&operation.destination.physical_key)
-                    .version_id(version_id)
-                    .send()
-                    .await
-                    .map_err(|error| ambiguous("inspect_object_version", &error))?;
+                    .fenced(
+                        self.client
+                            .head_object()
+                            .bucket(&operation.destination.bucket)
+                            .key(&operation.destination.physical_key)
+                            .version_id(version_id)
+                            .send(),
+                    )
+                    .await?
+                    .map_err(|error| {
+                        provider_error(
+                            "inspect_object_version",
+                            ProviderErrorPhase::Observation,
+                            &error,
+                        )
+                    })?;
                 let operation_matches = head
                     .metadata()
                     .and_then(|metadata| metadata.get("s4-operation-id"))
@@ -724,14 +911,22 @@ impl TransactionBackend for AwsS3TransactionBackend {
                 "exact object-version deletion requires a version ID",
             ));
         }
-        self.client
-            .delete_object()
-            .bucket(&operation.destination.bucket)
-            .key(&operation.destination.physical_key)
-            .version_id(version_id)
-            .send()
-            .await
-            .map_err(|error| ambiguous("delete_object_version", &error))?;
+        self.fenced(
+            self.client
+                .delete_object()
+                .bucket(&operation.destination.bucket)
+                .key(&operation.destination.physical_key)
+                .version_id(version_id)
+                .send(),
+        )
+        .await?
+        .map_err(|error| {
+            provider_error(
+                "delete_object_version",
+                ProviderErrorPhase::AfterPossibleMutation,
+                &error,
+            )
+        })?;
         Ok(())
     }
 
@@ -746,15 +941,23 @@ impl TransactionBackend for AwsS3TransactionBackend {
             let mut parts = Vec::new();
             loop {
                 let output = self
-                    .client
-                    .list_parts()
-                    .bucket(&operation.destination.bucket)
-                    .key(&operation.destination.physical_key)
-                    .upload_id(&upload.upload_id)
-                    .set_part_number_marker(part_number_marker.clone())
-                    .send()
-                    .await
-                    .map_err(|error| ambiguous("list_multipart_parts", &error))?;
+                    .fenced(
+                        self.client
+                            .list_parts()
+                            .bucket(&operation.destination.bucket)
+                            .key(&operation.destination.physical_key)
+                            .upload_id(&upload.upload_id)
+                            .set_part_number_marker(part_number_marker.clone())
+                            .send(),
+                    )
+                    .await?
+                    .map_err(|error| {
+                        provider_error(
+                            "list_multipart_parts",
+                            ProviderErrorPhase::Observation,
+                            &error,
+                        )
+                    })?;
                 parts.extend(output.parts().iter().filter_map(|part| {
                     Some(DiscoveredMultipartPart {
                         part_number: part.part_number()?,
@@ -802,6 +1005,8 @@ pub struct DirectS3Sink {
     output_bytes: u64,
     output_verified: bool,
     finished: bool,
+    mutation_ambiguity_window: std::time::Duration,
+    exact_absence_confirmation_delay: std::time::Duration,
 }
 
 impl DirectS3Sink {
@@ -819,6 +1024,7 @@ impl DirectS3Sink {
             OperationRecord::intent(destination, expected),
             max_attempts,
             abort_signal,
+            true,
         )
         .await
     }
@@ -844,6 +1050,7 @@ impl DirectS3Sink {
             ),
             max_attempts,
             abort_signal,
+            true,
         )
         .await
     }
@@ -863,6 +1070,29 @@ impl DirectS3Sink {
             OperationRecord::direct_intent(scope, destination, expected),
             max_attempts,
             abort_signal,
+            true,
+        )
+        .await
+    }
+
+    /// Builds a sink for an operation whose workspace adapter atomically
+    /// inserted the INTENT row together with its routing lease.
+    pub async fn new_direct_admitted(
+        journal: Arc<dyn OperationJournal>,
+        backend: Arc<dyn TransactionBackend>,
+        scope: super::DirectOperationScope,
+        destination: ObjectDestination,
+        expected: super::ExpectedObject,
+        max_attempts: usize,
+        abort_signal: AbortSignal,
+    ) -> Result<Self, TransactionError> {
+        Self::from_operation(
+            journal,
+            backend,
+            OperationRecord::direct_intent(scope, destination, expected),
+            max_attempts,
+            abort_signal,
+            false,
         )
         .await
     }
@@ -873,9 +1103,12 @@ impl DirectS3Sink {
         operation: OperationRecord,
         max_attempts: usize,
         abort_signal: AbortSignal,
+        insert_intent: bool,
     ) -> Result<Self, TransactionError> {
         backend.capabilities().streaming_eligibility()?;
-        journal.insert_intent(operation.clone()).await?;
+        if insert_intent {
+            journal.insert_intent(operation.clone()).await?;
+        }
         Ok(Self {
             journal,
             backend,
@@ -889,6 +1122,8 @@ impl DirectS3Sink {
             output_bytes: 0,
             output_verified: false,
             finished: false,
+            mutation_ambiguity_window: PROVIDER_MUTATION_AMBIGUITY_WINDOW,
+            exact_absence_confirmation_delay: EXACT_ABSENCE_CONFIRMATION_DELAY,
         })
     }
 
@@ -907,11 +1142,43 @@ impl DirectS3Sink {
         Ok(())
     }
 
+    async fn record_mutation_launch(&self) -> Result<(), TransactionError> {
+        self.journal
+            .record_mutation_launch(
+                self.operation.id,
+                unix_time_ms().saturating_add(
+                    self.mutation_ambiguity_window
+                        .as_millis()
+                        .min(i64::MAX as u128) as i64,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_redundant_versions(
+        &self,
+        meta: &StoredObjectMeta,
+    ) -> Result<(), TransactionError> {
+        for version_id in &meta.superseded_version_ids {
+            if meta.version_id.as_deref() == Some(version_id) {
+                return Err(TransactionError::Journal(super::JournalError::Corrupt(
+                    "authoritative provider version was listed as redundant".to_string(),
+                )));
+            }
+            self.backend
+                .delete_object_version(&self.operation, version_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_multipart(&mut self) -> Result<(), TransactionError> {
         if self.upload_id.is_some() {
             return Ok(());
         }
         self.evidence("create_multipart_before", json!({})).await?;
+        self.record_mutation_launch().await?;
         let upload_id = match self.backend.create_multipart(&self.operation).await {
             Ok(upload_id) => upload_id,
             Err(error) => {
@@ -948,12 +1215,14 @@ impl DirectS3Sink {
         }
         let digest = sha256_hex(&body);
         let mut last_error = None;
+        let mut prior_ambiguous = false;
         for attempt in 1..=self.max_attempts {
             self.evidence(
                 "upload_part_before",
                 json!({"part_number": part_number, "attempt": attempt, "digest": digest}),
             )
             .await?;
+            self.record_mutation_launch().await?;
             match self
                 .backend
                 .upload_part(&self.operation, upload_id, part_number, body.clone())
@@ -978,7 +1247,15 @@ impl DirectS3Sink {
                     self.parts.push(UploadedPart { part_number, etag });
                     return Ok(());
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    let definitive =
+                        error.kind == super::BackendErrorKind::Definitive && !prior_ambiguous;
+                    prior_ambiguous |= !definitive;
+                    last_error = Some(error);
+                    if definitive {
+                        break;
+                    }
+                }
             }
         }
         Err(last_error
@@ -1001,17 +1278,20 @@ impl DirectS3Sink {
         let body = self.buffer.split().freeze();
         let digest = sha256_hex(&body);
         let mut last_error = None;
+        let mut prior_ambiguous = false;
         for attempt in 1..=self.max_attempts {
             self.evidence(
                 "put_object_before",
                 json!({"attempt": attempt, "digest": digest, "size": body.len()}),
             )
             .await?;
+            self.record_mutation_launch().await?;
             match self.backend.put_object(&self.operation, body.clone()).await {
                 Ok(mut meta) => {
                     if attempt > 1 && !self.backend.has_exact_version_recovery() {
                         meta.version_history_complete = false;
                     }
+                    self.delete_redundant_versions(&meta).await?;
                     if let Err(error) = self
                         .journal
                         .transition(
@@ -1049,12 +1329,32 @@ impl DirectS3Sink {
                     return Ok(meta);
                 }
                 Err(error) => {
+                    let definitive =
+                        error.kind == super::BackendErrorKind::Definitive && !prior_ambiguous;
+                    prior_ambiguous |= !definitive;
                     let _ = self
                         .evidence(
-                            "put_object_attempt_ambiguous",
+                            if definitive {
+                                "put_object_attempt_definitive"
+                            } else {
+                                "put_object_attempt_ambiguous"
+                            },
                             json!({"attempt": attempt, "kind": format!("{:?}", error.kind)}),
                         )
                         .await;
+                    if definitive {
+                        self.journal
+                            .transition(
+                                self.operation.id,
+                                OperationState::Completing,
+                                OperationState::ProvenAborted,
+                                None,
+                            )
+                            .await?;
+                        self.operation.state = OperationState::ProvenAborted;
+                        self.finished = true;
+                        return Err(error.into());
+                    }
                     last_error = Some(error);
                 }
             }
@@ -1087,12 +1387,14 @@ impl DirectS3Sink {
             .as_deref()
             .expect("multipart completion requires upload ID");
         let mut last_error = None;
+        let mut prior_ambiguous = false;
         for attempt in 1..=self.max_attempts {
             self.evidence(
                 "complete_multipart_before",
                 json!({"attempt": attempt, "part_count": self.parts.len()}),
             )
             .await?;
+            self.record_mutation_launch().await?;
             match self
                 .backend
                 .complete_multipart(&self.operation, upload_id, &self.parts)
@@ -1102,6 +1404,7 @@ impl DirectS3Sink {
                     if attempt > 1 && !self.backend.has_exact_version_recovery() {
                         meta.version_history_complete = false;
                     }
+                    self.delete_redundant_versions(&meta).await?;
                     if let Err(error) = self
                         .journal
                         .transition(
@@ -1139,12 +1442,38 @@ impl DirectS3Sink {
                     return Ok(meta);
                 }
                 Err(error) => {
+                    let definitive =
+                        error.kind == super::BackendErrorKind::Definitive && !prior_ambiguous;
+                    prior_ambiguous |= !definitive;
                     let _ = self
                         .evidence(
-                            "complete_multipart_attempt_ambiguous",
+                            if definitive {
+                                "complete_multipart_attempt_definitive"
+                            } else {
+                                "complete_multipart_attempt_ambiguous"
+                            },
                             json!({"attempt": attempt, "kind": format!("{:?}", error.kind)}),
                         )
                         .await;
+                    if definitive {
+                        if let Some(upload_id) = &self.upload_id {
+                            self.backend
+                                .abort_multipart(&self.operation, upload_id)
+                                .await?;
+                        }
+                        self.abort_discovered().await?;
+                        self.journal
+                            .transition(
+                                self.operation.id,
+                                OperationState::Completing,
+                                OperationState::ProvenAborted,
+                                None,
+                            )
+                            .await?;
+                        self.operation.state = OperationState::ProvenAborted;
+                        self.finished = true;
+                        return Err(error.into());
+                    }
                     last_error = Some(error);
                 }
             }
@@ -1196,6 +1525,7 @@ impl DirectS3Sink {
                     if !self.backend.has_exact_version_recovery() {
                         meta.version_history_complete = false;
                     }
+                    self.delete_redundant_versions(&meta).await?;
                     let evidence_kind = if meta.version_history_complete {
                         "provider_version_history_complete"
                     } else {
@@ -1222,6 +1552,20 @@ impl DirectS3Sink {
                     operation.committed = Some(meta);
                 }
                 CompletionProbe::ProvenAbsentExact => {
+                    if !self
+                        .journal
+                        .confirm_exact_absence(
+                            operation.id,
+                            unix_time_ms(),
+                            self.exact_absence_confirmation_delay
+                                .as_millis()
+                                .min(i64::MAX as u128) as i64,
+                        )
+                        .await?
+                    {
+                        self.operation = operation;
+                        return Ok(None);
+                    }
                     self.journal
                         .transition(
                             operation.id,
@@ -1417,6 +1761,7 @@ impl Drop for DirectS3Sink {
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use aws_sdk_s3::config::{Credentials, Region};
@@ -1463,7 +1808,7 @@ mod tests {
                 .status(StatusCode::OK)
                 .header("content-type", "application/xml")
                 .body(Body::from(
-                    r#"<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>bucket</Name><Prefix>physical</Prefix><IsTruncated>false</IsTruncated><Version><Key>physical</Key><VersionId>version-2</VersionId><IsLatest>true</IsLatest><LastModified>2026-08-31T12:00:00.000Z</LastModified><ETag>&quot;etag-2&quot;</ETag><Size>3</Size><StorageClass>STANDARD</StorageClass></Version><Version><Key>physical</Key><VersionId>version-1</VersionId><IsLatest>false</IsLatest><LastModified>2026-08-31T11:59:00.000Z</LastModified><ETag>&quot;etag-1&quot;</ETag><Size>3</Size><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"#,
+                    r#"<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>bucket</Name><Prefix>physical</Prefix><IsTruncated>false</IsTruncated><Version><Key>physical</Key><VersionId>customer-version</VersionId><IsLatest>true</IsLatest><LastModified>2026-08-31T12:01:00.000Z</LastModified><ETag>&quot;customer&quot;</ETag><Size>8</Size><StorageClass>STANDARD</StorageClass></Version><Version><Key>physical</Key><VersionId>version-2</VersionId><IsLatest>false</IsLatest><LastModified>2026-08-31T12:00:00.000Z</LastModified><ETag>&quot;etag-2&quot;</ETag><Size>3</Size><StorageClass>STANDARD</StorageClass></Version><Version><Key>physical</Key><VersionId>version-1</VersionId><IsLatest>false</IsLatest><LastModified>2026-08-31T11:59:00.000Z</LastModified><ETag>&quot;etag-1&quot;</ETag><Size>3</Size><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"#,
                 ))
                 .unwrap();
         }
@@ -1488,22 +1833,29 @@ mod tests {
         if method == Method::HEAD {
             let version = if query.contains("versionId=version-1") {
                 "version-1"
+            } else if query.contains("versionId=customer-version") {
+                "customer-version"
             } else {
                 "version-2"
             };
-            return axum::response::Response::builder()
+            let etag = if version == "customer-version" {
+                "\"customer\"".to_string()
+            } else {
+                format!("\"etag-{}\"", &version[version.len() - 1..])
+            };
+            let mut response = axum::response::Response::builder()
                 .status(StatusCode::OK)
-                .header(
-                    "etag",
-                    format!("\"etag-{}\"", &version[version.len() - 1..]),
-                )
+                .header("etag", etag)
                 .header("content-length", "3")
                 .header("x-amz-version-id", version)
-                .header("x-amz-server-side-encryption", "AES256")
-                .header(
+                .header("x-amz-server-side-encryption", "AES256");
+            if version != "customer-version" {
+                response = response.header(
                     "x-amz-meta-s4-operation-id",
                     "018f0000-0000-7000-8000-000000000001",
-                )
+                );
+            }
+            return response
                 .header("x-amz-meta-s4-sha256", "digest")
                 .header("x-amz-meta-s4-size", "3")
                 .body(Body::empty())
@@ -1573,6 +1925,68 @@ mod tests {
         (client, requests, server)
     }
 
+    async fn error_client(
+        status: StatusCode,
+        code: &'static str,
+    ) -> (Client, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(move || async move {
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/xml")
+                .body(Body::from(format!(
+                    "<Error><Code>{code}</Code><Message>provider detail</Message></Error>"
+                )))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("key", "secret", None, None, "test"))
+            .retry_config(crate::s3_safety::s3_retry_config())
+            .load()
+            .await;
+        (
+            Client::from_conf(
+                aws_sdk_s3::config::Builder::from(&config)
+                    .force_path_style(true)
+                    .build(),
+            ),
+            server,
+        )
+    }
+
+    async fn client_for_app(app: Router) -> (Client, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("key", "secret", None, None, "test"))
+            .retry_config(crate::s3_safety::s3_retry_config())
+            .load()
+            .await;
+        let client = Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&config)
+                .force_path_style(true)
+                .build(),
+        );
+        (client, server)
+    }
+
+    fn xml_error(status: StatusCode, code: &str) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(status)
+            .header("content-type", "application/xml")
+            .body(Body::from(format!(
+                "<Error><Code>{code}</Code><Message>provider detail</Message></Error>"
+            )))
+            .unwrap()
+    }
+
     #[derive(Default)]
     struct ScriptState {
         events: Vec<String>,
@@ -1588,6 +2002,99 @@ mod tests {
         state: Mutex<ScriptState>,
     }
 
+    #[derive(Default)]
+    struct LateCommitBackend {
+        committed: Arc<tokio::sync::Mutex<Option<StoredObjectMeta>>>,
+    }
+
+    #[async_trait]
+    impl TransactionBackend for LateCommitBackend {
+        fn capabilities(&self) -> BackendCapabilities {
+            ScriptBackend::default().capabilities()
+        }
+
+        fn has_exact_version_recovery(&self) -> bool {
+            true
+        }
+
+        async fn put_object(
+            &self,
+            _operation: &OperationRecord,
+            _body: Bytes,
+        ) -> Result<StoredObjectMeta, BackendError> {
+            let committed = self.committed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                *committed.lock().await = Some(StoredObjectMeta {
+                    etag: Some("late-etag".to_string()),
+                    version_id: Some("late-version".to_string()),
+                    superseded_version_ids: Vec::new(),
+                    version_history_complete: true,
+                });
+            });
+            std::future::pending().await
+        }
+
+        async fn create_multipart(
+            &self,
+            _operation: &OperationRecord,
+        ) -> Result<String, BackendError> {
+            Err(BackendError::definitive("unused"))
+        }
+
+        async fn upload_part(
+            &self,
+            _operation: &OperationRecord,
+            _upload_id: &str,
+            _part_number: i32,
+            _body: Bytes,
+        ) -> Result<String, BackendError> {
+            Err(BackendError::definitive("unused"))
+        }
+
+        async fn complete_multipart(
+            &self,
+            _operation: &OperationRecord,
+            _upload_id: &str,
+            _parts: &[UploadedPart],
+        ) -> Result<StoredObjectMeta, BackendError> {
+            Err(BackendError::definitive("unused"))
+        }
+
+        async fn abort_multipart(
+            &self,
+            _operation: &OperationRecord,
+            _upload_id: &str,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn discover_incomplete(
+            &self,
+            _operation: &OperationRecord,
+        ) -> Result<Vec<DiscoveredUpload>, BackendError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_object_version(
+            &self,
+            _operation: &OperationRecord,
+            _version_id: &str,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn probe_completion(
+            &self,
+            _operation: &OperationRecord,
+        ) -> Result<CompletionProbe, BackendError> {
+            Ok(self.committed.lock().await.clone().map_or(
+                CompletionProbe::ProvenAbsentExact,
+                CompletionProbe::Committed,
+            ))
+        }
+    }
+
     impl ScriptBackend {
         fn fail_next(&self, event: &str) {
             self.state
@@ -1597,15 +2104,23 @@ mod tests {
                 .push_back(event.to_string());
         }
 
+        fn fail_next_definitive(&self, event: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .failures
+                .push_back(format!("definitive:{event}"));
+        }
+
         fn event(&self, event: &str) -> Result<(), BackendError> {
             let mut state = self.state.lock().unwrap();
             state.events.push(event.to_string());
-            if state
-                .failures
-                .front()
-                .is_some_and(|failure| failure == event)
-            {
-                state.failures.pop_front();
+            if let Some(failure) = state.failures.pop_front_if(|failure| {
+                failure == event || failure == &format!("definitive:{event}")
+            }) {
+                if failure.starts_with("definitive:") {
+                    return Err(BackendError::definitive(format!("scripted {event}")));
+                }
                 return Err(BackendError::ambiguous(format!("scripted {event}")));
             }
             Ok(())
@@ -1778,12 +2293,13 @@ mod tests {
             bucket: "bucket".to_string(),
             logical_key: "key".to_string(),
             physical_key: "key".to_string(),
+            workspace_binding: None,
         }
     }
 
     async fn sink(
         journal: Arc<InMemoryOperationJournal>,
-        backend: Arc<ScriptBackend>,
+        backend: Arc<dyn TransactionBackend>,
         attempts: usize,
     ) -> (DirectS3Sink, tokio::sync::mpsc::Receiver<uuid::Uuid>) {
         let (signal, receiver) = AbortSignal::channel(8);
@@ -1883,6 +2399,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn byo_b2_exact_recovery_does_not_assume_managed_sse() {
+        let (client, requests, server) = provider_client().await;
+        let capabilities = ScriptBackend::default().capabilities();
+        let backend = AwsS3TransactionBackend::new_b2(client, capabilities);
+        assert!(backend.exact_version_recovery);
+        assert_eq!(backend.server_side_encryption, None);
+
+        let operation = OperationRecord::intent(destination(), ExpectedObject::default());
+        backend.create_multipart(&operation).await.unwrap();
+        let recorded = requests.lock().unwrap();
+        let create = recorded
+            .iter()
+            .find(|(method, uri, _)| *method == Method::POST && uri.contains("uploads"))
+            .unwrap();
+        assert!(!create.2.contains_key("x-amz-server-side-encryption"));
+        assert_eq!(backend.capabilities(), capabilities);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn provider_put_accepts_a_zero_byte_object() {
         let (client, requests, server) = provider_client().await;
         let operation = OperationRecord::intent(destination(), ExpectedObject::default());
@@ -1911,7 +2447,7 @@ mod tests {
     async fn b2_recovery_enumerates_versions_inspects_mpu_and_deletes_exact_version() {
         let (client, requests, server) = provider_client().await;
         let capabilities = ScriptBackend::default().capabilities();
-        let backend = AwsS3TransactionBackend::new_managed_b2(client, capabilities);
+        let backend = AwsS3TransactionBackend::new_b2(client, capabilities);
         let mut exact_destination = destination();
         exact_destination.physical_key = "physical".to_string();
         let mut operation = OperationRecord::scoped_intent(
@@ -1928,12 +2464,14 @@ mod tests {
         operation.created_at_ms = 0;
 
         let versions = backend.inspect_object_versions(&operation).await.unwrap();
-        assert_eq!(versions.len(), 2);
-        assert!(versions.iter().all(|version| {
-            version.operation_matches
-                && version.expected_metadata_matches
-                && version.encryption_matches
-        }));
+        assert_eq!(versions.len(), 3);
+        assert_eq!(
+            versions
+                .iter()
+                .filter(|version| version.operation_matches)
+                .count(),
+            2
+        );
         assert_eq!(
             backend
                 .resolve_exact_version_history(&operation, Some("missing-version"))
@@ -1953,6 +2491,18 @@ mod tests {
             "unexpected managed PUT error: {}",
             error.message
         );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, uri, headers)| {
+                    *method == Method::PUT
+                        && !uri.contains("uploadId")
+                        && !headers.contains_key("x-amz-server-side-encryption")
+                        && headers.contains_key("x-amz-meta-s4-operation-id")
+                })
+        );
         assert_eq!(
             backend.probe_completion(&operation).await.unwrap(),
             CompletionProbe::Committed(StoredObjectMeta {
@@ -1968,6 +2518,14 @@ mod tests {
         assert_eq!(uploads[0].upload.upload_id, "incomplete-upload");
         assert_eq!(uploads[0].parts.len(), 1);
         assert_eq!(uploads[0].parts[0].part_number, 1);
+
+        backend
+            .abort_multipart(&operation, "incomplete-upload")
+            .await
+            .unwrap();
+        assert!(requests.lock().unwrap().iter().any(|(method, uri, _)| {
+            *method == Method::DELETE && uri.contains("uploadId=incomplete-upload")
+        }));
 
         backend
             .delete_object_version(&operation, "version-1")
@@ -2134,6 +2692,383 @@ mod tests {
                 OperationState::Committed
             );
         }
+    }
+
+    #[tokio::test]
+    async fn definitive_put_failure_is_not_retried_and_is_proven_aborted() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        let backend = Arc::new(ScriptBackend::default());
+        backend.fail_next_definitive("put");
+        let (mut sink, _) = sink(journal.clone(), backend.clone(), 3).await;
+        let operation_id = sink.operation_id();
+        sink.write(Bytes::from_static(b"body")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+
+        let error = sink.complete().await.unwrap_err();
+        let TransactionError::Backend(error) = error else {
+            panic!("expected definitive backend error, got {error:?}");
+        };
+        assert_eq!(error.kind, super::super::BackendErrorKind::Definitive);
+        assert_eq!(backend.bodies("put").len(), 1);
+        assert_eq!(
+            journal.get(operation_id).await.unwrap().unwrap().state,
+            OperationState::ProvenAborted
+        );
+        assert_eq!(sink.commit_state(), SinkCommitState::PreCommit);
+    }
+
+    #[tokio::test]
+    async fn dropped_remote_put_cannot_be_proven_aborted_before_late_commit_converges() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        let backend = Arc::new(LateCommitBackend::default());
+        let (mut sink, _) = sink(journal.clone(), backend, 1).await;
+        sink.mutation_ambiguity_window = Duration::from_millis(75);
+        sink.exact_absence_confirmation_delay = Duration::from_millis(10);
+        sink.write(Bytes::from_static(b"body")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), sink.complete())
+                .await
+                .is_err(),
+            "the local provider future is dropped while the remote call remains accepted"
+        );
+        assert!(sink.reconcile_completion().await.unwrap().is_none());
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::CommitUnknown
+        );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let committed = sink.reconcile_completion().await.unwrap().unwrap();
+        assert_eq!(committed.version_id.as_deref(), Some("late-version"));
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_4xx_is_definitive_while_5xx_is_ambiguous_and_opaque() {
+        let capabilities = ScriptBackend::default().capabilities();
+        for (status, code, expected) in [
+            (
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                super::super::BackendErrorKind::Definitive,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                super::super::BackendErrorKind::Ambiguous,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AccessDenied",
+                super::super::BackendErrorKind::Ambiguous,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "UnknownThrottleCode",
+                super::super::BackendErrorKind::Ambiguous,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "RequestTimeout",
+                super::super::BackendErrorKind::Ambiguous,
+            ),
+        ] {
+            let (client, server) = error_client(status, code).await;
+            let error = AwsS3TransactionBackend::new(client, capabilities)
+                .put_object(
+                    &OperationRecord::intent(destination(), ExpectedObject::default()),
+                    Bytes::from_static(b"body"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, expected);
+            assert!(!error.to_string().contains("provider detail"));
+            assert!(!error.to_string().contains("AccessDenied"));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_and_post_mutation_denials_remain_ambiguous() {
+        let capabilities = ScriptBackend::default().capabilities();
+
+        let complete_app = Router::new().fallback(|method: Method, uri: Uri| async move {
+            if method == Method::HEAD {
+                return xml_error(StatusCode::NOT_FOUND, "NoSuchKey");
+            }
+            assert!(uri.query().unwrap_or_default().contains("uploadId=upload"));
+            xml_error(StatusCode::NOT_FOUND, "NoSuchUpload")
+        });
+        let (client, server) = client_for_app(complete_app).await;
+        let error = AwsS3TransactionBackend::new(client, capabilities)
+            .complete_multipart(
+                &OperationRecord::intent(destination(), ExpectedObject::default()),
+                "upload",
+                &[UploadedPart {
+                    part_number: 1,
+                    etag: "etag".to_string(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, super::super::BackendErrorKind::Ambiguous);
+        server.abort();
+
+        let b2_app = Router::new().fallback(|method: Method, uri: Uri| async move {
+            if method == Method::PUT {
+                return axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("etag", "\"etag\"")
+                    .header("x-amz-version-id", "version-a")
+                    .body(Body::empty())
+                    .unwrap();
+            }
+            assert!(uri.query().unwrap_or_default().contains("versions"));
+            xml_error(StatusCode::FORBIDDEN, "AccessDenied")
+        });
+        let (client, server) = client_for_app(b2_app).await;
+        let error = AwsS3TransactionBackend::new_b2(client, capabilities)
+            .put_object(
+                &OperationRecord::intent(destination(), ExpectedObject::default()),
+                Bytes::from_static(b"body"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, super::super::BackendErrorKind::Ambiguous);
+        server.abort();
+
+        let rewrite_app = Router::new().fallback(|method: Method, uri: Uri| async move {
+            let query = uri.query().unwrap_or_default();
+            if method == Method::HEAD {
+                return xml_error(StatusCode::NOT_FOUND, "NoSuchKey");
+            }
+            if method == Method::POST && query.contains("uploadId=original") {
+                return axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/xml")
+                    .header("x-amz-version-id", "original-version")
+                    .body(Body::from(
+                        r#"<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>physical</Key><ETag>&quot;etag&quot;</ETag></CompleteMultipartUploadResult>"#,
+                    ))
+                    .unwrap();
+            }
+            assert!(method == Method::POST && query.contains("uploads"));
+            xml_error(StatusCode::FORBIDDEN, "AccessDenied")
+        });
+        let (client, server) = client_for_app(rewrite_app).await;
+        let mut operation = OperationRecord::intent(destination(), ExpectedObject::default());
+        operation.expected.size = Some(4);
+        let error = AwsS3TransactionBackend::new(client, capabilities)
+            .complete_multipart(
+                &operation,
+                "original",
+                &[UploadedPart {
+                    part_number: 1,
+                    etag: "etag".to_string(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, super::super::BackendErrorKind::Ambiguous);
+        server.abort();
+    }
+
+    struct CountingFence {
+        interval: Duration,
+        heartbeats: AtomicUsize,
+        assertions: AtomicUsize,
+        fail_at: Option<usize>,
+    }
+
+    #[async_trait]
+    impl ProviderMutationFence for CountingFence {
+        fn heartbeat_interval(&self) -> Duration {
+            self.interval
+        }
+
+        async fn assert_current(&self) -> Result<(), BackendError> {
+            self.assertions.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn heartbeat(&self) -> Result<(), BackendError> {
+            let heartbeat = self.heartbeats.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_at == Some(heartbeat) {
+                Err(BackendError::ambiguous("fence lost"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn cancelled(&self) {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_call_longer_than_ttl_is_heartbeated_and_dropped_on_fence_loss() {
+        let delayed = Router::new().fallback(|| async {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("etag", "\"etag\"")
+                .body(Body::empty())
+                .unwrap()
+        });
+        let capabilities = ScriptBackend::default().capabilities();
+        let (client, server) = client_for_app(delayed).await;
+        let fence = Arc::new(CountingFence {
+            interval: Duration::from_millis(10),
+            heartbeats: AtomicUsize::new(0),
+            assertions: AtomicUsize::new(0),
+            fail_at: None,
+        });
+        AwsS3TransactionBackend::new(client, capabilities)
+            .with_mutation_fence(fence.clone())
+            .put_object(
+                &OperationRecord::intent(destination(), ExpectedObject::default()),
+                Bytes::from_static(b"body"),
+            )
+            .await
+            .unwrap();
+        assert!(fence.heartbeats.load(Ordering::SeqCst) >= 3);
+        server.abort();
+
+        let delayed = Router::new().fallback(|| async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap()
+        });
+        let (client, server) = client_for_app(delayed).await;
+        let fence = Arc::new(CountingFence {
+            interval: Duration::from_millis(10),
+            heartbeats: AtomicUsize::new(0),
+            assertions: AtomicUsize::new(0),
+            fail_at: Some(2),
+        });
+        let started = std::time::Instant::now();
+        let error = AwsS3TransactionBackend::new(client, capabilities)
+            .with_mutation_fence(fence)
+            .put_object(
+                &OperationRecord::intent(destination(), ExpectedObject::default()),
+                Bytes::from_static(b"body"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, super::super::BackendErrorKind::Ambiguous);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fenced_proven_absent_reaches_proven_aborted_after_window_and_separation() {
+        let app = Router::new().fallback(|method: Method, uri: Uri| async move {
+            let query = uri.query().unwrap_or_default();
+            if method == Method::HEAD {
+                return xml_error(StatusCode::NOT_FOUND, "NoSuchKey");
+            }
+            if method == Method::GET && query.contains("versions") {
+                return axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/xml")
+                    .body(Body::from(
+                        r#"<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>bucket</Name><Prefix>key</Prefix><IsTruncated>false</IsTruncated></ListVersionsResult>"#,
+                    ))
+                    .unwrap();
+            }
+            if method == Method::GET && query.contains("uploads") {
+                return axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/xml")
+                    .body(Body::from(
+                        r#"<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"#,
+                    ))
+                    .unwrap();
+            }
+            xml_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
+        });
+        let capabilities = ScriptBackend::default().capabilities();
+        let (client, server) = client_for_app(app).await;
+        let fence = Arc::new(CountingFence {
+            interval: Duration::from_millis(10),
+            heartbeats: AtomicUsize::new(0),
+            assertions: AtomicUsize::new(0),
+            fail_at: None,
+        });
+        let backend = Arc::new(
+            AwsS3TransactionBackend::new_b2(client, capabilities)
+                .with_mutation_fence(fence.clone()),
+        );
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        let (signal, _receiver) = AbortSignal::channel(8);
+        let mut sink = DirectS3Sink::new(
+            journal.clone(),
+            backend,
+            destination(),
+            ExpectedObject::default(),
+            1,
+            signal,
+        )
+        .await
+        .unwrap();
+        sink.mutation_ambiguity_window = Duration::from_millis(75);
+        sink.exact_absence_confirmation_delay = Duration::from_millis(10);
+        sink.write(Bytes::from_static(b"body")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+
+        let error = sink.complete().await.unwrap_err();
+        let TransactionError::Backend(error) = error else {
+            panic!("expected ambiguous backend error, got {error:?}");
+        };
+        assert_eq!(error.kind, super::super::BackendErrorKind::Ambiguous);
+        assert!(
+            fence.assertions.load(Ordering::SeqCst) > 0,
+            "the mutation fence must gate provider observations"
+        );
+
+        assert!(sink.reconcile_completion().await.unwrap().is_none());
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::CommitUnknown
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(sink.reconcile_completion().await.unwrap().is_none());
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(sink.reconcile_completion().await.unwrap().is_none());
+        assert_eq!(
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::ProvenAborted
+        );
+        server.abort();
     }
 
     #[tokio::test]

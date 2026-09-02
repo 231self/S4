@@ -19,7 +19,8 @@ use crate::entity::{object_operation, object_operation_evidence, object_operatio
 
 use super::{
     EvidenceRecord, ExpectedObject, JournalError, ObjectDestination, OperationJournal,
-    OperationRecord, OperationState, PartRecord, StoredObjectMeta, unix_time_ms,
+    OperationRecord, OperationState, PartRecord, StoredObjectMeta, WorkspaceDestinationBinding,
+    unix_time_ms,
 };
 
 #[derive(Clone, Debug)]
@@ -78,6 +79,33 @@ fn operation_from_model(model: object_operation::Model) -> Result<OperationRecor
             bucket: model.bucket,
             logical_key: model.logical_key,
             physical_key: model.physical_key,
+            workspace_binding: match (
+                model.backend_config_version,
+                model.capability_attestation_id,
+                model.routing_epoch,
+                model.routing_lease_id,
+                model.routing_fencing_token,
+            ) {
+                (None, None, None, None, None) => None,
+                (Some(config), Some(attestation), Some(epoch), Some(lease_id), Some(token)) => {
+                    Some(WorkspaceDestinationBinding {
+                        backend_config_version: config,
+                        capability_attestation_id: attestation,
+                        routing_epoch: u64::try_from(epoch).map_err(|_| {
+                            JournalError::Corrupt("negative routing epoch".to_string())
+                        })?,
+                        routing_lease_id: lease_id,
+                        routing_fencing_token: u64::try_from(token).map_err(|_| {
+                            JournalError::Corrupt("negative routing fencing token".to_string())
+                        })?,
+                    })
+                }
+                _ => {
+                    return Err(JournalError::Corrupt(
+                        "partial workspace destination binding".to_string(),
+                    ));
+                }
+            },
         },
         expected: ExpectedObject {
             digest: model.expected_digest,
@@ -88,6 +116,8 @@ fn operation_from_model(model: object_operation::Model) -> Result<OperationRecor
         committed,
         lease_owner: model.lease_owner,
         lease_expires_at_ms: model.lease_expires_at_ms,
+        mutation_not_before_ms: model.mutation_not_before_ms,
+        exact_absence_observed_at_ms: model.exact_absence_observed_at_ms,
         created_at_ms: model.created_at_ms,
         updated_at_ms: model.updated_at_ms,
     })
@@ -138,6 +168,7 @@ impl OperationJournal for PostgresOperationJournal {
             .transpose()?;
         let expected_metadata = serde_json::to_value(&operation.expected.metadata)
             .map_err(|error| JournalError::Corrupt(error.to_string()))?;
+        let workspace_binding = operation.destination.workspace_binding;
         object_operation::ActiveModel {
             id: Set(operation.id),
             state: Set(OperationState::Intent.as_str().to_string()),
@@ -153,6 +184,29 @@ impl OperationJournal for PostgresOperationJournal {
                 .map_err(|_| {
                     JournalError::Conflict("namespace epoch exceeds BIGINT".to_string())
                 })?),
+            backend_config_version: Set(workspace_binding
+                .as_ref()
+                .map(|binding| binding.backend_config_version.clone())),
+            capability_attestation_id: Set(workspace_binding
+                .as_ref()
+                .map(|binding| binding.capability_attestation_id.clone())),
+            routing_epoch: Set(workspace_binding
+                .as_ref()
+                .map(|binding| i64::try_from(binding.routing_epoch))
+                .transpose()
+                .map_err(|_| JournalError::Corrupt("routing epoch exceeds BIGINT".to_string()))?),
+            routing_lease_id: Set(workspace_binding
+                .as_ref()
+                .map(|binding| binding.routing_lease_id)),
+            routing_fencing_token: Set(workspace_binding
+                .as_ref()
+                .map(|binding| i64::try_from(binding.routing_fencing_token))
+                .transpose()
+                .map_err(|_| {
+                    JournalError::Corrupt("routing fencing token exceeds BIGINT".to_string())
+                })?),
+            mutation_not_before_ms: Set(operation.mutation_not_before_ms),
+            exact_absence_observed_at_ms: Set(operation.exact_absence_observed_at_ms),
             expected_digest: Set(operation.expected.digest),
             expected_size: Set(expected_size),
             expected_metadata: Set(expected_metadata),
@@ -413,6 +467,60 @@ impl OperationJournal for PostgresOperationJournal {
             .collect())
     }
 
+    async fn record_mutation_launch(
+        &self,
+        operation_id: Uuid,
+        not_before_ms: i64,
+    ) -> Result<(), JournalError> {
+        let model = object_operation::Entity::find_by_id(operation_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .ok_or(JournalError::NotFound(operation_id))?;
+        if OperationState::parse(&model.state)?.is_terminal() {
+            return Err(JournalError::Conflict(
+                "terminal operation cannot launch a provider mutation".to_string(),
+            ));
+        }
+        let next_not_before = model
+            .mutation_not_before_ms
+            .unwrap_or(i64::MIN)
+            .max(not_before_ms);
+        let mut active: object_operation::ActiveModel = model.into();
+        active.mutation_not_before_ms = Set(Some(next_not_before));
+        active.exact_absence_observed_at_ms = Set(None);
+        active.updated_at_ms = Set(unix_time_ms());
+        active.update(&self.db).await.map_err(persistence)?;
+        Ok(())
+    }
+
+    async fn confirm_exact_absence(
+        &self,
+        operation_id: Uuid,
+        observed_at_ms: i64,
+        minimum_separation_ms: i64,
+    ) -> Result<bool, JournalError> {
+        let model = object_operation::Entity::find_by_id(operation_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .ok_or(JournalError::NotFound(operation_id))?;
+        if model
+            .mutation_not_before_ms
+            .is_some_and(|not_before| observed_at_ms < not_before)
+        {
+            return Ok(false);
+        }
+        if let Some(first) = model.exact_absence_observed_at_ms {
+            return Ok(observed_at_ms.saturating_sub(first) >= minimum_separation_ms);
+        }
+        let mut active: object_operation::ActiveModel = model.into();
+        active.exact_absence_observed_at_ms = Set(Some(observed_at_ms));
+        active.updated_at_ms = Set(unix_time_ms());
+        active.update(&self.db).await.map_err(persistence)?;
+        Ok(false)
+    }
+
     async fn claim_reconcilable(
         &self,
         owner: &str,
@@ -533,12 +641,20 @@ pub struct InMemoryOperationJournal {
     state: Arc<Mutex<MemoryState>>,
     fail_committed_transitions: Arc<AtomicUsize>,
     fail_evidence_appends: Arc<AtomicUsize>,
+    durable_for_test: bool,
 }
 
 #[cfg(any(test, debug_assertions))]
 impl InMemoryOperationJournal {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn durable_for_test() -> Self {
+        Self {
+            durable_for_test: true,
+            ..Self::default()
+        }
     }
 
     pub fn fail_next_committed_transitions(&self, count: usize) {
@@ -555,7 +671,7 @@ impl InMemoryOperationJournal {
 #[async_trait]
 impl OperationJournal for InMemoryOperationJournal {
     fn is_durable(&self) -> bool {
-        false
+        self.durable_for_test
     }
 
     async fn insert_intent(&self, operation: OperationRecord) -> Result<(), JournalError> {
@@ -753,6 +869,57 @@ impl OperationJournal for InMemoryOperationJournal {
             .collect())
     }
 
+    async fn record_mutation_launch(
+        &self,
+        operation_id: Uuid,
+        not_before_ms: i64,
+    ) -> Result<(), JournalError> {
+        let mut state = self.state.lock().await;
+        let operation = state
+            .operations
+            .get_mut(&operation_id)
+            .ok_or(JournalError::NotFound(operation_id))?;
+        if operation.state.is_terminal() {
+            return Err(JournalError::Conflict(
+                "terminal operation cannot launch a provider mutation".to_string(),
+            ));
+        }
+        operation.mutation_not_before_ms = Some(
+            operation
+                .mutation_not_before_ms
+                .unwrap_or(i64::MIN)
+                .max(not_before_ms),
+        );
+        operation.exact_absence_observed_at_ms = None;
+        operation.updated_at_ms = unix_time_ms();
+        Ok(())
+    }
+
+    async fn confirm_exact_absence(
+        &self,
+        operation_id: Uuid,
+        observed_at_ms: i64,
+        minimum_separation_ms: i64,
+    ) -> Result<bool, JournalError> {
+        let mut state = self.state.lock().await;
+        let operation = state
+            .operations
+            .get_mut(&operation_id)
+            .ok_or(JournalError::NotFound(operation_id))?;
+        if operation
+            .mutation_not_before_ms
+            .is_some_and(|not_before| observed_at_ms < not_before)
+        {
+            return Ok(false);
+        }
+        if let Some(first) = operation.exact_absence_observed_at_ms {
+            return Ok(observed_at_ms.saturating_sub(first) >= minimum_separation_ms);
+        }
+        operation.exact_absence_observed_at_ms = Some(observed_at_ms);
+        operation.updated_at_ms = unix_time_ms();
+        Ok(false)
+    }
+
     async fn claim_reconcilable(
         &self,
         owner: &str,
@@ -824,6 +991,7 @@ mod tests {
                 bucket: "bucket".to_string(),
                 logical_key: "logical".to_string(),
                 physical_key: "physical".to_string(),
+                workspace_binding: None,
             },
             ExpectedObject::default(),
         )

@@ -8,7 +8,9 @@ alter table object_operations
     add column if not exists routing_lease_id uuid,
     add column if not exists routing_fencing_token bigint check (
         routing_fencing_token is null or routing_fencing_token > 0
-    );
+    ),
+    add column if not exists mutation_not_before_ms bigint,
+    add column if not exists exact_absence_observed_at_ms bigint;
 
 alter table object_operations
     add constraint object_operations_workspace_binding_complete check (

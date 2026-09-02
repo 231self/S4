@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::transaction::{BackendCapabilities, VersioningCapability};
+use crate::transaction::{BackendCapabilities, OperationRecord, VersioningCapability};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct WorkspaceId(String);
@@ -444,6 +444,8 @@ pub enum WorkspaceStorageError {
     UnsupportedConfig(String),
     #[error("workspace storage repository failed: {0}")]
     Repository(String),
+    #[error("workspace streaming admission outcome is ambiguous: {0}")]
+    AmbiguousAdmission(String),
 }
 
 /// Public injection seam for private workspace mapping and encrypted backend
@@ -483,20 +485,25 @@ pub trait WorkspaceStorageRepository: Send + Sync + 'static {
         ))
     }
 
-    /// Atomically verifies the active config/attestation/epoch and records an
-    /// open operation. Config transition or retirement must conflict while any
-    /// such lease is nonterminal.
-    async fn acquire_streaming_operation_lease(
+    /// Atomically verifies the active config/attestation/epoch, creates its
+    /// route lease, and inserts `operation` as an INTENT journal row with the
+    /// returned lease identity bound into its destination. The supplied
+    /// operation must not already contain a workspace binding. Config
+    /// transition or retirement must conflict while the lease or journal row
+    /// is nonterminal. An unknown transaction result must return
+    /// `AmbiguousAdmission`; callers preserve billing and recover by operation
+    /// ID instead of releasing a lease that may have committed.
+    async fn admit_streaming_operation(
         &self,
         _workspace_id: &WorkspaceId,
-        _operation_id: Uuid,
+        _operation: &OperationRecord,
         _config_version: &BackendConfigVersionId,
         _attestation_id: &CapabilityAttestationId,
         _routing_epoch: u64,
         _ttl: Duration,
     ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
         Err(WorkspaceStorageError::UnsupportedConfig(
-            "durable workspace streaming operation leases are not implemented".to_string(),
+            "atomic durable workspace streaming admission is not implemented".to_string(),
         ))
     }
 
@@ -521,15 +528,19 @@ pub trait WorkspaceStorageRepository: Send + Sync + 'static {
         ))
     }
 
-    /// Reclaims the exact durable lease after process loss. It must never
-    /// substitute the current config for the operation's historical version.
+    /// Reclaims an expired exact durable lease after process loss.
+    ///
+    /// The implementation must atomically verify that the operation journal is
+    /// nonterminal and owned by `journal_claim_owner`, compare every field in
+    /// `expected` identity (including lease ID and fencing token), reject an unexpired
+    /// route lease, advance its fencing token, and persist that new token in the
+    /// operation journal binding. It must never substitute the current config
+    /// for the operation's historical version.
     async fn recover_streaming_operation_lease(
         &self,
         _workspace_id: &WorkspaceId,
-        _operation_id: Uuid,
-        _config_version: &BackendConfigVersionId,
-        _attestation_id: &CapabilityAttestationId,
-        _routing_epoch: u64,
+        _expected: &WorkspaceOperationLease,
+        _journal_claim_owner: &str,
         _ttl: Duration,
     ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
         Err(WorkspaceStorageError::UnsupportedConfig(
@@ -537,6 +548,11 @@ pub trait WorkspaceStorageRepository: Send + Sync + 'static {
         ))
     }
 
+    /// Settles the route lease after the journal reaches the matching terminal
+    /// state. Implementations must verify that journal state and every persisted
+    /// lease identity field (expiry is not journaled) in the same transaction.
+    /// Repeating the same settlement is an idempotent success; conflicting
+    /// identities or outcomes fail closed.
     async fn release_streaming_operation_lease(
         &self,
         _workspace_id: &WorkspaceId,
@@ -614,7 +630,8 @@ impl WorkspaceStorageRepository for InMemoryWorkspaceStorageRepository {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::*;
 
@@ -680,10 +697,25 @@ mod tests {
         versions: RwLock<HashMap<String, WorkspaceStorageResolution>>,
         active: RwLock<Option<(String, u64)>>,
         leases: RwLock<HashMap<Uuid, WorkspaceOperationLease>>,
+        settled: RwLock<HashMap<Uuid, WorkspaceOperationOutcome>>,
+        admitted_operations: RwLock<HashMap<Uuid, OperationRecord>>,
+        lose_next_admission_response: AtomicBool,
         fence: AtomicU64,
     }
 
     impl DurableContractRepository {
+        fn same_lease_identity(
+            stored: &WorkspaceOperationLease,
+            expected: &WorkspaceOperationLease,
+        ) -> bool {
+            stored.operation_id == expected.operation_id
+                && stored.lease_id == expected.lease_id
+                && stored.config_version == expected.config_version
+                && stored.attestation_id == expected.attestation_id
+                && stored.routing_epoch == expected.routing_epoch
+                && stored.fencing_token == expected.fencing_token
+        }
+
         async fn install(&self, version: &str, epoch: u64) {
             self.versions
                 .write()
@@ -761,15 +793,22 @@ mod tests {
                 })
         }
 
-        async fn acquire_streaming_operation_lease(
+        async fn admit_streaming_operation(
             &self,
             _workspace_id: &WorkspaceId,
-            operation_id: Uuid,
+            operation: &OperationRecord,
             config_version: &BackendConfigVersionId,
             attestation_id: &CapabilityAttestationId,
             routing_epoch: u64,
             ttl: Duration,
         ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
+            if operation.state != crate::transaction::OperationState::Intent
+                || operation.destination.workspace_binding.is_some()
+            {
+                return Err(WorkspaceStorageError::Repository(
+                    "invalid atomic admission intent".to_string(),
+                ));
+            }
             let active = self.active.read().await.clone();
             if active.as_ref() != Some(&(config_version.as_str().to_string(), routing_epoch)) {
                 return Err(WorkspaceStorageError::Repository(
@@ -794,18 +833,30 @@ mod tests {
                 ));
             }
             let lease = WorkspaceOperationLease {
-                operation_id,
+                operation_id: operation.id,
                 lease_id: Uuid::now_v7(),
                 config_version: config_version.clone(),
                 attestation_id: attestation_id.clone(),
                 routing_epoch,
                 fencing_token: self.fence.fetch_add(1, Ordering::SeqCst) + 1,
-                expires_at_ms: i64::try_from(ttl.as_millis()).unwrap(),
+                expires_at_ms: now_ms().saturating_add(i64::try_from(ttl.as_millis()).unwrap()),
             };
             self.leases
                 .write()
                 .await
-                .insert(operation_id, lease.clone());
+                .insert(operation.id, lease.clone());
+            self.admitted_operations
+                .write()
+                .await
+                .insert(operation.id, operation.clone());
+            if self
+                .lose_next_admission_response
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err(WorkspaceStorageError::AmbiguousAdmission(
+                    "injected post-commit response loss".to_string(),
+                ));
+            }
             Ok(lease)
         }
 
@@ -835,9 +886,12 @@ mod tests {
                     "operation lease was fenced".to_string(),
                 ));
             }
-            stored.expires_at_ms = stored
-                .expires_at_ms
-                .saturating_add(i64::try_from(ttl.as_millis()).unwrap());
+            if stored.expires_at_ms <= now_ms() {
+                return Err(WorkspaceStorageError::Repository(
+                    "operation lease expired".to_string(),
+                ));
+            }
+            stored.expires_at_ms = now_ms().saturating_add(i64::try_from(ttl.as_millis()).unwrap());
             Ok(stored.clone())
         }
 
@@ -846,33 +900,47 @@ mod tests {
             workspace_id: &WorkspaceId,
             lease: &WorkspaceOperationLease,
         ) -> Result<(), WorkspaceStorageError> {
-            self.renew_streaming_operation_lease(workspace_id, lease, Duration::ZERO)
-                .await
-                .map(|_| ())
+            let leases = self.leases.read().await;
+            let stored = leases.get(&lease.operation_id).ok_or_else(|| {
+                WorkspaceStorageError::Repository("operation lease missing".to_string())
+            })?;
+            if stored != lease || stored.expires_at_ms <= now_ms() {
+                return Err(WorkspaceStorageError::Repository(
+                    "operation lease was fenced or expired".to_string(),
+                ));
+            }
+            let _ = workspace_id;
+            Ok(())
         }
 
         async fn recover_streaming_operation_lease(
             &self,
             _workspace_id: &WorkspaceId,
-            operation_id: Uuid,
-            config_version: &BackendConfigVersionId,
-            attestation_id: &CapabilityAttestationId,
-            routing_epoch: u64,
-            _ttl: Duration,
+            expected: &WorkspaceOperationLease,
+            journal_claim_owner: &str,
+            ttl: Duration,
         ) -> Result<WorkspaceOperationLease, WorkspaceStorageError> {
+            if journal_claim_owner.is_empty() {
+                return Err(WorkspaceStorageError::Repository(
+                    "journal operation is not claimed".to_string(),
+                ));
+            }
             let mut leases = self.leases.write().await;
-            let lease = leases.get_mut(&operation_id).ok_or_else(|| {
+            let lease = leases.get_mut(&expected.operation_id).ok_or_else(|| {
                 WorkspaceStorageError::Repository("operation lease missing".to_string())
             })?;
-            if &lease.config_version != config_version
-                || &lease.attestation_id != attestation_id
-                || lease.routing_epoch != routing_epoch
-            {
+            if !Self::same_lease_identity(lease, expected) {
                 return Err(WorkspaceStorageError::Repository(
                     "historical operation identity changed".to_string(),
                 ));
             }
+            if lease.expires_at_ms > now_ms() {
+                return Err(WorkspaceStorageError::Repository(
+                    "operation lease is still active".to_string(),
+                ));
+            }
             lease.fencing_token = self.fence.fetch_add(1, Ordering::SeqCst) + 1;
+            lease.expires_at_ms = now_ms().saturating_add(i64::try_from(ttl.as_millis()).unwrap());
             Ok(lease.clone())
         }
 
@@ -880,14 +948,31 @@ mod tests {
             &self,
             _workspace_id: &WorkspaceId,
             lease: &WorkspaceOperationLease,
-            _outcome: WorkspaceOperationOutcome,
+            outcome: WorkspaceOperationOutcome,
         ) -> Result<(), WorkspaceStorageError> {
-            let removed = self.leases.write().await.remove(&lease.operation_id);
-            if removed.as_ref().map(|value| value.lease_id) != Some(lease.lease_id) {
+            if let Some(settled) = self.settled.read().await.get(&lease.operation_id) {
+                return if *settled == outcome {
+                    Ok(())
+                } else {
+                    Err(WorkspaceStorageError::Repository(
+                        "operation lease outcome changed".to_string(),
+                    ))
+                };
+            }
+            let mut leases = self.leases.write().await;
+            if !leases
+                .get(&lease.operation_id)
+                .is_some_and(|stored| Self::same_lease_identity(stored, lease))
+            {
                 return Err(WorkspaceStorageError::Repository(
                     "operation lease was fenced".to_string(),
                 ));
             }
+            leases.remove(&lease.operation_id);
+            self.settled
+                .write()
+                .await
+                .insert(lease.operation_id, outcome);
             Ok(())
         }
 
@@ -909,6 +994,14 @@ mod tests {
         }
     }
 
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64
+    }
+
     #[tokio::test]
     async fn durable_streaming_contract_fences_versions_and_recovers_exact_history() {
         let repository = DurableContractRepository::default();
@@ -918,13 +1011,26 @@ mod tests {
         let identity = attested_identity(S3ProviderFamily::Aws, "config-v1");
         let operation_id = Uuid::now_v7();
         let lease = repository
-            .acquire_streaming_operation_lease(
+            .admit_streaming_operation(
                 &workspace,
-                operation_id,
+                &OperationRecord::direct_intent(
+                    crate::transaction::DirectOperationScope {
+                        operation_id,
+                        tenant_id: workspace.as_str().to_string(),
+                    },
+                    crate::transaction::ObjectDestination {
+                        backend_id: "PerUserS3".to_string(),
+                        bucket: "bucket".to_string(),
+                        logical_key: "key".to_string(),
+                        physical_key: "key".to_string(),
+                        workspace_binding: None,
+                    },
+                    crate::transaction::ExpectedObject::default(),
+                ),
                 &identity.config_version,
                 &identity.attestation.id,
                 1,
-                Duration::from_secs(30),
+                Duration::from_millis(20),
             )
             .await
             .unwrap();
@@ -939,13 +1045,24 @@ mod tests {
                 .unwrap(),
             identity
         );
+        assert!(
+            repository
+                .recover_streaming_operation_lease(
+                    &workspace,
+                    &lease,
+                    "reconciler-a",
+                    Duration::from_secs(30),
+                )
+                .await
+                .is_err(),
+            "an active route lease must never be stolen"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
         let recovered = repository
             .recover_streaming_operation_lease(
                 &workspace,
-                operation_id,
-                &lease.config_version,
-                &lease.attestation_id,
-                lease.routing_epoch,
+                &lease,
+                "reconciler-a",
                 Duration::from_secs(30),
             )
             .await
@@ -973,7 +1090,128 @@ mod tests {
             )
             .await
             .unwrap();
+        repository
+            .release_streaming_operation_lease(
+                &workspace,
+                &restored,
+                WorkspaceOperationOutcome::Committed,
+            )
+            .await
+            .unwrap();
         repository.activate("config-v2", 2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_route_recovery_is_exact_cas_and_has_one_concurrent_winner() {
+        let repository = Arc::new(DurableContractRepository::default());
+        repository.install("config-v1", 1).await;
+        let workspace = WorkspaceId::new("workspace-a").unwrap();
+        let identity = attested_identity(S3ProviderFamily::Aws, "config-v1");
+        let lease = repository
+            .admit_streaming_operation(
+                &workspace,
+                &OperationRecord::direct_intent(
+                    crate::transaction::DirectOperationScope {
+                        operation_id: Uuid::now_v7(),
+                        tenant_id: workspace.as_str().to_string(),
+                    },
+                    crate::transaction::ObjectDestination {
+                        backend_id: "PerUserS3".to_string(),
+                        bucket: "bucket".to_string(),
+                        logical_key: "key".to_string(),
+                        physical_key: "key".to_string(),
+                        workspace_binding: None,
+                    },
+                    crate::transaction::ExpectedObject::default(),
+                ),
+                &identity.config_version,
+                &identity.attestation.id,
+                1,
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let first_repository = repository.clone();
+        let first_workspace = workspace.clone();
+        let first_expected = lease.clone();
+        let first = tokio::spawn(async move {
+            first_repository
+                .recover_streaming_operation_lease(
+                    &first_workspace,
+                    &first_expected,
+                    "reconciler-a",
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        let second_repository = repository.clone();
+        let second_workspace = workspace.clone();
+        let second_expected = lease.clone();
+        let second = tokio::spawn(async move {
+            second_repository
+                .recover_streaming_operation_lease(
+                    &second_workspace,
+                    &second_expected,
+                    "reconciler-b",
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        let (first, second) = tokio::join!(first, second);
+        let winners = [first.unwrap(), second.unwrap()]
+            .into_iter()
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(winners, 1);
+    }
+
+    #[tokio::test]
+    async fn atomic_admission_has_no_route_only_orphan_on_unknown_response() {
+        let repository = DurableContractRepository::default();
+        repository.install("config-v1", 1).await;
+        repository
+            .lose_next_admission_response
+            .store(true, Ordering::Release);
+        let workspace = WorkspaceId::new("workspace-a").unwrap();
+        let identity = attested_identity(S3ProviderFamily::Aws, "config-v1");
+        let operation = OperationRecord::direct_intent(
+            crate::transaction::DirectOperationScope {
+                operation_id: Uuid::now_v7(),
+                tenant_id: workspace.as_str().to_string(),
+            },
+            crate::transaction::ObjectDestination {
+                backend_id: "PerUserS3".to_string(),
+                bucket: "bucket".to_string(),
+                logical_key: "key".to_string(),
+                physical_key: "key".to_string(),
+                workspace_binding: None,
+            },
+            crate::transaction::ExpectedObject::default(),
+        );
+
+        assert!(matches!(
+            repository
+                .admit_streaming_operation(
+                    &workspace,
+                    &operation,
+                    &identity.config_version,
+                    &identity.attestation.id,
+                    1,
+                    Duration::from_secs(30),
+                )
+                .await,
+            Err(WorkspaceStorageError::AmbiguousAdmission(_))
+        ));
+        assert!(repository.leases.read().await.contains_key(&operation.id));
+        assert!(
+            repository
+                .admitted_operations
+                .read()
+                .await
+                .contains_key(&operation.id)
+        );
     }
 
     #[tokio::test]
@@ -984,9 +1222,22 @@ mod tests {
         let attestation = CapabilityAttestationId::new("attestation-v1").unwrap();
         assert!(
             repository
-                .acquire_streaming_operation_lease(
+                .admit_streaming_operation(
                     &workspace,
-                    Uuid::now_v7(),
+                    &OperationRecord::direct_intent(
+                        crate::transaction::DirectOperationScope {
+                            operation_id: Uuid::now_v7(),
+                            tenant_id: workspace.as_str().to_string(),
+                        },
+                        crate::transaction::ObjectDestination {
+                            backend_id: "PerUserS3".to_string(),
+                            bucket: "bucket".to_string(),
+                            logical_key: "key".to_string(),
+                            physical_key: "key".to_string(),
+                            workspace_binding: None,
+                        },
+                        crate::transaction::ExpectedObject::default(),
+                    ),
                     &version,
                     &attestation,
                     1,

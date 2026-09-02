@@ -17,6 +17,8 @@ pub struct Model {
     pub routing_epoch: Option<i64>,
     pub routing_lease_id: Option<Uuid>,
     pub routing_fencing_token: Option<i64>,
+    pub mutation_not_before_ms: Option<i64>,
+    pub exact_absence_observed_at_ms: Option<i64>,
     pub expected_digest: Option<String>,
     pub expected_size: Option<i64>,
     pub expected_metadata: Json,

@@ -51,7 +51,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -2400,10 +2400,23 @@ type MockObjects = Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>;
 struct MockS3State {
     objects: MockObjects,
     block_destination_put: Arc<AtomicBool>,
+    destination_put_count: Arc<AtomicUsize>,
     destination_put_started: Arc<tokio::sync::Notify>,
     release_destination_put: Arc<tokio::sync::Notify>,
     omit_destination_head_length: Arc<AtomicBool>,
     fail_destination_delete: Arc<AtomicBool>,
+}
+
+impl MockS3State {
+    async fn wait_for_destination_put_after(&self, previous: usize) {
+        loop {
+            let notified = self.destination_put_started.notified();
+            if self.destination_put_count.load(Ordering::Acquire) > previous {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 struct UnknownSizeEmptyBody;
@@ -2504,8 +2517,15 @@ async fn mock_s3_handler(
             if !path.starts_with(&format!("{MOCK_STAGING_BUCKET}/"))
                 && state.block_destination_put.load(Ordering::Acquire)
             {
-                state.destination_put_started.notify_one();
-                state.release_destination_put.notified().await;
+                state.destination_put_count.fetch_add(1, Ordering::AcqRel);
+                state.destination_put_started.notify_waiters();
+                while state.block_destination_put.load(Ordering::Acquire) {
+                    let released = state.release_destination_put.notified();
+                    if !state.block_destination_put.load(Ordering::Acquire) {
+                        break;
+                    }
+                    released.await;
+                }
             }
             let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024)
                 .await
@@ -2842,10 +2862,11 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         mock_state
             .block_destination_put
             .store(true, Ordering::Release);
+        let destination_puts_before = mock_state.destination_put_count.load(Ordering::Acquire);
         let first_completion = tokio::spawn(restarted_app.clone().oneshot(complete));
         tokio::time::timeout(
             Duration::from_secs(5),
-            mock_state.destination_put_started.notified(),
+            mock_state.wait_for_destination_put_after(destination_puts_before),
         )
         .await
         .expect("first completion reached the direct destination");

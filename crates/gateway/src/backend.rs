@@ -49,35 +49,25 @@ impl WorkspaceS3Provider {
     fn classify(host: &str) -> Option<Self> {
         let labels = host.split('.').collect::<Vec<_>>();
         let aws_standard = matches!(labels.as_slice(), ["s3", "amazonaws", "com"])
-            || matches!(labels.as_slice(), ["s3", _, "amazonaws", "com"])
-            || matches!(
-                labels.as_slice(),
-                ["s3", "dualstack", _, "amazonaws", "com"]
-            )
-            || matches!(labels.as_slice(), ["s3-fips", _, "amazonaws", "com"])
-            || matches!(labels.as_slice(), [first, "amazonaws", "com"] if first.starts_with("s3-")
-                && !first.starts_with("s3-website")
-                && first != &"s3-accelerate"
-                && first != &"s3-accesspoint"
-                && first != &"s3-object-lambda"
-                && first != &"s3-outposts"
-                && first != &"s3-control");
-        let aws_china = matches!(labels.as_slice(), ["s3", _, "amazonaws", "com", "cn"])
-            || matches!(
-                labels.as_slice(),
-                ["s3", "dualstack", _, "amazonaws", "com", "cn"]
-            )
-            || matches!(labels.as_slice(), ["s3-fips", _, "amazonaws", "com", "cn"]);
+            || matches!(labels.as_slice(), ["s3-external-1", "amazonaws", "com"])
+            || matches!(labels.as_slice(), ["s3", region, "amazonaws", "com"] if aws_s3_region(region, false))
+            || matches!(labels.as_slice(), ["s3", "dualstack", region, "amazonaws", "com"] if aws_s3_region(region, false))
+            || matches!(labels.as_slice(), ["s3-fips", region, "amazonaws", "com"] if aws_s3_region(region, false))
+            || matches!(labels.as_slice(), ["s3-fips", "dualstack", region, "amazonaws", "com"] if aws_s3_region(region, false))
+            || matches!(labels.as_slice(), [legacy, "amazonaws", "com"] if legacy
+                .strip_prefix("s3-")
+                .is_some_and(|region| aws_s3_region(region, false)));
+        let aws_china = matches!(labels.as_slice(), ["s3", region, "amazonaws", "com", "cn"] if aws_s3_region(region, true))
+            || matches!(labels.as_slice(), ["s3", "dualstack", region, "amazonaws", "com", "cn"] if aws_s3_region(region, true))
+            || matches!(labels.as_slice(), ["s3-fips", region, "amazonaws", "com", "cn"] if aws_s3_region(region, true))
+            || matches!(labels.as_slice(), ["s3-fips", "dualstack", region, "amazonaws", "com", "cn"] if aws_s3_region(region, true));
         if aws_standard || aws_china {
             return Some(Self::Aws);
         }
         if host == "storage.googleapis.com" {
             return Some(Self::Gcs);
         }
-        if host.ends_with(".backblazeb2.com")
-            && labels.len() == 4
-            && labels.first().is_some_and(|label| *label == "s3")
-        {
+        if matches!(labels.as_slice(), ["s3", region, "backblazeb2", "com"] if valid_b2_region(region)) {
             return Some(Self::B2);
         }
         if host.ends_with(".r2.cloudflarestorage.com") && labels.len() == 4 {
@@ -92,6 +82,68 @@ impl WorkspaceS3Provider {
             return Some(Self::Wasabi);
         }
         None
+    }
+}
+
+fn valid_b2_region(region: &str) -> bool {
+    let mut labels = region.split('-');
+    let (Some(country), Some(area), Some(cluster), None) =
+        (labels.next(), labels.next(), labels.next(), labels.next())
+    else {
+        return false;
+    };
+    country.len() == 2
+        && country.bytes().all(|byte| byte.is_ascii_lowercase())
+        && !area.is_empty()
+        && area.bytes().all(|byte| byte.is_ascii_lowercase())
+        && cluster.len() == 3
+        && cluster.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn aws_s3_region(region: &str, china_partition: bool) -> bool {
+    const STANDARD: &[&str] = &[
+        "af-south-1",
+        "ap-east-1",
+        "ap-east-2",
+        "ap-northeast-1",
+        "ap-northeast-2",
+        "ap-northeast-3",
+        "ap-south-1",
+        "ap-south-2",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-southeast-3",
+        "ap-southeast-4",
+        "ap-southeast-5",
+        "ap-southeast-6",
+        "ap-southeast-7",
+        "ca-central-1",
+        "ca-west-1",
+        "eu-central-1",
+        "eu-central-2",
+        "eu-north-1",
+        "eu-south-1",
+        "eu-south-2",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-west-3",
+        "il-central-1",
+        "me-central-1",
+        "me-south-1",
+        "mx-central-1",
+        "sa-east-1",
+        "us-east-1",
+        "us-east-2",
+        "us-gov-east-1",
+        "us-gov-west-1",
+        "us-west-1",
+        "us-west-2",
+    ];
+    const CHINA: &[&str] = &["cn-north-1", "cn-northwest-1"];
+    if china_partition {
+        CHINA.contains(&region)
+    } else {
+        STANDARD.contains(&region)
     }
 }
 
@@ -394,6 +446,7 @@ impl BackendResolver {
         workspace_id: &WorkspaceId,
         operation_id: uuid::Uuid,
         binding: &WorkspaceDestinationBinding,
+        journal_claim_owner: &str,
         ttl: Duration,
     ) -> Result<(ResolvedBackend, WorkspaceOperationLease), String> {
         let config_version = BackendConfigVersionId::new(binding.backend_config_version.clone())
@@ -401,20 +454,28 @@ impl BackendResolver {
         let attestation_id =
             CapabilityAttestationId::new(binding.capability_attestation_id.clone())
                 .map_err(|_| "workspace storage recovery identity is invalid".to_string())?;
+        let expected = WorkspaceOperationLease {
+            operation_id,
+            lease_id: binding.routing_lease_id,
+            config_version,
+            attestation_id,
+            routing_epoch: binding.routing_epoch,
+            fencing_token: binding.routing_fencing_token,
+            // Expiry is deliberately not journaled. The repository compares
+            // its durable expiry while CASing the persisted identity above.
+            expires_at_ms: 0,
+        };
         let lease = self
             .workspace_storage
-            .recover_streaming_operation_lease(
-                workspace_id,
-                operation_id,
-                &config_version,
-                &attestation_id,
-                binding.routing_epoch,
-                ttl,
-            )
+            .recover_streaming_operation_lease(workspace_id, &expected, journal_claim_owner, ttl)
             .await
             .map_err(|_| "workspace storage recovery lease is unavailable".to_string())?;
-        if lease.lease_id != binding.routing_lease_id
-            || lease.fencing_token < binding.routing_fencing_token
+        if lease.operation_id != operation_id
+            || lease.lease_id != binding.routing_lease_id
+            || lease.config_version.as_str() != binding.backend_config_version
+            || lease.attestation_id.as_str() != binding.capability_attestation_id
+            || lease.routing_epoch != binding.routing_epoch
+            || lease.fencing_token <= binding.routing_fencing_token
         {
             return Err("workspace storage recovery fence changed".to_string());
         }
@@ -541,6 +602,16 @@ impl WorkspaceEndpointPolicy {
     pub async fn validate(&self, endpoint: &str) -> Result<Url, String> {
         if !endpoint.is_ascii() {
             return Err("workspace endpoint must use an ASCII hostname".to_string());
+        }
+        let authority = endpoint
+            .split_once("://")
+            .map(|(_, remainder)| remainder)
+            .unwrap_or_default()
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        if authority.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err("workspace endpoint host must be lowercase".to_string());
         }
         let url = Url::parse(endpoint)
             .map_err(|_| "workspace endpoint must be an absolute HTTP(S) URL".to_string())?;
@@ -1834,12 +1905,17 @@ mod tests {
             ("s3.amazonaws.com", WorkspaceS3Provider::Aws),
             ("s3.us-east-1.amazonaws.com", WorkspaceS3Provider::Aws),
             ("s3-us-west-2.amazonaws.com", WorkspaceS3Provider::Aws),
+            ("s3-external-1.amazonaws.com", WorkspaceS3Provider::Aws),
             (
                 "s3.dualstack.eu-west-1.amazonaws.com",
                 WorkspaceS3Provider::Aws,
             ),
             (
                 "s3-fips.us-gov-west-1.amazonaws.com",
+                WorkspaceS3Provider::Aws,
+            ),
+            (
+                "s3-fips.dualstack.us-gov-west-1.amazonaws.com",
                 WorkspaceS3Provider::Aws,
             ),
             ("s3.cn-north-1.amazonaws.com.cn", WorkspaceS3Provider::Aws),
@@ -1871,11 +1947,22 @@ mod tests {
             "s3-accelerate.amazonaws.com",
             "s3-website-us-east-1.amazonaws.com",
             "s3-website.us-east-1.amazonaws.com",
+            "s3-evil.amazonaws.com",
+            "s3-mars-1.amazonaws.com",
+            "s3.evil.amazonaws.com",
+            "s3.dualstack.evil.amazonaws.com",
+            "s3-fips.evil.amazonaws.com",
+            "s3-external-2.amazonaws.com",
             "ec2.us-east-1.amazonaws.com",
             "r2.cloudflarestorage.com",
             "bucket.account.r2.cloudflarestorage.com",
             "bucket.nyc3.digitaloceanspaces.com",
             "s3.foo.us-east-005.backblazeb2.com",
+            "s3.evil.backblazeb2.com",
+            "s3.us-east-5.backblazeb2.com",
+            "s3.us-east-0005.backblazeb2.com",
+            "s3.u-east-005.backblazeb2.com",
+            "s3.us-ea5t-005.backblazeb2.com",
         ] {
             assert_eq!(WorkspaceS3Provider::classify(host), None, "{host}");
         }
@@ -2098,6 +2185,9 @@ mod tests {
             "https://user@objects.example",
             "https://objects.example?token=secret",
             "https://objects.example#fragment",
+            "https://Objects.example",
+            "https://s3.US-east-005.backblazeb2.com",
+            "https://s3.us-\u{00e9}ast-005.backblazeb2.com",
         ] {
             assert!(policy.validate(endpoint).await.is_err(), "{endpoint}");
         }

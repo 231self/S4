@@ -430,24 +430,37 @@ Persisted S3-compatible workspace endpoints use a separate
 - Public builds provide no common-provider allowlist defaults. Deployments must
   choose the provider domains they trust.
 - Endpoint-family recognition and streaming authority are separate. The public
-  engine recognizes only canonical AWS S3 data-plane, GCS XML/HMAC, B2 S3, R2,
-  DigitalOcean Spaces, and Wasabi origin grammars; AWS website, control,
-  Object Lambda, Outposts, accelerate, access-point, and virtual-hosted bucket
-  forms are not accepted. Recognition never grants capabilities.
+  engine recognizes only explicit AWS S3 global, known regional, legacy
+  regional, external-1, dualstack, and FIPS data-plane forms, plus GCS XML/HMAC,
+  B2 S3, R2, DigitalOcean Spaces, and Wasabi origin grammars. Arbitrary `s3-*`
+  labels and AWS website, control, Object Lambda, Outposts, accelerate,
+  access-point, and virtual-hosted bucket forms are not accepted. Recognition
+  never grants capabilities.
 - Hosted direct streaming requires an adapter-supplied immutable config version
   and operator capability/permission attestation. B2 additionally requires
   version listing/deletion and exact-version recovery. Missing attestations or
   legacy repository implementations fail closed.
-- Before body polling or provider mutation, the adapter must atomically acquire
+- Before body polling (including Avro OCF) or provider mutation, the adapter must atomically acquire
   a database routing lease bound to operation ID, config version, attestation,
-  and routing epoch. Writes renew it, completion rechecks it, and only committed
-  or proven-aborted operations release it. Config transitions and version
-  retirement must conflict while a lease or nonterminal journal row is open.
+  and routing epoch. A background heartbeat covers body processing, and every
+  provider future is directly raced against renewal after an immediate fence
+  assertion. Fence loss drops that future and forbids later probes, aborts, or
+  mutations. Only committed or proven-aborted operations release the lease.
+  Config transitions and version retirement must conflict while a lease or
+  nonterminal journal row is open.
 - Journal rows store only opaque version/attestation IDs and routing lease/fence
   values, never credentials. Startup and periodic reconcilers call
-  `reconcile_workspace_streaming_operation`, which reloads historical encrypted
-  credentials by exact version and reconstructs the same client. There is no
-  fallback to current credentials.
+  `reconcile_workspace_streaming_operation`. Nonterminal recovery claims the
+  journal row first, then performs an expired-only CAS over the persisted lease
+  ID/token/config/attestation/epoch. The private adapter advances both the route
+  fence and journal binding in one transaction before historical credentials
+  are loaded and the same client is reconstructed. There is no fallback to
+  current credentials and an active route lease is never stolen.
+- Journal terminal state precedes route settlement. This ordering preserves the
+  authoritative provider outcome across crashes. The startup/periodic pass also
+  visits workspace-bound `COMMITTED` and `PROVEN_ABORTED` rows and idempotently
+  settles their exact lease after atomically verifying the matching journal
+  outcome, closing the crash window between journal commit and request cleanup.
 - **Private implementation boundary:** the SaaS repository owns encrypted,
   immutable config-version retention, provider conformance attestation, atomic
   lease/config-transition transactions, lease recovery, and scheduling the
@@ -471,7 +484,9 @@ Persisted S3-compatible workspace endpoints use a separate
   reconcile pending staging outboxes against the artifact store, reap expired
   multipart uploads, and reconcile managed repairs. Direct `COMMIT_UNKNOWN`
   operations require exact-operation reconciliation with the immutable backend
-  config version and routing fence originally bound to the request.
+  config version and routing fence originally bound to the request. The same
+  pass revisits terminal workspace operations until route settlement succeeds;
+  terminal settlement is idempotent and performs no provider request.
 
 ## 12. Bounded parsing and memory
 

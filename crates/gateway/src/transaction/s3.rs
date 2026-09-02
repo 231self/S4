@@ -15,11 +15,11 @@ use crate::s3_safety::record_s3_failure;
 
 use super::{
     AbortSignal, BackendCapabilities, BackendError, CompletionProbe, DIRECT_PART_BYTES,
-    DiscoveredMultipartPart, DiscoveredObjectVersion, DiscoveredUpload, EvidenceRecord,
-    MultipartUploadInspection, ObjectDestination, ObjectSinkTransaction, OperationJournal,
-    OperationRecord, OperationState, PartRecord, ProviderMutationFence, SinkCommitState,
-    StoredObjectMeta, TransactionBackend, TransactionError, UploadedPart,
-    EXACT_ABSENCE_CONFIRMATION_DELAY, PROVIDER_MUTATION_AMBIGUITY_WINDOW, sha256_hex, unix_time_ms,
+    DiscoveredMultipartPart, DiscoveredObjectVersion, DiscoveredUpload,
+    EXACT_ABSENCE_CONFIRMATION_DELAY, EvidenceRecord, MultipartUploadInspection, ObjectDestination,
+    ObjectSinkTransaction, OperationJournal, OperationRecord, OperationState,
+    PROVIDER_MUTATION_AMBIGUITY_WINDOW, PartRecord, ProviderMutationFence, SinkCommitState,
+    StoredObjectMeta, TransactionBackend, TransactionError, UploadedPart, sha256_hex, unix_time_ms,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,9 +135,9 @@ impl AwsS3TransactionBackend {
                 .iter()
                 .filter(|version| {
                     version.operation_matches
-                    && version.expected_metadata_matches
-                    && version.encryption_matches
-                    && !version.delete_marker
+                        && version.expected_metadata_matches
+                        && version.encryption_matches
+                        && !version.delete_marker
                 })
                 .max_by(|left, right| {
                     left.last_modified_ms
@@ -2088,12 +2088,10 @@ mod tests {
             &self,
             _operation: &OperationRecord,
         ) -> Result<CompletionProbe, BackendError> {
-            Ok(self
-                .committed
-                .lock()
-                .await
-                .clone()
-                .map_or(CompletionProbe::ProvenAbsentExact, CompletionProbe::Committed))
+            Ok(self.committed.lock().await.clone().map_or(
+                CompletionProbe::ProvenAbsentExact,
+                CompletionProbe::Committed,
+            ))
         }
     }
 
@@ -2737,7 +2735,12 @@ mod tests {
         );
         assert!(sink.reconcile_completion().await.unwrap().is_none());
         assert_eq!(
-            journal.get(sink.operation_id()).await.unwrap().unwrap().state,
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             OperationState::CommitUnknown
         );
 
@@ -2745,7 +2748,12 @@ mod tests {
         let committed = sink.reconcile_completion().await.unwrap().unwrap();
         assert_eq!(committed.version_id.as_deref(), Some("late-version"));
         assert_eq!(
-            journal.get(sink.operation_id()).await.unwrap().unwrap().state,
+            journal
+                .get(sink.operation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             OperationState::Committed
         );
     }

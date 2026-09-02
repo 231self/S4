@@ -67,7 +67,8 @@ impl WorkspaceS3Provider {
         if host == "storage.googleapis.com" {
             return Some(Self::Gcs);
         }
-        if matches!(labels.as_slice(), ["s3", region, "backblazeb2", "com"] if valid_b2_region(region)) {
+        if matches!(labels.as_slice(), ["s3", region, "backblazeb2", "com"] if valid_b2_region(region))
+        {
             return Some(Self::B2);
         }
         if host.ends_with(".r2.cloudflarestorage.com") && labels.len() == 4 {

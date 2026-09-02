@@ -40,6 +40,7 @@ use s4_gateway::store::{KeyRepository, PostgresKeyStore, sha256_hash};
 use s4_gateway::transaction::{
     EvidenceRecord, ExpectedObject, ObjectDestination, OperationJournal, OperationRecord,
     OperationState, PartRecord, PostgresOperationJournal, StoredObjectMeta,
+    WorkspaceDestinationBinding,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -50,7 +51,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -402,6 +403,7 @@ fn postgres_namespace_purge_fences_late_writes_and_completes_idempotently() {
                     bucket: "bucket".to_string(),
                     logical_key: "bucket/key".to_string(),
                     physical_key: "managed/physical-key".to_string(),
+                    workspace_binding: None,
                 },
                 ExpectedObject::default(),
                 tenant.clone(),
@@ -428,6 +430,7 @@ fn postgres_namespace_purge_fences_late_writes_and_completes_idempotently() {
                     bucket: "bucket".to_string(),
                     logical_key: "bucket/unresolved".to_string(),
                     physical_key: "managed/unresolved".to_string(),
+                    workspace_binding: None,
                 },
                 ExpectedObject::default(),
                 tenant.clone(),
@@ -717,6 +720,7 @@ fn postgres_operation_journal_persists_canonical_ambiguous_completion() {
                 bucket: "bucket".to_string(),
                 logical_key: format!("logical-{}", uuid::Uuid::new_v4()),
                 physical_key: format!("physical-{}", uuid::Uuid::new_v4()),
+                workspace_binding: None,
             },
             ExpectedObject {
                 digest: Some("sha256:test".to_string()),
@@ -776,6 +780,82 @@ fn postgres_operation_journal_persists_canonical_ambiguous_completion() {
             .exec(&db)
             .await
             .expect("delete operation journal test row");
+    });
+}
+
+#[test]
+fn postgres_workspace_destination_survives_restart_in_every_recovery_state() {
+    with_pool(|pool| async move {
+        for target_state in [
+            OperationState::Open,
+            OperationState::Completing,
+            OperationState::CommitUnknown,
+        ] {
+            let journal = PostgresOperationJournal::new(pool.clone());
+            let operation_id = uuid::Uuid::now_v7();
+            let binding = WorkspaceDestinationBinding {
+                backend_config_version: format!("config-{operation_id}"),
+                capability_attestation_id: format!("attestation-{operation_id}"),
+                routing_epoch: 7,
+                routing_lease_id: uuid::Uuid::now_v7(),
+                routing_fencing_token: 11,
+            };
+            let operation = OperationRecord::direct_intent(
+                s4_gateway::transaction::DirectOperationScope {
+                    operation_id,
+                    tenant_id: "workspace-restart".to_string(),
+                },
+                ObjectDestination {
+                    backend_id: "PerUserS3".to_string(),
+                    bucket: "bucket".to_string(),
+                    logical_key: "logical".to_string(),
+                    physical_key: "physical".to_string(),
+                    workspace_binding: Some(binding.clone()),
+                },
+                ExpectedObject::default(),
+            );
+            journal.insert_intent(operation).await.unwrap();
+            journal
+                .set_open(operation_id, Some("upload-id"))
+                .await
+                .unwrap();
+            if matches!(
+                target_state,
+                OperationState::Completing | OperationState::CommitUnknown
+            ) {
+                journal
+                    .transition(
+                        operation_id,
+                        OperationState::Open,
+                        OperationState::Completing,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if target_state == OperationState::CommitUnknown {
+                journal
+                    .transition(
+                        operation_id,
+                        OperationState::Completing,
+                        OperationState::CommitUnknown,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let restarted = PostgresOperationJournal::new(pool.clone())
+                .get(operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(restarted.state, target_state);
+            assert_eq!(restarted.destination.workspace_binding, Some(binding));
+            let persisted = serde_json::to_string(&restarted.destination).unwrap();
+            assert!(!persisted.contains("secret"));
+            assert!(!persisted.contains("access-key"));
+        }
     });
 }
 
@@ -2320,10 +2400,23 @@ type MockObjects = Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>;
 struct MockS3State {
     objects: MockObjects,
     block_destination_put: Arc<AtomicBool>,
+    destination_put_count: Arc<AtomicUsize>,
     destination_put_started: Arc<tokio::sync::Notify>,
     release_destination_put: Arc<tokio::sync::Notify>,
     omit_destination_head_length: Arc<AtomicBool>,
     fail_destination_delete: Arc<AtomicBool>,
+}
+
+impl MockS3State {
+    async fn wait_for_destination_put_after(&self, previous: usize) {
+        loop {
+            let notified = self.destination_put_started.notified();
+            if self.destination_put_count.load(Ordering::Acquire) > previous {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 struct UnknownSizeEmptyBody;
@@ -2424,8 +2517,15 @@ async fn mock_s3_handler(
             if !path.starts_with(&format!("{MOCK_STAGING_BUCKET}/"))
                 && state.block_destination_put.load(Ordering::Acquire)
             {
-                state.destination_put_started.notify_one();
-                state.release_destination_put.notified().await;
+                state.destination_put_count.fetch_add(1, Ordering::AcqRel);
+                state.destination_put_started.notify_waiters();
+                while state.block_destination_put.load(Ordering::Acquire) {
+                    let released = state.release_destination_put.notified();
+                    if !state.block_destination_put.load(Ordering::Acquire) {
+                        break;
+                    }
+                    released.await;
+                }
             }
             let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024)
                 .await
@@ -2762,10 +2862,11 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         mock_state
             .block_destination_put
             .store(true, Ordering::Release);
+        let destination_puts_before = mock_state.destination_put_count.load(Ordering::Acquire);
         let first_completion = tokio::spawn(restarted_app.clone().oneshot(complete));
         tokio::time::timeout(
             Duration::from_secs(5),
-            mock_state.destination_put_started.notified(),
+            mock_state.wait_for_destination_put_after(destination_puts_before),
         )
         .await
         .expect("first completion reached the direct destination");

@@ -10,12 +10,13 @@ use tracing::{info, warn};
 
 use crate::control::{RequestKind, UsageEvent, UsageRoute};
 use crate::managed::{
-    BackendVersioningCapability, BackendVersioningMode, CopyStatus, DurablePhysicalWriteIntent,
-    LogicalObjectKey, ManagedError, ManagedLogicalOperationIntent, ManagedLogicalOperationState,
-    ManagedMutationKind, ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence,
-    NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1,
-    PhysicalVersionTarget, PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind,
-    RepairRecord, RepairTargetRole, generation_physical_key, rendezvous_placement,
+    AuthorityListPage, AuthorityListQuery, BackendVersioningCapability, BackendVersioningMode,
+    CopyStatus, DurablePhysicalWriteIntent, LogicalObjectKey, ManagedError,
+    ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
+    ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence, NamespacePurgeRequest,
+    NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget,
+    PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind, RepairRecord,
+    RepairTargetRole, generation_physical_key, rendezvous_placement,
 };
 use crate::s3_safety::{
     record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
@@ -206,6 +207,17 @@ impl ServiceStorage {
 
     pub fn authority_repository(&self) -> Option<&Arc<dyn ManagedRepository>> {
         self.authority.as_ref()
+    }
+
+    /// Lists only authoritative logical objects. Provider buckets hold opaque
+    /// generation keys and must never be exposed through the S3 front door.
+    pub async fn list_authority(
+        &self,
+        query: AuthorityListQuery,
+    ) -> Result<AuthorityListPage, ManagedError> {
+        self.authority_repository_required()?
+            .list_authority(query)
+            .await
     }
 
     /// Validate the launch topology before enabling transactional managed

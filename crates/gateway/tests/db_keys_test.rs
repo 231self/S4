@@ -22,13 +22,14 @@ use s4_gateway::entity::multipart_upload;
 use s4_gateway::entity::object_operation;
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
 use s4_gateway::managed::{
-    AuthorityListQuery, BackendVersioningCapability, BackendVersioningMode, CopyStatus,
-    InMemoryManagedRepository, LogicalObjectKey, MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES,
-    MANAGED_LIST_CURSOR_WORKSPACE_LIMIT, ManagedListCursorBinding, ManagedListCursorPosition,
-    ManagedListCursorRequest, ManagedListCursorState, ManagedListVersion,
-    ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
-    ManagedProvenPhysicalAllocation, ManagedRepository, ManagedRouteFence, ManagedUsageEvidence,
-    NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority, PhysicalWriteIntent, Placement,
+    AuthorityListQuery, AuthorityPlacementPageQuery, BackendVersioningCapability,
+    BackendVersioningMode, CopyStatus, InMemoryManagedRepository, LogicalObjectKey,
+    MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES, MANAGED_LIST_CURSOR_WORKSPACE_LIMIT,
+    ManagedListCursorBinding, ManagedListCursorPosition, ManagedListCursorRequest,
+    ManagedListCursorState, ManagedListVersion, ManagedLogicalOperationIntent,
+    ManagedLogicalOperationState, ManagedMutationKind, ManagedProvenPhysicalAllocation,
+    ManagedRepository, ManagedRouteFence, ManagedUsageEvidence, NamespacePurgeRequest,
+    NamespacePurgeStatus, ObjectAuthority, PhysicalWriteIntent, Placement,
     PostgresManagedRepository, ProviderStorageIdentity, generation_physical_key,
 };
 use s4_gateway::multipart_staging::{
@@ -1008,6 +1009,66 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
             .exec(&db)
             .await
             .expect("delete multipart completion test rows");
+    });
+}
+
+#[test]
+fn postgres_global_authority_placement_page_has_stable_boundaries() {
+    with_pool(|pool| async move {
+        let repository = PostgresManagedRepository::new(pool);
+        let tenant = format!("managed-placement-page-{}", uuid::Uuid::new_v4());
+        for key in ["a", "b", "c"] {
+            let logical = LogicalObjectKey::new(&tenant, "bucket", key);
+            let generation = uuid::Uuid::now_v7();
+            let version = ledger_managed_test_version(
+                &repository,
+                &tenant,
+                "primary",
+                &generation_physical_key(&logical, generation),
+            )
+            .await;
+            repository
+                .publish(
+                    ObjectAuthority {
+                        logical,
+                        generation,
+                        digest: "digest".to_string(),
+                        size: 3,
+                        metadata: std::collections::BTreeMap::new(),
+                        placement_version: 1,
+                        primary_backend_id: "primary".to_string(),
+                        primary_version_id: Some(version),
+                        replica_backend_id: None,
+                        primary_status: CopyStatus::Ready,
+                        replica_status: CopyStatus::Absent,
+                        tombstone: false,
+                        cas_version: 0,
+                        created_at_ms: 0,
+                        updated_at_ms: 0,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let first = repository
+            .list_authority_below_placement_version(AuthorityPlacementPageQuery {
+                target_placement_version: 2,
+                after: None,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.objects.len(), 2);
+        let second = repository
+            .list_authority_below_placement_version(AuthorityPlacementPageQuery {
+                target_placement_version: 2,
+                after: first.next_after,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.objects.len(), 1);
     });
 }
 

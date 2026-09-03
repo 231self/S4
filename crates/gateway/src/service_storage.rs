@@ -1,7 +1,7 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use bytes::Bytes;
-use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use crate::managed::{
     ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence, NamespacePurgeRequest,
     NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget,
     PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind, RepairRecord,
-    RepairTargetRole, generation_physical_key, rendezvous_placement,
+    RepairTargetRole, generation_physical_key, weighted_rendezvous_placement,
 };
 use crate::s3_safety::{
     record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
@@ -38,6 +38,8 @@ pub struct ServiceBackend {
     pub provider_instance_id: Option<String>,
     pub provider_account_id: Option<String>,
     pub credential_epoch: Option<u64>,
+    pub placement_weight: u64,
+    pub placement_capacity_units: u64,
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
@@ -71,6 +73,11 @@ impl ServiceBackend {
             || format!("{}:{}", self.provider, self.bucket),
             |instance_id| format!("{}:{instance_id}", self.provider),
         )
+    }
+
+    pub fn placement_weight(&self) -> Option<u64> {
+        self.placement_weight
+            .checked_mul(self.placement_capacity_units)
     }
 
     pub fn storage_identity(&self) -> Option<ProviderStorageIdentity> {
@@ -226,32 +233,48 @@ impl ServiceStorage {
         if self.managed_mode != ManagedStreamingMode::Enforce {
             return Ok(());
         }
-        let [backend] = self.backends.as_slice() else {
+        if self.backends.is_empty() {
             return Err(
-                "transactional managed mode requires exactly one managed B2 backend at launch"
-                    .to_string(),
-            );
-        };
-        if !backend.is_b2() {
-            return Err(
-                "transactional managed mode requires the launch backend provider to be B2"
+                "transactional managed mode requires one or more managed B2 backends at launch"
                     .to_string(),
             );
         }
-        if reqwest::Url::parse(&backend.endpoint)
-            .ok()
-            .is_none_or(|endpoint| endpoint.scheme() != "https")
-        {
-            return Err("transactional managed B2 requires an HTTPS provider endpoint".to_string());
-        }
-        if backend.storage_identity().is_none()
-            || backend.provider_account_id().is_none()
-            || !backend.credential_epoch().is_some_and(|epoch| epoch > 0)
-        {
-            return Err(
-                "transactional managed B2 requires explicit provider instance/account identity and a positive credential epoch"
-                    .to_string(),
-            );
+        let mut backend_ids = HashSet::with_capacity(self.backends.len());
+        for backend in &self.backends {
+            if !backend.is_b2() {
+                return Err(
+                    "transactional managed mode supports only B2 backend pools at launch"
+                        .to_string(),
+                );
+            }
+            if reqwest::Url::parse(&backend.endpoint)
+                .ok()
+                .is_none_or(|endpoint| endpoint.scheme() != "https")
+            {
+                return Err(
+                    "transactional managed B2 requires HTTPS provider endpoints".to_string()
+                );
+            }
+            if backend.storage_identity().is_none()
+                || backend.provider_account_id().is_none()
+                || !backend.credential_epoch().is_some_and(|epoch| epoch > 0)
+            {
+                return Err(
+                    "transactional managed B2 requires explicit provider instance/account identity and a positive credential epoch"
+                        .to_string(),
+                );
+            }
+            if backend.placement_weight().is_none_or(|weight| weight == 0) {
+                return Err(
+                    "transactional managed B2 requires positive static placement weight and capacity units"
+                        .to_string(),
+                );
+            }
+            if !backend_ids.insert(backend.id()) {
+                return Err(
+                    "transactional managed B2 requires unique stable backend IDs".to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -488,11 +511,15 @@ impl ServiceStorage {
     }
 
     pub fn placement(&self, logical: &LogicalObjectKey) -> Option<Placement> {
-        rendezvous_placement(
+        weighted_rendezvous_placement(
             self.placement_version,
             &logical.tenant_id,
             &logical.object_key(),
-            self.backends.iter().map(ServiceBackend::id),
+            self.backends.iter().filter_map(|backend| {
+                backend
+                    .placement_weight()
+                    .map(|weight| (backend.id(), weight))
+            }),
         )
     }
 
@@ -2350,6 +2377,8 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
             instance,
             account,
             credential_epoch,
+            placement_weight,
+            placement_capacity_units,
             endpoint,
             region,
             bucket,
@@ -2358,6 +2387,8 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
         ) = match parts.as_slice() {
             [provider, endpoint, region, bucket, access_key, secret_key] => (
                 *provider,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -2382,6 +2413,33 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
                 Some(*instance),
                 Some(*account),
                 Some(*credential_epoch),
+                None,
+                None,
+                *endpoint,
+                *region,
+                *bucket,
+                *access_key,
+                *secret_key,
+            ),
+            [
+                provider,
+                instance,
+                account,
+                credential_epoch,
+                placement_weight,
+                placement_capacity_units,
+                endpoint,
+                region,
+                bucket,
+                access_key,
+                secret_key,
+            ] => (
+                *provider,
+                Some(*instance),
+                Some(*account),
+                Some(*credential_epoch),
+                Some(*placement_weight),
+                Some(*placement_capacity_units),
                 *endpoint,
                 *region,
                 *bucket,
@@ -2390,7 +2448,7 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
             ),
             _ => {
                 return Err(format!(
-                    "invalid S4_SERVICE_BUCKETS entry {entry}: expected six legacy fields or nine managed identity fields"
+                    "invalid S4_SERVICE_BUCKETS entry {entry}: expected six legacy fields, nine managed identity fields, or eleven managed placement fields"
                 ));
             }
         };
@@ -2431,6 +2489,26 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
                 Ok((instance, account, credential_epoch))
             })
             .transpose()?;
+        let placement_policy = placement_weight
+            .zip(placement_capacity_units)
+            .map(|(weight, capacity_units)| {
+                let weight = weight.parse::<u64>().map_err(|_| {
+                    format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed placement weight")
+                })?;
+                let capacity_units = capacity_units.parse::<u64>().map_err(|_| {
+                    format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed placement capacity units")
+                })?;
+                if weight == 0 || capacity_units == 0 || weight.checked_mul(capacity_units).is_none() {
+                    return Err(format!(
+                        "invalid S4_SERVICE_BUCKETS entry {entry}: placement weight and capacity units must be positive without overflow"
+                    ));
+                }
+                Ok((weight, capacity_units))
+            })
+            .transpose()?
+            // S7a's deployed managed identity form had no placement policy.
+            // Its single backend retains the equivalent 1x1 static policy.
+            .unwrap_or((1, 1));
         let endpoint_url = reqwest::Url::parse(endpoint)
             .map_err(|_| format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint"))?;
         if endpoint.len() > 2048
@@ -2478,6 +2556,8 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
                 .as_ref()
                 .map(|(_, account, _)| (*account).to_string()),
             credential_epoch: explicit_identity.map(|(_, _, epoch)| epoch),
+            placement_weight: placement_policy.0,
+            placement_capacity_units: placement_policy.1,
             endpoint: canonical_endpoint,
             region: region.to_string(),
             bucket: bucket.to_string(),
@@ -2523,11 +2603,21 @@ mod tests {
         assert_eq!(managed.provider_instance_id(), Some("managed-primary"));
         assert_eq!(managed.provider_account_id(), Some("account-123"));
         assert_eq!(managed.credential_epoch(), Some(2));
+        assert_eq!(managed.placement_weight, 1);
+        assert_eq!(managed.placement_capacity_units, 1);
         assert_eq!(managed.id(), "b2:managed-primary");
         assert_eq!(
             managed.storage_identity().unwrap().canonical_endpoint,
             "https://s3.us-east-005.backblazeb2.com/"
         );
+        let weighted = parse_service_backends(
+            "b2|managed-secondary|account-123|3|4|5|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket-two|rotated-key|rotated-secret",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!(weighted.placement_weight, 4);
+        assert_eq!(weighted.placement_capacity_units, 5);
         assert!(
             parse_service_backends(
                 "b2|managed-primary|2|https://s3.example|us-east-1|bucket|key|secret"
@@ -2538,7 +2628,7 @@ mod tests {
     }
 
     #[test]
-    fn transactional_managed_launch_requires_one_identified_b2_backend() {
+    fn transactional_managed_launch_requires_identified_b2_pool_with_static_policy() {
         let repository = Arc::new(InMemoryManagedRepository::new());
         let managed = parse_service_backends(
             "b2|managed-primary|account-123|1|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|key|secret",
@@ -2551,6 +2641,21 @@ mod tests {
             PLACEMENT_VERSION_V1,
         );
         assert!(storage.validate_managed_launch_configuration().is_ok());
+
+        let multi_b2 = parse_service_backends(
+            "b2|managed-primary|account-123|1|1|1|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|key|secret;b2|managed-replica|account-123|1|3|2|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket-two|key|secret",
+        )
+        .unwrap();
+        assert!(
+            ServiceStorage::with_management(
+                multi_b2,
+                repository.clone(),
+                ManagedStreamingMode::Enforce,
+                PLACEMENT_VERSION_V1,
+            )
+            .validate_managed_launch_configuration()
+            .is_ok()
+        );
 
         for invalid in [
             Vec::new(),
@@ -2567,7 +2672,11 @@ mod tests {
             )
             .unwrap(),
             parse_service_backends(
-                "b2|one|account-1|1|https://s3.example|us-east-1|bucket-one|key|secret;b2|two|account-2|1|https://s3.example|us-east-1|bucket-two|key|secret",
+                "b2|one|account-1|1|1|1|https://s3.example|us-east-1|bucket-one|key|secret;aws|two|account-2|1|1|1|https://s3.example|us-east-1|bucket-two|key|secret",
+            )
+            .unwrap(),
+            parse_service_backends(
+                "b2|duplicate|account-1|1|1|1|https://s3.example|us-east-1|bucket-one|key|secret;b2|duplicate|account-2|1|1|1|https://s3.example|us-east-1|bucket-two|key|secret",
             )
             .unwrap(),
         ] {
@@ -2579,6 +2688,30 @@ mod tests {
             );
             assert!(storage.validate_managed_launch_configuration().is_err());
         }
+        for invalid_policy in [
+            "b2|one|account-1|1|0|1|https://s3.example|us-east-1|bucket|key|secret",
+            "b2|one|account-1|1|1|0|https://s3.example|us-east-1|bucket|key|secret",
+            "b2|one|account-1|1|18446744073709551615|2|https://s3.example|us-east-1|bucket|key|secret",
+        ] {
+            assert!(parse_service_backends(invalid_policy).is_err());
+        }
+    }
+
+    #[test]
+    fn managed_placement_is_weighted_order_independent_and_has_distinct_replica() {
+        let first = parse_service_backends(
+            "b2|one|account-1|1|1|1|https://s3.example|us-east-1|bucket-one|key|secret;b2|two|account-2|1|3|1|https://s3.example|us-east-1|bucket-two|key|secret;b2|three|account-3|1|2|1|https://s3.example|us-east-1|bucket-three|key|secret",
+        )
+        .unwrap();
+        let second = vec![first[2].clone(), first[0].clone(), first[1].clone()];
+        let logical = LogicalObjectKey::new("tenant", "bucket", "key");
+        let first_placement = ServiceStorage::new(first).placement(&logical).unwrap();
+        let second_placement = ServiceStorage::new(second).placement(&logical).unwrap();
+        assert_eq!(first_placement, second_placement);
+        assert_ne!(
+            first_placement.primary_backend_id,
+            first_placement.replica_backend_id.unwrap()
+        );
     }
 
     #[test]
@@ -3058,6 +3191,8 @@ mod tests {
             provider_instance_id: Some("managed-primary".to_string()),
             provider_account_id: Some("test-account".to_string()),
             credential_epoch: Some(1),
+            placement_weight: 1,
+            placement_capacity_units: 1,
             endpoint: format!("http://{}", listener.local_addr().unwrap()),
             region: "us-east-1".to_string(),
             bucket: "bucket".to_string(),

@@ -3353,10 +3353,75 @@ async fn begin_streaming_sink(
         ResolvedBackend::Memory(_) => Err(StreamingPutError::Unsupported(
             "development memory streaming is not enabled".to_string(),
         )),
-        ResolvedBackend::Managed(_) => Err(StreamingPutError::Unsupported(
-            "managed streaming cannot use one authorization identity for replicated journals"
-                .to_string(),
-        )),
+        ResolvedBackend::Managed(storage) => {
+            let journal = state.operation_journal.clone().ok_or_else(|| {
+                StreamingPutError::Unsupported(
+                    "managed streaming needs a durable operation journal".to_string(),
+                )
+            })?;
+            if !journal.is_durable() {
+                return Err(StreamingPutError::Unsupported(
+                    "managed streaming needs a durable operation journal".to_string(),
+                ));
+            }
+            if storage.managed_mode() != ManagedStreamingMode::Enforce {
+                return Err(StreamingPutError::Unsupported(
+                    "managed streaming requires enforce mode".to_string(),
+                ));
+            }
+            storage
+                .validate_managed_launch_configuration()
+                .map_err(|detail| {
+                    StreamingPutError::Unsupported(format!(
+                        "managed streaming configuration is invalid: {detail}"
+                    ))
+                })?;
+            let capabilities = state
+                .managed_streaming_capabilities
+                .ok_or_else(|| {
+                    StreamingPutError::Unsupported(
+                        "managed streaming capabilities are not configured".to_string(),
+                    )
+                })?;
+            let repository = storage.authority_repository().cloned().ok_or_else(|| {
+                StreamingPutError::Unsupported(
+                    "managed streaming has no authority repository".to_string(),
+                )
+            })?;
+            let tenant_id = operation.auth.workspace_id().as_str().to_string();
+            let logical = LogicalObjectKey::new(&tenant_id, bucket, key);
+            let existing = repository.get(&logical).await.map_err(|error| {
+                StreamingPutError::Transaction(TransactionError::Publication(error.to_string()))
+            })?;
+            let (expected_authority_cas, prior_logical_size) = match existing.as_ref() {
+                Some(authority) => (
+                    Some(authority.cas_version),
+                    if authority.tombstone {
+                        0
+                    } else {
+                        authority.size
+                    },
+                ),
+                None => (None, 0),
+            };
+            let grant = operation.grant;
+            let sink = storage
+                .begin_managed_put_sink(
+                    journal,
+                    capabilities,
+                    logical,
+                    content_type,
+                    grant.operation_id(),
+                    grant.receipt_id(),
+                    crate::transaction::unix_time_ms(),
+                    grant.rate_version(),
+                    grant.max_processed_bytes(),
+                    expected_authority_cas,
+                    prior_logical_size,
+                )
+                .await?;
+            Ok(sink)
+        }
     }
 }
 
@@ -3411,8 +3476,20 @@ fn validate_streaming_backend(
             "presigned streaming cannot durably align authorization and destination commit"
                 .to_string(),
         )),
+        ResolvedBackend::Managed(storage)
+            if state.operation_journal.as_ref().is_some_and(|journal| journal.is_durable())
+                && state.managed_streaming_capabilities.is_some()
+                && storage.managed_mode() == ManagedStreamingMode::Enforce
+                && storage
+                    .authority_repository()
+                    .is_some_and(|repository| repository.is_durable())
+                && storage.validate_managed_launch_configuration().is_ok() =>
+        {
+            Ok(())
+        }
         ResolvedBackend::Managed(_) => Err(StreamingPutError::Unsupported(
-            "managed replicated streaming cannot use one authorization commit identity".to_string(),
+            "managed streaming needs a durable operation journal and authority ledger in enforce mode"
+                .to_string(),
         )),
     }
 }
@@ -3656,6 +3733,7 @@ async fn streaming_single_put(
         )
         .await
         .map_err(TransactionError::from)?;
+        sink.record_usage_evidence(&usage_event).await?;
         let stored = sink.complete().await?;
         Ok((stored, output_bytes, pipeline_evidence))
     }
@@ -3854,6 +3932,7 @@ async fn streaming_avro_single_put(
             )
             .await
             .map_err(TransactionError::from)?;
+            sink.record_usage_evidence(&usage_event).await?;
             sink.complete().await?
         };
         Ok((stored, input_bytes, output_bytes))

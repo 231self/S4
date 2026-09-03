@@ -8,13 +8,14 @@ use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 use tracing::{info, warn};
 
+use crate::control::{RequestKind, UsageEvent, UsageRoute};
 use crate::managed::{
     BackendVersioningCapability, BackendVersioningMode, CopyStatus, DurablePhysicalWriteIntent,
-    LogicalObjectKey, ManagedError, ManagedLogicalOperationState, ManagedMutationKind,
-    ManagedRepository, ManagedStreamingMode, NamespacePurgeRequest, NamespacePurgeStatus,
-    ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget, PhysicalWriteIntent, Placement,
-    ProviderStorageIdentity, RepairKind, RepairRecord, RepairTargetRole, generation_physical_key,
-    rendezvous_placement,
+    LogicalObjectKey, ManagedError, ManagedLogicalOperationIntent, ManagedLogicalOperationState,
+    ManagedMutationKind, ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence,
+    NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1,
+    PhysicalVersionTarget, PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind,
+    RepairRecord, RepairTargetRole, generation_physical_key, rendezvous_placement,
 };
 use crate::s3_safety::{
     record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
@@ -22,9 +23,13 @@ use crate::s3_safety::{
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, DirectS3Sink, ExpectedObject,
     ManagedChildRole, ManagedOperationScope, ObjectDestination, ObjectSinkTransaction,
-    OperationJournal, OperationReconciler, OperationState, StoredObjectMeta, TransactionBackend,
-    TransactionError, VersioningCapability,
+    OperationJournal, OperationReconciler, OperationState, SinkCommitState, StoredObjectMeta,
+    TransactionBackend, TransactionError, VersioningCapability,
 };
+
+/// Reservation headroom for physical versions a managed generation may accrue
+/// across exact-version recovery before its logical commit settles.
+const MANAGED_STREAMING_PUT_HEADROOM: u64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct ServiceBackend {
@@ -1272,6 +1277,167 @@ impl ServiceStorage {
         }))
     }
 
+    /// Admit a single-object streaming PUT against managed storage and begin
+    /// its authoritative sink. The logical operation is journaled in the
+    /// managed repository under the operator routing fence captured from the
+    /// persisted namespace, while the request authorization grant remains the
+    /// tenant-side identity; the returned sink records the canonical usage
+    /// evidence into the same authority ledger before publishing object
+    /// authority at commit. This separation is what makes managed commit an
+    /// operator-fenced act rather than one the tenant grant could forge.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn begin_managed_put_sink(
+        self: &Arc<Self>,
+        journal: Arc<dyn OperationJournal>,
+        capabilities: BackendCapabilities,
+        logical: LogicalObjectKey,
+        content_type: &str,
+        operation_id: uuid::Uuid,
+        receipt_id: uuid::Uuid,
+        occurred_at_ms: i64,
+        rate_version: i32,
+        max_processed_bytes: u64,
+        expected_authority_cas: Option<u64>,
+        prior_logical_size: u64,
+    ) -> Result<Box<dyn ObjectSinkTransaction>, TransactionError> {
+        if self.managed_mode != ManagedStreamingMode::Enforce {
+            return Err(TransactionError::Publication(
+                ManagedError::MutationDisabled(self.managed_mode).to_string(),
+            ));
+        }
+        self.validate_managed_launch_configuration()
+            .map_err(TransactionError::Publication)?;
+        if !journal.is_durable() {
+            return Err(TransactionError::Publication(
+                "managed streaming requires a durable operation journal".to_string(),
+            ));
+        }
+        let repository = self
+            .authority_repository_required()
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        repository
+            .assert_namespace_active(&logical.tenant_id)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        let fence = repository
+            .route_fence(&logical.tenant_id)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        let placement = self.placement(&logical).ok_or_else(|| {
+            TransactionError::Publication("managed storage has no backends".to_string())
+        })?;
+        let backend_index = self
+            .index_for_id(&placement.primary_backend_id)
+            .ok_or_else(|| {
+                TransactionError::Publication(format!(
+                    "unknown managed backend {}",
+                    placement.primary_backend_id
+                ))
+            })?;
+        let provider_bucket = self.backends[backend_index].bucket.clone();
+        let generation = uuid::Uuid::now_v7();
+        let physical_key = generation_physical_key(&logical, generation);
+        let child_scope = ManagedOperationScope::deterministic_child(
+            operation_id,
+            logical.tenant_id.clone(),
+            fence.namespace_epoch,
+            &ObjectDestination {
+                backend_id: placement.primary_backend_id.clone(),
+                bucket: provider_bucket.clone(),
+                logical_key: logical.object_key(),
+                physical_key: physical_key.clone(),
+                workspace_binding: None,
+            },
+            ManagedChildRole::Primary,
+        );
+        let intent = ManagedLogicalOperationIntent {
+            operation_id,
+            receipt_id,
+            logical: logical.clone(),
+            kind: ManagedMutationKind::Put,
+            generation,
+            fence,
+            expected_authority_cas,
+            prior_logical_size,
+            primary_child_operation_id: child_scope.operation_id,
+            backend_id: placement.primary_backend_id.clone(),
+            provider_bucket: provider_bucket.clone(),
+            physical_key: physical_key.clone(),
+            occurred_at_ms,
+            rate_version,
+            route: UsageRoute::PutObject,
+            request_kind: RequestKind::Write,
+            max_processed_bytes,
+        };
+        if let Err(error) = repository.insert_logical_operation(intent.clone()).await {
+            return Err(TransactionError::Publication(format!(
+                "managed logical admission failed: {error}"
+            )));
+        }
+        // Reserve the maximum exposure this request could publish, bounded by
+        // the workspace's physical headroom so an arbitrary per-object limit
+        // can never overflow the launch usage budget. The workspace admits one
+        // managed mutation at a time, so the reservation is always released
+        // before the next operation reserves again.
+        let usage = repository
+            .workspace_usage(&logical.tenant_id)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        let available = usage
+            .map(|usage| {
+                usage
+                    .visible_limit_bytes
+                    .saturating_add(usage.replacement_headroom_bytes)
+                    .saturating_sub(usage.physical_allocated_bytes)
+                    .saturating_sub(usage.reserved_bytes)
+            })
+            .unwrap_or(crate::managed::MANAGED_VISIBLE_LIMIT_BYTES)
+            .max(1);
+        let reservation = max_processed_bytes
+            .saturating_mul(MANAGED_STREAMING_PUT_HEADROOM)
+            .min(available);
+        if let Err(error) = repository
+            .reserve_logical_operation(operation_id, reservation)
+            .await
+        {
+            let _ = repository
+                .prove_logical_abort(operation_id, "reservation_failed", None)
+                .await;
+            return Err(TransactionError::Publication(format!(
+                "managed physical reservation failed: {error}"
+            )));
+        }
+        let sink = match self
+            .begin_authoritative_sink_for_operation(
+                journal,
+                capabilities,
+                logical.clone(),
+                content_type,
+                operation_id,
+                child_scope,
+                generation,
+            )
+            .await
+        {
+            Ok(sink) => sink,
+            Err(error) => {
+                let _ = repository
+                    .prove_logical_abort(operation_id, "sink_begin_failed", None)
+                    .await;
+                return Err(error);
+            }
+        };
+        Ok(Box::new(ManagedLogicalSink {
+            inner: sink,
+            repository,
+            operation_id,
+            expected_output_size: None,
+            expected_output_digest: None,
+            usage_recorded: false,
+            committed: false,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn direct_sink_for(
         &self,
@@ -2007,6 +2173,147 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
         self.abandon_replica().await;
         self.finished = primary.is_ok();
         primary
+    }
+}
+
+/// Logical-operation wrapper around a managed authoritative sink. The inner
+/// replicated sink writes the generation to the provider and publishes object
+/// authority; this wrapper records the canonical usage evidence into the
+/// managed authority ledger before commit and proves the logical abort on a
+/// clean failure so the workspace's mutation slot and reservation are released.
+struct ManagedLogicalSink {
+    inner: Box<dyn ObjectSinkTransaction>,
+    repository: Arc<dyn ManagedRepository>,
+    operation_id: uuid::Uuid,
+    expected_output_size: Option<u64>,
+    expected_output_digest: Option<String>,
+    usage_recorded: bool,
+    committed: bool,
+}
+
+#[async_trait::async_trait]
+impl ObjectSinkTransaction for ManagedLogicalSink {
+    fn commit_state(&self) -> SinkCommitState {
+        if self.committed {
+            SinkCommitState::Committed
+        } else if self.usage_recorded {
+            SinkCommitState::CommitUnknown
+        } else {
+            SinkCommitState::PreCommit
+        }
+    }
+
+    async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
+        if self.committed {
+            return Err(TransactionError::Finished);
+        }
+        self.inner.write(chunk).await
+    }
+
+    async fn verify_output(
+        &mut self,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<(), TransactionError> {
+        if self.committed {
+            return Err(TransactionError::Finished);
+        }
+        self.inner
+            .verify_output(expected_size, expected_sha256)
+            .await?;
+        self.expected_output_size = Some(expected_size);
+        self.expected_output_digest = Some(expected_sha256.to_string());
+        Ok(())
+    }
+
+    async fn record_usage_evidence(&mut self, event: &UsageEvent) -> Result<(), TransactionError> {
+        if self.usage_recorded {
+            return Ok(());
+        }
+        let expected_output_size = self.expected_output_size.ok_or_else(|| {
+            TransactionError::Publication(
+                "managed logical usage evidence requires a verified output size".to_string(),
+            )
+        })?;
+        let expected_output_digest = self.expected_output_digest.clone().ok_or_else(|| {
+            TransactionError::Publication(
+                "managed logical usage evidence requires a verified output digest".to_string(),
+            )
+        })?;
+        let logical = self
+            .repository
+            .logical_operation(self.operation_id)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?
+            .ok_or_else(|| {
+                TransactionError::Publication("managed logical operation disappeared".to_string())
+            })?;
+        if logical.intent.kind != ManagedMutationKind::Put {
+            return Err(TransactionError::Publication(
+                "managed logical operation is not a put".to_string(),
+            ));
+        }
+        if event.processed_bytes() != event.source_bytes().max(expected_output_size) {
+            return Err(TransactionError::Publication(
+                "managed usage evidence is inconsistent with the request".to_string(),
+            ));
+        }
+        let evidence = ManagedUsageEvidence {
+            expected_output_digest: Some(expected_output_digest),
+            expected_output_size,
+            source_bytes: event.source_bytes(),
+            processed_bytes: event.processed_bytes(),
+            payload: serde_json::json!({
+                "route": event.route().as_str(),
+                "kind": event.kind().as_str(),
+                "bucket": event.bucket(),
+                "pipeline_evidence": event.pipeline_evidence(),
+            }),
+        };
+        self.repository
+            .record_logical_usage(self.operation_id, evidence)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        self.repository
+            .transition_logical_operation(
+                self.operation_id,
+                ManagedLogicalOperationState::Open,
+                ManagedLogicalOperationState::Completing,
+                None,
+            )
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        self.usage_recorded = true;
+        Ok(())
+    }
+
+    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+        if self.committed {
+            return Err(TransactionError::Finished);
+        }
+        if !self.usage_recorded {
+            return Err(TransactionError::Publication(
+                "managed logical usage evidence was not recorded before commit".to_string(),
+            ));
+        }
+        let stored = self.inner.complete().await?;
+        self.committed = true;
+        Ok(stored)
+    }
+
+    async fn abort(&mut self) -> Result<(), TransactionError> {
+        if self.committed {
+            return Ok(());
+        }
+        self.inner.abort().await?;
+        if self.usage_recorded {
+            return Ok(());
+        }
+        self.repository
+            .prove_logical_abort(self.operation_id, "client_abort", None)
+            .await
+            .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        Ok(())
     }
 }
 
@@ -3158,6 +3465,83 @@ mod tests {
         assert_eq!(
             repository.get(&logical).await.unwrap().unwrap().generation,
             winner.generation
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_streaming_put_admission_fails_closed_without_durable_prerequisites() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let backends = parse_service_backends(
+            "b2|managed-primary|account-123|1|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|key|secret",
+        )
+        .unwrap();
+        let enforce = Arc::new(ServiceStorage::with_management(
+            backends,
+            repository.clone(),
+            ManagedStreamingMode::Enforce,
+            PLACEMENT_VERSION_V1,
+        ));
+        let logical = LogicalObjectKey::new("tenant-streaming-admission", "bucket", "key.json");
+
+        // A non-durable journal fails closed before admission.
+        let journal = Arc::new(crate::transaction::InMemoryOperationJournal::new());
+        let error = match enforce
+            .clone()
+            .begin_managed_put_sink(
+                journal.clone(),
+                managed_test_capabilities(),
+                logical.clone(),
+                "application/json",
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                crate::transaction::unix_time_ms(),
+                1,
+                1024,
+                None,
+                0,
+            )
+            .await
+        {
+            Ok(_) => panic!("managed admission unexpectedly succeeded without a durable journal"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("durable operation journal"),
+            "unexpected admission error: {error}"
+        );
+
+        // Off mode fails closed even when every other prerequisite is present.
+        let off = Arc::new(ServiceStorage::with_management(
+            parse_service_backends(
+                "b2|managed-primary|account-123|1|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|key|secret",
+            )
+            .unwrap(),
+            repository.clone(),
+            ManagedStreamingMode::Off,
+            PLACEMENT_VERSION_V1,
+        ));
+        let error = match off
+            .begin_managed_put_sink(
+                journal,
+                managed_test_capabilities(),
+                logical,
+                "application/json",
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                crate::transaction::unix_time_ms(),
+                1,
+                1024,
+                None,
+                0,
+            )
+            .await
+        {
+            Ok(_) => panic!("managed admission unexpectedly succeeded in off mode"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("mutation"),
+            "unexpected admission error: {error}"
         );
     }
 }

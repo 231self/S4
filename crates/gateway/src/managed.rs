@@ -8654,11 +8654,11 @@ mod tests {
         let small = primary_counts["b2:small"];
         let large = primary_counts["b2:large"];
         assert!(
-            (45_00..=55_00).contains(&small),
+            (4_500..=5_500).contains(&small),
             "expected roughly 25% of the fixed corpus on small, got {small}"
         );
         assert!(
-            (145_00..=155_00).contains(&large),
+            (14_500..=15_500).contains(&large),
             "expected roughly 75% of the fixed corpus on large, got {large}"
         );
     }

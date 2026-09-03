@@ -51,8 +51,8 @@ use crate::customer_headers;
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::managed::{
-    InMemoryManagedRepository, LogicalObjectKey, ManagedRepository, ManagedStreamingMode,
-    PLACEMENT_VERSION_V1, PostgresManagedRepository, validate_mode,
+    AuthorityListQuery, InMemoryManagedRepository, LogicalObjectKey, ManagedRepository,
+    ManagedStreamingMode, PLACEMENT_VERSION_V1, PostgresManagedRepository, validate_mode,
 };
 use crate::multipart_staging::{
     ARTIFACT_PREFIX, AbortMutationError, COMPLETION_LEASE, CleanupAudit, CompletePart,
@@ -9437,10 +9437,23 @@ async fn s3_list_objects(
                 Err(error) => s3_error::invalid_request(&bucket, &error),
             }
         }
-        ResolvedBackend::Managed(_) => {
-            warn!("listing is not supported against managed service storage for {bucket}");
-            s3_xml_ok(empty_list(&bucket, &params))
-        }
+        ResolvedBackend::Managed(storage) => match list_from_managed(
+            &storage,
+            auth.workspace_id().as_str(),
+            &bucket,
+            &params,
+            &state.continuation_token_key,
+        )
+        .await
+        {
+            Ok(xml) => s3_xml_ok(xml),
+            Err(ManagedListError::InvalidRequest(error)) => {
+                s3_error::invalid_request(&bucket, &error)
+            }
+            Err(ManagedListError::Unavailable) => {
+                s3_error::service_unavailable(&bucket, "managed listing is temporarily unavailable")
+            }
+        },
         ResolvedBackend::PresignedHttp(url) => {
             match open_http_object(&state, url, &headers, false).await {
                 Ok(object) => object.into_response(),
@@ -9694,6 +9707,182 @@ fn decode_memory_continuation(
         .ok_or_else(|| "continuation token does not match this listing".to_string())
 }
 
+#[derive(Debug)]
+enum ManagedListError {
+    InvalidRequest(String),
+    Unavailable,
+}
+
+fn encode_managed_continuation(
+    key: &[u8; 32],
+    tenant_id: &str,
+    bucket: &str,
+    prefix: &str,
+    last: &str,
+) -> String {
+    let payload = serde_json::to_vec(&(tenant_id, bucket, prefix, last))
+        .expect("managed continuation tuple is serializable");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts fixed key");
+    mac.update(&payload);
+    let mut encoded = mac.finalize().into_bytes().to_vec();
+    encoded.extend(payload);
+    URL_SAFE_NO_PAD.encode(encoded)
+}
+
+fn decode_managed_continuation(
+    key: &[u8; 32],
+    token: &str,
+    tenant_id: &str,
+    bucket: &str,
+    prefix: &str,
+) -> Result<String, ManagedListError> {
+    let encoded = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| ManagedListError::InvalidRequest("invalid continuation token".to_string()))?;
+    if encoded.len() < 32 {
+        return Err(ManagedListError::InvalidRequest(
+            "invalid continuation token".to_string(),
+        ));
+    }
+    let (tag, payload) = encoded.split_at(32);
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts fixed key");
+    mac.update(payload);
+    mac.verify_slice(tag)
+        .map_err(|_| ManagedListError::InvalidRequest("invalid continuation token".to_string()))?;
+    let (token_tenant, token_bucket, token_prefix, last): (String, String, String, String) =
+        serde_json::from_slice(payload).map_err(|_| {
+            ManagedListError::InvalidRequest("invalid continuation token".to_string())
+        })?;
+    (token_tenant == tenant_id && token_bucket == bucket && token_prefix == prefix)
+        .then_some(last)
+        .ok_or_else(|| {
+            ManagedListError::InvalidRequest(
+                "continuation token does not match this listing".to_string(),
+            )
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn managed_list_continuation_is_bound_to_tenant_and_query() {
+    let key = [7_u8; 32];
+    let token = encode_managed_continuation(&key, "tenant-a", "bucket", "logs/", "logs/a");
+    assert_eq!(
+        decode_managed_continuation(&key, &token, "tenant-a", "bucket", "logs/").unwrap(),
+        "logs/a"
+    );
+    assert!(matches!(
+        decode_managed_continuation(&key, &token, "tenant-b", "bucket", "logs/"),
+        Err(ManagedListError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        decode_managed_continuation(&key, &token, "tenant-a", "bucket", "other/"),
+        Err(ManagedListError::InvalidRequest(_))
+    ));
+}
+
+/// ListObjects against the managed authority ledger. The ledger is the sole
+/// logical namespace: service-provider generation keys are never listed.
+async fn list_from_managed(
+    storage: &ServiceStorage,
+    tenant_id: &str,
+    bucket: &str,
+    params: &S3Query,
+    continuation_key: &[u8; 32],
+) -> Result<String, ManagedListError> {
+    if params
+        .delimiter
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err(ManagedListError::InvalidRequest(
+            "managed listing does not support delimiter".to_string(),
+        ));
+    }
+    let prefix = params.prefix.as_deref().unwrap_or("");
+    let is_v2 = params.list_type.as_deref() == Some("2");
+    let max_keys = params.max_keys.unwrap_or(1000).clamp(0, 1000) as u64;
+    let after = match params.continuation_token.as_deref() {
+        Some(token) if is_v2 => Some(decode_managed_continuation(
+            continuation_key,
+            token,
+            tenant_id,
+            bucket,
+            prefix,
+        )?),
+        Some(_) => {
+            return Err(ManagedListError::InvalidRequest(
+                "continuation-token requires list-type=2".to_string(),
+            ));
+        }
+        None => params
+            .start_after
+            .as_deref()
+            .or(params.marker.as_deref())
+            .map(ToOwned::to_owned),
+    };
+    let page = storage
+        .list_authority(AuthorityListQuery {
+            tenant_id: tenant_id.to_string(),
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            after: after.clone(),
+            max_keys,
+        })
+        .await
+        .map_err(|_| ManagedListError::Unavailable)?;
+    let truncated = page.next_after.is_some();
+    let encoding = params.encoding_type.as_deref() == Some("url");
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    );
+    xml.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
+    xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
+    xml.push_str(&format!("<KeyCount>{}</KeyCount>", page.objects.len()));
+    xml.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if let Some(token) = params.continuation_token.as_deref() {
+        xml.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            xml_escape(token)
+        ));
+    } else if let Some(position) = &after {
+        let element = if is_v2 { "StartAfter" } else { "Marker" };
+        xml.push_str(&format!("<{element}>{}</{element}>", xml_escape(position)));
+    }
+    if let Some(next_after) = &page.next_after {
+        let next = if is_v2 {
+            encode_managed_continuation(continuation_key, tenant_id, bucket, prefix, next_after)
+        } else {
+            next_after.clone()
+        };
+        let element = if is_v2 {
+            "NextContinuationToken"
+        } else {
+            "NextMarker"
+        };
+        xml.push_str(&format!("<{element}>{}</{element}>", xml_escape(&next)));
+    }
+    for authority in page.objects {
+        let key = if encoding {
+            url_encode(&authority.logical.key)
+        } else {
+            authority.logical.key
+        };
+        let last_modified = chrono::DateTime::from_timestamp_millis(authority.updated_at_ms)
+            .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
+        xml.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>{last_modified}</LastModified><ETag>\"{}\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            xml_escape(&key),
+            xml_escape(&authority.digest),
+            authority.size,
+        ));
+    }
+    xml.push_str("</ListBucketResult>");
+    Ok(xml)
+}
+
 /// ListObjectsV2 against the in-memory store.
 fn list_from_memory(
     store: &MemoryStore,
@@ -9850,15 +10039,6 @@ fn list_from_memory(
     }
     xml.push_str("</ListBucketResult>");
     Ok(xml)
-}
-
-fn empty_list(bucket: &str, params: &S3Query) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix><KeyCount>0</KeyCount><MaxKeys>{}</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#,
-        xml_escape(bucket),
-        xml_escape(params.prefix.as_deref().unwrap_or("")),
-        params.max_keys.unwrap_or(1000).min(1000),
-    )
 }
 
 /// `GET /` — serve the dashboard to browsers, ListBuckets to S3 clients.

@@ -3376,13 +3376,11 @@ async fn begin_streaming_sink(
                         "managed streaming configuration is invalid: {detail}"
                     ))
                 })?;
-            let capabilities = state
-                .managed_streaming_capabilities
-                .ok_or_else(|| {
-                    StreamingPutError::Unsupported(
-                        "managed streaming capabilities are not configured".to_string(),
-                    )
-                })?;
+            let capabilities = state.managed_streaming_capabilities.ok_or_else(|| {
+                StreamingPutError::Unsupported(
+                    "managed streaming capabilities are not configured".to_string(),
+                )
+            })?;
             let repository = storage.authority_repository().cloned().ok_or_else(|| {
                 StreamingPutError::Unsupported(
                     "managed streaming has no authority repository".to_string(),

@@ -134,6 +134,42 @@ pub fn rendezvous_placement(
     })
 }
 
+/// Select a primary and distinct replica using weighted rendezvous hashing.
+/// The placement version is part of the SHA-256 domain, so policy changes must
+/// be accompanied by a version bump before they affect durable placement.
+pub fn weighted_rendezvous_placement(
+    placement_version: u32,
+    tenant_id: &str,
+    object_key: &str,
+    backend_weights: impl IntoIterator<Item = (String, u64)>,
+) -> Option<Placement> {
+    let mut scored: Vec<_> = backend_weights
+        .into_iter()
+        .filter(|(_, weight)| *weight > 0)
+        .map(|(backend_id, weight)| {
+            let score = rendezvous_score(placement_version, tenant_id, object_key, &backend_id);
+            let random = u64::from_be_bytes(score[..8].try_into().expect("SHA-256 prefix"));
+            // Map the hash to (0, 1]; zero must remain selectable rather than
+            // producing an infinite penalty.
+            let uniform = (random as f64 + 1.0) / (u64::MAX as f64 + 1.0);
+            (-uniform.ln() / weight as f64, backend_id)
+        })
+        .collect();
+    scored.sort_by(|(left_score, left_id), (right_score, right_id)| {
+        left_score
+            .total_cmp(right_score)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    scored.dedup_by(|(_, left), (_, right)| left == right);
+    let primary_backend_id = scored.first()?.1.clone();
+    let replica_backend_id = scored.get(1).map(|(_, id)| id.clone());
+    Some(Placement {
+        version: placement_version,
+        primary_backend_id,
+        replica_backend_id,
+    })
+}
+
 pub fn generation_physical_key(logical: &LogicalObjectKey, generation: Uuid) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, logical.tenant_id.as_bytes());
@@ -8594,6 +8630,37 @@ mod tests {
             ["c", "a", "b"].into_iter().map(str::to_string),
         );
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn weighted_placement_favors_configured_capacity_over_fixed_corpus() {
+        let mut primary_counts = HashMap::new();
+        for object in 0..20_000 {
+            let placement = weighted_rendezvous_placement(
+                2,
+                "tenant",
+                &format!("bucket/object-{object}"),
+                [("b2:small".to_string(), 1), ("b2:large".to_string(), 3)],
+            )
+            .unwrap();
+            assert_ne!(
+                placement.primary_backend_id,
+                placement.replica_backend_id.unwrap()
+            );
+            *primary_counts
+                .entry(placement.primary_backend_id)
+                .or_insert(0usize) += 1;
+        }
+        let small = primary_counts["b2:small"];
+        let large = primary_counts["b2:large"];
+        assert!(
+            (45_00..=55_00).contains(&small),
+            "expected roughly 25% of the fixed corpus on small, got {small}"
+        );
+        assert!(
+            (145_00..=155_00).contains(&large),
+            "expected roughly 75% of the fixed corpus on large, got {large}"
+        );
     }
 
     #[test]

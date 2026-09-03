@@ -669,6 +669,16 @@ pub trait ObjectSinkTransaction: Send {
         expected_size: u64,
         expected_sha256: &str,
     ) -> Result<(), TransactionError>;
+    /// Record the canonical usage evidence on the sink before its terminal
+    /// commit. Managed sinks persist the same evidence into their authority
+    /// ledger so settlement and the usage event stay consistent; direct and
+    /// development sinks have no separate authority ledger and ignore this.
+    async fn record_usage_evidence(
+        &mut self,
+        _event: &crate::control::UsageEvent,
+    ) -> Result<(), TransactionError> {
+        Ok(())
+    }
     async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError>;
     async fn abort(&mut self) -> Result<(), TransactionError>;
 }

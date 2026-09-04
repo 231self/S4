@@ -10,13 +10,14 @@ use tracing::{info, warn};
 
 use crate::control::{RequestKind, UsageEvent, UsageRoute};
 use crate::managed::{
-    AuthorityListPage, AuthorityListQuery, BackendVersioningCapability, BackendVersioningMode,
-    CopyStatus, DurablePhysicalWriteIntent, LogicalObjectKey, ManagedError,
-    ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
-    ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence, NamespacePurgeRequest,
-    NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget,
-    PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind, RepairRecord,
-    RepairTargetRole, generation_physical_key, weighted_rendezvous_placement,
+    AuthorityListPage, AuthorityListQuery, AuthorityPlacementCursor, AuthorityPlacementPage,
+    AuthorityPlacementPageQuery, BackendVersioningCapability, BackendVersioningMode, CopyStatus,
+    DurablePhysicalWriteIntent, LogicalObjectKey, ManagedError, ManagedLogicalOperationIntent,
+    ManagedLogicalOperationState, ManagedMutationKind, ManagedRepository, ManagedStreamingMode,
+    ManagedUsageEvidence, NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority,
+    PLACEMENT_VERSION_V1, PhysicalVersionTarget, PhysicalWriteIntent, Placement,
+    ProviderStorageIdentity, RepairKind, RepairRecord, RepairTargetRole, generation_physical_key,
+    weighted_rendezvous_placement,
 };
 use crate::s3_safety::{
     record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
@@ -225,6 +226,109 @@ impl ServiceStorage {
         self.authority_repository_required()?
             .list_authority(query)
             .await
+    }
+
+    /// Reconciles one stale authority to a desired placement. A ready authority
+    /// that already occupies every desired location advances by CAS without a
+    /// provider copy; otherwise only the missing placement repair legs are
+    /// enqueued from an already verified ready authority location.
+    pub async fn reconcile_authority_placement(
+        &self,
+        authority: &ObjectAuthority,
+        desired: &Placement,
+    ) -> Result<(), ManagedError> {
+        if authority.tombstone || authority.placement_version >= desired.version {
+            return Ok(());
+        }
+        let repository = self.authority_repository_required()?;
+        let locations_match = authority.primary_backend_id == desired.primary_backend_id
+            && authority.primary_status == CopyStatus::Ready
+            && match desired.replica_backend_id.as_deref() {
+                Some(replica) => {
+                    authority.replica_backend_id.as_deref() == Some(replica)
+                        && authority.replica_status == CopyStatus::Ready
+                }
+                None => {
+                    authority.replica_backend_id.is_none()
+                        && authority.replica_status == CopyStatus::Absent
+                }
+            };
+        if locations_match {
+            repository
+                .advance_placement_version(&authority.logical, authority.cas_version, desired)
+                .await?;
+            return Ok(());
+        }
+
+        let source = if authority.primary_status == CopyStatus::Ready {
+            Some(authority.primary_backend_id.clone())
+        } else if authority.replica_status == CopyStatus::Ready {
+            authority.replica_backend_id.clone()
+        } else {
+            None
+        }
+        .ok_or_else(|| {
+            ManagedError::Persistence(
+                "stale authority has no verified ready source for placement repair".to_string(),
+            )
+        })?;
+
+        let primary_matches = authority.primary_backend_id == desired.primary_backend_id
+            && authority.primary_status == CopyStatus::Ready;
+        // A primary leg is also the durable way to remove an obsolete replica.
+        if !primary_matches
+            || (desired.replica_backend_id.is_none() && authority.replica_backend_id.is_some())
+        {
+            repository
+                .enqueue(RepairRecord::placement(
+                    authority,
+                    Some(source.clone()),
+                    desired.primary_backend_id.clone(),
+                    RepairTargetRole::Primary,
+                    desired,
+                ))
+                .await?;
+        }
+        if let Some(replica) = &desired.replica_backend_id
+            && (authority.replica_backend_id.as_deref() != Some(replica)
+                || authority.replica_status != CopyStatus::Ready)
+        {
+            repository
+                .enqueue(RepairRecord::placement(
+                    authority,
+                    Some(source),
+                    replica.clone(),
+                    RepairTargetRole::Replica,
+                    desired,
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Processes one bounded global page of authorities behind this storage's
+    /// placement version. The returned cursor can resume the same keyset scan.
+    pub async fn reconcile_authority_placement_page(
+        &self,
+        after: Option<AuthorityPlacementCursor>,
+        limit: u64,
+    ) -> Result<AuthorityPlacementPage, ManagedError> {
+        let repository = self.authority_repository_required()?;
+        let page = repository
+            .list_authority_below_placement_version(AuthorityPlacementPageQuery {
+                target_placement_version: self.placement_version,
+                after,
+                limit,
+            })
+            .await?;
+        for authority in &page.objects {
+            let desired = self.placement(&authority.logical).ok_or_else(|| {
+                ManagedError::Persistence("managed storage has no backends".to_string())
+            })?;
+            self.reconcile_authority_placement(authority, &desired)
+                .await?;
+        }
+        Ok(page)
     }
 
     /// Validate the launch topology before enabling transactional managed
@@ -1811,6 +1915,19 @@ impl ServiceStorage {
         let repository = self
             .authority_repository_required()
             .map_err(|error| error.to_string())?;
+        if let Some(authority) = repository
+            .get(&repair.logical)
+            .await
+            .map_err(|error| error.to_string())?
+            && !authority.tombstone
+            && authority.generation == repair.generation
+            && (authority.primary_backend_id == repair.target_backend_id
+                || authority.replica_backend_id.as_deref() == Some(&repair.target_backend_id))
+        {
+            return Err(
+                "cleanup target is currently authoritative for this generation".to_string(),
+            );
+        }
         let versions = repository
             .physical_versions(
                 &repair.logical.tenant_id,
@@ -3690,5 +3807,90 @@ mod tests {
             error.to_string().contains("mutation"),
             "unexpected admission error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn placement_reconciliation_advances_without_copy_and_deduplicates_repairs() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let storage = ServiceStorage::with_management(
+            parse_service_backends(
+                "b2|one|account-1|1|https://s3.example|us-east-1|bucket-one|key|secret;b2|two|account-2|1|https://s3.example|us-east-1|bucket-two|key|secret",
+            ).unwrap(),
+            repository.clone(),
+            ManagedStreamingMode::Enforce,
+            2,
+        );
+        let logical = LogicalObjectKey::new("tenant-placement", "bucket", "ready");
+        let desired = storage.placement(&logical).unwrap();
+        let ready = ObjectAuthority {
+            logical: logical.clone(),
+            generation: uuid::Uuid::now_v7(),
+            digest: "digest".to_string(),
+            size: 3,
+            metadata: BTreeMap::new(),
+            placement_version: 1,
+            primary_backend_id: desired.primary_backend_id.clone(),
+            primary_version_id: None,
+            replica_backend_id: desired.replica_backend_id.clone(),
+            primary_status: CopyStatus::Ready,
+            replica_status: if desired.replica_backend_id.is_some() {
+                CopyStatus::Ready
+            } else {
+                CopyStatus::Absent
+            },
+            tombstone: false,
+            cas_version: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let ready = repository.publish(ready, None).await.unwrap();
+        storage
+            .reconcile_authority_placement(&ready, &desired)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get(&logical)
+                .await
+                .unwrap()
+                .unwrap()
+                .placement_version,
+            2
+        );
+        assert!(
+            repository
+                .claim_repairs("no-copy", crate::transaction::unix_time_ms() + 1_000, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let stale = LogicalObjectKey::new("tenant-placement", "bucket", "stale");
+        let mut stale_authority = repository.get(&logical).await.unwrap().unwrap();
+        stale_authority.logical = stale.clone();
+        stale_authority.generation = uuid::Uuid::now_v7();
+        stale_authority.placement_version = 1;
+        stale_authority.primary_backend_id = "old".to_string();
+        stale_authority.replica_backend_id = None;
+        stale_authority.primary_status = CopyStatus::Ready;
+        stale_authority.replica_status = CopyStatus::Absent;
+        let stale_authority = repository.publish(stale_authority, None).await.unwrap();
+        storage
+            .reconcile_authority_placement(&stale_authority, &storage.placement(&stale).unwrap())
+            .await
+            .unwrap();
+        storage
+            .reconcile_authority_placement(&stale_authority, &storage.placement(&stale).unwrap())
+            .await
+            .unwrap();
+        let repairs = repository
+            .claim_repairs(
+                "deduplicated",
+                crate::transaction::unix_time_ms() + 1_000,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repairs.len(), 2, "one leg per desired primary and replica");
     }
 }

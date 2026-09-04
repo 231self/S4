@@ -618,6 +618,26 @@ pub struct AuthorityListPage {
     pub next_after: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityPlacementCursor {
+    pub tenant_id: String,
+    pub bucket: String,
+    pub key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityPlacementPageQuery {
+    pub target_placement_version: u32,
+    pub after: Option<AuthorityPlacementCursor>,
+    pub limit: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityPlacementPage {
+    pub objects: Vec<ObjectAuthority>,
+    pub next_after: Option<AuthorityPlacementCursor>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedListVersion {
     V1,
@@ -901,6 +921,11 @@ pub trait ManagedRepository: Send + Sync {
         &self,
         query: AuthorityListQuery,
     ) -> Result<AuthorityListPage, ManagedError>;
+    async fn list_authority_below_placement_version(
+        &self,
+        query: AuthorityPlacementPageQuery,
+    ) -> Result<AuthorityPlacementPage, ManagedError>;
+
     async fn create_list_cursor(
         &self,
         request: ManagedListCursorRequest,
@@ -978,6 +1003,12 @@ pub trait ManagedRepository: Send + Sync {
         &self,
         authority: ObjectAuthority,
         expected_cas: Option<u64>,
+    ) -> Result<ObjectAuthority, ManagedError>;
+    async fn advance_placement_version(
+        &self,
+        logical: &LogicalObjectKey,
+        expected_cas: u64,
+        placement: &Placement,
     ) -> Result<ObjectAuthority, ManagedError>;
     async fn tombstone(
         &self,
@@ -1171,6 +1202,34 @@ fn publication_repairs(authority: &ObjectAuthority) -> Vec<RepairRecord> {
         )],
         _ => Vec::new(),
     }
+}
+
+fn placement_cleanup_repairs(
+    previous: &ObjectAuthority,
+    authority: &ObjectAuthority,
+) -> Vec<RepairRecord> {
+    let mut old_locations = vec![Some(previous.primary_backend_id.clone())];
+    old_locations.push(previous.replica_backend_id.clone());
+    old_locations
+        .into_iter()
+        .flatten()
+        .filter(|backend| {
+            backend != &authority.primary_backend_id
+                && authority.replica_backend_id.as_deref() != Some(backend)
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|backend| {
+            RepairRecord::copy(
+                RepairKind::DeleteGeneration,
+                authority,
+                None,
+                backend,
+                RepairTargetRole::Cleanup,
+                authority.placement_version,
+            )
+        })
+        .collect()
 }
 
 fn apply_repair_to_authority(
@@ -1627,6 +1686,31 @@ fn repair_active(repair: RepairRecord) -> Result<managed_object_repair::ActiveMo
 
 fn persistence(error: impl std::fmt::Display) -> ManagedError {
     ManagedError::Persistence(error.to_string())
+}
+
+async fn insert_waiting_placement_cleanup<C>(
+    db: &C,
+    repair: RepairRecord,
+) -> Result<(), ManagedError>
+where
+    C: sea_orm::ConnectionTrait,
+{
+    let mut active = repair_active(repair)?;
+    active.state = Set("WAITING_CUTOVER".to_string());
+    managed_object_repair::Entity::insert(active)
+        .on_conflict(
+            OnConflict::columns([
+                managed_object_repair::Column::Kind,
+                managed_object_repair::Column::Generation,
+                managed_object_repair::Column::TargetBackendId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .map_err(persistence)?;
+    Ok(())
 }
 
 async fn locked_namespace<C>(
@@ -3479,6 +3563,68 @@ impl ManagedRepository for PostgresManagedRepository {
         })
     }
 
+    async fn list_authority_below_placement_version(
+        &self,
+        query: AuthorityPlacementPageQuery,
+    ) -> Result<AuthorityPlacementPage, ManagedError> {
+        if query.limit > MANAGED_AUTHORITY_LIST_MAX_KEYS || query.target_placement_version == 0 {
+            return Err(ManagedError::Conflict);
+        }
+        if query.limit == 0 {
+            return Ok(AuthorityPlacementPage {
+                objects: Vec::new(),
+                next_after: None,
+            });
+        }
+        let mut select = managed_object_authority::Entity::find()
+            .filter(managed_object_authority::Column::Tombstone.eq(false))
+            .filter(
+                managed_object_authority::Column::PlacementVersion
+                    .lt(i64::from(query.target_placement_version)),
+            )
+            .order_by_asc(managed_object_authority::Column::TenantId)
+            .order_by_asc(managed_object_authority::Column::Bucket)
+            .order_by_asc(managed_object_authority::Column::LogicalKey)
+            .limit(query.limit.saturating_add(1));
+        if let Some(after) = &query.after {
+            select = select.filter(
+                Condition::any()
+                    .add(managed_object_authority::Column::TenantId.gt(&after.tenant_id))
+                    .add(
+                        Condition::all()
+                            .add(managed_object_authority::Column::TenantId.eq(&after.tenant_id))
+                            .add(managed_object_authority::Column::Bucket.gt(&after.bucket)),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(managed_object_authority::Column::TenantId.eq(&after.tenant_id))
+                            .add(managed_object_authority::Column::Bucket.eq(&after.bucket))
+                            .add(managed_object_authority::Column::LogicalKey.gt(&after.key)),
+                    ),
+            );
+        }
+        let mut objects = select
+            .all(&self.db)
+            .await
+            .map_err(persistence)?
+            .into_iter()
+            .map(authority_from_model)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_after = (objects.len() as u64 > query.limit).then(|| {
+            let authority = &objects[query.limit as usize - 1];
+            AuthorityPlacementCursor {
+                tenant_id: authority.logical.tenant_id.clone(),
+                bucket: authority.logical.bucket.clone(),
+                key: authority.logical.key.clone(),
+            }
+        });
+        objects.truncate(query.limit as usize);
+        Ok(AuthorityPlacementPage {
+            objects,
+            next_after,
+        })
+    }
+
     async fn create_list_cursor(
         &self,
         request: ManagedListCursorRequest,
@@ -4082,6 +4228,88 @@ impl ManagedRepository for PostgresManagedRepository {
         Ok(authority)
     }
 
+    async fn advance_placement_version(
+        &self,
+        logical: &LogicalObjectKey,
+        expected_cas: u64,
+        placement: &Placement,
+    ) -> Result<ObjectAuthority, ManagedError> {
+        let txn = self.db.begin().await.map_err(persistence)?;
+        require_active_namespace(&txn, &logical.tenant_id).await?;
+        let authority = managed_object_authority::Entity::find_by_id((
+            logical.tenant_id.clone(),
+            logical.bucket.clone(),
+            logical.key.clone(),
+        ))
+        .lock(LockType::Update)
+        .one(&txn)
+        .await
+        .map_err(persistence)?
+        .map(authority_from_model)
+        .transpose()?
+        .ok_or(ManagedError::Conflict)?;
+        let locations_match = authority.primary_backend_id == placement.primary_backend_id
+            && authority.primary_status == CopyStatus::Ready
+            && match placement.replica_backend_id.as_deref() {
+                Some(replica) => {
+                    authority.replica_backend_id.as_deref() == Some(replica)
+                        && authority.replica_status == CopyStatus::Ready
+                }
+                None => {
+                    authority.replica_backend_id.is_none()
+                        && authority.replica_status == CopyStatus::Absent
+                }
+            };
+        if authority.tombstone
+            || authority.cas_version != expected_cas
+            || placement.version <= authority.placement_version
+            || !locations_match
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let now = crate::transaction::unix_time_ms();
+        let result = managed_object_authority::Entity::update_many()
+            .col_expr(
+                managed_object_authority::Column::PlacementVersion,
+                Expr::value(i64::from(placement.version)),
+            )
+            .col_expr(
+                managed_object_authority::Column::CasVersion,
+                Expr::value(i64::try_from(expected_cas.saturating_add(1)).map_err(|_| {
+                    ManagedError::Corrupt("authority CAS exceeds BIGINT".to_string())
+                })?),
+            )
+            .col_expr(
+                managed_object_authority::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_object_authority::Column::TenantId.eq(&logical.tenant_id))
+            .filter(managed_object_authority::Column::Bucket.eq(&logical.bucket))
+            .filter(managed_object_authority::Column::LogicalKey.eq(&logical.key))
+            .filter(
+                managed_object_authority::Column::CasVersion
+                    .eq(i64::try_from(expected_cas).map_err(|_| ManagedError::Conflict)?),
+            )
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected != 1 {
+            return Err(ManagedError::Conflict);
+        }
+        let advanced = managed_object_authority::Entity::find_by_id((
+            logical.tenant_id.clone(),
+            logical.bucket.clone(),
+            logical.key.clone(),
+        ))
+        .one(&txn)
+        .await
+        .map_err(persistence)?
+        .ok_or(ManagedError::Conflict)
+        .and_then(authority_from_model)?;
+        txn.commit().await.map_err(persistence)?;
+        Ok(advanced)
+    }
+
     async fn tombstone(
         &self,
         logical: &LogicalObjectKey,
@@ -4328,8 +4556,7 @@ impl ManagedRepository for PostgresManagedRepository {
             if let Some(current) = current {
                 let mut authority = authority_from_model(current.clone())?;
                 if authority.generation == repair.generation
-                    && (repair.kind == RepairKind::Placement
-                        || authority.cas_version == repair.authority_cas_version)
+                    && authority.cas_version == repair.authority_cas_version
                     && !authority.tombstone
                     && apply_repair_to_authority(&mut authority, repair)?
                 {
@@ -4356,6 +4583,49 @@ impl ManagedRepository for PostgresManagedRepository {
                         return Err(ManagedError::Conflict);
                     }
                     authority_updated = true;
+                    if repair.kind == RepairKind::Placement {
+                        for mut cleanup in
+                            placement_cleanup_repairs(&authority_from_model(current)?, &authority)
+                        {
+                            cleanup.namespace_epoch = repair.namespace_epoch;
+                            cleanup.placement_version = repair.placement_version;
+                            insert_waiting_placement_cleanup(&txn, cleanup).await?;
+                        }
+                        if authority.placement_version == repair.placement_version {
+                            managed_object_repair::Entity::update_many()
+                                .col_expr(
+                                    managed_object_repair::Column::State,
+                                    Expr::value("PENDING"),
+                                )
+                                .col_expr(
+                                    managed_object_repair::Column::UpdatedAtMs,
+                                    Expr::value(crate::transaction::unix_time_ms()),
+                                )
+                                .filter(managed_object_repair::Column::State.eq("WAITING_CUTOVER"))
+                                .filter(
+                                    managed_object_repair::Column::TenantId
+                                        .eq(&repair.logical.tenant_id),
+                                )
+                                .filter(
+                                    managed_object_repair::Column::Bucket
+                                        .eq(&repair.logical.bucket),
+                                )
+                                .filter(
+                                    managed_object_repair::Column::LogicalKey
+                                        .eq(&repair.logical.key),
+                                )
+                                .filter(
+                                    managed_object_repair::Column::Generation.eq(repair.generation),
+                                )
+                                .filter(
+                                    managed_object_repair::Column::PlacementVersion
+                                        .eq(i64::from(repair.placement_version)),
+                                )
+                                .exec(&txn)
+                                .await
+                                .map_err(persistence)?;
+                        }
+                    }
                 }
             }
         }
@@ -5508,6 +5778,19 @@ fn insert_memory_repair(state: &mut MemoryState, repair: RepairRecord) {
     }
 }
 
+fn insert_memory_waiting_placement_cleanup(state: &mut MemoryState, repair: RepairRecord) {
+    let duplicate = state.repairs.values().any(|(existing, _)| {
+        existing.kind == repair.kind
+            && existing.generation == repair.generation
+            && existing.target_backend_id == repair.target_backend_id
+    });
+    if !duplicate {
+        state
+            .repairs
+            .insert(repair.repair_id, (repair, "WAITING_CUTOVER".to_string()));
+    }
+}
+
 #[async_trait]
 impl ManagedRepository for InMemoryManagedRepository {
     fn is_durable(&self) -> bool {
@@ -6267,6 +6550,67 @@ impl ManagedRepository for InMemoryManagedRepository {
         })
     }
 
+    async fn list_authority_below_placement_version(
+        &self,
+        query: AuthorityPlacementPageQuery,
+    ) -> Result<AuthorityPlacementPage, ManagedError> {
+        if query.limit > MANAGED_AUTHORITY_LIST_MAX_KEYS || query.target_placement_version == 0 {
+            return Err(ManagedError::Conflict);
+        }
+        if query.limit == 0 {
+            return Ok(AuthorityPlacementPage {
+                objects: Vec::new(),
+                next_after: None,
+            });
+        }
+        let state = self.state.lock().await;
+        let mut objects: Vec<_> = state
+            .authorities
+            .values()
+            .filter(|authority| {
+                !authority.tombstone
+                    && authority.placement_version < query.target_placement_version
+                    && query.after.as_ref().is_none_or(|after| {
+                        (
+                            authority.logical.tenant_id.as_str(),
+                            authority.logical.bucket.as_str(),
+                            authority.logical.key.as_str(),
+                        ) > (
+                            after.tenant_id.as_str(),
+                            after.bucket.as_str(),
+                            after.key.as_str(),
+                        )
+                    })
+            })
+            .cloned()
+            .collect();
+        objects.sort_by(|left, right| {
+            (
+                left.logical.tenant_id.as_str(),
+                left.logical.bucket.as_str(),
+                left.logical.key.as_str(),
+            )
+                .cmp(&(
+                    right.logical.tenant_id.as_str(),
+                    right.logical.bucket.as_str(),
+                    right.logical.key.as_str(),
+                ))
+        });
+        let next_after = (objects.len() as u64 > query.limit).then(|| {
+            let authority = &objects[query.limit as usize - 1];
+            AuthorityPlacementCursor {
+                tenant_id: authority.logical.tenant_id.clone(),
+                bucket: authority.logical.bucket.clone(),
+                key: authority.logical.key.clone(),
+            }
+        });
+        objects.truncate(query.limit as usize);
+        Ok(AuthorityPlacementPage {
+            objects,
+            next_after,
+        })
+    }
+
     async fn create_list_cursor(
         &self,
         request: ManagedListCursorRequest,
@@ -6552,6 +6896,45 @@ impl ManagedRepository for InMemoryManagedRepository {
         Ok(authority)
     }
 
+    async fn advance_placement_version(
+        &self,
+        logical: &LogicalObjectKey,
+        expected_cas: u64,
+        placement: &Placement,
+    ) -> Result<ObjectAuthority, ManagedError> {
+        let mut state = self.state.lock().await;
+        if state.fenced_namespaces.contains_key(&logical.tenant_id) {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        let authority = state
+            .authorities
+            .get_mut(logical)
+            .ok_or(ManagedError::Conflict)?;
+        let locations_match = authority.primary_backend_id == placement.primary_backend_id
+            && authority.primary_status == CopyStatus::Ready
+            && match placement.replica_backend_id.as_deref() {
+                Some(replica) => {
+                    authority.replica_backend_id.as_deref() == Some(replica)
+                        && authority.replica_status == CopyStatus::Ready
+                }
+                None => {
+                    authority.replica_backend_id.is_none()
+                        && authority.replica_status == CopyStatus::Absent
+                }
+            };
+        if authority.tombstone
+            || authority.cas_version != expected_cas
+            || placement.version <= authority.placement_version
+            || !locations_match
+        {
+            return Err(ManagedError::Conflict);
+        }
+        authority.placement_version = placement.version;
+        authority.cas_version = authority.cas_version.saturating_add(1);
+        authority.updated_at_ms = crate::transaction::unix_time_ms();
+        Ok(authority.clone())
+    }
+
     async fn tombstone(
         &self,
         logical: &LogicalObjectKey,
@@ -6730,17 +7113,40 @@ impl ManagedRepository for InMemoryManagedRepository {
             stored.updated_at_ms = now;
         }
         let mut updated = false;
+        let mut cleanups = Vec::new();
+        let mut activate_cleanup = false;
         if repair.kind != RepairKind::DeleteGeneration
             && let Some(authority) = state.authorities.get_mut(&repair.logical)
             && authority.generation == repair.generation
-            && (repair.kind == RepairKind::Placement
-                || authority.cas_version == repair.authority_cas_version)
+            && authority.cas_version == repair.authority_cas_version
             && !authority.tombstone
-            && apply_repair_to_authority(authority, repair)?
         {
-            authority.cas_version = authority.cas_version.saturating_add(1);
-            authority.updated_at_ms = crate::transaction::unix_time_ms();
-            updated = true;
+            let previous = authority.clone();
+            if apply_repair_to_authority(authority, repair)? {
+                authority.cas_version = authority.cas_version.saturating_add(1);
+                authority.updated_at_ms = crate::transaction::unix_time_ms();
+                updated = true;
+                if repair.kind == RepairKind::Placement {
+                    cleanups = placement_cleanup_repairs(&previous, authority);
+                    activate_cleanup = authority.placement_version == repair.placement_version;
+                }
+            }
+        }
+        for mut cleanup in cleanups {
+            cleanup.namespace_epoch = repair.namespace_epoch;
+            cleanup.placement_version = repair.placement_version;
+            insert_memory_waiting_placement_cleanup(&mut state, cleanup);
+        }
+        if activate_cleanup {
+            for (cleanup, status) in state.repairs.values_mut() {
+                if *status == "WAITING_CUTOVER"
+                    && cleanup.logical == repair.logical
+                    && cleanup.generation == repair.generation
+                    && cleanup.placement_version == repair.placement_version
+                {
+                    *status = "PENDING".to_string();
+                }
+            }
         }
         Ok(updated)
     }
@@ -8926,15 +9332,49 @@ mod tests {
         assert_eq!(partial.replica_backend_id.as_deref(), Some("b"));
         assert_eq!(partial.placement_version, initial.placement_version);
 
-        repository.complete_repair(&replica).await.unwrap();
+        assert!(
+            !repository.complete_repair(&replica).await.unwrap(),
+            "a leg leased before another leg's CAS update must not mutate authority"
+        );
+        repository
+            .enqueue(RepairRecord::placement(
+                &partial,
+                Some("c".to_string()),
+                "d".to_string(),
+                RepairTargetRole::Replica,
+                &placement,
+            ))
+            .await
+            .unwrap();
+        let retry = repository
+            .claim_repairs(
+                "placement-worker",
+                crate::transaction::unix_time_ms() + 30_000,
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(repository.complete_repair(&retry).await.unwrap());
         let converged = repository.get(&logical).await.unwrap().unwrap();
         assert_eq!(converged.primary_backend_id, "c");
         assert_eq!(converged.replica_backend_id.as_deref(), Some("d"));
         assert_eq!(converged.placement_version, placement.version);
+        let cleanup = repository
+            .claim_repairs("cleanup", crate::transaction::unix_time_ms() + 30_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(cleanup.len(), 2);
+        assert!(cleanup.iter().all(|repair| {
+            repair.kind == RepairKind::DeleteGeneration
+                && repair.target_role == RepairTargetRole::Cleanup
+                && matches!(repair.target_backend_id.as_str(), "a" | "b")
+        }));
     }
 
     #[tokio::test]
-    async fn concurrent_placement_repair_completions_converge() {
+    async fn concurrent_placement_repair_completions_fence_stale_legs() {
         let repository = InMemoryManagedRepository::new();
         let logical = LogicalObjectKey::new("tenant", "bucket", "placement-race");
         let mut initial = authority(logical.clone(), Uuid::now_v7());
@@ -8972,8 +9412,34 @@ mod tests {
             repository.complete_repair(&repairs[0]),
             repository.complete_repair(&repairs[1]),
         );
-        left.unwrap();
-        right.unwrap();
+        assert_ne!(left.unwrap(), right.unwrap());
+        let partial = repository.get(&logical).await.unwrap().unwrap();
+        let (target_backend_id, target_role) = if partial.primary_backend_id == "c" {
+            ("d".to_string(), RepairTargetRole::Replica)
+        } else {
+            ("c".to_string(), RepairTargetRole::Primary)
+        };
+        repository
+            .enqueue(RepairRecord::placement(
+                &partial,
+                Some(partial.primary_backend_id.clone()),
+                target_backend_id,
+                target_role,
+                &placement,
+            ))
+            .await
+            .unwrap();
+        let retry = repository
+            .claim_repairs(
+                "placement-retry",
+                crate::transaction::unix_time_ms() + 30_000,
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(repository.complete_repair(&retry).await.unwrap());
         let converged = repository.get(&logical).await.unwrap().unwrap();
         assert_eq!(converged.primary_backend_id, "c");
         assert_eq!(converged.replica_backend_id.as_deref(), Some("d"));
@@ -9045,5 +9511,88 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn global_placement_pages_are_ordered_resumable_and_exclude_tombstones() {
+        let repository = InMemoryManagedRepository::new();
+        for (tenant, bucket, key, version, tombstone) in [
+            ("a", "b", "one", 1, false),
+            ("a", "b", "two", 1, false),
+            ("b", "a", "one", 1, false),
+            ("b", "a", "tombstone", 1, true),
+            ("z", "z", "current", 2, false),
+        ] {
+            let mut object = authority(LogicalObjectKey::new(tenant, bucket, key), Uuid::now_v7());
+            object.placement_version = version;
+            object.tombstone = tombstone;
+            repository.publish(object, None).await.unwrap();
+        }
+        let first = repository
+            .list_authority_below_placement_version(AuthorityPlacementPageQuery {
+                target_placement_version: 2,
+                after: None,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .objects
+                .iter()
+                .map(|object| object.logical.key.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        let second = repository
+            .list_authority_below_placement_version(AuthorityPlacementPageQuery {
+                target_placement_version: 2,
+                after: first.next_after.clone(),
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .objects
+                .iter()
+                .map(|object| object.logical.tenant_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert!(second.next_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn placement_advance_requires_current_cas_and_ready_locations() {
+        let repository = InMemoryManagedRepository::new();
+        let logical = LogicalObjectKey::new("tenant", "bucket", "key");
+        let mut object = authority(logical.clone(), Uuid::now_v7());
+        object.replica_status = CopyStatus::Ready;
+        let published = repository.publish(object, None).await.unwrap();
+        let desired = Placement {
+            version: 2,
+            primary_backend_id: "a".to_string(),
+            replica_backend_id: Some("b".to_string()),
+        };
+        let advanced = repository
+            .advance_placement_version(&logical, published.cas_version, &desired)
+            .await
+            .unwrap();
+        assert_eq!(advanced.placement_version, 2);
+        assert!(matches!(
+            repository
+                .advance_placement_version(
+                    &logical,
+                    published.cas_version,
+                    &Placement {
+                        version: 3,
+                        primary_backend_id: "a".to_string(),
+                        replica_backend_id: Some("b".to_string())
+                    }
+                )
+                .await,
+            Err(ManagedError::Conflict)
+        ));
     }
 }

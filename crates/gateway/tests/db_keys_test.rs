@@ -22,13 +22,14 @@ use s4_gateway::entity::multipart_upload;
 use s4_gateway::entity::object_operation;
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
 use s4_gateway::managed::{
-    AuthorityListQuery, BackendVersioningCapability, BackendVersioningMode, CopyStatus,
-    InMemoryManagedRepository, LogicalObjectKey, MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES,
-    MANAGED_LIST_CURSOR_WORKSPACE_LIMIT, ManagedListCursorBinding, ManagedListCursorPosition,
-    ManagedListCursorRequest, ManagedListCursorState, ManagedListVersion,
-    ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
-    ManagedProvenPhysicalAllocation, ManagedRepository, ManagedRouteFence, ManagedUsageEvidence,
-    NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority, PhysicalWriteIntent, Placement,
+    AuthorityListQuery, AuthorityPlacementPageQuery, BackendVersioningCapability,
+    BackendVersioningMode, CopyStatus, InMemoryManagedRepository, LogicalObjectKey,
+    MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES, MANAGED_LIST_CURSOR_WORKSPACE_LIMIT,
+    ManagedListCursorBinding, ManagedListCursorPosition, ManagedListCursorRequest,
+    ManagedListCursorState, ManagedListVersion, ManagedLogicalOperationIntent,
+    ManagedLogicalOperationState, ManagedMutationKind, ManagedProvenPhysicalAllocation,
+    ManagedRepository, ManagedRouteFence, ManagedUsageEvidence, NamespacePurgeRequest,
+    NamespacePurgeStatus, ObjectAuthority, PhysicalWriteIntent, Placement,
     PostgresManagedRepository, ProviderStorageIdentity, generation_physical_key,
 };
 use s4_gateway::multipart_staging::{
@@ -1012,6 +1013,84 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
 }
 
 #[test]
+fn postgres_global_authority_placement_page_has_stable_boundaries() {
+    with_pool(|pool| async move {
+        let db = sea_db(pool.clone());
+        let repository = PostgresManagedRepository::new(pool);
+        let tenant = format!("managed-placement-page-{}", uuid::Uuid::new_v4());
+        for key in ["a", "b", "c"] {
+            let logical = LogicalObjectKey::new(&tenant, "bucket", key);
+            let generation = uuid::Uuid::now_v7();
+            let version = ledger_managed_test_version(
+                &repository,
+                &tenant,
+                "primary",
+                &generation_physical_key(&logical, generation),
+            )
+            .await;
+            repository
+                .publish(
+                    ObjectAuthority {
+                        logical,
+                        generation,
+                        digest: "digest".to_string(),
+                        size: 3,
+                        metadata: std::collections::BTreeMap::new(),
+                        placement_version: 1,
+                        primary_backend_id: "primary".to_string(),
+                        primary_version_id: Some(version),
+                        replica_backend_id: None,
+                        primary_status: CopyStatus::Ready,
+                        replica_status: CopyStatus::Absent,
+                        tombstone: false,
+                        cas_version: 0,
+                        created_at_ms: 0,
+                        updated_at_ms: 0,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let first = repository
+            .list_authority_below_placement_version(AuthorityPlacementPageQuery {
+                target_placement_version: 2,
+                after: None,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.objects.len(), 2);
+        let second = repository
+            .list_authority_below_placement_version(AuthorityPlacementPageQuery {
+                target_placement_version: 2,
+                after: first.next_after,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.objects.len(), 1);
+
+        // This global-page test must not leave stale placement candidates for
+        // later router tests sharing the same Postgres database.
+        managed_object_authority::Entity::delete_many()
+            .filter(managed_object_authority::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_physical_object_version::Entity::delete_many()
+            .filter(managed_physical_object_version::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_namespace::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
 fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
@@ -1207,8 +1286,16 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .claim_repairs("process-placement-race", unix_time_ms() + 30_000, 10)
             .await
             .unwrap();
-        assert_eq!(migration_repairs.len(), 2);
-        for repair in &migration_repairs {
+        // A prior completed placement may have released cleanup work as well;
+        // only its two placement legs participate in this cutover race.
+        let (placement_repairs, cleanup_repairs): (Vec<_>, Vec<_>) = migration_repairs
+            .into_iter()
+            .partition(|repair| repair.kind == s4_gateway::managed::RepairKind::Placement);
+        assert_eq!(placement_repairs.len(), 2);
+        for repair in cleanup_repairs {
+            assert!(!repository.complete_repair(&repair).await.unwrap());
+        }
+        for repair in &placement_repairs {
             let _ = ledger_managed_test_version(
                 &repository,
                 &tenant,
@@ -1218,11 +1305,39 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .await;
         }
         let (left, right) = tokio::join!(
-            repository.complete_repair(&migration_repairs[0]),
-            repository.complete_repair(&migration_repairs[1]),
+            repository.complete_repair(&placement_repairs[0]),
+            repository.complete_repair(&placement_repairs[1]),
         );
-        left.unwrap();
-        right.unwrap();
+        assert_ne!(left.unwrap(), right.unwrap());
+        let partial = repository.get(&logical).await.unwrap().unwrap();
+        let (target_backend_id, target_role) = if partial.primary_backend_id == "primary-v3" {
+            (
+                "replica-v3".to_string(),
+                s4_gateway::managed::RepairTargetRole::Replica,
+            )
+        } else {
+            (
+                "primary-v3".to_string(),
+                s4_gateway::managed::RepairTargetRole::Primary,
+            )
+        };
+        repository
+            .enqueue(s4_gateway::managed::RepairRecord::placement(
+                &partial,
+                Some(partial.primary_backend_id.clone()),
+                target_backend_id,
+                target_role,
+                &full_placement,
+            ))
+            .await
+            .unwrap();
+        let retry = repository
+            .claim_repairs("process-placement-retry", unix_time_ms() + 30_000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(repository.complete_repair(&retry).await.unwrap());
         let converged = repository.get(&logical).await.unwrap().unwrap();
         assert_eq!(converged.primary_backend_id, "primary-v3");
         assert_eq!(converged.replica_backend_id.as_deref(), Some("replica-v3"));
@@ -1256,8 +1371,6 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .await
             .unwrap()
             .len();
-        assert_eq!(cleanup_count, 2);
-
         managed_object_repair::Entity::delete_many()
             .filter(managed_object_repair::Column::TenantId.eq(&tenant))
             .exec(&db)
@@ -1277,6 +1390,10 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .exec(&db)
             .await
             .unwrap();
+
+        // Cleanup precedes the assertion so a future expectation mismatch
+        // cannot contaminate later tests sharing this database.
+        assert_eq!(cleanup_count, 5);
     });
 }
 

@@ -1371,8 +1371,6 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .await
             .unwrap()
             .len();
-        assert_eq!(cleanup_count, 4);
-
         managed_object_repair::Entity::delete_many()
             .filter(managed_object_repair::Column::TenantId.eq(&tenant))
             .exec(&db)
@@ -1392,6 +1390,10 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .exec(&db)
             .await
             .unwrap();
+
+        // Cleanup precedes the assertion so a future expectation mismatch
+        // cannot contaminate later tests sharing this database.
+        assert_eq!(cleanup_count, 5);
     });
 }
 

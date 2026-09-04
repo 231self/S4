@@ -4668,14 +4668,16 @@ async fn complete_staged_multipart(
             size_bytes: output_bytes,
             pipeline_evidence: pipeline_evidence.clone(),
         };
+        let usage_event = multipart_completion_event(operation.grant, &precommit_result);
         persist_transaction_usage_evidence(
             state.operation_journal.as_ref(),
             sink.durable_operation_id(),
-            &multipart_completion_event(operation.grant, &precommit_result),
+            &usage_event,
         )
         .await
         .map_err(TransactionError::from)
         .map_err(StreamingPutError::from)?;
+        sink.record_usage_evidence(&usage_event).await?;
         renew_and_fence_completion(staging, identity, lease).await?;
         let stored = sink.complete().await?;
         let result = MultipartCompletionResult {
@@ -5286,14 +5288,16 @@ async fn complete_staged_avro_multipart(
             size_bytes: output_bytes,
             pipeline_evidence: None,
         };
+        let usage_event = multipart_completion_event(operation.grant, &precommit_result);
         persist_transaction_usage_evidence(
             state.operation_journal.as_ref(),
             sink.durable_operation_id(),
-            &multipart_completion_event(operation.grant, &precommit_result),
+            &usage_event,
         )
         .await
         .map_err(TransactionError::from)
         .map_err(StreamingPutError::from)?;
+        sink.record_usage_evidence(&usage_event).await?;
         renew_and_fence_completion(staging, identity, lease).await?;
         let stored = sink.complete().await?;
         let result = MultipartCompletionResult {

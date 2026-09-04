@@ -1204,6 +1204,34 @@ fn publication_repairs(authority: &ObjectAuthority) -> Vec<RepairRecord> {
     }
 }
 
+fn placement_cleanup_repairs(
+    previous: &ObjectAuthority,
+    authority: &ObjectAuthority,
+) -> Vec<RepairRecord> {
+    let mut old_locations = vec![Some(previous.primary_backend_id.clone())];
+    old_locations.push(previous.replica_backend_id.clone());
+    old_locations
+        .into_iter()
+        .flatten()
+        .filter(|backend| {
+            backend != &authority.primary_backend_id
+                && authority.replica_backend_id.as_deref() != Some(backend)
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|backend| {
+            RepairRecord::copy(
+                RepairKind::DeleteGeneration,
+                authority,
+                None,
+                backend,
+                RepairTargetRole::Cleanup,
+                authority.placement_version,
+            )
+        })
+        .collect()
+}
+
 fn apply_repair_to_authority(
     authority: &mut ObjectAuthority,
     repair: &RepairRecord,
@@ -1658,6 +1686,31 @@ fn repair_active(repair: RepairRecord) -> Result<managed_object_repair::ActiveMo
 
 fn persistence(error: impl std::fmt::Display) -> ManagedError {
     ManagedError::Persistence(error.to_string())
+}
+
+async fn insert_waiting_placement_cleanup<C>(
+    db: &C,
+    repair: RepairRecord,
+) -> Result<(), ManagedError>
+where
+    C: sea_orm::ConnectionTrait,
+{
+    let mut active = repair_active(repair)?;
+    active.state = Set("WAITING_CUTOVER".to_string());
+    managed_object_repair::Entity::insert(active)
+        .on_conflict(
+            OnConflict::columns([
+                managed_object_repair::Column::Kind,
+                managed_object_repair::Column::Generation,
+                managed_object_repair::Column::TargetBackendId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .map_err(persistence)?;
+    Ok(())
 }
 
 async fn locked_namespace<C>(
@@ -4503,8 +4556,7 @@ impl ManagedRepository for PostgresManagedRepository {
             if let Some(current) = current {
                 let mut authority = authority_from_model(current.clone())?;
                 if authority.generation == repair.generation
-                    && (repair.kind == RepairKind::Placement
-                        || authority.cas_version == repair.authority_cas_version)
+                    && authority.cas_version == repair.authority_cas_version
                     && !authority.tombstone
                     && apply_repair_to_authority(&mut authority, repair)?
                 {
@@ -4531,6 +4583,49 @@ impl ManagedRepository for PostgresManagedRepository {
                         return Err(ManagedError::Conflict);
                     }
                     authority_updated = true;
+                    if repair.kind == RepairKind::Placement {
+                        for mut cleanup in
+                            placement_cleanup_repairs(&authority_from_model(current)?, &authority)
+                        {
+                            cleanup.namespace_epoch = repair.namespace_epoch;
+                            cleanup.placement_version = repair.placement_version;
+                            insert_waiting_placement_cleanup(&txn, cleanup).await?;
+                        }
+                        if authority.placement_version == repair.placement_version {
+                            managed_object_repair::Entity::update_many()
+                                .col_expr(
+                                    managed_object_repair::Column::State,
+                                    Expr::value("PENDING"),
+                                )
+                                .col_expr(
+                                    managed_object_repair::Column::UpdatedAtMs,
+                                    Expr::value(crate::transaction::unix_time_ms()),
+                                )
+                                .filter(managed_object_repair::Column::State.eq("WAITING_CUTOVER"))
+                                .filter(
+                                    managed_object_repair::Column::TenantId
+                                        .eq(&repair.logical.tenant_id),
+                                )
+                                .filter(
+                                    managed_object_repair::Column::Bucket
+                                        .eq(&repair.logical.bucket),
+                                )
+                                .filter(
+                                    managed_object_repair::Column::LogicalKey
+                                        .eq(&repair.logical.key),
+                                )
+                                .filter(
+                                    managed_object_repair::Column::Generation.eq(repair.generation),
+                                )
+                                .filter(
+                                    managed_object_repair::Column::PlacementVersion
+                                        .eq(i64::from(repair.placement_version)),
+                                )
+                                .exec(&txn)
+                                .await
+                                .map_err(persistence)?;
+                        }
+                    }
                 }
             }
         }
@@ -5680,6 +5775,19 @@ fn insert_memory_repair(state: &mut MemoryState, repair: RepairRecord) {
         state
             .repairs
             .insert(repair.repair_id, (repair, "PENDING".to_string()));
+    }
+}
+
+fn insert_memory_waiting_placement_cleanup(state: &mut MemoryState, repair: RepairRecord) {
+    let duplicate = state.repairs.values().any(|(existing, _)| {
+        existing.kind == repair.kind
+            && existing.generation == repair.generation
+            && existing.target_backend_id == repair.target_backend_id
+    });
+    if !duplicate {
+        state
+            .repairs
+            .insert(repair.repair_id, (repair, "WAITING_CUTOVER".to_string()));
     }
 }
 
@@ -7005,17 +7113,40 @@ impl ManagedRepository for InMemoryManagedRepository {
             stored.updated_at_ms = now;
         }
         let mut updated = false;
+        let mut cleanups = Vec::new();
+        let mut activate_cleanup = false;
         if repair.kind != RepairKind::DeleteGeneration
             && let Some(authority) = state.authorities.get_mut(&repair.logical)
             && authority.generation == repair.generation
-            && (repair.kind == RepairKind::Placement
-                || authority.cas_version == repair.authority_cas_version)
+            && authority.cas_version == repair.authority_cas_version
             && !authority.tombstone
-            && apply_repair_to_authority(authority, repair)?
         {
-            authority.cas_version = authority.cas_version.saturating_add(1);
-            authority.updated_at_ms = crate::transaction::unix_time_ms();
-            updated = true;
+            let previous = authority.clone();
+            if apply_repair_to_authority(authority, repair)? {
+                authority.cas_version = authority.cas_version.saturating_add(1);
+                authority.updated_at_ms = crate::transaction::unix_time_ms();
+                updated = true;
+                if repair.kind == RepairKind::Placement {
+                    cleanups = placement_cleanup_repairs(&previous, authority);
+                    activate_cleanup = authority.placement_version == repair.placement_version;
+                }
+            }
+        }
+        for mut cleanup in cleanups {
+            cleanup.namespace_epoch = repair.namespace_epoch;
+            cleanup.placement_version = repair.placement_version;
+            insert_memory_waiting_placement_cleanup(&mut state, cleanup);
+        }
+        if activate_cleanup {
+            for (cleanup, status) in state.repairs.values_mut() {
+                if *status == "WAITING_CUTOVER"
+                    && cleanup.logical == repair.logical
+                    && cleanup.generation == repair.generation
+                    && cleanup.placement_version == repair.placement_version
+                {
+                    *status = "PENDING".to_string();
+                }
+            }
         }
         Ok(updated)
     }
@@ -9201,15 +9332,49 @@ mod tests {
         assert_eq!(partial.replica_backend_id.as_deref(), Some("b"));
         assert_eq!(partial.placement_version, initial.placement_version);
 
-        repository.complete_repair(&replica).await.unwrap();
+        assert!(
+            !repository.complete_repair(&replica).await.unwrap(),
+            "a leg leased before another leg's CAS update must not mutate authority"
+        );
+        repository
+            .enqueue(RepairRecord::placement(
+                &partial,
+                Some("c".to_string()),
+                "d".to_string(),
+                RepairTargetRole::Replica,
+                &placement,
+            ))
+            .await
+            .unwrap();
+        let retry = repository
+            .claim_repairs(
+                "placement-worker",
+                crate::transaction::unix_time_ms() + 30_000,
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(repository.complete_repair(&retry).await.unwrap());
         let converged = repository.get(&logical).await.unwrap().unwrap();
         assert_eq!(converged.primary_backend_id, "c");
         assert_eq!(converged.replica_backend_id.as_deref(), Some("d"));
         assert_eq!(converged.placement_version, placement.version);
+        let cleanup = repository
+            .claim_repairs("cleanup", crate::transaction::unix_time_ms() + 30_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(cleanup.len(), 2);
+        assert!(cleanup.iter().all(|repair| {
+            repair.kind == RepairKind::DeleteGeneration
+                && repair.target_role == RepairTargetRole::Cleanup
+                && matches!(repair.target_backend_id.as_str(), "a" | "b")
+        }));
     }
 
     #[tokio::test]
-    async fn concurrent_placement_repair_completions_converge() {
+    async fn concurrent_placement_repair_completions_fence_stale_legs() {
         let repository = InMemoryManagedRepository::new();
         let logical = LogicalObjectKey::new("tenant", "bucket", "placement-race");
         let mut initial = authority(logical.clone(), Uuid::now_v7());
@@ -9247,8 +9412,34 @@ mod tests {
             repository.complete_repair(&repairs[0]),
             repository.complete_repair(&repairs[1]),
         );
-        left.unwrap();
-        right.unwrap();
+        assert_ne!(left.unwrap(), right.unwrap());
+        let partial = repository.get(&logical).await.unwrap().unwrap();
+        let (target_backend_id, target_role) = if partial.primary_backend_id == "c" {
+            ("d".to_string(), RepairTargetRole::Replica)
+        } else {
+            ("c".to_string(), RepairTargetRole::Primary)
+        };
+        repository
+            .enqueue(RepairRecord::placement(
+                &partial,
+                Some(partial.primary_backend_id.clone()),
+                target_backend_id,
+                target_role,
+                &placement,
+            ))
+            .await
+            .unwrap();
+        let retry = repository
+            .claim_repairs(
+                "placement-retry",
+                crate::transaction::unix_time_ms() + 30_000,
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(repository.complete_repair(&retry).await.unwrap());
         let converged = repository.get(&logical).await.unwrap().unwrap();
         assert_eq!(converged.primary_backend_id, "c");
         assert_eq!(converged.replica_backend_id.as_deref(), Some("d"));

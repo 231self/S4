@@ -1915,6 +1915,19 @@ impl ServiceStorage {
         let repository = self
             .authority_repository_required()
             .map_err(|error| error.to_string())?;
+        if let Some(authority) = repository
+            .get(&repair.logical)
+            .await
+            .map_err(|error| error.to_string())?
+            && !authority.tombstone
+            && authority.generation == repair.generation
+            && (authority.primary_backend_id == repair.target_backend_id
+                || authority.replica_backend_id.as_deref() == Some(&repair.target_backend_id))
+        {
+            return Err(
+                "cleanup target is currently authoritative for this generation".to_string(),
+            );
+        }
         let versions = repository
             .physical_versions(
                 &repair.logical.tenant_id,

@@ -1015,6 +1015,7 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
 #[test]
 fn postgres_global_authority_placement_page_has_stable_boundaries() {
     with_pool(|pool| async move {
+        let db = sea_db(pool.clone());
         let repository = PostgresManagedRepository::new(pool);
         let tenant = format!("managed-placement-page-{}", uuid::Uuid::new_v4());
         for key in ["a", "b", "c"] {
@@ -1069,6 +1070,23 @@ fn postgres_global_authority_placement_page_has_stable_boundaries() {
             .await
             .unwrap();
         assert_eq!(second.objects.len(), 1);
+
+        // This global-page test must not leave stale placement candidates for
+        // later router tests sharing the same Postgres database.
+        managed_object_authority::Entity::delete_many()
+            .filter(managed_object_authority::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_physical_object_version::Entity::delete_many()
+            .filter(managed_physical_object_version::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_namespace::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
     });
 }
 
@@ -1282,8 +1300,36 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             repository.complete_repair(&migration_repairs[0]),
             repository.complete_repair(&migration_repairs[1]),
         );
-        left.unwrap();
-        right.unwrap();
+        assert_ne!(left.unwrap(), right.unwrap());
+        let partial = repository.get(&logical).await.unwrap().unwrap();
+        let (target_backend_id, target_role) = if partial.primary_backend_id == "primary-v3" {
+            (
+                "replica-v3".to_string(),
+                s4_gateway::managed::RepairTargetRole::Replica,
+            )
+        } else {
+            (
+                "primary-v3".to_string(),
+                s4_gateway::managed::RepairTargetRole::Primary,
+            )
+        };
+        repository
+            .enqueue(s4_gateway::managed::RepairRecord::placement(
+                &partial,
+                Some(partial.primary_backend_id.clone()),
+                target_backend_id,
+                target_role,
+                &full_placement,
+            ))
+            .await
+            .unwrap();
+        let retry = repository
+            .claim_repairs("process-placement-retry", unix_time_ms() + 30_000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(repository.complete_repair(&retry).await.unwrap());
         let converged = repository.get(&logical).await.unwrap().unwrap();
         assert_eq!(converged.primary_backend_id, "primary-v3");
         assert_eq!(converged.replica_backend_id.as_deref(), Some("replica-v3"));

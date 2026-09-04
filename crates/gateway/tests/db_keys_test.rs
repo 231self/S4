@@ -1286,8 +1286,16 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .claim_repairs("process-placement-race", unix_time_ms() + 30_000, 10)
             .await
             .unwrap();
-        assert_eq!(migration_repairs.len(), 2);
-        for repair in &migration_repairs {
+        // A prior completed placement may have released cleanup work as well;
+        // only its two placement legs participate in this cutover race.
+        let (placement_repairs, cleanup_repairs): (Vec<_>, Vec<_>) = migration_repairs
+            .into_iter()
+            .partition(|repair| repair.kind == s4_gateway::managed::RepairKind::Placement);
+        assert_eq!(placement_repairs.len(), 2);
+        for repair in cleanup_repairs {
+            assert!(!repository.complete_repair(&repair).await.unwrap());
+        }
+        for repair in &placement_repairs {
             let _ = ledger_managed_test_version(
                 &repository,
                 &tenant,
@@ -1297,8 +1305,8 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .await;
         }
         let (left, right) = tokio::join!(
-            repository.complete_repair(&migration_repairs[0]),
-            repository.complete_repair(&migration_repairs[1]),
+            repository.complete_repair(&placement_repairs[0]),
+            repository.complete_repair(&placement_repairs[1]),
         );
         assert_ne!(left.unwrap(), right.unwrap());
         let partial = repository.get(&logical).await.unwrap().unwrap();
@@ -1363,7 +1371,7 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .await
             .unwrap()
             .len();
-        assert_eq!(cleanup_count, 2);
+        assert_eq!(cleanup_count, 4);
 
         managed_object_repair::Entity::delete_many()
             .filter(managed_object_repair::Column::TenantId.eq(&tenant))

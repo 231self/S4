@@ -23,6 +23,17 @@ use crate::entity::{
 
 pub const PLACEMENT_VERSION_V1: u32 = 1;
 pub const PHYSICAL_WRITE_LEASE_MS: i64 = 2 * 60 * 60 * 1000;
+/// A repair that fails this many times is dead-lettered and no longer retried.
+pub const MAX_REPAIR_ATTEMPTS: u32 = 8;
+pub const REPAIR_BACKOFF_BASE_MS: i64 = 30_000;
+pub const REPAIR_BACKOFF_MAX_MS: i64 = 4 * 60 * 60 * 1000;
+
+/// Exponential backoff before a failed repair is eligible for retry.
+fn repair_backoff_ms(attempts: u32) -> i64 {
+    REPAIR_BACKOFF_BASE_MS
+        .saturating_mul(1i64 << attempts.min(10))
+        .min(REPAIR_BACKOFF_MAX_MS)
+}
 pub const MANAGED_VISIBLE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MANAGED_REPLACEMENT_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 pub const MANAGED_LIST_CURSOR_TTL_MS: i64 = 15 * 60 * 1000;
@@ -348,6 +359,7 @@ pub struct RepairRecord {
     pub lease_owner: Option<String>,
     pub lease_token: Option<Uuid>,
     pub lease_expires_at_ms: Option<i64>,
+    pub not_before_ms: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -385,6 +397,7 @@ impl RepairRecord {
             lease_owner: None,
             lease_token: None,
             lease_expires_at_ms: None,
+            not_before_ms: 0,
             created_at_ms: now,
             updated_at_ms: now,
         }
@@ -1685,6 +1698,7 @@ fn repair_from_model(model: managed_object_repair::Model) -> Result<RepairRecord
         lease_owner: model.lease_owner,
         lease_token: model.lease_token,
         lease_expires_at_ms: model.lease_expires_at_ms,
+        not_before_ms: model.not_before_ms,
         created_at_ms: model.created_at_ms,
         updated_at_ms: model.updated_at_ms,
     })
@@ -1722,6 +1736,7 @@ fn repair_active(repair: RepairRecord) -> Result<managed_object_repair::ActiveMo
         lease_owner: Set(repair.lease_owner),
         lease_token: Set(None),
         lease_expires_at_ms: Set(repair.lease_expires_at_ms),
+        not_before_ms: Set(repair.not_before_ms),
         last_error: Set(None),
         created_at_ms: Set(repair.created_at_ms),
         updated_at_ms: Set(repair.updated_at_ms),
@@ -4480,7 +4495,11 @@ impl ManagedRepository for PostgresManagedRepository {
         let candidates = managed_object_repair::Entity::find()
             .filter(
                 Condition::any()
-                    .add(managed_object_repair::Column::State.eq("PENDING"))
+                    .add(
+                        Condition::all()
+                            .add(managed_object_repair::Column::State.eq("PENDING"))
+                            .add(managed_object_repair::Column::NotBeforeMs.lte(now)),
+                    )
                     .add(
                         Condition::all()
                             .add(managed_object_repair::Column::State.eq("LEASED"))
@@ -4715,11 +4734,32 @@ impl ManagedRepository for PostgresManagedRepository {
 
     async fn fail_repair(&self, lease_token: Uuid, error: &str) -> Result<(), ManagedError> {
         let now = crate::transaction::unix_time_ms();
-        let result = managed_object_repair::Entity::update_many()
-            .col_expr(managed_object_repair::Column::State, Expr::value("PENDING"))
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let model = managed_object_repair::Entity::find()
+            .filter(managed_object_repair::Column::State.eq("LEASED"))
+            .filter(managed_object_repair::Column::LeaseToken.eq(lease_token))
+            .filter(managed_object_repair::Column::LeaseExpiresAtMs.gt(now))
+            .lock(LockType::Update)
+            .one(&txn)
+            .await
+            .map_err(persistence)?
+            .ok_or(ManagedError::Conflict)?;
+        let attempts = model.attempts.saturating_add(1);
+        let attempts = u32::try_from(attempts).unwrap_or(u32::MAX);
+        let (state, not_before_ms) = if attempts >= MAX_REPAIR_ATTEMPTS {
+            ("DEAD", 0)
+        } else {
+            ("PENDING", now.saturating_add(repair_backoff_ms(attempts)))
+        };
+        managed_object_repair::Entity::update_many()
+            .col_expr(managed_object_repair::Column::State, Expr::value(state))
             .col_expr(
                 managed_object_repair::Column::Attempts,
-                Expr::col(managed_object_repair::Column::Attempts).add(1),
+                Expr::value(i32::try_from(attempts).unwrap_or(i32::MAX)),
+            )
+            .col_expr(
+                managed_object_repair::Column::NotBeforeMs,
+                Expr::value(not_before_ms),
             )
             .col_expr(
                 managed_object_repair::Column::LeaseOwner,
@@ -4738,16 +4778,14 @@ impl ManagedRepository for PostgresManagedRepository {
                 Expr::value(Some(error.chars().take(1024).collect::<String>())),
             )
             .col_expr(managed_object_repair::Column::UpdatedAtMs, Expr::value(now))
+            .filter(managed_object_repair::Column::Id.eq(model.id))
             .filter(managed_object_repair::Column::State.eq("LEASED"))
             .filter(managed_object_repair::Column::LeaseToken.eq(lease_token))
             .filter(managed_object_repair::Column::LeaseExpiresAtMs.gt(now))
-            .exec(&self.db)
+            .exec(&txn)
             .await
             .map_err(persistence)?;
-        if result.rows_affected != 1 {
-            return Err(ManagedError::Conflict);
-        }
-        Ok(())
+        txn.commit().await.map_err(persistence)
     }
 
     async fn begin_physical_write(
@@ -7131,6 +7169,7 @@ impl ManagedRepository for InMemoryManagedRepository {
                             && repair
                                 .lease_expires_at_ms
                                 .is_some_and(|expiry| expiry <= now)))
+                    && repair.not_before_ms <= now
             })
             .collect();
         candidates.sort_by_key(|(repair, _)| repair.updated_at_ms);
@@ -7268,7 +7307,13 @@ impl ManagedRepository for InMemoryManagedRepository {
         repair.lease_token = None;
         repair.lease_expires_at_ms = None;
         repair.updated_at_ms = now;
-        *status = "PENDING".to_string();
+        if repair.attempts >= MAX_REPAIR_ATTEMPTS {
+            *status = "DEAD".to_string();
+            repair.not_before_ms = 0;
+        } else {
+            *status = "PENDING".to_string();
+            repair.not_before_ms = now.saturating_add(repair_backoff_ms(repair.attempts));
+        }
         Ok(())
     }
 
@@ -8938,6 +8983,78 @@ mod tests {
             repository.enqueue(stale_repair).await,
             Err(ManagedError::Conflict)
         ));
+    }
+
+    #[test]
+    fn repair_backoff_grows_and_is_capped() {
+        assert_eq!(repair_backoff_ms(0), 30_000);
+        assert_eq!(repair_backoff_ms(1), 60_000);
+        assert_eq!(repair_backoff_ms(10), REPAIR_BACKOFF_MAX_MS);
+        assert_eq!(repair_backoff_ms(100), REPAIR_BACKOFF_MAX_MS);
+    }
+
+    #[tokio::test]
+    async fn repair_dead_letters_after_max_attempts_and_honors_backoff() {
+        let repository = InMemoryManagedRepository::new();
+        let published = repository
+            .publish(
+                authority(
+                    LogicalObjectKey::new("tenant-repair", "bucket", "key"),
+                    Uuid::now_v7(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let repair = RepairRecord::copy(
+            RepairKind::Replica,
+            &published,
+            Some(published.primary_backend_id.clone()),
+            published.replica_backend_id.clone().unwrap(),
+            RepairTargetRole::Replica,
+            published.placement_version,
+        );
+        repository.enqueue(repair).await.unwrap();
+
+        for attempt in 1..=MAX_REPAIR_ATTEMPTS {
+            let claimed = repository
+                .claim_repairs("worker", crate::transaction::unix_time_ms() + 60_000, 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                claimed.len(),
+                1,
+                "attempt {attempt} should claim the repair"
+            );
+            repository
+                .fail_repair(claimed[0].lease_token.unwrap(), "injected failure")
+                .await
+                .unwrap();
+            if attempt < MAX_REPAIR_ATTEMPTS {
+                let immediate = repository
+                    .claim_repairs("worker", crate::transaction::unix_time_ms() + 60_000, 10)
+                    .await
+                    .unwrap();
+                assert!(
+                    immediate.is_empty(),
+                    "attempt {attempt} should be backed off, not immediately claimable"
+                );
+                // Advance past the backoff for the next attempt.
+                let mut state = repository.state.lock().await;
+                for (repair, _) in state.repairs.values_mut() {
+                    repair.not_before_ms = 0;
+                }
+            }
+        }
+
+        let final_claim = repository
+            .claim_repairs("worker", crate::transaction::unix_time_ms() + 60_000, 10)
+            .await
+            .unwrap();
+        assert!(
+            final_claim.is_empty(),
+            "dead-lettered repair must never be retried"
+        );
     }
 
     #[tokio::test]

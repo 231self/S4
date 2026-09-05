@@ -27,6 +27,7 @@ pub struct Model {
     pub lease_owner: Option<String>,
     pub lease_token: Option<Uuid>,
     pub lease_expires_at_ms: Option<i64>,
+    pub not_before_ms: i64,
     pub last_error: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,

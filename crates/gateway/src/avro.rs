@@ -288,7 +288,7 @@ fn schema_node_to_json(node: &SchemaNode, records: &mut u32) -> Result<JsonValue
             json!({"type":"map","values":schema_node_to_json(values, records)?})
         }
         SchemaKind::Record { fields } => {
-            let name = format!("s4_record_{records}");
+            let name = format!("maskura_record_{records}");
             *records = records.saturating_add(1);
             let fields = fields
                 .iter()

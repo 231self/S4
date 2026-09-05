@@ -119,7 +119,7 @@ just dev-up
 maskura put ./data.csv ingest/data.csv --bucket s4-local
 
 # End-to-end validation:
-just e2e
+just e2e                # see docs/e2e.md for the feature-by-feature breakdown
 ```
 
 **Agent-safe reads — raw at rest, scrubbed on the way out**

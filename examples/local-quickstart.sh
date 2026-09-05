@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-SAMPLE="/tmp/s4-quickstart.csv"
+SAMPLE="/tmp/maskura-quickstart.csv"
 
 echo "=== Maskura local quickstart ==="
 maskura --version

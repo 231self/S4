@@ -2830,8 +2830,10 @@ async fn state_assertions_for_unknown_head_and_ambiguous_delete(
 #[test]
 fn router_staged_multipart_flow_is_durable_and_idempotent() {
     with_pool(|pool| async move {
-        let staging_dir =
-            std::env::temp_dir().join(format!("s4-multipart-staging-{}", uuid::Uuid::new_v4()));
+        let staging_dir = std::env::temp_dir().join(format!(
+            "maskura-multipart-staging-{}",
+            uuid::Uuid::new_v4()
+        ));
         tokio::fs::create_dir_all(&staging_dir).await.unwrap();
 
         let mock_state = MockS3State::default();

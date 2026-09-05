@@ -256,7 +256,7 @@ impl BackendResolver {
 
         // The request-level shortcut is a single-tenant development feature.
         // Hosted routing must consult persisted workspace state first so a BYO
-        // workspace cannot be redirected into S4-managed storage by a header.
+        // workspace cannot be redirected into Maskura-managed storage by a header.
         if self.explicit_single_tenant && managed_requested {
             if self.managed.is_empty() {
                 return Err("managed storage is not configured (no S4_SERVICE_BUCKETS)".to_string());
@@ -319,7 +319,7 @@ impl BackendResolver {
                     resolution.routing,
                 );
                 let credentials =
-                    Credentials::new(access_key, secret_key, None, None, "s4-backend");
+                    Credentials::new(access_key, secret_key, None, None, "maskura-backend");
                 // Tenant-selected destinations must never inherit process proxy
                 // settings. DNS is intentionally resolved again by the SDK: in
                 // multi-tenant mode the hostname belongs to an operator-trusted
@@ -419,7 +419,7 @@ impl BackendResolver {
         let workspace_streaming =
             workspace_streaming_binding(&endpoint, Some(identity), resolution.routing)
                 .ok_or_else(|| "historical workspace storage attestation is invalid".to_string())?;
-        let credentials = Credentials::new(access_key, secret_key, None, None, "s4-recovery");
+        let credentials = Credentials::new(access_key, secret_key, None, None, "maskura-recovery");
         let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(Region::new(region))
             .endpoint_url(endpoint.as_str())
@@ -2035,7 +2035,7 @@ mod tests {
 
     #[test]
     fn byo_s3_custom_endpoint_uses_path_style_and_ignores_environment_proxies() {
-        const CHILD_ENV: &str = "S4_TEST_WORKSPACE_S3_NO_PROXY_CHILD";
+        const CHILD_ENV: &str = "MASKURA_TEST_WORKSPACE_S3_NO_PROXY_CHILD";
         const TEST_NAME: &str = "backend::tests::byo_s3_custom_endpoint_uses_path_style_and_ignores_environment_proxies";
         if std::env::var_os(CHILD_ENV).is_none() {
             let poison_proxy = "http://127.0.0.1:1";

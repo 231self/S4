@@ -2956,7 +2956,7 @@ mod tests {
 
     #[tokio::test]
     async fn ciphertext_does_not_contain_plaintext_and_aad_is_identity_bound() {
-        let directory = std::env::temp_dir().join(format!("s4-stage-test-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("maskura-stage-test-{}", Uuid::now_v7()));
         let wrapping = Arc::new(LocalKeyWrapping::with_kek([7; 32]));
         let mut writer = EncryptedPartWriter::begin(
             &directory,
@@ -3025,7 +3025,7 @@ mod tests {
 
     #[tokio::test]
     async fn encrypted_parts_feed_one_decoder_across_record_and_utf8_boundaries() {
-        let directory = std::env::temp_dir().join(format!("s4-stage-test-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("maskura-stage-test-{}", Uuid::now_v7()));
         let wrapping = Arc::new(LocalKeyWrapping::with_kek([8; 32]));
         let snapshot = snapshot();
         let mut first_writer = EncryptedPartWriter::begin(
@@ -3109,7 +3109,7 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_wrapping_cannot_start_durable_staging() {
-        let directory = std::env::temp_dir().join(format!("s4-stage-test-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("maskura-stage-test-{}", Uuid::now_v7()));
         let result = EncryptedPartWriter::begin(
             &directory,
             &identity(),
@@ -3164,7 +3164,7 @@ mod tests {
             .await
             .unwrap();
         let artifacts = MemoryStagingArtifactStore::default();
-        let path = std::env::temp_dir().join(format!("s4-crash-artifact-{}", Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!("maskura-crash-artifact-{}", Uuid::now_v7()));
         tokio::fs::write(&path, b"ciphertext-only-test-artifact")
             .await
             .unwrap();

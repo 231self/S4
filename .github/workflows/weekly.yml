@@ -35,7 +35,7 @@ jobs:
       - name: Build Wasm filters
         run: bash scripts/build-filters.sh
       - name: Soak streaming round-trips (500 iterations)
-        run: S4_SOAK_ITERATIONS=500 cargo test --locked -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored --nocapture
+        run: MASKURA_SOAK_ITERATIONS=500 cargo test --locked -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored --nocapture
 
   property:
     runs-on: ubuntu-latest

@@ -661,7 +661,7 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
-            r#"{"backend_type":"aws_role","role_arn":"arn:aws:iam::123456789012:role/s4"}"#,
+            r#"{"backend_type":"aws_role","role_arn":"arn:aws:iam::123456789012:role/maskura"}"#,
         ))
         .unwrap();
     assert_eq!(
@@ -739,8 +739,10 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
 #[tokio::test]
 async fn create_key_persistence_failure_returns_unavailable_without_secret() {
     let mut state = test_state().await;
-    let blocking_parent =
-        std::env::temp_dir().join(format!("s4-create-key-failure-{}", uuid::Uuid::new_v4()));
+    let blocking_parent = std::env::temp_dir().join(format!(
+        "maskura-create-key-failure-{}",
+        uuid::Uuid::new_v4()
+    ));
     std::fs::create_dir_all(&blocking_parent).unwrap();
     let file_store = FileKeyStore::new(blocking_parent.join("keys.json")).unwrap();
     std::fs::remove_dir_all(&blocking_parent).unwrap();
@@ -775,8 +777,10 @@ async fn create_key_persistence_failure_returns_unavailable_without_secret() {
 #[tokio::test]
 async fn public_key_persistence_failure_returns_generic_503_and_rolls_back() {
     let mut state = test_state().await;
-    let parent =
-        std::env::temp_dir().join(format!("s4-public-key-handler-{}", uuid::Uuid::new_v4()));
+    let parent = std::env::temp_dir().join(format!(
+        "maskura-public-key-handler-{}",
+        uuid::Uuid::new_v4()
+    ));
     let durable_parent = parent.with_extension("durable");
     std::fs::create_dir_all(&parent).unwrap();
     let path = parent.join("keys.json");
@@ -1021,8 +1025,10 @@ fn test_filter_component() -> Vec<u8> {
 
 async fn unsafe_transformed_test_state(later_filter: bool) -> Arc<AppState> {
     let mut state = test_state().await;
-    let spool_dir =
-        std::env::temp_dir().join(format!("s4-read-spool-failure-{}", uuid::Uuid::now_v7()));
+    let spool_dir = std::env::temp_dir().join(format!(
+        "maskura-read-spool-failure-{}",
+        uuid::Uuid::now_v7()
+    ));
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = true;
@@ -2194,7 +2200,7 @@ async fn put_with_unsupported_content_encoding_is_rejected_without_polling_body(
 #[tokio::test]
 #[ignore = "soak: run via `just soak-streaming` or the weekly workflow"]
 async fn soak_streaming_roundtrip_holds_under_repetition() {
-    let iterations = std::env::var("S4_SOAK_ITERATIONS")
+    let iterations = std::env::var("MASKURA_SOAK_ITERATIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(200);
@@ -4171,7 +4177,7 @@ fn presigned_request(
 async fn sigv4_signed_request_accepted_and_rejected() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
-    let uri = "http://s4.local/demo/signed.txt";
+    let uri = "http://maskura.local/demo/signed.txt";
 
     // Correct signature → 200.
     let req = signed_request(
@@ -4230,7 +4236,7 @@ async fn sigv4_wrapping_provider_failure_returns_generic_service_unavailable() {
         &created.key_id,
         &secret,
         "PUT",
-        "http://s4.local/outage/unwrap.txt",
+        "http://maskura.local/outage/unwrap.txt",
         b"sensitive",
         &[],
     );
@@ -4283,7 +4289,7 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
     .into_iter()
     .enumerate()
     {
-        let uri = format!("http://s4.local/semantic/signed-{index}.txt");
+        let uri = format!("http://maskura.local/semantic/signed-{index}.txt");
         let request = signed_request(
             &access_key,
             &secret_key,
@@ -4343,7 +4349,7 @@ async fn sigv4_signs_the_exact_old_or_new_semantic_header_names() {
             &access_key,
             &secret_key,
             "PUT",
-            &format!("http://s4.local/sigv4-aliases/{index}.txt"),
+            &format!("http://maskura.local/sigv4-aliases/{index}.txt"),
             b"signed alias",
             &[("content-type", "text/plain"), (name, value)],
         );
@@ -4358,7 +4364,7 @@ async fn sigv4_signs_the_exact_old_or_new_semantic_header_names() {
         &access_key,
         &secret_key,
         "PUT",
-        "http://s4.local/sigv4-aliases/equal.txt",
+        "http://maskura.local/sigv4-aliases/equal.txt",
         b"equal aliases",
         &[
             ("content-type", "text/plain"),
@@ -4375,7 +4381,7 @@ async fn sigv4_signs_the_exact_old_or_new_semantic_header_names() {
         &access_key,
         &secret_key,
         "PUT",
-        "http://s4.local/sigv4-aliases/conflict.txt",
+        "http://maskura.local/sigv4-aliases/conflict.txt",
         b"conflicting aliases",
         &[
             ("content-type", "text/plain"),
@@ -4463,7 +4469,7 @@ async fn sigv4_rejects_ambiguous_or_noncanonical_integrity_headers_before_body_p
             signed_headers.push(("content-type", "text/plain"));
         }
         signed_headers.push((name, signed_value));
-        let uri = format!("http://s4.local/semantic/shape-{index}.txt");
+        let uri = format!("http://maskura.local/semantic/shape-{index}.txt");
         let request = signed_request(
             &access_key,
             &secret_key,
@@ -4518,7 +4524,7 @@ async fn sigv4_rejects_unsigned_integrity_header_injection_before_polling_the_bo
     .into_iter()
     .enumerate()
     {
-        let uri = format!("http://s4.local/semantic/unsigned-{index}.txt");
+        let uri = format!("http://maskura.local/semantic/unsigned-{index}.txt");
         let request = signed_request(
             &access_key,
             &secret_key,
@@ -4572,7 +4578,7 @@ async fn presigned_host_only_get_accepts_but_appended_protected_headers_are_reje
         Bytes::from_static(b"presigned body"),
         "text/plain",
     );
-    let uri = "https://s4.local/presigned/object.txt";
+    let uri = "https://maskura.local/presigned/object.txt";
 
     let response = app
         .clone()
@@ -4681,7 +4687,7 @@ async fn streaming_sigv4_hash_is_checked_before_atomic_commit() {
     state_mut.dev_memory_streaming_enabled = true;
     let (access_key, secret_key) = make_key(&state).await;
     let app = build_router(state.clone());
-    let uri = "http://s4.local/stream/signed-stream.txt";
+    let uri = "http://maskura.local/stream/signed-stream.txt";
     let input = b"contact a@b.com now\n";
 
     let request = signed_request(
@@ -4713,7 +4719,7 @@ async fn streaming_sigv4_hash_is_checked_before_atomic_commit() {
         Bytes::from_static(b"contact [REDACTED_EMAIL] now\n")
     );
 
-    let bad_uri = "http://s4.local/stream/tampered-stream.txt";
+    let bad_uri = "http://maskura.local/stream/tampered-stream.txt";
     let request = signed_request(
         &access_key,
         &secret_key,
@@ -4735,7 +4741,7 @@ async fn sigv4_get_object_roundtrip() {
     let (ak, sk) = make_key(&state).await;
 
     // PUT via SigV4.
-    let uri = "http://s4.local/bkt/signed.txt";
+    let uri = "http://maskura.local/bkt/signed.txt";
     let req = signed_request(
         &ak,
         &sk,
@@ -4908,7 +4914,7 @@ async fn managed_storage_isolates_users() {
 async fn sigv4_tampered_body_rejected() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
-    let uri = "http://s4.local/bkt/tamper.txt";
+    let uri = "http://maskura.local/bkt/tamper.txt";
 
     // Sign body A, then send body B with the A-signature -> 403.
     let req = signed_request(
@@ -4933,7 +4939,7 @@ async fn sigv4_tampered_body_rejected() {
 async fn invalid_sigv4_headers_are_rejected_without_polling_put_body() {
     let (app, state) = router().await;
     let (ak, _sk) = make_key(&state).await;
-    let uri = "http://s4.local/bkt/unpolled.txt";
+    let uri = "http://maskura.local/bkt/unpolled.txt";
     let signed = signed_request(&ak, "wrong-secret", "PUT", uri, b"sensitive body", &[]);
     let (parts, _) = signed.into_parts();
     let polls = Arc::new(AtomicUsize::new(0));
@@ -4954,7 +4960,7 @@ async fn invalid_sigv4_headers_are_rejected_without_polling_put_body() {
 async fn valid_sigv4_seed_polls_then_rejects_payload_hash_mismatch() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
-    let uri = "http://s4.local/bkt/hash-mismatch.txt";
+    let uri = "http://maskura.local/bkt/hash-mismatch.txt";
     let signed = signed_request(
         &ak,
         &sk,
@@ -5031,7 +5037,7 @@ async fn unmodified_rust_sdk_default_put_is_accepted() {
 
 #[tokio::test]
 async fn available_aws_cli_and_boto3_interoperate() {
-    if std::env::var("S4_RUN_EXTERNAL_CLIENT_INTEROP").as_deref() != Ok("1") {
+    if std::env::var("MASKURA_RUN_EXTERNAL_CLIENT_INTEROP").as_deref() != Ok("1") {
         return;
     }
     let aws_available = tokio::time::timeout(
@@ -5054,11 +5060,11 @@ async fn available_aws_cli_and_boto3_interoperate() {
     .is_ok_and(|result| result.is_ok_and(|output| output.status.success()));
     assert!(
         aws_available,
-        "S4_RUN_EXTERNAL_CLIENT_INTEROP requires AWS CLI"
+        "MASKURA_RUN_EXTERNAL_CLIENT_INTEROP requires AWS CLI"
     );
     assert!(
         boto3_available,
-        "S4_RUN_EXTERNAL_CLIENT_INTEROP requires boto3"
+        "MASKURA_RUN_EXTERNAL_CLIENT_INTEROP requires boto3"
     );
 
     let mut state = test_state().await;
@@ -5126,7 +5132,7 @@ import boto3, os
 from botocore.config import Config
 boto3.client(
     "s3",
-    endpoint_url=os.environ["S4_TEST_ENDPOINT"],
+    endpoint_url=os.environ["MASKURA_TEST_ENDPOINT"],
     region_name="us-east-1",
     aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
     aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
@@ -5137,7 +5143,7 @@ boto3.client(
             Duration::from_secs(30),
             Command::new("python3")
                 .args(["-c", script])
-                .env("S4_TEST_ENDPOINT", &endpoint)
+                .env("MASKURA_TEST_ENDPOINT", &endpoint)
                 .env("AWS_ACCESS_KEY_ID", &access_key)
                 .env("AWS_SECRET_ACCESS_KEY", &secret)
                 .env("AWS_EC2_METADATA_DISABLED", "true")
@@ -5793,8 +5799,10 @@ async fn stable_transformed_reads_are_rejected_without_disclosure() {
 #[tokio::test]
 async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
     let mut state = test_state().await;
-    let spool_dir =
-        std::env::temp_dir().join(format!("s4-read-spool-router-{}", uuid::Uuid::now_v7()));
+    let spool_dir = std::env::temp_dir().join(format!(
+        "maskura-read-spool-router-{}",
+        uuid::Uuid::now_v7()
+    ));
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     let control = Arc::new(RecordingMeteringControl::default());
     state_mut.streaming_read_mode = StreamingReadMode::Transformed;
@@ -6307,8 +6315,10 @@ async fn nonempty_prefix_safe_reads_stream_and_settle_without_spool() {
     let mut state = test_state().await;
     let control = Arc::new(RecordingMeteringControl::default());
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    let spool_dir =
-        std::env::temp_dir().join(format!("s4-direct-read-no-spool-{}", uuid::Uuid::now_v7()));
+    let spool_dir = std::env::temp_dir().join(format!(
+        "maskura-direct-read-no-spool-{}",
+        uuid::Uuid::now_v7()
+    ));
     let spool_quota = Arc::new(SpoolQuota::new(2048));
     state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = false;

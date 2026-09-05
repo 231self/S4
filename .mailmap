@@ -1,0 +1,7 @@
+# .mailmap — canonical author identity
+
+# All commits are authored by the maintainer; unify the historical name
+# spellings so `git log`/`git shortlog` and stats show one identity.
+Amit Mor <amit@231self.com> amit231self <amit@231self.com>
+Amit Mor <amit@231self.com> Amit <amit@231self.com>
+Amit Mor <amit@231self.com> Amit Mor <amit@231self.com>

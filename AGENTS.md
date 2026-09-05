@@ -15,6 +15,12 @@ jj git fetch         # fetch from origin
 All commits require a description (-m). Avoid interactive flags.
 Verify with `jj st` and `jj log` after each mutation.
 
+Author identity: commit as `amit231self <amit@231self.com>` (jj user config).
+Never append AI `Co-Authored-By` / `Generated with <tool>` trailers (Claude,
+Codex, etc.) to commit messages — they pollute GitHub's contributors graph.
+`main` history is shared and must never be force-rewritten except by the
+owner after an explicit, documented decision.
+
 ## Build
 
 - `just check` — format, lint, test

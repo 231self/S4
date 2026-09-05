@@ -299,6 +299,8 @@ response timeline, and what to include in a report.
 - `docs/security.md` — the security model of the gateway.
 - `docs/adr/` — architecture decision records.
 - `AGENTS.md` — development conventions.
+- `CONTRIBUTING.md` — contribution guide, tests, and author identity policy.
+- `OWNERS.md` — maintainers and decision process.
 
 ## LLM agents
 

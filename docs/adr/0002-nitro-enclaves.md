@@ -1,7 +1,7 @@
 # ADR 0002: AWS Nitro Enclaves, TLS-in-Enclave, us-east-1
 
-Date: 2026-08-09
-Status: Accepted
+- Status: Accepted
+- Date: 2026-08-09
 
 ## Context
 

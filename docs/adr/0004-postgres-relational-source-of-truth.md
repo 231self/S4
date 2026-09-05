@@ -1,7 +1,7 @@
 # ADR 0004: Postgres Relational Source of Truth
 
-Date: 2026-08-09
-Status: Accepted
+- Status: Accepted
+- Date: 2026-08-09
 
 ## Context
 

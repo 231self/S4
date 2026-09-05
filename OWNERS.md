@@ -19,6 +19,37 @@ here, extend `CODEOWNERS`, and then enable required CODEOWNERS reviews on
   GitHub Releases with prebuilt binaries and the canonical/legacy container
   images.
 
+## Architecture Decision Records
+
+ADRs live in `docs/adr/NNNN-short-name.md` and render as a chapter on the
+docs site. Write one when a change is architectural — a lasting choice about
+interfaces, trust boundaries, storage, security, or deployment — not for
+routine bug fixes or refactors.
+
+Structure each ADR as:
+
+```markdown
+# ADR NNNN: Title
+
+- Status: Accepted | Superseded by ADR-XXXX | Proposed
+- Date: YYYY-MM-DD
+
+## Context     -- the problem and options considered
+## Decision    -- what was chosen and why
+## Consequences -- what it costs and enables
+```
+
+Rules:
+
+- Number sequentially; use the next free `NNNN` when adding a record.
+- Keep `Status` honest: flip it to `Superseded by ADR-XXXX` (linking the
+  replacement) when a later decision changes the earlier one — never rewrite
+  or delete a superseded ADR's history.
+- ADRs are written by the humans and agents making the decision, in the same
+  PR/change as the work they describe.
+- If an ADR no longer matches the code, updating or superseding it is part of
+  the architectural change — not a separate docs chore.
+
 ## Commit identity policy
 
 - Every commit is authored by a real human with their **GitHub identity**

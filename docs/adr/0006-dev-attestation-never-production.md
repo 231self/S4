@@ -1,7 +1,7 @@
 # ADR 0006: Dev Attestation Never Production-Valid
 
-Date: 2026-08-09
-Status: Accepted
+- Status: Accepted
+- Date: 2026-08-09
 
 ## Context
 

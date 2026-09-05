@@ -1,7 +1,7 @@
 # ADR 0007: Fresh Wasmtime Store Per Object
 
-Date: 2026-08-09
-Status: Accepted
+- Status: Accepted
+- Date: 2026-08-09
 
 ## Context
 

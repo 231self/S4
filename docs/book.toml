@@ -1,0 +1,11 @@
+[book]
+title = "Maskura"
+authors = ["231self"]
+language = "en"
+src = "."
+
+[build]
+build-dir = "output"
+
+[output.html]
+git-repository-url = "https://github.com/231self/maskura"

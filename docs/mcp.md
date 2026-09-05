@@ -18,11 +18,11 @@ apply.
 Build and install from the public source:
 
 ```bash
-cargo install --git https://github.com/231self/S4 --bin maskura-mcp s4-mcp
+cargo install --git https://github.com/231self/maskura --bin maskura-mcp s4-mcp
 ```
 
 Linux x86_64 and arm64 binaries are also attached to each
-[Maskura GitHub release](https://github.com/231self/S4/releases) as
+[Maskura GitHub release](https://github.com/231self/maskura/releases) as
 `maskura-mcp-linux-amd64` and `maskura-mcp-linux-arm64`. The `s4-mcp` binary
 and `s4_*` tools remain permanent compatibility aliases.
 

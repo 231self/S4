@@ -8,7 +8,7 @@ filter, then encrypt, then convert.
 ## The interface
 
 Plugins implement one world, `s4:filter`
-([wit/s4-filter/world.wit](../wit/s4-filter/world.wit)):
+([`wit/s4-filter/world.wit`](https://github.com/231self/maskura/blob/main/wit/s4-filter/world.wit)):
 
 | Function | Called | Purpose |
 |---|---|---|
@@ -110,7 +110,8 @@ The default local setup preloads `pii-default` via `MASKURA_FILTER_COMPONENT`.
   [Binary adapters](binary-adapters.md).
 - Filters shipped in-tree: `noop` (pass-through baseline), `pii-default`,
   `email-detect`, `ssn-detect`, `card-detect`, `envelope-encrypt`, `stable-encrypt`.
-- The original WIT design is recorded in `docs/adr/0001-component-model-wit.md`.
+- The original WIT design is recorded in
+  [ADR-0001: component model and WIT](adr/0001-component-model-wit.md).
 
 ## Hosted workspaces (`maskura hosted`)
 

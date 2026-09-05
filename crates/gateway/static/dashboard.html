@@ -686,12 +686,12 @@ window.toggleTheme = function() {
   var d = html.getAttribute('data-theme') === 'dark';
   html.setAttribute('data-theme', d ? 'light' : 'dark');
   document.getElementById('theme-btn').textContent = d ? 'Dark' : 'Light';
-  localStorage.setItem('s4-theme', d ? 'light' : 'dark');
+  localStorage.setItem('maskura-theme', d ? 'light' : 'dark');
   drawFlow();
 };
 
 (function initTheme() {
-  var s = localStorage.getItem('s4-theme') || 'light';
+  var s = localStorage.getItem('maskura-theme') || 'light';
   document.documentElement.setAttribute('data-theme', s);
   document.getElementById('theme-btn').textContent = s === 'dark' ? 'Light' : 'Dark';
 })();
@@ -815,9 +815,9 @@ window.createKey = function() {
       expInfo +
       '<p class="reveal-warn">Copy this secret. It will not be shown again.</p>' +
       '<div class="code-wrapper"><button class="copy-btn" onclick="copyBlock(this)">Copy</button>' +
-      '<div class="code-block">aws configure set aws_access_key_id '+r.key_id+' --profile s4\n' +
-      'aws configure set aws_secret_access_key '+r.secret+' --profile s4\n' +
-      'aws configure set region us-east-1 --profile s4</div></div></div>';
+      '<div class="code-block">aws configure set aws_access_key_id '+r.key_id+' --profile maskura\n' +
+      'aws configure set aws_secret_access_key '+r.secret+' --profile maskura\n' +
+      'aws configure set region us-east-1 --profile maskura</div></div></div>';
     loadKeys();
   });
 };

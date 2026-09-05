@@ -11125,7 +11125,7 @@ pub async fn build_state_with_pipeline_template(
     let spool_config = CompatibilitySpoolConfig {
         directory: resolve_customer_env(customer_env::SPOOL_DIR)?
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("s4-spool")),
+            .unwrap_or_else(|| std::env::temp_dir().join("maskura-spool")),
         max_object_bytes: spool_max_object_bytes,
         stale_after: Duration::from_secs(24 * 60 * 60),
     };

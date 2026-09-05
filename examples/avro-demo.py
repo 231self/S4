@@ -34,7 +34,7 @@ KEY = "customers/day=2026-08-30/part-000.avro"
 SCHEMA = {
     "type": "record",
     "name": "Customer",
-    "namespace": "s4.example",
+    "namespace": "maskura.example",
     "fields": [
         {"name": "id", "type": "long"},
         {"name": "email", "type": ["null", "string"]},

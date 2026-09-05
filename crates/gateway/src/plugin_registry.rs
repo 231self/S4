@@ -1611,7 +1611,7 @@ mod tests {
 
     #[test]
     fn directory_catalog_preserves_digest_identical_steps() {
-        let directory = std::env::temp_dir().join(format!("s4-plugin-dir-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("maskura-plugin-dir-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&directory).unwrap();
         let bytes = component();
         std::fs::write(directory.join("a.wasm"), &bytes).unwrap();
@@ -1661,7 +1661,7 @@ mod tests {
 
     #[test]
     fn standard_image_excludes_only_the_explicit_component_path() {
-        let directory = std::env::temp_dir().join(format!("s4-image-dir-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("maskura-image-dir-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&directory).unwrap();
         let bytes = component();
         let explicit = directory.join("pii-default.component.wasm");

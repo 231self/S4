@@ -12,10 +12,10 @@ use uuid::Uuid;
 
 use super::{ObjectSinkTransaction, SinkCommitState, StoredObjectMeta, TransactionError};
 
-const FILE_PREFIX: &str = "s4-spool-";
+const FILE_PREFIX: &str = "maskura-spool-";
 /// Encrypted transformed-read staging shares the compatibility spool directory.
 /// Keep its cleanup policy and private-file handling in this module as well.
-pub(crate) const READ_FILE_PREFIX: &str = "s4-read-spool-";
+pub(crate) const READ_FILE_PREFIX: &str = "maskura-read-spool-";
 
 #[derive(Clone, Debug)]
 pub struct CompatibilitySpoolConfig {
@@ -331,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn quota_object_limit_abort_and_permissions_are_enforced() {
-        let directory = std::env::temp_dir().join(format!("s4-spool-test-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("maskura-spool-test-{}", Uuid::now_v7()));
         let quota = Arc::new(SpoolQuota::new(5));
         let uploader = Arc::new(RecordingUploader::default());
         let mut transaction = CompatibilitySpoolTransaction::begin(
@@ -365,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_upload_retries_the_identical_immutable_file() {
-        let directory = std::env::temp_dir().join(format!("s4-spool-test-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("maskura-spool-test-{}", Uuid::now_v7()));
         let quota = Arc::new(SpoolQuota::new(1024));
         let uploader = Arc::new(RecordingUploader {
             attempts: Mutex::default(),
@@ -399,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_removes_only_recognized_stale_regular_files() {
-        let directory = std::env::temp_dir().join(format!("s4-spool-test-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("maskura-spool-test-{}", Uuid::now_v7()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let stale = directory.join(format!("{FILE_PREFIX}old.tmp"));
         let stale_read = directory.join(format!("{READ_FILE_PREFIX}old.tmp"));

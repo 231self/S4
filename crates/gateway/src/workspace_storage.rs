@@ -1409,7 +1409,7 @@ mod tests {
 
         let mut unsupported = valid_request();
         unsupported.backend_type = BackendType::AwsRole;
-        unsupported.role_arn = "arn:aws:iam::123456789012:role/s4".to_string();
+        unsupported.role_arn = "arn:aws:iam::123456789012:role/maskura".to_string();
         assert!(matches!(
             repository.put_config(&workspace, unsupported).await,
             Err(WorkspaceStorageError::UnsupportedConfig(_))

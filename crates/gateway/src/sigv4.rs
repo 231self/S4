@@ -405,7 +405,7 @@ impl RequestAuthorization {
             secret.to_string(),
             None,
             None,
-            "s4-front-door",
+            "maskura-front-door",
         )
         .into();
         let params: SigningParams = v4::SigningParams::builder()
@@ -927,8 +927,8 @@ mod tests {
     #[test]
     fn validates_sdk_canonical_path_query_and_headers() {
         for uri in [
-            "http://s4.local/bucket/a%20b//c?z=last&a=first",
-            "http://s4.local/bucket/%E2%98%83?empty=&repeat=b&repeat=a",
+            "http://maskura.local/bucket/a%20b//c?z=last&a=first",
+            "http://maskura.local/bucket/%E2%98%83?empty=&repeat=b&repeat=a",
         ] {
             let (uri, headers, time) = signed_request(uri, "us-east-1", &[]);
             let auth = RequestAuthorization::parse(&uri, &headers)
@@ -949,7 +949,8 @@ mod tests {
 
     #[test]
     fn rejects_wrong_scope_skew_and_duplicate_or_unsorted_headers() {
-        let (uri, headers, time) = signed_request("http://s4.local/bucket/key", "eu-west-1", &[]);
+        let (uri, headers, time) =
+            signed_request("http://maskura.local/bucket/key", "eu-west-1", &[]);
         let auth = RequestAuthorization::parse(&uri, &headers)
             .unwrap()
             .unwrap();
@@ -968,7 +969,8 @@ mod tests {
             SigV4Error::InvalidScope
         );
 
-        let (uri, headers, time) = signed_request("http://s4.local/bucket/key", "us-east-1", &[]);
+        let (uri, headers, time) =
+            signed_request("http://maskura.local/bucket/key", "us-east-1", &[]);
         let auth = RequestAuthorization::parse(&uri, &headers)
             .unwrap()
             .unwrap();
@@ -1022,7 +1024,7 @@ mod tests {
             },
         ] {
             let mut baseline_headers = HeaderMap::new();
-            baseline_headers.insert("host", HeaderValue::from_static("s4.local"));
+            baseline_headers.insert("host", HeaderValue::from_static("maskura.local"));
             let mut baseline_signed = vec!["host".to_string()];
             if location == Location::Header {
                 baseline_headers.insert("x-amz-date", HeaderValue::from_static(DATE));
@@ -1062,7 +1064,7 @@ mod tests {
         }
 
         let mut query_headers = HeaderMap::new();
-        query_headers.insert("host", HeaderValue::from_static("s4.local"));
+        query_headers.insert("host", HeaderValue::from_static("maskura.local"));
         query_headers.insert(
             "x-amz-content-sha256",
             HeaderValue::from_static("UNSIGNED-PAYLOAD"),
@@ -1110,7 +1112,7 @@ mod tests {
         ];
         for (name, value) in canonical_values {
             let mut headers = HeaderMap::new();
-            headers.insert("host", HeaderValue::from_static("s4.local"));
+            headers.insert("host", HeaderValue::from_static("maskura.local"));
             headers.insert("x-amz-date", HeaderValue::from_static(DATE));
             headers.insert(
                 "x-amz-content-sha256",
@@ -1143,7 +1145,7 @@ mod tests {
         }
 
         let mut invalid_utf8 = HeaderMap::new();
-        invalid_utf8.insert("host", HeaderValue::from_static("s4.local"));
+        invalid_utf8.insert("host", HeaderValue::from_static("maskura.local"));
         invalid_utf8.insert(
             "x-amz-meta-project",
             HeaderValue::from_bytes(&[0xff]).unwrap(),
@@ -1160,7 +1162,7 @@ mod tests {
         );
 
         let mut excluded_amz = HeaderMap::new();
-        excluded_amz.insert("host", HeaderValue::from_static("s4.local"));
+        excluded_amz.insert("host", HeaderValue::from_static("maskura.local"));
         excluded_amz.append("x-amz-user-agent", HeaderValue::from_static(" agent "));
         excluded_amz.append("x-amz-user-agent", HeaderValue::from_static("second"));
         excluded_amz.append("x-amz-checksum-mode", HeaderValue::from_static(" ENABLED "));
@@ -1202,7 +1204,7 @@ mod tests {
             ("x-amz-meta-project", "one,two", "one", "two"),
         ] {
             let (uri, headers, time) = signed_request(
-                "http://s4.local/bucket/duplicate",
+                "http://maskura.local/bucket/duplicate",
                 "us-east-1",
                 &[(name, combined)],
             );
@@ -1255,7 +1257,7 @@ mod tests {
             ("x-amz-tagging", " project=one&owner=two"),
         ] {
             let (uri, headers, time) = signed_request(
-                "http://s4.local/bucket/noncanonical",
+                "http://maskura.local/bucket/noncanonical",
                 "us-east-1",
                 &[(name, raw)],
             );
@@ -1288,7 +1290,7 @@ mod tests {
             ("x-amz-meta-project", "project one"),
         ] {
             let (uri, headers, time) = signed_request(
-                "http://s4.local/bucket/canonical",
+                "http://maskura.local/bucket/canonical",
                 "us-east-1",
                 &[(name, canonical)],
             );
@@ -1326,7 +1328,7 @@ mod tests {
             ("x-amz-meta-dynamic-name", "one", "two"),
         ] {
             let (uri, headers, time) = signed_request(
-                "http://s4.local/bucket/semantic",
+                "http://maskura.local/bucket/semantic",
                 "us-east-1",
                 &[(name, value)],
             );
@@ -1415,7 +1417,7 @@ mod tests {
     #[test]
     fn accepts_sdk_generated_presign_and_rejects_expiry_replay() {
         let (uri, headers, time) =
-            presigned_request("https://s4.local/bucket/a%20b?versionId=one", &[]);
+            presigned_request("https://maskura.local/bucket/a%20b?versionId=one", &[]);
         let authorization = RequestAuthorization::parse(&uri, &headers)
             .unwrap()
             .unwrap();
@@ -1452,7 +1454,7 @@ mod tests {
 
     #[test]
     fn presign_rejects_headers_appended_after_host_only_signing() {
-        let (uri, headers, time) = presigned_request("https://s4.local/bucket/object", &[]);
+        let (uri, headers, time) = presigned_request("https://maskura.local/bucket/object", &[]);
         let authorization = RequestAuthorization::parse(&uri, &headers)
             .unwrap()
             .unwrap();

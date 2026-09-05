@@ -24,18 +24,18 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PORT="${S4_TEST_PORT:-9012}"
+PORT="${MASKURA_TEST_PORT:-9012}"
 GATEWAY_URL="http://127.0.0.1:${PORT}"
 INPUT="$ROOT/tests/fixtures/pii/sample1.txt"
 OBJ_KEY="demo/encrypted-sample.txt"
 CERT="$ROOT/tests/fixtures/pii/crypto/cert.pem"
 KEY="$ROOT/tests/fixtures/pii/crypto/key.pem"
-MC_CONF="s4-mc-demo"
+MC_CONF="maskura-mc-demo"
 MC_IMAGE="minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
-GW_LOG="/tmp/s4-b2-enc-demo.log"
-RAW="/tmp/s4-b2-enc-raw.txt"
-THROUGH="/tmp/s4-b2-enc-through.txt"
-DECRYPTED="/tmp/s4-b2-decrypted.txt"
+GW_LOG="/tmp/maskura-b2-enc-demo.log"
+RAW="/tmp/maskura-b2-enc-raw.txt"
+THROUGH="/tmp/maskura-b2-enc-through.txt"
+DECRYPTED="/tmp/maskura-b2-decrypted.txt"
 
 for v in B2_S3_ENDPOINT B2_REGION B2_BUCKET B2_ACCESS_KEY_ID B2_SECRET_ACCESS_KEY; do
   [ -n "${!v:-}" ] || { echo "ERROR: $v is not set (see script header)" >&2; exit 1; }

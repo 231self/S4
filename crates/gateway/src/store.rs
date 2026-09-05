@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     fn temp_keys_file() -> PathBuf {
-        let path = std::env::temp_dir().join(format!("s4-file-keys-{}.json", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("maskura-file-keys-{}.json", Uuid::new_v4()));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -2118,7 +2118,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_store_creation_establishes_snapshot_parent_directory() {
-        let root = std::env::temp_dir().join(format!("s4-file-parent-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("maskura-file-parent-{}", Uuid::new_v4()));
         let path = root.join("nested").join("keys.json");
         assert!(!root.exists());
 
@@ -2132,7 +2132,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn file_readers_never_observe_failed_persisted_mutations() {
-        let parent = std::env::temp_dir().join(format!("s4-file-visibility-{}", Uuid::new_v4()));
+        let parent =
+            std::env::temp_dir().join(format!("maskura-file-visibility-{}", Uuid::new_v4()));
         let durable_parent = parent.with_extension("durable");
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("keys.json");
@@ -2310,7 +2311,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_key_store_rolls_back_public_key_when_persist_fails_and_restart_keeps_old_value() {
-        let parent = std::env::temp_dir().join(format!("s4-file-keys-{}", Uuid::new_v4()));
+        let parent = std::env::temp_dir().join(format!("maskura-file-keys-{}", Uuid::new_v4()));
         let durable_parent = parent.with_extension("durable");
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("keys.json");
@@ -2364,7 +2365,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_key_store_rolls_back_key_delete_when_persist_fails() {
-        let parent = std::env::temp_dir().join(format!("s4-file-keys-{}", Uuid::new_v4()));
+        let parent = std::env::temp_dir().join(format!("maskura-file-keys-{}", Uuid::new_v4()));
         let durable_parent = parent.with_extension("durable");
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("keys.json");
@@ -2400,7 +2401,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_key_store_rolls_back_mcp_mutations_when_persist_fails() {
-        let parent = std::env::temp_dir().join(format!("s4-file-keys-{}", Uuid::new_v4()));
+        let parent = std::env::temp_dir().join(format!("maskura-file-keys-{}", Uuid::new_v4()));
         let durable_parent = parent.with_extension("durable");
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("keys.json");
@@ -2657,7 +2658,7 @@ mod tests {
     async fn postgres_create_key_propagates_insert_error() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(50))
-            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/s4")
+            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/maskura")
             .unwrap();
         let store = PostgresKeyStore::new(pool);
 
@@ -2683,7 +2684,7 @@ mod tests {
     async fn postgres_set_public_key_propagates_update_error() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(50))
-            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/s4")
+            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/maskura")
             .unwrap();
         let store = PostgresKeyStore::new(pool);
 
@@ -2703,7 +2704,7 @@ mod tests {
     async fn postgres_reads_lists_resolves_and_deletes_propagate_database_errors() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(50))
-            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/s4")
+            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/maskura")
             .unwrap();
         let store = PostgresKeyStore::with_cipher(pool, test_cipher());
 
@@ -2777,7 +2778,7 @@ mod tests {
     async fn postgres_configured_cipher_failure_prevents_insert() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(50))
-            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/s4")
+            .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/maskura")
             .unwrap();
         let store = PostgresKeyStore::with_cipher(pool, failing_cipher());
 

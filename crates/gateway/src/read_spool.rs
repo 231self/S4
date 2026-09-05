@@ -336,7 +336,7 @@ mod tests {
     use http_body_util::BodyExt as _;
 
     fn directory() -> PathBuf {
-        std::env::temp_dir().join(format!("s4-read-spool-test-{}", Uuid::now_v7()))
+        std::env::temp_dir().join(format!("maskura-read-spool-test-{}", Uuid::now_v7()))
     }
 
     async fn wait_for_release(quota: &SpoolQuota) {

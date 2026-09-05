@@ -8,15 +8,15 @@ fi
 
 IMAGE_REF="$1"
 RUN_ID="${GITHUB_RUN_ID:-$$}-${GITHUB_RUN_ATTEMPT:-0}-${RANDOM}"
-NETWORK="s4-release-smoke-${RUN_ID}"
-MINIO_NAME="s4-minio-${RUN_ID}"
-POSTGRES_NAME="s4-postgres-${RUN_ID}"
-GATEWAY_NAME="s4-gateway-${RUN_ID}"
+NETWORK="maskura-release-smoke-${RUN_ID}"
+MINIO_NAME="maskura-minio-${RUN_ID}"
+POSTGRES_NAME="maskura-postgres-${RUN_ID}"
+GATEWAY_NAME="maskura-gateway-${RUN_ID}"
 MINIO_IMAGE="minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
 POSTGRES_IMAGE="postgres:17-trixie@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449"
 MC_IMAGE="minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
-MC_CONF="s4-release-smoke-mc-${RUN_ID}"
-GATEWAY_PORT="${S4_RELEASE_SMOKE_PORT:-18080}"
+MC_CONF="maskura-release-smoke-mc-${RUN_ID}"
+GATEWAY_PORT="${MASKURA_RELEASE_SMOKE_PORT:-18080}"
 
 cleanup() {
   docker rm -f "$GATEWAY_NAME" "$MINIO_NAME" "$POSTGRES_NAME" >/dev/null 2>&1 || true
@@ -50,11 +50,11 @@ fi
 # Release builds have no in-memory operation journal, so the gateway needs a
 # Postgres for the durable journal the streaming S3 sink requires.
 docker run -d --name "$POSTGRES_NAME" --network "$NETWORK" \
-  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=s4 \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=maskura \
   "$POSTGRES_IMAGE" >/dev/null
 pg_ready=0
 for _ in $(seq 1 30); do
-  if docker exec "$POSTGRES_NAME" pg_isready -U postgres -d s4 >/dev/null 2>&1; then
+  if docker exec "$POSTGRES_NAME" pg_isready -U postgres -d maskura >/dev/null 2>&1; then
     pg_ready=1
     break
   fi
@@ -69,14 +69,14 @@ fi
 docker run --rm --network "$NETWORK" -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color \
   alias set local "http://${MINIO_NAME}:9000" minioadmin minioadmin >/dev/null
 docker run --rm --network "$NETWORK" -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color \
-  mb "local/s4-release-smoke" --ignore-existing >/dev/null
+  mb "local/maskura-release-smoke" --ignore-existing >/dev/null
 
 docker run -d --name "$GATEWAY_NAME" --network "$NETWORK" \
   -p "127.0.0.1:${GATEWAY_PORT}:8080" \
   -e AUTH_DISABLED=true \
   -e MASKURA_STREAMING_WRITE_MODE=all \
   -e MASKURA_STREAMING_S3_PROVIDER=minio \
-  -e DATABASE_URL="postgres://postgres:postgres@${POSTGRES_NAME}:5432/s4" \
+  -e DATABASE_URL="postgres://postgres:postgres@${POSTGRES_NAME}:5432/maskura" \
   -e MASKURA_KEYS_FILE=/tmp/keys.json \
   -e S3_ENDPOINT="http://${MINIO_NAME}:9000" \
   -e S3_ACCESS_KEY_ID=minioadmin \
@@ -106,10 +106,10 @@ curl --fail --silent --show-error \
   -X PUT \
   -H 'Content-Type: text/plain' \
   --data-binary "$INPUT" \
-  "http://127.0.0.1:${GATEWAY_PORT}/s4-release-smoke/object.txt" >/dev/null
+  "http://127.0.0.1:${GATEWAY_PORT}/maskura-release-smoke/object.txt" >/dev/null
 
 READBACK="$(docker run --rm --network "$NETWORK" -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color \
-  cat 'local/s4-release-smoke/object.txt')"
+  cat 'local/maskura-release-smoke/object.txt')"
 case "$READBACK" in
   *'[REDACTED_EMAIL]'*'[REDACTED_CARD]'*) ;;
   *)

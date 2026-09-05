@@ -1,7 +1,7 @@
 # ADR 0005: Record Boundaries vs Transport Chunks
 
-Date: 2026-08-09
-Status: Accepted
+- Status: Accepted
+- Date: 2026-08-09
 
 ## Context
 

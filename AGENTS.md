@@ -41,6 +41,13 @@ owner after an explicit, documented decision.
 - No functionality is added without extensive unit tests.
 - Prefer specialized libraries over raw regex for PII detection (email, card validation).
 
+- **Architecture decisions belong in the public repo's ADRs.** When work
+  changes a lasting choice (interfaces, trust boundaries, storage, security,
+  deployment), create a new `docs/adr/NNNN-*.md` or update/supersede the
+  affected record in the same change, following the template and rules in
+  `OWNERS.md` ("Architecture Decision Records"). Never silently let an ADR go
+  stale relative to the code.
+
 ## Database
 
 - Relational modeling with normalized Postgres relations.

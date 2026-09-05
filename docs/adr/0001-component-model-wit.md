@@ -1,7 +1,7 @@
 # ADR 0001: WebAssembly Component Model and WIT Contract
 
-Date: 2026-08-09
-Status: Accepted
+- Status: Accepted
+- Date: 2026-08-09
 
 ## Context
 

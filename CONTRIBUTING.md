@@ -22,6 +22,10 @@ Thanks for considering a contribution to Maskura.
   imports.
 - Match the surrounding code style; do not add comments unless they earn their place.
 
+- Architectural changes (interfaces, trust boundaries, storage, security,
+  deployment) create or update an ADR in `docs/adr/` — see the rules in
+  `OWNERS.md` under "Architecture Decision Records".
+
 ## Commit messages
 
 - Concise, imperative summary line (≤ ~72 chars), then a body explaining the *why*.

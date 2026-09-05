@@ -1,7 +1,7 @@
 # ADR 0003: Canonical CBOR and Ed25519 Policy Manifests
 
-Date: 2026-08-09
-Status: Accepted
+- Status: Accepted
+- Date: 2026-08-09
 
 ## Context
 

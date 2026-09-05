@@ -69,7 +69,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Unmodified-client interop (AWS CLI + boto3)
         env:
-          S4_RUN_EXTERNAL_CLIENT_INTEROP: "1"
+          MASKURA_RUN_EXTERNAL_CLIENT_INTEROP: "1"
         run: cargo test --locked -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
 
   e2e:

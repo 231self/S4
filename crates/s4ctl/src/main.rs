@@ -2123,7 +2123,7 @@ mod tests {
     #[test]
     fn parse_draft_step_reads_config_file() {
         let dir = std::env::temp_dir().join(format!(
-            "s4ctl-step-{}-{}",
+            "maskura-step-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

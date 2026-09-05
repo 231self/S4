@@ -69,7 +69,7 @@ bench-rss:
 # Soak: high-case-count property tests + repeated streaming round-trips
 soak-streaming:
   PROPTEST_CASES=10000 cargo test -p s4-gateway --test property --test record_decoder
-  S4_SOAK_ITERATIONS=500 cargo test -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored
+  MASKURA_SOAK_ITERATIONS=500 cargo test -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored
 
 # Release image smoke (boot smoke against the built OCI image)
 release-smoke:

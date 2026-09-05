@@ -9071,7 +9071,7 @@ mod tests {
 
     #[test]
     fn placement_process_helper() {
-        if std::env::var_os("S4_PLACEMENT_PROCESS_HELPER").is_some() {
+        if std::env::var_os("MASKURA_PLACEMENT_PROCESS_HELPER").is_some() {
             let placement = rendezvous_placement(
                 1,
                 "tenant-a",
@@ -9082,7 +9082,7 @@ mod tests {
             )
             .unwrap();
             println!(
-                "S4_PLACEMENT={}:{}",
+                "MASKURA_PLACEMENT={}:{}",
                 placement.primary_backend_id,
                 placement.replica_backend_id.unwrap()
             );
@@ -9097,13 +9097,13 @@ mod tests {
                 "managed::tests::placement_process_helper",
                 "--nocapture",
             ])
-            .env("S4_PLACEMENT_PROCESS_HELPER", "1")
+            .env("MASKURA_PLACEMENT_PROCESS_HELPER", "1")
             .output()
             .unwrap();
         assert!(output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stdout)
-                .contains("S4_PLACEMENT=s3:bucket-b:b2:bucket-a")
+                .contains("MASKURA_PLACEMENT=s3:bucket-b:b2:bucket-a")
         );
     }
 

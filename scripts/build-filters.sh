@@ -29,7 +29,7 @@ sha256_file() {
   fi
 }
 
-ADAPTER="${S4_WASI_ADAPTER:-}"
+ADAPTER="${MASKURA_WASI_ADAPTER:-}"
 if [ -z "$ADAPTER" ]; then
   ADAPTER_DIR="$ROOT/target/wasi-preview1-adapter-v${ADAPTER_VERSION}"
   ADAPTER="$ADAPTER_DIR/wasi_snapshot_preview1.reactor.wasm"
@@ -47,7 +47,7 @@ if [ -z "$ADAPTER" ]; then
     mv "$ADAPTER_TMP" "$ADAPTER"
   fi
 elif [ ! -f "$ADAPTER" ]; then
-  echo "ERROR: S4_WASI_ADAPTER does not exist: $ADAPTER" >&2
+  echo "ERROR: MASKURA_WASI_ADAPTER does not exist: $ADAPTER" >&2
   exit 1
 fi
 

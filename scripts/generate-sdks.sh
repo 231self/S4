@@ -12,7 +12,7 @@ GATEWAY_PID=""
 # Isolate the local-mode key store from the user's real config directory so a
 # stale `~/Library/Application Support/s4/keys.json` (DEK wrapped by an earlier
 # ephemeral/secret key) can never abort gateway startup.
-KEYS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s4-sdkgen-keys.XXXXXX")"
+KEYS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/maskura-sdkgen-keys.XXXXXX")"
 KEYS_FILE="$KEYS_DIR/keys.json"
 
 cleanup() {

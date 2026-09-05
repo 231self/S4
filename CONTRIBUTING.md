@@ -15,7 +15,7 @@ Thanks for considering a contribution to Maskura.
 - Rust 2024 edition. No warnings allowed: production code builds with
   `RUSTFLAGS=-D warnings`.
 - Every functional change ships with tests. Maskura favors unit tests in the crate plus
-  end-to-end coverage (`just e2e`).
+  end-to-end coverage (`just e2e`, broken down feature-by-feature in `docs/e2e.md`).
 - No raw SQL strings inline; use `sqlx` (runtime-checked queries) and migrations in
   `migrations/`. Never apply schema changes by hand.
 - Keep the Wasm filter boundary clean: plugins are pure byte-in/byte-out, no host

@@ -857,7 +857,7 @@ impl RuntimeComponent {
     }
 }
 
-/// Registers only the WASI preview 2 interfaces that built-in S4 filters
+/// Registers only the WASI preview 2 interfaces that built-in Maskura filters
 /// require, denying sockets, terminal, and other capabilities outright.
 ///
 /// This is the hardened capability surface: guests may read the empty
@@ -958,7 +958,7 @@ fn register_epoch_engine(engine: &Arc<EpochEngine>) {
         .push(Arc::downgrade(engine));
     EPOCH_THREAD.get_or_init(|| {
         std::thread::Builder::new()
-            .name("s4-wasm-epoch".to_string())
+            .name("maskura-wasm-epoch".to_string())
             .spawn(|| {
                 loop {
                     std::thread::sleep(EPOCH_TICK);

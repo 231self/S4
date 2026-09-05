@@ -107,7 +107,7 @@ impl ServiceBackend {
         let secret_key = self.secret_key.clone();
         let region = self.region.clone();
         let endpoint = self.endpoint.clone();
-        let creds = Credentials::new(access_key, secret_key, None, None, "s4-service");
+        let creds = Credentials::new(access_key, secret_key, None, None, "maskura-service");
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(Region::new(region))
             .endpoint_url(&endpoint)

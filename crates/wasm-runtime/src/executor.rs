@@ -433,7 +433,7 @@ fn panic_error(payload: Box<dyn Any + Send>) -> S4Error {
 
 fn spawn_worker(index: usize, receiver: Arc<Mutex<Receiver<Job>>>) -> Result<(), S4Error> {
     std::thread::Builder::new()
-        .name(format!("s4-wasm-{index}"))
+        .name(format!("maskura-wasm-{index}"))
         .spawn(move || {
             loop {
                 let job = receiver.lock().unwrap().recv();
@@ -480,7 +480,7 @@ mod tests {
                 std::thread::current().name().unwrap().to_string()
             })
             .unwrap();
-        assert_eq!(name, "s4-wasm-0");
+        assert_eq!(name, "maskura-wasm-0");
         assert_eq!(executor.admission().used(), 0);
     }
 

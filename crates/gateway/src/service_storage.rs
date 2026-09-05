@@ -11,13 +11,13 @@ use tracing::{info, warn};
 use crate::control::{RequestKind, UsageEvent, UsageRoute};
 use crate::managed::{
     AuthorityListPage, AuthorityListQuery, AuthorityPlacementCursor, AuthorityPlacementPage,
-    AuthorityPlacementPageQuery, BackendVersioningCapability, BackendVersioningMode, CopyStatus,
-    DurablePhysicalWriteIntent, LogicalObjectKey, ManagedError, ManagedLogicalOperationIntent,
-    ManagedLogicalOperationState, ManagedMutationKind, ManagedRepository, ManagedStreamingMode,
-    ManagedUsageEvidence, NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority,
-    PLACEMENT_VERSION_V1, PhysicalVersionTarget, PhysicalWriteIntent, Placement,
-    ProviderStorageIdentity, RepairKind, RepairRecord, RepairTargetRole, generation_physical_key,
-    weighted_rendezvous_placement,
+    AuthorityPlacementPageQuery, AuthorityPlacementStats, BackendVersioningCapability,
+    BackendVersioningMode, CopyStatus, DurablePhysicalWriteIntent, LogicalObjectKey, ManagedError,
+    ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
+    ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence, NamespacePurgeRequest,
+    NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget,
+    PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind, RepairRecord,
+    RepairStateCounts, RepairTargetRole, generation_physical_key, weighted_rendezvous_placement,
 };
 use crate::s3_safety::{
     record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
@@ -213,6 +213,10 @@ impl ServiceStorage {
         self.managed_mode
     }
 
+    pub fn placement_version(&self) -> u32 {
+        self.placement_version
+    }
+
     pub fn authority_repository(&self) -> Option<&Arc<dyn ManagedRepository>> {
         self.authority.as_ref()
     }
@@ -329,6 +333,20 @@ impl ServiceStorage {
                 .await?;
         }
         Ok(page)
+    }
+
+    /// Aggregate of authorities still below the target placement version.
+    pub async fn authority_placement_stats(&self) -> Result<AuthorityPlacementStats, ManagedError> {
+        self.authority_repository_required()?
+            .authority_placement_stats(self.placement_version)
+            .await
+    }
+
+    /// Counts of repair records grouped by lifecycle state.
+    pub async fn repair_state_counts(&self) -> Result<RepairStateCounts, ManagedError> {
+        self.authority_repository_required()?
+            .repair_state_counts()
+            .await
     }
 
     /// Validate the launch topology before enabling transactional managed

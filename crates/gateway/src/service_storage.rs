@@ -1368,6 +1368,10 @@ impl ServiceStorage {
                     "managed logical parent operation was not found".to_string(),
                 )
             })?;
+        let parent_bucket = self
+            .index_for_id(&parent.intent.backend_id)
+            .map(|index| self.backends[index].bucket.as_str())
+            .unwrap_or_default();
         let usage = repository
             .workspace_usage(&logical.tenant_id)
             .await
@@ -1382,7 +1386,7 @@ impl ServiceStorage {
             || parent.intent.primary_child_operation_id != child_scope.operation_id
             || parent.intent.fence.namespace_epoch != child_scope.namespace_epoch
             || parent.intent.backend_id != placement.primary_backend_id
-            || parent.intent.provider_bucket != self.backends[0].bucket
+            || parent.intent.provider_bucket != parent_bucket
             || parent.intent.physical_key != physical_key
         {
             return Err(TransactionError::Publication(

@@ -51,8 +51,9 @@ use crate::customer_headers;
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::managed::{
-    AuthorityListQuery, InMemoryManagedRepository, LogicalObjectKey, ManagedRepository,
-    ManagedStreamingMode, PLACEMENT_VERSION_V1, PostgresManagedRepository, validate_mode,
+    AuthorityListQuery, InMemoryManagedRepository, LogicalObjectKey, ManagedPlacementBackendFact,
+    ManagedPlacementPolicy, ManagedRepository, ManagedStreamingMode, PLACEMENT_VERSION_V1,
+    PostgresManagedRepository, placement_policy_fingerprint, validate_mode,
 };
 use crate::multipart_staging::{
     ARTIFACT_PREFIX, AbortMutationError, COMPLETION_LEASE, CleanupAudit, CompletePart,
@@ -11191,6 +11192,39 @@ pub async fn build_state_with_pipeline_template(
     } else {
         Arc::new(InMemoryManagedRepository::new())
     };
+    if !service_backends.is_empty() {
+        let policy = ManagedPlacementPolicy {
+            version: managed_placement_version,
+            fingerprint: placement_policy_fingerprint(
+                managed_placement_version,
+                service_backends.iter().map(|backend| {
+                    (
+                        backend.id(),
+                        backend.placement_weight,
+                        backend.placement_capacity_units,
+                    )
+                }),
+            ),
+            backend_facts: service_backends
+                .iter()
+                .map(|backend| ManagedPlacementBackendFact {
+                    backend_id: backend.id(),
+                    placement_weight: backend.placement_weight,
+                    placement_capacity_units: backend.placement_capacity_units,
+                })
+                .collect(),
+            activated_at_ms: crate::transaction::unix_time_ms(),
+        };
+        let recorded = managed_repository
+            .record_placement_policy(&policy)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        if !recorded {
+            anyhow::bail!(
+                "S4_MANAGED_PLACEMENT_VERSION {managed_placement_version} is already durable with a different backend policy fingerprint; bump the placement version to change the policy"
+            );
+        }
+    }
     let multipart_staging = if multipart_mode == MultipartMode::Staged && wrapping.is_durable() {
         if let Some(pool) = postgres_pool.clone() {
             let endpoint = std::env::var("S4_MULTIPART_STAGING_ENDPOINT").ok();

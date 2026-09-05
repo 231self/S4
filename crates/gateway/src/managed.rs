@@ -17,8 +17,8 @@ use crate::control::{RequestKind, UsageRoute};
 use crate::entity::{
     managed_list_cursor, managed_logical_operation, managed_multipart_activity, managed_namespace,
     managed_namespace_purge, managed_object_authority, managed_object_repair,
-    managed_physical_object_version, managed_physical_write_intent, managed_workspace_usage,
-    object_operation,
+    managed_physical_object_version, managed_physical_write_intent,
+    managed_placement_policy_version, managed_workspace_usage, object_operation,
 };
 
 pub const PLACEMENT_VERSION_V1: u32 = 1;
@@ -82,6 +82,43 @@ pub struct Placement {
     pub version: u32,
     pub primary_backend_id: String,
     pub replica_backend_id: Option<String>,
+}
+
+/// Durable facts that define a placement policy version: the backends, their
+/// weights, and their capacities, plus when the policy was activated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedPlacementPolicy {
+    pub version: u32,
+    pub fingerprint: String,
+    pub backend_facts: Vec<ManagedPlacementBackendFact>,
+    pub activated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
+pub struct ManagedPlacementBackendFact {
+    pub backend_id: String,
+    pub placement_weight: u64,
+    pub placement_capacity_units: u64,
+}
+
+/// Canonical fingerprint of a placement policy: the version plus every
+/// backend's identity, weight, and capacity in a stable order. A policy edit
+/// changes the fingerprint, so a version bump is required to admit it.
+pub fn placement_policy_fingerprint(
+    version: u32,
+    backends: impl IntoIterator<Item = (String, u64, u64)>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"s4-placement-policy\0");
+    hasher.update(version.to_be_bytes());
+    let mut facts: Vec<_> = backends.into_iter().collect();
+    facts.sort();
+    for (backend_id, weight, capacity) in facts {
+        hash_field(&mut hasher, backend_id.as_bytes());
+        hash_field(&mut hasher, &weight.to_be_bytes());
+        hash_field(&mut hasher, &capacity.to_be_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
@@ -1010,6 +1047,13 @@ pub trait ManagedRepository: Send + Sync {
         expected_cas: u64,
         placement: &Placement,
     ) -> Result<ObjectAuthority, ManagedError>;
+    /// Record a durable placement policy. Returns `Ok(false)` when a different
+    /// policy (a different fingerprint) is already durable at the same version —
+    /// a same-version edit that the caller must reject.
+    async fn record_placement_policy(
+        &self,
+        policy: &ManagedPlacementPolicy,
+    ) -> Result<bool, ManagedError>;
     async fn tombstone(
         &self,
         logical: &LogicalObjectKey,
@@ -4228,6 +4272,42 @@ impl ManagedRepository for PostgresManagedRepository {
         Ok(authority)
     }
 
+    async fn record_placement_policy(
+        &self,
+        policy: &ManagedPlacementPolicy,
+    ) -> Result<bool, ManagedError> {
+        let version = i32::try_from(policy.version).map_err(|_| {
+            ManagedError::Corrupt("placement policy version exceeds INTEGER".to_string())
+        })?;
+        let facts_json = serde_json::to_string(&policy.backend_facts).map_err(|error| {
+            ManagedError::Corrupt(format!("placement policy facts serialize: {error}"))
+        })?;
+        managed_placement_policy_version::Entity::insert(
+            managed_placement_policy_version::ActiveModel {
+                version: Set(version),
+                fingerprint: Set(policy.fingerprint.clone()),
+                backend_facts: Set(facts_json),
+                activated_at_ms: Set(policy.activated_at_ms),
+            },
+        )
+        .on_conflict(
+            OnConflict::column(managed_placement_policy_version::Column::Version)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await
+        .map_err(persistence)?;
+        let existing = managed_placement_policy_version::Entity::find_by_id(version)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .ok_or_else(|| {
+                ManagedError::Persistence("placement policy insert did not persist".to_string())
+            })?;
+        Ok(existing.fingerprint == policy.fingerprint)
+    }
+
     async fn advance_placement_version(
         &self,
         logical: &LogicalObjectKey,
@@ -5514,6 +5594,7 @@ struct MemoryState {
     multipart_activities: HashMap<String, (String, u64)>,
     confirmed_multipart_activities: HashSet<String>,
     multipart_registration_expiry: HashMap<String, i64>,
+    placement_policy_fingerprints: HashMap<u32, String>,
 }
 
 #[derive(Clone)]
@@ -6894,6 +6975,20 @@ impl ManagedRepository for InMemoryManagedRepository {
             }
         }
         Ok(authority)
+    }
+
+    async fn record_placement_policy(
+        &self,
+        policy: &ManagedPlacementPolicy,
+    ) -> Result<bool, ManagedError> {
+        let mut state = self.state.lock().await;
+        if let Some(existing) = state.placement_policy_fingerprints.get(&policy.version) {
+            return Ok(existing == &policy.fingerprint);
+        }
+        state
+            .placement_policy_fingerprints
+            .insert(policy.version, policy.fingerprint.clone());
+        Ok(true)
     }
 
     async fn advance_placement_version(
@@ -9036,6 +9131,46 @@ mod tests {
             ["c", "a", "b"].into_iter().map(str::to_string),
         );
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn placement_policy_fingerprint_is_order_independent_and_version_sensitive() {
+        let ordered =
+            placement_policy_fingerprint(1, [("a".to_string(), 1, 2), ("b".to_string(), 3, 4)]);
+        let reordered =
+            placement_policy_fingerprint(1, [("b".to_string(), 3, 4), ("a".to_string(), 1, 2)]);
+        assert_eq!(ordered, reordered);
+        let other_version =
+            placement_policy_fingerprint(2, [("a".to_string(), 1, 2), ("b".to_string(), 3, 4)]);
+        assert_ne!(ordered, other_version);
+        let other_weight =
+            placement_policy_fingerprint(1, [("a".to_string(), 1, 2), ("b".to_string(), 5, 4)]);
+        assert_ne!(ordered, other_weight);
+    }
+
+    #[tokio::test]
+    async fn record_placement_policy_rejects_same_version_different_fingerprint() {
+        let repository = InMemoryManagedRepository::new();
+        let policy = ManagedPlacementPolicy {
+            version: 1,
+            fingerprint: "fingerprint-one".to_string(),
+            backend_facts: vec![],
+            activated_at_ms: 1,
+        };
+        assert!(repository.record_placement_policy(&policy).await.unwrap());
+        assert!(repository.record_placement_policy(&policy).await.unwrap());
+        let conflicting = ManagedPlacementPolicy {
+            version: 1,
+            fingerprint: "fingerprint-two".to_string(),
+            backend_facts: vec![],
+            activated_at_ms: 2,
+        };
+        assert!(
+            !repository
+                .record_placement_policy(&conflicting)
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

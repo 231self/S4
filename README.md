@@ -32,12 +32,55 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 `envelope-encrypt` (per-field RSA-OAEP / AES-256-GCM), `stable-encrypt`
 (deterministic encryption).
 
-## Quickstart (local-only)
+## Contents
 
-No cloud account, no database, no repo clone — everything runs on your machine:
+- [Try it in 60 seconds](#try-it-in-60-seconds)
+- [Install the CLI (optional)](#install-the-cli-optional)
+- [Compatibility](#compatibility)
+- [Run your own plugin](#run-your-own-plugin)
+- [Usage examples](#usage-examples)
+- [How it works](#how-it-works)
+- [Development](#development)
+- [Security](#security)
+- [Documentation](#documentation)
+- [LLM agents](#llm-agents)
+- [License](#license)
+
+## Try it in 60 seconds
+
+No cloud account, no database, no repo clone — run the published image and open
+the demo dashboard:
 
 ```bash
-cargo install --git https://github.com/231self/S4 --bin maskura s4ctl
+docker run --rm -p 127.0.0.1:8791:8080 -e AUTH_DISABLED=true \
+  ghcr.io/231self/maskura/maskura:latest
+# open http://localhost:8791 → demo dashboard (no sign-up)
+
+# Grab an API key from the dashboard's "API Keys" tab, then either follow its
+# "Quick Start" (the snippets auto-fill your port) or run:
+echo "jane.doe@example.com 4111111111111111" > data.jsonl
+curl -X PUT http://localhost:8791/ingest/data.jsonl \
+  -H "x-maskura-access-key: YOUR_KEY_ID" \
+  -H "x-maskura-secret-key: YOUR_SECRET" \
+  --data-binary @data.jsonl
+curl http://localhost:8791/ingest/data.jsonl \
+  -H "x-maskura-access-key: YOUR_KEY_ID" \
+  -H "x-maskura-secret-key: YOUR_SECRET"
+```
+
+The container listens on `8080`; `8791` is just the uncommon host port this
+example maps it to, so nothing already on `8080` collides. Dashboard snippets
+rewrite themselves to whatever `host:port` you open, so copy-paste works for any
+mapping.
+
+## Install the CLI (optional)
+
+Prefer the CLI? Install it with `cargo install`, or grab the prebuilt Linux
+(amd64/arm64) binaries attached to each
+[GitHub Release](https://github.com/231self/maskura/releases):
+
+```bash
+cargo install --git https://github.com/231self/maskura --bin maskura s4ctl
 maskura local init                  # runs the published gateway image (Docker)
 maskura plugin list                 # the pii-default plugin is preloaded
 
@@ -52,11 +95,11 @@ maskura get ingest/data.csv --bucket s4-local
 ```
 
 `maskura local init` pulls the gateway image tagged with the CLI version
-(`ghcr.io/231self/maskura/maskura:v0.3.3` for `maskura` 0.3.3; CLI and gateway always match,
-never `:latest`) and runs it in local mode (`AUTH_DISABLED=true`, keys persisted on a
-volume, in-memory storage); it picks a free port (8080+) and binds the loopback
-interface only. `maskura local down` stops it. For durable local storage (MinIO),
-clone the repo and use `just dev-up`.
+(`ghcr.io/231self/maskura/maskura:v0.3.3` for `maskura` 0.3.3; CLI and gateway always
+match, never `:latest`) and runs it in local mode (`AUTH_DISABLED=true`, keys
+persisted on a volume, in-memory storage); it picks a free port (8080+) and binds
+the loopback interface only. `maskura local down` stops it. For durable local
+storage (MinIO), clone the repo and use `just dev-up`.
 
 ## Compatibility
 
@@ -241,14 +284,16 @@ fail-closed guarantees on the streaming data plane (see
 responsibilities and non-guarantees).
 
 Found a vulnerability? Report it **privately** — via
-[Maskura private vulnerability reporting](https://github.com/231self/S4/security/advisories/new)
+[Maskura private vulnerability reporting](https://github.com/231self/maskura/security/advisories/new)
 or security@231self.com — and never through a
-[public issue](https://github.com/231self/S4/issues/new/choose). See
+[public issue](https://github.com/231self/maskura/issues/new/choose). See
 [SECURITY.md](SECURITY.md) for the supported-version policy,
 response timeline, and what to include in a report.
 
 ## Documentation
 
+- **Docs site** — the same docs, rendered:
+  <https://231self.github.io/maskura/>.
 - `examples/` — runnable end-to-end demos (B2 encryption round-trip).
 - `docs/plugins.md` — create and consume your own plugins.
 - `docs/security.md` — the security model of the gateway.

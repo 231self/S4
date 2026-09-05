@@ -7,7 +7,7 @@ format-specific logical type must be converted to a Maskura-supported type befor
 typed transform, then reconstructed for output.
 
 The contract is `s4:binary-reductor@0.1.0` in
-[`wit/s4-binary-reductor/world.wit`](../wit/s4-binary-reductor/world.wit).
+[`wit/s4-binary-reductor/world.wit`](https://github.com/231self/maskura/blob/main/wit/s4-binary-reductor/world.wit).
 
 ## Lifecycle
 
@@ -30,7 +30,7 @@ do not reuse plans across component versions.
 
 Schema and value inputs are canonical JSON representations of the bounded Maskura
 IR. The definitive Rust types and validators are in
-[`crates/gateway/src/binary_ir.rs`](../crates/gateway/src/binary_ir.rs).
+[`crates/gateway/src/binary_ir.rs`](https://github.com/231self/maskura/blob/main/crates/gateway/src/binary_ir.rs).
 
 - A nullable Avro-like field is represented by `"nullable": true`, not an
   arbitrary union.
@@ -41,7 +41,7 @@ IR. The definitive Rust types and validators are in
   best-effort result.
 
 The test fixture in
-[`filters/test-binary-reductor/src/lib.rs`](../filters/test-binary-reductor/src/lib.rs)
+[`filters/test-binary-reductor/src/lib.rs`](https://github.com/231self/maskura/blob/main/filters/test-binary-reductor/src/lib.rs)
 is the smallest complete example. It reduces `vendor.money` from a custom value
 to a string and restores it after the typed transform.
 

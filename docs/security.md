@@ -7,7 +7,8 @@ what the trust boundaries are, what a production deployment must configure, and
 what Maskura explicitly does **not** guarantee. Anything not described here is not a
 guarantee.
 
-For the vulnerability reporting process, see [SECURITY.md](../SECURITY.md).
+For the vulnerability reporting process, see
+[SECURITY.md](https://github.com/231self/maskura/blob/main/SECURITY.md).
 
 ---
 

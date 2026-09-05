@@ -89,8 +89,8 @@ are deliberately not part of this suite yet. Each is a natural future
 
 - **Positive Avro round trip and envelope/stable field encryption** —
   need `MASKURA_ENABLE_AVRO=true`, an authenticated public key, OCF fixtures,
-  and an Avro codec (e.g. `fastavro`) on the runner to assert typed output.
-  See `docs/avro.md`.
+   and an Avro codec (e.g. `fastavro`) on the runner to assert typed output.
+   See [Avro OCF support](avro.md).
 - **Managed service storage** — needs a multi-backend boot with
   `S4_SERVICE_BUCKETS` and no `S3_ENDPOINT` (the two are mutually exclusive at
   startup).

@@ -1237,6 +1237,10 @@ if (document.getElementById('flowCanvas')) {
   startFlow();
 }
 
+document.querySelectorAll('.code-block').forEach(function(el) {
+  el.textContent = el.textContent.replaceAll('http://localhost:9000', window.location.origin);
+});
+
 // Boot
 (function() {
   /*BOOT*/

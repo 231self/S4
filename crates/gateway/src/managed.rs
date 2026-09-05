@@ -4363,7 +4363,7 @@ impl ManagedRepository for PostgresManagedRepository {
                 .do_nothing()
                 .to_owned(),
         )
-        .exec(&self.db)
+        .exec_without_returning(&self.db)
         .await
         .map_err(persistence)?;
         let existing = managed_placement_policy_version::Entity::find_by_id(version)

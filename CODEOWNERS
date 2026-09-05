@@ -1,0 +1,10 @@
+# Default code owners (declarative; not enforced as a required review yet).
+# Expand with teams/reviewers as the maintainer group grows.
+* @amit231self
+
+# Areas that benefit from a domain-focused reviewer once available.
+# /filters/  @amit231self
+# /crates/   @amit231self
+# /docs/     @amit231self
+# /sdks/     @amit231self
+# /.github/  @amit231self

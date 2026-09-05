@@ -31,8 +31,12 @@ Thanks for considering a contribution to Maskura.
 
 - Target `main`. CI runs format, clippy, tests, filter builds, and a MinIO
   end-to-end pass on every PR.
+- Use the PR template (`.github/pull_request_template.md`): summary, linked
+  issue, and a test plan.
 - Keep changes scoped; split unrelated work into separate PRs.
 - Update `docs/` or `AGENTS.md` when behavior or architecture changes.
+- `main` is protected: the aggregate `check` CI status must pass and the
+  branch must be up to date.
 
 ## Testing
 
@@ -44,6 +48,31 @@ cargo test --workspace
 
 Integration tests that need `DATABASE_URL` skip themselves when it is unset. CI provides
 Postgres and requires these tests to run successfully.
+
+## Author identity
+
+- Commit with your real GitHub identity (for the maintainer:
+  `amit231self <amit@231self.com>`). The repo keeps a `.mailmap` so `git log`
+  and stats show one canonical author.
+- Do **not** append AI `Co-Authored-By` / `Generated with <tool>` trailers
+  (Claude, Codex, and similar) to commit messages. They create phantom entries
+  on GitHub's contributors graph. If you want to credit assistance, say it in
+  the PR description instead.
+- If you ever commit with the wrong email, say so in the PR — the maintainers
+  prefer correcting attribution before merge over rewriting history later.
+
+## Docs site
+
+The docs are an mdBook site in `docs/` (chapters listed in `docs/SUMMARY.md`,
+config in `docs/book.toml`), published to GitHub Pages from `main`. When you
+change a chapter, run `mdbook build docs` locally (`brew install mdbook`) and
+keep out-of-tree links as `https://github.com/231self/maskura/blob/main/...`
+URLs rather than relative `../` paths.
+
+## Maintainers and ownership
+
+See `OWNERS.md` for the maintainer list, decision process, and branch
+protection notes.
 
 ## Security
 

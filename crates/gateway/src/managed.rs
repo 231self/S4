@@ -688,6 +688,21 @@ pub struct AuthorityPlacementPage {
     pub next_after: Option<AuthorityPlacementCursor>,
 }
 
+/// Aggregate view of authorities still below the target placement version.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AuthorityPlacementStats {
+    pub remaining: u64,
+    pub oldest_updated_at_ms: Option<i64>,
+}
+
+/// Counts of repair records grouped by their lifecycle state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RepairStateCounts {
+    pub pending: u64,
+    pub leased: u64,
+    pub dead: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedListVersion {
     V1,
@@ -975,6 +990,10 @@ pub trait ManagedRepository: Send + Sync {
         &self,
         query: AuthorityPlacementPageQuery,
     ) -> Result<AuthorityPlacementPage, ManagedError>;
+    async fn authority_placement_stats(
+        &self,
+        target_placement_version: u32,
+    ) -> Result<AuthorityPlacementStats, ManagedError>;
 
     async fn create_list_cursor(
         &self,
@@ -1087,6 +1106,7 @@ pub trait ManagedRepository: Send + Sync {
     ) -> Result<(), ManagedError>;
     async fn complete_repair(&self, repair: &RepairRecord) -> Result<bool, ManagedError>;
     async fn fail_repair(&self, lease_token: Uuid, error: &str) -> Result<(), ManagedError>;
+    async fn repair_state_counts(&self) -> Result<RepairStateCounts, ManagedError>;
 
     /// Persist a write intent before any provider operation can create a
     /// physical version. Implementations must reject a fenced namespace.
@@ -3684,6 +3704,39 @@ impl ManagedRepository for PostgresManagedRepository {
         })
     }
 
+    async fn authority_placement_stats(
+        &self,
+        target_placement_version: u32,
+    ) -> Result<AuthorityPlacementStats, ManagedError> {
+        if target_placement_version == 0 {
+            return Err(ManagedError::Conflict);
+        }
+        let remaining = managed_object_authority::Entity::find()
+            .filter(managed_object_authority::Column::Tombstone.eq(false))
+            .filter(
+                managed_object_authority::Column::PlacementVersion
+                    .lt(i64::from(target_placement_version)),
+            )
+            .count(&self.db)
+            .await
+            .map_err(persistence)?;
+        let oldest_updated_at_ms = managed_object_authority::Entity::find()
+            .filter(managed_object_authority::Column::Tombstone.eq(false))
+            .filter(
+                managed_object_authority::Column::PlacementVersion
+                    .lt(i64::from(target_placement_version)),
+            )
+            .order_by_asc(managed_object_authority::Column::UpdatedAtMs)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .map(|model| model.updated_at_ms);
+        Ok(AuthorityPlacementStats {
+            remaining,
+            oldest_updated_at_ms,
+        })
+    }
+
     async fn create_list_cursor(
         &self,
         request: ManagedListCursorRequest,
@@ -4786,6 +4839,29 @@ impl ManagedRepository for PostgresManagedRepository {
             .await
             .map_err(persistence)?;
         txn.commit().await.map_err(persistence)
+    }
+
+    async fn repair_state_counts(&self) -> Result<RepairStateCounts, ManagedError> {
+        let pending = managed_object_repair::Entity::find()
+            .filter(managed_object_repair::Column::State.eq("PENDING"))
+            .count(&self.db)
+            .await
+            .map_err(persistence)?;
+        let leased = managed_object_repair::Entity::find()
+            .filter(managed_object_repair::Column::State.eq("LEASED"))
+            .count(&self.db)
+            .await
+            .map_err(persistence)?;
+        let dead = managed_object_repair::Entity::find()
+            .filter(managed_object_repair::Column::State.eq("DEAD"))
+            .count(&self.db)
+            .await
+            .map_err(persistence)?;
+        Ok(RepairStateCounts {
+            pending,
+            leased,
+            dead,
+        })
     }
 
     async fn begin_physical_write(
@@ -6730,6 +6806,32 @@ impl ManagedRepository for InMemoryManagedRepository {
         })
     }
 
+    async fn authority_placement_stats(
+        &self,
+        target_placement_version: u32,
+    ) -> Result<AuthorityPlacementStats, ManagedError> {
+        if target_placement_version == 0 {
+            return Err(ManagedError::Conflict);
+        }
+        let state = self.state.lock().await;
+        let mut remaining = 0_u64;
+        let mut oldest_updated_at_ms: Option<i64> = None;
+        for authority in state.authorities.values() {
+            if !authority.tombstone && authority.placement_version < target_placement_version {
+                remaining = remaining.saturating_add(1);
+                oldest_updated_at_ms = Some(
+                    oldest_updated_at_ms.map_or(authority.updated_at_ms, |oldest| {
+                        oldest.min(authority.updated_at_ms)
+                    }),
+                );
+            }
+        }
+        Ok(AuthorityPlacementStats {
+            remaining,
+            oldest_updated_at_ms,
+        })
+    }
+
     async fn create_list_cursor(
         &self,
         request: ManagedListCursorRequest,
@@ -7315,6 +7417,19 @@ impl ManagedRepository for InMemoryManagedRepository {
             repair.not_before_ms = now.saturating_add(repair_backoff_ms(repair.attempts));
         }
         Ok(())
+    }
+
+    async fn repair_state_counts(&self) -> Result<RepairStateCounts, ManagedError> {
+        let state = self.state.lock().await;
+        let mut counts = RepairStateCounts::default();
+        for (_, status) in state.repairs.values() {
+            match status.as_str() {
+                "LEASED" => counts.leased = counts.leased.saturating_add(1),
+                "DEAD" => counts.dead = counts.dead.saturating_add(1),
+                _ => counts.pending = counts.pending.saturating_add(1),
+            }
+        }
+        Ok(counts)
     }
 
     async fn begin_physical_write(
@@ -9846,5 +9961,96 @@ mod tests {
                 .await,
             Err(ManagedError::Conflict)
         ));
+    }
+
+    #[tokio::test]
+    async fn authority_placement_stats_counts_stale_and_reports_oldest() {
+        let repository = InMemoryManagedRepository::new();
+        for (key, version, tombstone) in [
+            ("stale", 1, false),
+            ("oldest", 1, false),
+            ("current", 2, false),
+            ("tombstone", 1, true),
+        ] {
+            let mut object = authority(
+                LogicalObjectKey::new("stats", "bucket", key),
+                Uuid::now_v7(),
+            );
+            object.placement_version = version;
+            object.tombstone = tombstone;
+            object.replica_status = CopyStatus::Ready;
+            repository.publish(object, None).await.unwrap();
+        }
+        {
+            let mut state = repository.state.lock().await;
+            state
+                .authorities
+                .get_mut(&LogicalObjectKey::new("stats", "bucket", "stale"))
+                .unwrap()
+                .updated_at_ms = 100;
+            state
+                .authorities
+                .get_mut(&LogicalObjectKey::new("stats", "bucket", "oldest"))
+                .unwrap()
+                .updated_at_ms = 40;
+            state
+                .authorities
+                .get_mut(&LogicalObjectKey::new("stats", "bucket", "current"))
+                .unwrap()
+                .updated_at_ms = 5;
+            state
+                .authorities
+                .get_mut(&LogicalObjectKey::new("stats", "bucket", "tombstone"))
+                .unwrap()
+                .updated_at_ms = 1;
+        }
+
+        let stats = repository.authority_placement_stats(2).await.unwrap();
+        assert_eq!(stats.remaining, 2);
+        assert_eq!(stats.oldest_updated_at_ms, Some(40));
+        assert!(matches!(
+            repository.authority_placement_stats(0).await,
+            Err(ManagedError::Conflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn repair_state_counts_groups_pending_leased_and_dead() {
+        let repository = InMemoryManagedRepository::new();
+        let mut object = authority(
+            LogicalObjectKey::new("repair-counts", "bucket", "key"),
+            Uuid::now_v7(),
+        );
+        object.replica_status = CopyStatus::Ready;
+        let published = repository.publish(object, None).await.unwrap();
+
+        {
+            let mut state = repository.state.lock().await;
+            for target in ["a", "b", "c"] {
+                let mut repair = RepairRecord::copy(
+                    RepairKind::Replica,
+                    &published,
+                    Some(published.primary_backend_id.clone()),
+                    target.to_string(),
+                    RepairTargetRole::Replica,
+                    published.placement_version,
+                );
+                repair.generation = Uuid::now_v7();
+                insert_memory_repair(&mut state, repair);
+            }
+            let statuses = ["PENDING", "LEASED", "DEAD"];
+            for ((_, status), wanted) in state.repairs.values_mut().zip(statuses) {
+                *status = wanted.to_string();
+            }
+        }
+
+        assert_eq!(
+            repository.repair_state_counts().await.unwrap(),
+            RepairStateCounts {
+                pending: 1,
+                leased: 1,
+                dead: 1
+            }
+        );
     }
 }

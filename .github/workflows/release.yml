@@ -163,6 +163,7 @@ jobs:
           python3 sdks/package-release.py --output-dir dist
 
       - name: Make canonical and legacy images public
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

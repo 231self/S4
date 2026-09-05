@@ -8,6 +8,7 @@ pub mod managed_object_authority;
 pub mod managed_object_repair;
 pub mod managed_physical_object_version;
 pub mod managed_physical_write_intent;
+pub mod managed_placement_policy_version;
 pub mod managed_workspace_usage;
 pub mod mcp_token;
 pub mod multipart_cleanup_audit;
